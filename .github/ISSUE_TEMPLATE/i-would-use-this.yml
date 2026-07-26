@@ -1,0 +1,40 @@
+name: I would use this
+description: Tell us about your situation. This is the signal we are measuring.
+labels: ["interest"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        No code exists yet — that is deliberate. We published the design first to find out whether
+        anyone wants it. Nothing here is required; partial answers are useful. If any of it is too
+        sensitive to post publicly, email works instead.
+  - type: input
+    attributes:
+      label: Roughly what do you spend on frontier AI per year?
+      description: A range is fine. Order of magnitude is what matters.
+  - type: textarea
+    attributes:
+      label: What are you running today?
+      description: Providers, chat interface, coding assistants, internal apps, anything self-hosted.
+  - type: dropdown
+    attributes:
+      label: Which of these do you most want answered?
+      options:
+        - Which department spent the most last month, and on what
+        - Capping a team's spend without cutting them off mid-sprint
+        - How much of this spend produced work anyone kept
+        - What we would save running some of it ourselves, and which some
+        - What breaks if we want to move providers
+        - Something else (describe below)
+  - type: textarea
+    attributes:
+      label: What would have to be true for you to actually deploy this?
+      description: Including the things that would stop you. Those are more useful than the things that would attract you.
+  - type: dropdown
+    attributes:
+      label: Do you own or rent GPUs today, or neither?
+      options:
+        - Neither — all frontier API
+        - Rent
+        - Own
+        - Both

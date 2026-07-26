@@ -1,0 +1,21 @@
+name: This is wrong
+description: Dispute a specific claim in the design. More useful to us than agreement.
+labels: ["design-dispute"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The design lists what we think would falsify each claim, and 14 gaps we have not closed.
+        Point at one. Being shown wrong early is cheaper than being shown wrong after building.
+  - type: input
+    attributes:
+      label: Which claim or section?
+      description: A section number or a quoted sentence from docs/design/design.md or the README.
+  - type: textarea
+    attributes:
+      label: Why is it wrong?
+      description: Specifics beat impressions. "The pricing deltas you cite do not hold under X" is useful; "this seems hard" is not.
+  - type: textarea
+    attributes:
+      label: What would change your mind?
+      description: Optional, and only fair since we asked the same of ourselves.
