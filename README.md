@@ -1,4 +1,4 @@
-# Switchboard
+# Enterprise AI Framework
 
 **You're spending six figures a year on AI and you can't answer basic questions about it.**
 
@@ -6,7 +6,7 @@ Who spent what. Which team. On which model. Whether it helped. Whether you could
 Your provider's console shows you *their* half of it, attributed to an API key rather than a
 person. Nothing shows you all of it.
 
-Switchboard is one layer that everything goes through. Your people keep the tools they already
+Enterprise AI Framework is one layer that everything goes through. Your people keep the tools they already
 use. You get one login, one bill, one audit trail across every provider — and then the bill starts
 going down.
 
@@ -32,7 +32,7 @@ Ask any of these and see how far you get:
 Not hard questions. There is just nothing that can answer them, because no single system sees all
 of it.
 
-## What Switchboard is
+## What Enterprise AI Framework is
 
 A layer between your people and the AI providers.
 
@@ -58,7 +58,7 @@ What you get later, without changing anything:
   is a corpus of how your company actually operates. Nobody else has it — not even the provider
   who generated the answers.
 - **The option to stop renting.** Run open models on hardware you rent or own, for the work where
-  they're good enough. Switchboard proves which work that is by testing candidates against your
+  they're good enough. Enterprise AI Framework proves which work that is by testing candidates against your
   real traffic before anything moves. The bill drops again.
 
 You are never required to take that last step. A company that stays entirely on frontier APIs
@@ -83,7 +83,7 @@ That is not villainy. Enterprise governance is unglamorous, expensive, and never
 weekend project is SCIM provisioning — so somebody has to fund it, and paywalling it is the
 mechanism the market found.
 
-Switchboard's bet is that this stopped being true. That layer is now cheap enough to build that it
+Enterprise AI Framework's bet is that this stopped being true. That layer is now cheap enough to build that it
 doesn't need a paywall to exist.
 
 ## What's different here
@@ -97,7 +97,7 @@ air-gapped. Your usage data is yours, verifiably — there is an inspectable rec
 was collected and what it was used for.
 
 **You keep your own contracts and your own keys.** We are not a reseller and we don't sit between
-you and your vendor commercially. Switchboard is software you run.
+you and your vendor commercially. Enterprise AI Framework is software you run.
 
 **Nothing is welded in.** The chat app, the coding assistant, the inference engine, the identity
 provider, the dashboards — each is a component behind a defined interface with a conformance test.
@@ -135,4 +135,4 @@ that is the only thing being built here.
 
 ---
 
-*Third Division Labs. The name is provisional — nothing depends on it yet.*
+*Third Division Labs.*

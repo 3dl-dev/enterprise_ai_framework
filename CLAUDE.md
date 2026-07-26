@@ -1,4 +1,4 @@
-# Switchboard — CLAUDE.md
+# Enterprise AI Framework — CLAUDE.md
 
 > Project instructions. OS-level rules inherited from ~/.claude/CLAUDE.md.
 
