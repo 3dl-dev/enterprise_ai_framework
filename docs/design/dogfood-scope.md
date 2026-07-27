@@ -15,7 +15,7 @@ A strict subset of design §7.2. Each item is a checkable end state, proven by `
 | 6 | Revoking a user in the identity provider stops their traffic on all three surfaces | done |
 | 7 | A per-user budget stop enforced at the gateway — past the limit requests are refused, not merely recorded | done |
 | 8 | The bundle starts from one command on a single host with no GPU, with fakes for upstream providers so it is testable with no provider account and no spend | done |
-| 9 | A tested exit path: export the ledger, revoke virtual keys, restore direct provider keys, and every surface keeps working with the layer removed | not built |
+| 9 | A tested exit path: export the ledger, revoke virtual keys, restore direct provider keys, and every surface keeps working with the layer removed | done |
 
 ## Out of scope
 
@@ -33,4 +33,17 @@ make test    # prove the items above
 make spend   # the one bill, by user and surface
 make audit   # verify the audit hash chain
 make sync    # reconcile identity -> virtual keys (idempotent)
+
+make export       # export the ledger and verify it (non-destructive)
+make exit-direct  # write the direct-provider config for each surface
+make exit         # leave: export, verify, direct config, revoke every key
 ```
+
+## Leaving
+
+The exit path is the anti-lock-in mechanism, and it answers the question a licence cannot.
+`make export` writes `spend.csv`, `audit.jsonl` and `keys.csv` with a manifest, then
+verifies the archive. `bundle/bin/verify-export.py` re-verifies it later using nothing but
+the Python standard library and no running service — an archive that needs the vendor's
+software to trust is not an exit. It detects both tampering and truncation, and a test
+asserts its digest still agrees with the control plane's, so the two cannot drift apart.

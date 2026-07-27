@@ -12,10 +12,11 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from . import db, gateway, identity, metering
+from . import db, export, gateway, identity, metering
 
 bearer = HTTPBearer(auto_error=True)
 
@@ -309,3 +310,64 @@ async def audit_log(limit: int = Query(default=100, le=1000)):
 async def audit_verify():
     """Recompute the hash chain end to end. An append-only claim nobody checks is decoration."""
     return await db.verify_chain()
+
+
+# ---------------------------------------------------------------- the exit path
+
+@app.get("/admin/export/manifest", dependencies=[Depends(require_admin)])
+async def export_manifest():
+    """Counts and chain head, so a truncated export is detectable."""
+    return await export.manifest()
+
+
+@app.get("/admin/export/audit", dependencies=[Depends(require_admin)])
+async def export_audit():
+    return StreamingResponse(export.audit_jsonl(), media_type="application/x-ndjson")
+
+
+@app.get("/admin/export/spend", dependencies=[Depends(require_admin)])
+async def export_spend():
+    return StreamingResponse(export.spend_csv(), media_type="text/csv")
+
+
+@app.get("/admin/export/keys", dependencies=[Depends(require_admin)])
+async def export_keys():
+    return StreamingResponse(export.keys_csv(), media_type="text/csv")
+
+
+class RevokeAllResult(BaseModel):
+    revoked: int
+    aliases: list[str] = Field(default_factory=list)
+
+
+@app.post("/admin/exit/revoke-all", response_model=RevokeAllResult,
+          dependencies=[Depends(require_admin)])
+async def revoke_all():
+    """Delete every virtual key at the gateway.
+
+    The second step of leaving: once the operator's surfaces hold direct provider keys,
+    the virtual keys must stop working, or the layer is still a live credential holder
+    for traffic nobody is watching any more.
+    """
+    pool = await db.pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT key_alias FROM virtual_key WHERE status = 'active'"
+        )
+    aliases = [r["key_alias"] for r in rows]
+
+    # Revoke what the gateway holds too, not only what we recorded — anything minted out
+    # of band (the chat surface key is, deliberately) would otherwise survive the exit.
+    gateway_aliases = await gateway.list_aliases()
+    all_aliases = sorted(set(aliases) | set(gateway_aliases))
+
+    if all_aliases:
+        await gateway.delete_by_aliases(all_aliases)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE virtual_key SET status = 'revoked', revoked_at = now() "
+                "WHERE status = 'active'"
+            )
+
+    await db.audit("admin", "exit.revoke_all", None, count=len(all_aliases))
+    return RevokeAllResult(revoked=len(all_aliases), aliases=all_aliases)

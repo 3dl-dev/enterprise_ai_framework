@@ -1,0 +1,4 @@
+username,surface,key_alias,status,max_budget,created_at,revoked_at
+baron,chat,baron::chat,active,,2026-07-27 15:28:59.742347+00,
+baron,ide,baron::ide,active,,2026-07-27 15:28:59.788397+00,
+baron,terminal,baron::terminal,active,,2026-07-27 15:28:59.805801+00,

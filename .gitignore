@@ -12,3 +12,6 @@ bundle/keycloak/realm-export.json
 
 # Self-signed TLS material generated at bundle-up.
 bundle/certs/
+
+# Ledger exports produced by the exit path.
+bundle/exports/

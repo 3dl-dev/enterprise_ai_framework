@@ -41,6 +41,11 @@ services:
 
   fakeprovider:
     build: ../fakeprovider
+    # Published so the exit-path test can reach "the provider" directly, the way a
+    # surface would once the layer is removed. A real provider is on the internet;
+    # this stands in for that reachability.
+    ports:
+      - "${FAKEPROVIDER_PORT:-8090}:8080"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8080/health')\""]
       interval: 5s

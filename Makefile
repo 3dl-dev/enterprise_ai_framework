@@ -1,4 +1,4 @@
-.PHONY: up down logs ps sync spend audit test nuke
+.PHONY: up down logs ps sync spend audit test export exit-direct exit nuke
 
 BUNDLE := bundle
 COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env
@@ -37,6 +37,19 @@ audit:
 
 test:
 	@$(BUNDLE)/bin/run-tests.sh
+
+## Export the ledger and verify it. Non-destructive — run it whenever.
+export:
+	@$(BUNDLE)/bin/exit.sh export
+
+## Write the direct-provider configuration for each surface.
+exit-direct:
+	@$(BUNDLE)/bin/exit.sh direct
+
+## Leave: export, verify, write direct config, then revoke every virtual key.
+## Destructive — surfaces stop working until they hold direct provider keys.
+exit:
+	@$(BUNDLE)/bin/exit.sh full --confirm
 
 ## Destroy all state including the databases. Not reversible.
 nuke:

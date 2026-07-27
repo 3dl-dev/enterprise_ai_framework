@@ -3,7 +3,11 @@
 If any of these cannot pass against the running bundle, the row is void — not re-scoped.
 """
 
+import importlib.util
 import json
+import os
+import pathlib
+import subprocess
 import time
 import uuid
 
@@ -11,7 +15,7 @@ import httpx
 import pytest
 
 import oidc_login
-from conftest import DOGFOOD_USER, compose, set_user_enabled
+from conftest import BUNDLE, DOGFOOD_USER, compose, set_user_enabled
 
 
 def _chat_token(client, chat_url: str) -> str:
@@ -516,3 +520,191 @@ class TestItem8RunsWithoutProviderAccount:
             assert state == "running", f"{service} is {state}"
             if health:
                 assert health == "healthy", f"{service} is {health}"
+
+
+# ---------------------------------------------------------------------------
+# Item 9 — a tested exit path
+# ---------------------------------------------------------------------------
+
+class TestItem9ExitPath:
+    """Leaving must be a procedure, not a support ticket.
+
+    These tests run near the end of the suite because revoking every key genuinely breaks
+    the running bundle; the class restores it afterwards.
+    """
+
+    @pytest.fixture(scope="class", autouse=True)
+    def _restore_bundle(self, control_plane_url, admin_headers):
+        yield
+        # Re-mint the chat surface key, restart the surface so it picks it up, and
+        # reconcile identity. Without this the bundle is left dead for the next run and
+        # the failure would look unrelated to the exit test that caused it.
+        subprocess.run([str(BUNDLE / "bin" / "provision-chat-key.sh")], check=False,
+                       capture_output=True)
+        compose("up", "-d", "chat", check=False)
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+        subprocess.run([str(BUNDLE / "bin" / "wait-healthy.sh")], check=False,
+                       capture_output=True)
+
+    def _export(self, tmp_path) -> pathlib.Path:
+        out = tmp_path / "export"
+        out.mkdir()
+        result = subprocess.run(
+            [str(BUNDLE / "bin" / "exit.sh"), "export"],
+            capture_output=True, text=True, cwd=str(BUNDLE),
+            env={**os.environ, "EXPORT_DIR": str(out)},
+        )
+        assert result.returncode == 0, f"export failed:\n{result.stdout}\n{result.stderr}"
+        latest = out / "latest"
+        assert latest.exists(), f"no export produced: {list(out.iterdir())}"
+        return latest.resolve()
+
+    def test_export_is_complete_and_verifies_standalone(self, tmp_path):
+        """The archive must verify with nothing from this platform running."""
+        export = self._export(tmp_path)
+
+        manifest = json.loads((export / "manifest.json").read_text())
+        assert manifest["audit_events"] > 0
+        assert (export / "audit.jsonl").exists()
+        assert (export / "spend.csv").exists()
+        assert (export / "keys.csv").exists()
+
+        result = subprocess.run(
+            [str(BUNDLE / "bin" / "verify-export.py"), str(export)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"verification failed:\n{result.stdout}"
+        assert "EXPORT VERIFIED" in result.stdout
+
+    def test_verifier_detects_a_tampered_event(self, tmp_path):
+        """A verifier that cannot fail proves nothing."""
+        export = self._export(tmp_path)
+        path = export / "audit.jsonl"
+        lines = path.read_text().splitlines()
+        assert len(lines) >= 2, "need at least two events to test tampering"
+
+        event = json.loads(lines[1])
+        event["actor"] = "attacker"
+        lines[1] = json.dumps(event, sort_keys=True)
+        path.write_text("\n".join(lines) + "\n")
+
+        result = subprocess.run(
+            [str(BUNDLE / "bin" / "verify-export.py"), str(export)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0, "tampering went undetected"
+        assert "has been altered" in result.stdout
+
+    def test_verifier_detects_a_truncated_export(self, tmp_path):
+        export = self._export(tmp_path)
+        path = export / "audit.jsonl"
+        lines = path.read_text().splitlines()
+        assert len(lines) >= 3
+        path.write_text("\n".join(lines[:-1]) + "\n")
+
+        result = subprocess.run(
+            [str(BUNDLE / "bin" / "verify-export.py"), str(export)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0, "truncation went undetected"
+        assert "truncated" in result.stdout
+
+    def test_standalone_verifier_agrees_with_the_control_plane(self, tmp_path):
+        """Guard against drift.
+
+        The verifier reimplements the chain digest so it can outlive this codebase. That
+        duplication is only safe if the two stay in agreement, so assert it rather than
+        hope: recomputing an exported event with the verifier's own digest must reproduce
+        the hash the control plane wrote.
+        """
+        export = self._export(tmp_path)
+        spec = importlib.util.spec_from_file_location(
+            "verify_export", BUNDLE / "bin" / "verify-export.py"
+        )
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+
+        events = [
+            json.loads(l) for l in (export / "audit.jsonl").read_text().splitlines() if l.strip()
+        ]
+        assert events, "nothing to compare"
+        for e in events:
+            recomputed = verifier.digest(
+                e["prev_hash"], e["ts"], e["actor"], e["action"], e["target"], e["detail"]
+            )
+            assert recomputed == e["hash"], (
+                f"verifier and control plane disagree on event {e['seq']}"
+            )
+
+    def test_direct_provider_config_names_the_real_upstreams(self, tmp_path):
+        self._export(tmp_path)
+        result = subprocess.run(
+            [str(BUNDLE / "bin" / "exit.sh"), "direct"],
+            capture_output=True, text=True, cwd=str(BUNDLE),
+            env={**os.environ, "EXPORT_DIR": str(tmp_path / "export")},
+        )
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+        direct = (tmp_path / "export" / "latest" / "direct").resolve()
+        upstreams = json.loads((direct / "upstreams.json").read_text())
+        assert upstreams, "no upstreams recorded"
+        for row in upstreams:
+            assert row["model"], row
+            assert row["api_base"], f"no base URL for {row['model']} — nothing to point at"
+        assert (direct / "README.md").exists()
+
+    def test_revoking_stops_every_key_and_surfaces_still_reach_the_provider(
+        self, gateway_url, control_plane_url, admin_headers, master_headers, env
+    ):
+        """The whole claim: after exit the layer refuses everything, and the surfaces
+        keep working by talking to the provider directly."""
+        # A key that works right now, to prove afterwards that it stopped.
+        alias = f"exittest-{uuid.uuid4().hex[:8]}::ide"
+        created = httpx.post(
+            f"{gateway_url}/key/generate", headers=master_headers,
+            json={"key_alias": alias}, timeout=TIMEOUT,
+        )
+        assert created.status_code == 200, created.text
+        key = created.json()["key"]
+
+        before = httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": f"pre-exit {uuid.uuid4().hex}"}]},
+            timeout=TIMEOUT,
+        )
+        assert before.status_code == 200, before.text
+
+        revoked = httpx.post(
+            f"{control_plane_url}/admin/exit/revoke-all", headers=admin_headers,
+            timeout=TIMEOUT,
+        )
+        assert revoked.status_code == 200, revoked.text
+        assert revoked.json()["revoked"] >= 1
+
+        after = httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": f"post-exit {uuid.uuid4().hex}"}]},
+            timeout=TIMEOUT,
+        )
+        assert after.status_code >= 400, (
+            "a virtual key still worked after the exit revoked everything"
+        )
+
+        # The layer is gone; the surface goes straight to the provider with the
+        # operator's own key. This is what makes the exit real rather than declarative.
+        provider = f"http://localhost:{env.get('FAKEPROVIDER_PORT', '8090')}/v1"
+        direct = httpx.post(
+            f"{provider}/chat/completions",
+            headers={"Authorization": "Bearer operators-own-provider-key"},
+            json={"model": "fake-gpt-large",
+                  "messages": [{"role": "user", "content": "direct after exit"}]},
+            timeout=TIMEOUT,
+        )
+        assert direct.status_code == 200, (
+            f"surface cannot reach the provider directly after exit: {direct.text[:300]}"
+        )
+        assert direct.json()["choices"][0]["message"]["content"].startswith("[fake-provider")

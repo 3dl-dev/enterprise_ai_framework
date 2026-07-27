@@ -143,8 +143,20 @@ ledger as a username — a corrupted bill is worse than a coarse one. The ledger
 already prefers `end_user` where present, so this becomes correct the moment the surface
 is confirmed to forward it.
 
-### 9. Scope item 9 is not built
+### 9. Out-of-band keys would have survived the exit
 
-The tested exit path — export the ledger, revoke virtual keys, restore direct provider
-keys, confirm every surface still works with the layer removed — has no implementation
-and no test. Item 1 is now done; items 2-8 were already done.
+The chat surface's virtual key is minted directly against the gateway by
+`provision-chat-key.sh`, not by the identity reconcile — the surface is a shared client,
+so there is no single user to mint it for. A revoke-all that walked only the control
+plane's own `virtual_key` table would therefore have left it alive: an exit that leaves a
+working credential behind is not an exit.
+
+`/admin/exit/revoke-all` now takes the union of what the control plane recorded and what
+the gateway actually holds, so anything minted out of band is caught too.
+
+### 10. Egress rules are outside the exit path
+
+If the operator restricted egress so that only the gateway could reach providers, then
+after the exit their surfaces will be blocked by the network rather than by this
+software. Egress control is out of scope for this row, so the exit cannot undo it — the
+generated README says so explicitly rather than leaving it to be discovered.
