@@ -1,0 +1,42 @@
+# Chat surface configuration.
+#
+# One control plane: the model catalogue and the upstream come from here, pushed by the
+# bundle — the surface is not administered through its own console.
+#
+# The surface holds a virtual key, never a provider key. Everything it sends goes to the
+# gateway, so chat traffic lands in the same ledger and the same audit trail as the
+# coding agents.
+
+version: 1.2.8
+cache: true
+
+interface:
+  # No local account management — Keycloak owns identity.
+  privacyPolicy:
+    externalUrl: ""
+  termsOfService:
+    externalUrl: ""
+
+registration:
+  # Only identities from the realm. Belt and braces alongside ALLOW_REGISTRATION=false.
+  socialLogins: ["openid"]
+
+endpoints:
+  custom:
+    - name: "Enterprise AI"
+      apiKey: "${CHAT_VIRTUAL_KEY}"
+      baseURL: "http://gateway:4000/v1"
+      models:
+        # Fetched from the gateway so the catalogue has exactly one source.
+        default: ["fake-large", "fake-small", "claude-opus-5"]
+        fetch: true
+      titleConvo: true
+      titleModel: "fake-small"
+      modelDisplayLabel: "Enterprise AI"
+      # NOTE: chat spend currently attributes to the chat surface as a whole, not to the
+      # individual signed-in user. Forwarding the user via addParams was tried and
+      # removed: {{LIBRECHAT_USER_ID}} substitution is only demonstrably supported for
+      # headers, and an unsubstituted placeholder would write the literal string into the
+      # bill as a username — worse than having no per-user chat attribution at all.
+      # The ledger already prefers end_user where present, so this becomes correct as
+      # soon as the surface is confirmed to forward it. Tracked as an open item.

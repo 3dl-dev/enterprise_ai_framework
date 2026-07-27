@@ -50,6 +50,45 @@ revocation check.
 **Fixed by:** real pagination in `gateway.list_keys()`, and `raise_for_status()` on every
 gateway call so a validation error can never be read as an empty result.
 
+### 4. The chat surface shipped five routes around the gateway
+
+LibreChat enables its built-in `openAI`, `anthropic`, `google`, `azureOpenAI` and
+`bedrock` endpoints by default. Each talks to a provider directly. With no keys set they
+fail, so nothing looks wrong — but the moment anyone supplies a key (the UI invites it),
+that traffic leaves the building with no virtual key, no metering, no budget and no audit
+entry. It is precisely the leak the one-control-plane constraint exists to prevent, and it
+was on by default.
+
+**Fixed by:** `ENDPOINTS=custom`, leaving exactly one selectable endpoint pointed at the
+gateway, with `userProvide: false` so users cannot substitute their own key.
+
+**Regression test:** `TestItem1OneLogin::test_only_the_gateway_endpoint_is_reachable_from_chat`,
+which asserts the selectable set is exactly `{"Enterprise AI"}`.
+
+### 5. OIDC forced TLS on the identity provider, and one issuer URL for everyone
+
+Three problems in sequence, each hidden behind the last:
+
+1. The chat surface's OIDC client refuses discovery over plaintext HTTP and exposes no
+   override, so identity had to serve TLS. This is the right posture anyway.
+2. With TLS on, Keycloak moves its management/health port to HTTPS too — so a plaintext
+   health probe reports a perfectly healthy server as unhealthy.
+3. The browser and the chat container must reach identity at the *same* URL, because the
+   client validates that the discovered issuer equals the one it requested. Keycloak's
+   `hostname-backchannel-dynamic` is designed to serve different URLs per channel and
+   therefore *causes* this failure rather than solving it.
+
+**Fixed by:** a self-signed certificate covering `localhost`, `identity` and the host's
+routable IP; a health probe against the realm endpoint on the plain-HTTP port; and a
+single issuer URL built from the host IP, which the browser reaches directly and
+containers reach because published ports bind on the host.
+
+### 6. An incomplete user record looks exactly like a broken SSO integration
+
+Keycloak's Verify Profile required action halts the login flow at a "complete your
+account" form when a user has no first or last name. The redirect chain simply stops
+partway with no error. Provisioning now always sets a complete profile.
+
 ## Open — behavior to know about, not yet decided
 
 ### 4. A cache hit bypasses budget enforcement and writes no spend row
@@ -78,8 +117,34 @@ Acceptable for a single-operator dogfood; it must not survive the row. Every adm
 is at least attributed in the audit trail — but attributed to `admin`, which is one
 principal by construction.
 
-### 6. Scope items 1 and 9 are not yet built
+### 7. The chat surface is not behind TLS, and its session cookies are Secure
 
-Item 1 (one login reaching all three surfaces) and item 9 (tested exit path) have no
-implementation and no test. The spine they depend on — identity, virtual keys, metering,
-audit, budgets — is built and tested. Until both are demonstrated, the row is incomplete.
+LibreChat marks `refreshToken` and `token_provider` as Secure. Browsers make a standard
+exception for `localhost`, so signing in at `http://localhost:3080` works — but any
+deployment on another host over plain HTTP will set the session cookies and then never
+receive them back, presenting as "login succeeds, then I am logged out."
+
+The bundle needs TLS terminated in front of the chat surface before it is reachable at
+anything other than localhost. Not done.
+
+The test suite emulates the browser's localhost exception explicitly rather than
+weakening the surface's cookie flags to suit a stricter HTTP client.
+
+### 8. Chat spend attributes to the surface, not to the person
+
+The chat surface is a shared client holding one virtual key, so its traffic lands under
+`chat-surface / chat` rather than under the signed-in user. The coding agents, which hold
+per-user keys, attribute correctly.
+
+Forwarding the user via `addParams: {user: "{{LIBRECHAT_USER_ID}}"}` was tried and
+removed: that substitution is only demonstrably supported for headers, and an
+unsubstituted placeholder writes the literal string `{{LIBRECHAT_USER_ID}}` into the
+ledger as a username — a corrupted bill is worse than a coarse one. The ledger query
+already prefers `end_user` where present, so this becomes correct the moment the surface
+is confirmed to forward it.
+
+### 9. Scope item 9 is not built
+
+The tested exit path — export the ledger, revoke virtual keys, restore direct provider
+keys, confirm every surface still works with the layer removed — has no implementation
+and no test. Item 1 is now done; items 2-8 were already done.

@@ -41,9 +41,18 @@ async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
         where = 'WHERE s."startTime" >= $1::text::timestamptz'
         params.append(since)
 
+    # Attribution precedence: the end user the surface forwarded, then the user encoded
+    # in the key alias. A surface that serves many people through one shared virtual key
+    # (the chat surface does) is only distinguishable via end_user, while a per-user key
+    # (the coding agents) carries it in the alias. Preferring end_user makes both work
+    # without the caller needing to know which kind of surface it is looking at.
     sql = f"""
     SELECT
-        COALESCE(split_part(v.key_alias, '::', 1), '(unattributed)') AS username,
+        COALESCE(
+            NULLIF(s.end_user, ''),
+            NULLIF(split_part(v.key_alias, '::', 1), ''),
+            '(unattributed)'
+        ) AS username,
         COALESCE(NULLIF(split_part(v.key_alias, '::', 2), ''), '(unknown)') AS surface,
         COUNT(*)                                  AS requests,
         COALESCE(SUM(s.spend), 0)::float8         AS spend,

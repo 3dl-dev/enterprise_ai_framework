@@ -7,7 +7,7 @@ A strict subset of design §7.2. Each item is a checkable end state, proven by `
 
 | # | Outcome | Status |
 |---|---|---|
-| 1 | A user authenticates once and reaches all three surfaces — web chat, IDE coding agent, terminal coding agent — without a second credential | not built |
+| 1 | A user authenticates once and reaches all three surfaces — web chat, IDE coding agent, terminal coding agent — without a second credential | done |
 | 2 | No surface holds a provider API key; each holds a virtual key minted against the operator's own upstream credentials, revocable per user | done |
 | 3 | Every request from all three surfaces transits one gateway speaking both OpenAI-compatible and Anthropic-native inbound, streaming without buffering | done |
 | 4 | One metering ledger; a single query returns total spend by user and by surface across all three | done |

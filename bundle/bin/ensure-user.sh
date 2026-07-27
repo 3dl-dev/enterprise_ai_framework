@@ -29,25 +29,39 @@ existing=$(curl -sS -G "${IDP}/admin/realms/${REALM}/users" \
     --data-urlencode "username=${USERNAME}" --data-urlencode "exact=true" \
     | python3 -c 'import sys,json; u=json.load(sys.stdin); print(u[0]["id"] if u else "")')
 
+# firstName/lastName are not decoration: Keycloak's Verify Profile required action
+# blocks the login flow at a "complete your account" form if they are missing, which
+# looks like a broken SSO integration rather than an incomplete user record.
+profile_json() {
+    python3 -c '
+import json, sys
+print(json.dumps({
+    "username": sys.argv[1],
+    "email": sys.argv[2],
+    "firstName": sys.argv[3],
+    "lastName": sys.argv[4],
+    "enabled": True,
+    "emailVerified": True,
+    "requiredActions": [],
+}))' "$USERNAME" "$EMAIL" "${USERNAME^}" "User"
+}
+
 if [[ -z "$existing" ]]; then
     echo "creating user ${USERNAME}"
     curl -sS -f -X POST "${IDP}/admin/realms/${REALM}/users" \
         -H "Authorization: Bearer ${token}" \
         -H "Content-Type: application/json" \
-        -d "$(python3 -c '
-import json, sys
-print(json.dumps({
-    "username": sys.argv[1],
-    "email": sys.argv[2],
-    "enabled": True,
-    "emailVerified": True,
-}))' "$USERNAME" "$EMAIL")" >/dev/null
+        -d "$(profile_json)" >/dev/null
     existing=$(curl -sS -G "${IDP}/admin/realms/${REALM}/users" \
         -H "Authorization: Bearer ${token}" \
         --data-urlencode "username=${USERNAME}" --data-urlencode "exact=true" \
         | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["id"])')
 else
-    echo "user ${USERNAME} already exists"
+    echo "user ${USERNAME} already exists; ensuring profile is complete"
+    curl -sS -f -X PUT "${IDP}/admin/realms/${REALM}/users/${existing}" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d "$(profile_json)" >/dev/null
 fi
 
 if [[ -n "$PASSWORD" ]]; then

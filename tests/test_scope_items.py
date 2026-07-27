@@ -10,15 +10,113 @@ import uuid
 import httpx
 import pytest
 
-from conftest import compose, set_user_enabled
+import oidc_login
+from conftest import DOGFOOD_USER, compose, set_user_enabled
 
-# A realm user that the revocation test disables and re-enables. Created by
-# `bundle/bin/ensure-user.sh`, which `make up` runs.
-DOGFOOD_USER = "baron"
+
+def _chat_token(client, chat_url: str) -> str:
+    """Short-lived API token minted from the signed-in session."""
+    r = client.post(
+        f"{chat_url}/api/auth/refresh",
+        headers={"Cookie": oidc_login._cookie_header(client)},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["token"]
 
 pytestmark = pytest.mark.usefixtures("stack_up")
 
 TIMEOUT = 60.0
+
+
+# ---------------------------------------------------------------------------
+# Item 1 — one login reaches all three surfaces
+# ---------------------------------------------------------------------------
+
+class TestItem1OneLogin:
+    def test_chat_surface_accepts_realm_identity_via_sso(self, chat_session, chat_url):
+        """A real authorization-code login, driven end to end — not a config assertion."""
+        me = oidc_login.whoami(chat_session, chat_url)
+        user = me.get("user", me)
+        assert user.get("username") == DOGFOOD_USER, user
+        assert user.get("provider") == "openid", (
+            f"signed in via {user.get('provider')} rather than the identity provider"
+        )
+
+    def test_chat_surface_has_no_local_account_path(self, chat_url):
+        """Registration must be closed. An account created locally would be an identity
+        the control plane never sees and can never revoke."""
+        r = httpx.post(
+            f"{chat_url}/api/auth/register",
+            json={
+                "email": f"intruder-{uuid.uuid4().hex[:8]}@example.invalid",
+                "password": "Sufficiently-Long-Password-1",
+                "confirm_password": "Sufficiently-Long-Password-1",
+                "name": "Intruder",
+                "username": f"intruder{uuid.uuid4().hex[:6]}",
+            },
+            timeout=TIMEOUT,
+        )
+        assert r.status_code >= 400, (
+            f"local registration succeeded ({r.status_code}) — identity is bypassable"
+        )
+
+    def test_only_the_gateway_endpoint_is_reachable_from_chat(
+        self, chat_session, chat_url
+    ):
+        """One control plane: the surface must offer no route to a provider except ours.
+
+        LibreChat ships direct openAI / anthropic / google / azure / bedrock endpoints.
+        Left enabled they are an unmetered, unaudited, unbudgeted path around the
+        gateway the moment anyone supplies a key.
+        """
+        token = _chat_token(chat_session, chat_url)
+        endpoints = chat_session.get(
+            f"{chat_url}/api/endpoints",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Cookie": oidc_login._cookie_header(chat_session),
+            },
+            timeout=TIMEOUT,
+        ).json()
+
+        assert set(endpoints) == {"Enterprise AI"}, (
+            f"surface offers routes around the gateway: {sorted(endpoints)}"
+        )
+        assert endpoints["Enterprise AI"].get("userProvide") is False, (
+            "users can supply their own provider key, bypassing the virtual key"
+        )
+
+    def test_chat_catalog_is_pushed_from_the_gateway(self, chat_session, chat_url):
+        token = _chat_token(chat_session, chat_url)
+        models = chat_session.get(
+            f"{chat_url}/api/models",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Cookie": oidc_login._cookie_header(chat_session),
+            },
+            timeout=TIMEOUT,
+        ).json()
+        assert set(models.get("Enterprise AI", [])) == {
+            "fake-large", "fake-small", "claude-opus-5",
+        }, models.get("Enterprise AI")
+
+    def test_one_identity_yields_credentials_for_all_three_surfaces(
+        self, chat_session, chat_url, control_plane_url, admin_headers
+    ):
+        """The whole claim in one assertion: the identity that just signed in to chat is
+        the same identity holding the coding agents' credentials."""
+        me = oidc_login.whoami(chat_session, chat_url)
+        username = me.get("user", me)["username"]
+
+        keys = httpx.get(
+            f"{control_plane_url}/admin/keys", headers=admin_headers,
+            params={"username": username}, timeout=TIMEOUT,
+        ).json()
+        active = {k["surface"] for k in keys if k["status"] == "active"}
+        assert active == {"chat", "ide", "terminal"}, (
+            f"{username} signed in to chat but holds credentials for {active}"
+        )
 
 
 # ---------------------------------------------------------------------------

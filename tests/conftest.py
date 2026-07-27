@@ -111,6 +111,32 @@ def set_user_enabled(env, username: str, enabled: bool) -> None:
 
 
 @pytest.fixture(scope="session")
+def chat_url(env) -> str:
+    return f"http://localhost:{env.get('CHAT_PORT', '3080')}"
+
+
+@pytest.fixture(scope="session")
+def chat_session(chat_url, env):
+    """One signed-in chat session for the whole run.
+
+    Session-scoped deliberately: the chat surface rate-limits login attempts, and a
+    per-test login trips it partway through the suite and turns every later test red for
+    the wrong reason.
+    """
+    import oidc_login
+
+    client = oidc_login.login(chat_url, DOGFOOD_USER, DOGFOOD_PASSWORD)
+    yield client
+    client.close()
+
+
+# The bootstrap realm user, created by `make up`. Read from .env rather than hardcoded so
+# the suite tracks whatever the bundle actually provisioned.
+DOGFOOD_USER = _load_env().get("BOOTSTRAP_USER", "baron")
+DOGFOOD_PASSWORD = _load_env().get("BOOTSTRAP_PASSWORD", "")
+
+
+@pytest.fixture(scope="session")
 def stack_up(control_plane_url, admin_headers):
     """Fail fast and clearly if the bundle is not running, rather than as N cryptic errors."""
     import httpx

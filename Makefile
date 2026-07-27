@@ -5,7 +5,11 @@ COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.
 
 ## Scope item 8: the whole bundle starts from one command on a single host, no GPU.
 up:
+	@$(BUNDLE)/bin/make-certs.sh
 	@$(BUNDLE)/bin/render-env.sh
+	@$(COMPOSE) up -d --build postgres valkey fakeprovider identity gateway control-plane
+	@$(BUNDLE)/bin/wait-healthy.sh
+	@$(BUNDLE)/bin/provision-chat-key.sh
 	@$(COMPOSE) up -d --build
 	@$(BUNDLE)/bin/wait-healthy.sh
 	@$(BUNDLE)/bin/post-up.sh

@@ -63,17 +63,33 @@ services:
       KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
       KC_HEALTH_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
+      # One issuer URL for everyone — the host's own IP, which the browser reaches
+      # directly and containers reach because published ports bind on the host.
+      # Backchannel-dynamic is deliberately NOT used: it
+      # makes the discovery document report a different issuer than the one the client
+      # requested, and the OIDC client rejects that mismatch outright.
+      KC_HOSTNAME: https://${IDP_PUBLIC_HOST}:${IDP_HTTPS_PORT:-8443}
+      # TLS is required by the chat surface's OIDC client, which refuses plaintext
+      # discovery. Plain HTTP stays available on 8080 for control-plane admin calls
+      # inside the compose network.
+      KC_HTTPS_CERTIFICATE_FILE: /certs/identity.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /certs/identity.key
     volumes:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm.json:ro
+      - ./certs:/certs:ro
     ports:
       - "${IDP_PORT:-8082}:8080"
+      - "${IDP_HTTPS_PORT:-8443}:8443"
     depends_on:
       postgres:
         condition: service_healthy
     healthcheck:
-      # The management port serves health; the JVM image has no curl, so use bash's
-      # /dev/tcp rather than adding a package just to probe.
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      # Probe the realm endpoint over plain HTTP on 8080. The management/health port
+      # switches to HTTPS as soon as a certificate is configured, so a plaintext probe
+      # against 9000 reports unhealthy on a server that is working fine. The JVM image
+      # has no curl, hence bash's /dev/tcp. Hitting the realm also proves the import
+      # landed, which a liveness probe would not.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /realms/${IDP_REALM:-enterprise-ai} HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"]
       interval: 10s
       timeout: 5s
       retries: 30
@@ -138,6 +154,91 @@ services:
       retries: 20
     restart: unless-stopped
 
+  # LibreChat's own store. Mongo is LibreChat's requirement, not ours — it holds
+  # conversations, not control-plane state. Postgres stays welded for everything that is
+  # ours (ledger, audit, principals).
+  chatdb:
+    image: mongo:7
+    command: ["--quiet"]
+    volumes:
+      - chatdbdata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  chat:
+    image: ghcr.io/danny-avila/librechat:v0.8.0
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3080
+      MONGO_URI: mongodb://chatdb:27017/librechat
+      DOMAIN_CLIENT: http://localhost:${CHAT_PORT:-3080}
+      DOMAIN_SERVER: http://localhost:${CHAT_PORT:-3080}
+      CONFIG_PATH: /app/librechat.yaml
+
+      # One control plane. Without this the surface also offers openAI, anthropic,
+      # google, azure and bedrock endpoints that talk to providers directly — a path
+      # around the gateway with no metering, no budget and no audit trail. Restricting
+      # to custom endpoints leaves exactly one way out of the building.
+      ENDPOINTS: custom
+
+      CREDS_KEY: ${CHAT_CREDS_KEY:?set CHAT_CREDS_KEY in .env}
+      CREDS_IV: ${CHAT_CREDS_IV:?set CHAT_CREDS_IV in .env}
+      JWT_SECRET: ${CHAT_JWT_SECRET:?set CHAT_JWT_SECRET in .env}
+      JWT_REFRESH_SECRET: ${CHAT_JWT_REFRESH_SECRET:?set CHAT_JWT_REFRESH_SECRET in .env}
+
+      # One login: the chat surface holds no user table and no password. Local
+      # registration and email login are off, so Keycloak is the only way in.
+      ALLOW_EMAIL_LOGIN: "false"
+      ALLOW_REGISTRATION: "false"
+      ALLOW_SOCIAL_LOGIN: "true"
+      ALLOW_SOCIAL_REGISTRATION: "true"
+
+      # Same URL the browser uses, which is what makes issuer validation pass.
+      OPENID_ISSUER: https://${IDP_PUBLIC_HOST}:${IDP_HTTPS_PORT:-8443}/realms/${IDP_REALM:-enterprise-ai}
+      # Trust the bundle's self-signed identity certificate. Scoped to this CA only —
+      # not a blanket disable of certificate verification.
+      NODE_EXTRA_CA_CERTS: /certs/identity.crt
+      OPENID_CLIENT_ID: librechat
+      OPENID_CLIENT_SECRET: ${CHAT_CLIENT_SECRET}
+      OPENID_CALLBACK_URL: /oauth/openid/callback
+      OPENID_SCOPE: "openid profile email"
+      OPENID_SESSION_SECRET: ${CHAT_SESSION_SECRET:?set CHAT_SESSION_SECRET in .env}
+      OPENID_BUTTON_LABEL: "Sign in with Enterprise AI"
+      OPENID_AUTO_REDIRECT: "false"
+
+      # Login throttling defaults to 7 attempts per 5 minutes, which the test suite trips
+      # immediately. Raised for the bundle; a production deployment should lower it back.
+      LOGIN_MAX: ${CHAT_LOGIN_MAX:-100}
+      LOGIN_WINDOW: ${CHAT_LOGIN_WINDOW:-1}
+      BAN_VIOLATIONS: "false"
+
+      # The surface never holds a provider key — only its virtual key.
+      CHAT_VIRTUAL_KEY: ${CHAT_VIRTUAL_KEY:-}
+    volumes:
+      - ./librechat/librechat.yaml:/app/librechat.yaml:ro
+      - ./certs:/certs:ro
+    ports:
+      - "${CHAT_PORT:-3080}:3080"
+    depends_on:
+      chatdb:
+        condition: service_healthy
+      identity:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
+
 volumes:
   pgdata:
   valkeydata:
+  chatdbdata:

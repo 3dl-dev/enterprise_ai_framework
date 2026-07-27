@@ -9,3 +9,6 @@ bundle/keycloak/realm-export.json
 
 # test venv
 .venv-test/
+
+# Self-signed TLS material generated at bundle-up.
+bundle/certs/
