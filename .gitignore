@@ -3,3 +3,9 @@ node_modules/
 __pycache__/
 .env
 *.log
+
+# Rendered from keycloak/realm-export.template.json at bundle-up; contains client secrets.
+bundle/keycloak/realm-export.json
+
+# test venv
+.venv-test/

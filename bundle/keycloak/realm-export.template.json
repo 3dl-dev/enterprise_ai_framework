@@ -1,0 +1,76 @@
+{
+  "realm": "enterprise-ai",
+  "enabled": true,
+  "displayName": "Enterprise AI",
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "editUsernameAllowed": false,
+  "accessTokenLifespan": 3600,
+  "clients": [
+    {
+      "clientId": "control-plane",
+      "name": "Control Plane",
+      "description": "Service account used to mirror identity into virtual keys. Not a login client.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "secret": "REPLACED_AT_BUNDLE_UP",
+      "attributes": {
+        "access.token.lifespan": "3600"
+      }
+    },
+    {
+      "clientId": "librechat",
+      "name": "Chat Surface",
+      "description": "Web chat. Delegates authentication here — it holds no user table of its own.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "secret": "REPLACED_AT_BUNDLE_UP",
+      "redirectUris": [
+        "http://localhost:3080/oauth/openid/callback",
+        "http://127.0.0.1:3080/oauth/openid/callback"
+      ],
+      "webOrigins": ["http://localhost:3080"],
+      "defaultClientScopes": ["openid", "profile", "email", "roles"]
+    },
+    {
+      "clientId": "coding-agent",
+      "name": "Coding Agent Surfaces",
+      "description": "Device-flow client for the IDE and terminal coding agents, which have no browser redirect target.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true"
+      },
+      "redirectUris": ["http://localhost:*", "http://127.0.0.1:*"]
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-control-plane",
+      "enabled": true,
+      "serviceAccountClientId": "control-plane",
+      "clientRoles": {
+        "realm-management": ["view-users", "query-users"]
+      }
+    }
+  ],
+  "groups": [
+    { "name": "engineering" },
+    { "name": "everyone" }
+  ]
+}

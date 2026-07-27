@@ -1,0 +1,143 @@
+# The reference bundle: one command, one host, no GPU (scope item 8).
+#
+# Defaults are wired to the fake provider so this comes up and is testable end to end
+# with no provider account and no spend. Point the gateway at real upstreams by editing
+# litellm/config.yaml and setting the provider keys in .env — nothing else changes.
+
+name: enterprise-ai
+
+x-postgres-env: &pg-env
+  POSTGRES_USER: ${POSTGRES_USER:-eai}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      <<: *pg-env
+      POSTGRES_DB: postgres
+      POSTGRES_MULTIPLE_DATABASES: identity,gateway,controlplane
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-eai} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    command: ["valkey-server", "--save", "60", "1", "--appendonly", "no"]
+    volumes:
+      - valkeydata:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  fakeprovider:
+    build: ../fakeprovider
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  identity:
+    image: quay.io/keycloak/keycloak:26.4
+    command:
+      - start-dev
+      - --import-realm
+      - --http-port=8080
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${IDP_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${IDP_ADMIN_PASSWORD:?set IDP_ADMIN_PASSWORD in .env}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/identity
+      KC_DB_USERNAME: ${POSTGRES_USER:-eai}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      KC_HEALTH_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm.json:ro
+    ports:
+      - "${IDP_PORT:-8082}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # The management port serves health; the JVM image has no curl, so use bash's
+      # /dev/tcp rather than adding a package just to probe.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
+    restart: unless-stopped
+
+  gateway:
+    image: ghcr.io/berriai/litellm:main-v1.77.3-stable
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${GATEWAY_MASTER_KEY:?set GATEWAY_MASTER_KEY in .env}
+      LITELLM_SALT_KEY: ${GATEWAY_SALT_KEY:?set GATEWAY_SALT_KEY in .env}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-eai}:${POSTGRES_PASSWORD}@postgres:5432/gateway
+      REDIS_URL: redis://valkey:6379
+      # Real upstreams go here. Unset in the default bundle — the fake provider needs none.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    ports:
+      - "${GATEWAY_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      fakeprovider:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:4000/health/liveliness')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+  control-plane:
+    build: ../control-plane
+    environment:
+      CONTROL_PLANE_DATABASE_URL: postgresql://${POSTGRES_USER:-eai}:${POSTGRES_PASSWORD}@postgres:5432/controlplane
+      GATEWAY_DATABASE_URL: postgresql://${POSTGRES_USER:-eai}:${POSTGRES_PASSWORD}@postgres:5432/gateway
+      GATEWAY_URL: http://gateway:4000
+      GATEWAY_MASTER_KEY: ${GATEWAY_MASTER_KEY}
+      IDP_URL: http://identity:8080
+      IDP_REALM: ${IDP_REALM:-enterprise-ai}
+      IDP_CLIENT_ID: control-plane
+      IDP_CLIENT_SECRET: ${IDP_CLIENT_SECRET:?set IDP_CLIENT_SECRET in .env}
+      CONTROL_PLANE_ADMIN_TOKEN: ${CONTROL_PLANE_ADMIN_TOKEN:?set CONTROL_PLANE_ADMIN_TOKEN in .env}
+    ports:
+      - "${CONTROL_PLANE_PORT:-8081}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gateway:
+        condition: service_started
+      identity:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  valkeydata:

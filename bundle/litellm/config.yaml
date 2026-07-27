@@ -1,0 +1,72 @@
+# Gateway model catalog.
+#
+# Default bundle routes everything to the fake provider so the system is testable with
+# no provider account (scope item 8). To use real upstreams, uncomment the real entries
+# and set the corresponding key in .env — no other file changes.
+#
+# MIT core only. Nothing here enables anything from LiteLLM's enterprise/ directory.
+
+# EVERY entry must carry an explicit per-token cost. A model the gateway cannot price
+# meters at $0 — tokens are still counted, but spend accumulates as zero, so budgets
+# never trip and the bill under-reports. That failure is silent. See the unpriced-model
+# detector on the control plane (/admin/unpriced), which exists because this was found
+# the hard way rather than reasoned about.
+
+model_list:
+  # ---- fake upstreams (default) -------------------------------------------------
+  - model_name: fake-large
+    litellm_params:
+      model: openai/fake-gpt-large
+      api_base: http://fakeprovider:8080/v1
+      api_key: fake-not-a-real-key
+      input_cost_per_token: 0.000003
+      output_cost_per_token: 0.000015
+
+  - model_name: fake-small
+    litellm_params:
+      model: openai/fake-gpt-small
+      api_base: http://fakeprovider:8080/v1
+      api_key: fake-not-a-real-key
+      input_cost_per_token: 0.0000003
+      output_cost_per_token: 0.0000015
+
+  # Anthropic-native inbound (Claude Code, terminal surface) needs a model whose name
+  # the client will send. Mapped to the fake upstream in the default bundle.
+  - model_name: claude-opus-5
+    litellm_params:
+      model: openai/fake-gpt-large
+      api_base: http://fakeprovider:8080/v1
+      api_key: fake-not-a-real-key
+      input_cost_per_token: 0.000003
+      output_cost_per_token: 0.000015
+
+  # ---- real upstreams (uncomment and set keys in .env) --------------------------
+  # - model_name: claude-opus-5
+  #   litellm_params:
+  #     model: anthropic/claude-opus-5
+  #     api_key: os.environ/ANTHROPIC_API_KEY
+  #
+  # - model_name: gpt-5
+  #   litellm_params:
+  #     model: openai/gpt-5
+  #     api_key: os.environ/OPENAI_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+
+litellm_settings:
+  # Every request gets a spend row. This is the ledger the control plane reads for
+  # the one bill (scope item 4) — without it, spend-by-user-and-surface returns nothing.
+  success_callback: ["postgres"]
+  failure_callback: ["postgres"]
+  drop_params: true
+  cache: true
+  cache_params:
+    type: redis
+    url: os.environ/REDIS_URL
+    # Exact-match only. Semantic cache is explicitly out of scope for this row.
+    supported_call_types: ["acompletion", "completion"]
+
+router_settings:
+  redis_url: os.environ/REDIS_URL

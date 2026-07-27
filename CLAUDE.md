@@ -19,27 +19,26 @@ It is the layer that four separate open-source projects independently chose to p
 (Open WebUI, Onyx, LiteLLM, Cline). The bet is that this layer is now cheap enough to build that
 it no longer needs a paywall to exist.
 
-## ⛔ Current milestone: VALIDATION. Do not write implementation code.
+## Current milestone: v0.1-dogfood. Build it.
 
-The milestone is **"does anyone care."**
+The founder is the first user. The use case is a Claude-like enterprise UX across three
+surfaces — web chat, an IDE coding agent, and a terminal coding agent — behind one login, one
+bill, and one audit trail.
 
-Building it is not in doubt and is not interesting. The failure mode being avoided is a good tool
-shipped to an empty room. **No production code until the validation threshold is met or provably
-missed.** Both outcomes are results; the negative one gets published.
+Build. Do not gate work on validation artifacts, pre-registration, or cost estimates; that thread
+is closed and is not to be reopened.
 
-If asked to build a feature, check the milestone first and say so.
-
-In scope right now: the pre-registration, the sealed estimate, distribution, responding to
-inbound, and correcting the design when someone shows it is wrong.
+Progress is tracked by the nine outcomes in `docs/design/dogfood-scope.md` and proven by
+`make test`.
 
 ## Source of truth, in order
 
 1. `docs/design/design.md` — the architecture. Every ruling with the losing argument stated, the
    attack register, and 14 known gaps. ~1500 lines; §7 is the buildable part.
 2. `docs/design/brief.md` — the requirement and the reasoning that produced it.
-3. `docs/evidence/` — the pre-registration and the sealed estimate. **Write-once. Read the
-   warnings in those files before touching them.**
-4. `rd` items — what is actually being worked.
+3. `docs/design/dogfood-scope.md` — the nine outcomes v0.1-dogfood must demonstrate.
+4. `docs/design/dogfood-findings.md` — defects found by running it, and open behavior.
+5. `rd` items — what is actually being worked.
 
 If a downstream artifact contradicts the design, flag the conflict explicitly rather than
 silently adopting different numbers.
@@ -80,14 +79,6 @@ packaging steers to non-OSI · **Perses not Grafana** — Grafana is AGPL; if sw
 via `auth.proxy`, never patch, or our integration code becomes AGPL inside an Apache bundle ·
 Keycloak or Ory · **Postgres, welded** — not a swap port · Axolotl · SkyPilot · **LiteLLM MIT
 core only** — its `enterprise/` directory is out of scope.
-
-## Two deadlines that have already effectively arrived
-
-1. **The sealed conventional-cost estimate** (`docs/evidence/conventional-estimate.md`) must be
-   written **before the first implementation commit**. It cannot be added afterward without
-   voiding the row it protects.
-2. **The validation threshold** (`docs/evidence/preregistration.md`) must be written **before any
-   outreach**, or every outcome can be narrated as vindication.
 
 ## What we will not do
 
