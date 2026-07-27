@@ -89,6 +89,35 @@ print(json.dumps({"username": u, "email": os.environ["BE"], "firstName": u.capit
     echo "    ${BU} ready"
 fi
 
+echo "==> chat surface virtual key"
+# Must be minted against THIS gateway. A key from the local compose bundle lives in a
+# different database and is rejected here — and LibreChat does not surface that: it
+# silently falls back to the hardcoded model list in librechat.yaml, so the surface looks
+# healthy while offering models it cannot reach.
+kubectl -n "$NS" port-forward svc/gateway 14000:4000 >/dev/null 2>&1 &
+GPF=$!
+trap 'kill $PF $GPF 2>/dev/null || true' EXIT
+sleep 3
+GW=http://localhost:14000
+MK="$(secret GATEWAY_MASTER_KEY)"
+CHAT_KEY=$(curl -sS -o /dev/null -w '%{http_code}' -G "${GW}/key/info" \
+    -H "Authorization: Bearer ${MK}" --data-urlencode "key=$(secret CHAT_VIRTUAL_KEY 2>/dev/null || echo x)")
+if [[ "$CHAT_KEY" != "200" ]]; then
+    curl -sS -X POST "${GW}/key/delete" -H "Authorization: Bearer ${MK}" \
+        -H "Content-Type: application/json" -d '{"key_aliases":["chat-surface::chat"]}' >/dev/null 2>&1 || true
+    NEW=$(curl -sS -X POST "${GW}/key/generate" -H "Authorization: Bearer ${MK}" \
+        -H "Content-Type: application/json" \
+        -d '{"key_alias":"chat-surface::chat","metadata":{"surface":"chat","issuer":"post-deploy"}}' \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin)["key"])')
+    kubectl -n "$NS" patch secret enterprise-ai-secrets --type=json \
+        -p "[{\"op\":\"replace\",\"path\":\"/data/CHAT_VIRTUAL_KEY\",\"value\":\"$(printf '%s' "$NEW" | base64 -w0)\"}]" >/dev/null
+    kubectl -n "$NS" rollout restart deployment/chat >/dev/null
+    kubectl -n "$NS" rollout status deployment/chat --timeout=300s >/dev/null
+    echo "    minted and chat restarted"
+else
+    echo "    existing key is valid"
+fi
+
 echo "==> reconciling identity into virtual keys"
 kubectl -n "$NS" port-forward svc/control-plane 18081:8000 >/dev/null 2>&1 &
 CPF=$!

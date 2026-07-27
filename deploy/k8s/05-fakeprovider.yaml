@@ -1,0 +1,41 @@
+# The fake upstream provider.
+#
+# Deployed to the cluster for the same reason it exists in the compose bundle: it makes
+# the whole path testable end to end with no provider account, no spend and no external
+# dependency. Without it, verifying "can a user actually send a message and get a reply"
+# requires working Forge credentials, so a credential problem and a broken deployment look
+# identical.
+#
+# It serves deterministic replies, so a test can assert on the content.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fakeprovider
+  namespace: enterprise-ai
+spec:
+  selector: { app: fakeprovider }
+  ports: [{ name: http, port: 8080, targetPort: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fakeprovider
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: fakeprovider } }
+  template:
+    metadata:
+      labels: { app: fakeprovider }
+    spec:
+      containers:
+        - name: fakeprovider
+          image: REPLACED_BY_DEPLOY
+          ports: [{ containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { memory: "256Mi" }

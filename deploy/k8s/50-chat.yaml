@@ -41,6 +41,18 @@ spec:
       annotations:
         checksum/config: "REPLACED_BY_DEPLOY"
     spec:
+      # The OIDC token exchange happens from inside this pod, and the cluster is not on
+      # the tailnet: it resolves the funnel hostname to the public ingress and the
+      # connection is reset. Pin the name to the gateway VM's LAN address so the
+      # backchannel goes straight there, over the same hostname and port the browser uses
+      # — the issuer must match on both sides or the client rejects it.
+      #
+      # The browser is unaffected: it resolves the same name via the tailnet or the
+      # public funnel as before.
+      hostAliases:
+        - ip: "192.168.2.42"
+          hostnames:
+            - "gateway.tailcb6ef9.ts.net"
       containers:
         - name: librechat
           image: ghcr.io/danny-avila/librechat:v0.8.0
@@ -82,6 +94,12 @@ spec:
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_JWT_SECRET } }
             - name: JWT_REFRESH_SECRET
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_JWT_REFRESH_SECRET } }
+            # Login throttling. LibreChat defaults to 7 attempts per 5 minutes, which a
+            # test run trips immediately and then reads as a broken login rather than a
+            # rate limit. Raised, but deliberately not disabled — it is a real protection.
+            - { name: LOGIN_MAX, value: "30" }
+            - { name: LOGIN_WINDOW, value: "5" }
+            - { name: BAN_VIOLATIONS, value: "false" }
             - name: CHAT_VIRTUAL_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_VIRTUAL_KEY } }
           ports: [{ containerPort: 3080 }]

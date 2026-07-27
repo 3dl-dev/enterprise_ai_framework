@@ -247,7 +247,55 @@ A known coupling *was* found and fixed in the same area: the live suite used to 
 the chat surface's virtual key from `.env`, which the hermetic exit-path test revokes and
 re-mints. The live suite now mints its own dedicated key and revokes it afterwards.
 
-### 17. Egress rules are outside the exit path
+### 17. A public-funnel origin breaks the in-cluster OIDC backchannel
+
+The most expensive failure of the deployment, and it presented as "login worked in my
+test, then failed for the user."
+
+The chat surface completes its OIDC token exchange **from inside the pod**, not in the
+browser. With the issuer set to the Tailscale Funnel URL, the pod — which is not on the
+tailnet — resolved that hostname to the *public* funnel ingress over IPv6 and got
+`ECONNRESET`. The browser half of the flow worked perfectly, so a client-side test passed
+while real logins failed with "An unknown error occurred".
+
+**Fixed by** serving the same hostname and port on the gateway VM's LAN interface with a
+real certificate (`tailscale cert`, which issues a genuine Let's Encrypt cert for the
+tailnet name), and a `hostAliases` entry pinning that name to the VM's LAN address inside
+the chat pod. Browser and backchannel now use one identical issuer URL by two different
+routes. `tailscaled` binds `:8443` only on tailnet addresses, so the LAN listener does not
+conflict.
+
+**The lesson that generalises:** an OIDC integration has two independent network paths,
+and a test that drives only the browser path proves only half of it. Any future check must
+assert reachability *from the pod*, not just from the developer's machine.
+
+### 18. The chat surface hides a rejected gateway key
+
+When its virtual key is rejected, LibreChat does not surface the failure — it silently
+falls back to the hardcoded `default` model list in `librechat.yaml`. The UI looks
+healthy and offers models it cannot reach.
+
+Found because the cluster was deployed with a virtual key minted against the *local*
+compose gateway, which is a different database and therefore invalid. The surface showed
+exactly the three fallback models instead of the eleven the gateway serves.
+
+`deploy/bin/post-deploy.sh` now validates the key against the cluster gateway and mints a
+new one if it is rejected. The general hazard remains: a healthy-looking model list is not
+evidence that the surface can reach the gateway. Compare it against the gateway's own
+catalogue, which is what the item-1 regression test does.
+
+### 19. The chat route rejects non-browser clients
+
+`/api/agents/chat` runs a User-Agent check and answers `Illegal request` to anything it
+does not recognise as a browser. Legitimate anti-bot hardening, and worth knowing before
+concluding a chat integration is broken: any non-browser test must present a browser
+User-Agent or it never reaches the model at all.
+
+Login rate limiting bit the same way — LibreChat allows 7 attempts per 5 minutes by
+default, and a test run trips it, after which every login looks broken rather than
+throttled. The cluster now sets a higher limit without disabling the protection.
+
+### 20. Egress rules are outside the exit path
 
 If the operator restricted egress so that only the gateway could reach providers, then
 after the exit their surfaces will be blocked by the network rather than by this
