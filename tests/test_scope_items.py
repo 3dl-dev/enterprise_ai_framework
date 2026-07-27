@@ -91,19 +91,36 @@ class TestItem1OneLogin:
             "users can supply their own provider key, bypassing the virtual key"
         )
 
-    def test_chat_catalog_is_pushed_from_the_gateway(self, chat_session, chat_url):
+    def test_chat_catalog_is_pushed_from_the_gateway(
+        self, chat_session, chat_url, gateway_url, master_headers
+    ):
+        """The surface must offer exactly what the gateway offers.
+
+        Compared against the gateway's live catalog rather than a hardcoded list: the
+        claim is "one control plane decides the catalogue", and a pinned list would both
+        go stale and stop testing that claim.
+        """
         token = _chat_token(chat_session, chat_url)
-        models = chat_session.get(
+        offered = set(chat_session.get(
             f"{chat_url}/api/models",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Cookie": oidc_login._cookie_header(chat_session),
             },
             timeout=TIMEOUT,
-        ).json()
-        assert set(models.get("Enterprise AI", [])) == {
-            "fake-large", "fake-small", "claude-opus-5",
-        }, models.get("Enterprise AI")
+        ).json().get("Enterprise AI", []))
+
+        available = {
+            m["id"] for m in httpx.get(
+                f"{gateway_url}/v1/models", headers=master_headers, timeout=TIMEOUT
+            ).json()["data"]
+        }
+
+        assert offered == available, (
+            f"chat surface and gateway disagree on the catalogue; "
+            f"only in chat: {sorted(offered - available)}, "
+            f"only in gateway: {sorted(available - offered)}"
+        )
 
     def test_one_identity_yields_credentials_for_all_three_surfaces(
         self, chat_session, chat_url, control_plane_url, admin_headers

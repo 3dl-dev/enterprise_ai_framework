@@ -15,3 +15,8 @@ bundle/certs/
 
 # Ledger exports produced by the exit path.
 bundle/exports/
+
+# Generated gateway catalog and Forge caches.
+bundle/litellm/config.generated.yaml
+bundle/litellm/forge-pricing.cache.json
+bundle/litellm/forge-catalog.cache.json

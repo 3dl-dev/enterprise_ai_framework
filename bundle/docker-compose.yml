@@ -112,8 +112,11 @@ services:
       # Real upstreams go here. Unset in the default bundle — the fake provider needs none.
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Forge agent key. Runtime inference only — it can spend, not mint keys. The
+      # admin key deliberately never reaches a container.
+      FORGE_API_KEY: ${FORGE_API_KEY:-}
     volumes:
-      - ./litellm/config.yaml:/app/config.yaml:ro
+      - ./litellm/config.generated.yaml:/app/config.yaml:ro
     ports:
       - "${GATEWAY_PORT:-4000}:4000"
     depends_on:

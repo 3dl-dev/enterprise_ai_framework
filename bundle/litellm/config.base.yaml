@@ -1,4 +1,7 @@
-# Gateway model catalog.
+# Gateway model catalog — BASE. Do not mount this directly.
+#
+# bin/render-gateway-config.py renders this into config.generated.yaml, which is what
+# the gateway actually loads.
 #
 # Default bundle routes everything to the fake provider so the system is testable with
 # no provider account (scope item 8). To use real upstreams, uncomment the real entries
@@ -40,16 +43,13 @@ model_list:
       input_cost_per_token: 0.000003
       output_cost_per_token: 0.000015
 
-  # ---- real upstreams (uncomment and set keys in .env) --------------------------
-  # - model_name: claude-opus-5
-  #   litellm_params:
-  #     model: anthropic/claude-opus-5
-  #     api_key: os.environ/ANTHROPIC_API_KEY
-  #
-  # - model_name: gpt-5
-  #   litellm_params:
-  #     model: openai/gpt-5
-  #     api_key: os.environ/OPENAI_API_KEY
+  # ---- upstream models, generated ------------------------------------------------
+  # bin/render-gateway-config.py replaces the marker below with one entry per model
+  # from Forge's live catalog, priced from that catalog. Do not hand-edit: the doc is
+  # explicit that GET /v1/models is the source of truth rather than a pinned list.
+  # With no Forge key configured the marker is removed and only the fakes remain, so
+  # the bundle still runs with no provider account.
+# @GENERATED_UPSTREAMS@
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

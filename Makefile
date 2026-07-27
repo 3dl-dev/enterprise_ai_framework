@@ -1,4 +1,4 @@
-.PHONY: up down logs ps sync spend audit test export exit-direct exit nuke
+.PHONY: up down logs ps sync spend audit test test-forge forge-config export exit-direct exit nuke
 
 BUNDLE := bundle
 COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env
@@ -7,6 +7,7 @@ COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.
 up:
 	@$(BUNDLE)/bin/make-certs.sh
 	@$(BUNDLE)/bin/render-env.sh
+	@$(BUNDLE)/bin/render-gateway-config.py
 	@$(COMPOSE) up -d --build postgres valkey fakeprovider identity gateway control-plane
 	@$(BUNDLE)/bin/wait-healthy.sh
 	@$(BUNDLE)/bin/provision-chat-key.sh
@@ -55,3 +56,12 @@ exit:
 nuke:
 	@$(COMPOSE) down -v
 	@rm -f $(BUNDLE)/keycloak/realm-export.json
+
+## Live smoke tests against Forge. Spends real money (fractions of a cent).
+## Kept out of `make test` so the nine items stay provable with no provider account.
+test-forge:
+	@.venv-test/bin/pytest tests-live/ -v --tb=short -p no:cacheprovider
+
+## Reload Forge credentials from 1Password and regenerate the gateway catalog.
+forge-config:
+	@$(BUNDLE)/bin/render-gateway-config.py

@@ -34,10 +34,28 @@ make spend   # the one bill, by user and surface
 make audit   # verify the audit hash chain
 make sync    # reconcile identity -> virtual keys (idempotent)
 
+make forge-config # regenerate the gateway catalogue from Forge's live catalog
+make test-forge   # live smoke tests against Forge (spends real money)
+
 make export       # export the ledger and verify it (non-destructive)
 make exit-direct  # write the direct-provider config for each surface
 make exit         # leave: export, verify, direct config, revoke every key
 ```
+
+## Upstreams
+
+The default bundle runs entirely against the fake provider, so the nine items above are
+provable with no provider account and no spend. That property is load-bearing and
+`make test` must never depend on a real upstream.
+
+Real inference goes through **Forge** (`https://forge.3dl.dev`), not retail provider APIs.
+`bin/render-gateway-config.py` generates the gateway catalogue from Forge's live catalog
+joined to its rate card, and **refuses to emit a model it cannot price** — an unpriced
+model meters at $0, so budgets never trip and the bill under-reports with no error
+anywhere. Today that yields 8 usable models out of 68; see finding 10.
+
+Live smoke tests are `make test-forge`, kept separate from `make test`. They reconcile our
+computed cost against Forge's own usage record, which currently agrees to the cent.
 
 ## Leaving
 

@@ -154,7 +154,62 @@ working credential behind is not an exit.
 `/admin/exit/revoke-all` now takes the union of what the control plane recorded and what
 the gateway actually holds, so anything minted out of band is caught too.
 
-### 10. Egress rules are outside the exit path
+### 10. Forge prices only 12 of its 68 models, and the unpriced ones are the interesting ones
+
+Wiring Forge as the real upstream ran straight back into finding 1, this time with real
+money and at scale. `GET /v1/models` returns 68 models and carries **no pricing**;
+`GET /v1/pricing` (admin-gated) quotes only 12.
+
+Of those 12, four are quoted at exactly `$0` — `whisper-large-v3-turbo`, `flux-1-schnell`,
+`kokoro`, `orpheus` — all on the `local` path. That zero is real rather than missing:
+they run on hardware already owned, so marginal token cost genuinely is zero. Our
+unpriced-model detector cannot tell that apart from a missing price by looking at the
+ledger, so those four are excluded until local-model accounting exists (capex, not a
+token price).
+
+That leaves **8 usable models**: six Claude and two GLM via DeepInfra.
+
+The other 56 — every open-weight model, including `kimi-k2.5`, `glm-5`, `gpt-oss-120b`,
+`deepseek-v3.2`, the whole Llama and Qwen families — have no price. They are excluded
+from the generated catalogue, loudly. Including them would meter every request at $0:
+budgets would not apply, the bill would under-report, and nothing would error.
+
+This directly blocks "run your own model" on anything but the six Claude models until
+Forge quotes prices or we add an operator-supplied price override.
+
+**Mechanism:** `bundle/bin/render-gateway-config.py` generates the gateway catalogue from
+Forge's live catalog joined to its rate card, and refuses to emit an unpriced entry.
+
+### 11. Our bill and Forge's agree to the cent
+
+Worth recording as a positive result because it is the number the whole layer exists to
+produce. Our gateway prices from Forge's published rate card; Forge meters independently.
+For the same request (39 input, 27 output on `claude-haiku-4-5`) both compute
+`$0.000184875`. Asserted every run by
+`TestMoneyIsCorrect::test_our_computed_cost_matches_what_forge_billed`, which reconciles a
+live request against Forge's own usage record rather than trusting either side.
+
+### 12. Sovereignty pinning does not survive our gateway
+
+Forge enforces sovereignty per request via an `X-Forge-Sovereignty` header, refusing
+violations with a list of compliant alternatives. Our gateway does not forward caller
+headers, so **a caller behind our layer cannot pin a stricter floor than their key's
+default**. That is a capability regression introduced by intermediating.
+
+It matters for the stated use case: handling data that must not touch foreign-origin
+models is exactly when a per-request pin is wanted, and today the answer is to mint a
+separate key with a stricter floor instead. Recorded as `xfail` in the live suite rather
+than hidden, so the day the gateway forwards the header the test flips to passing.
+
+Two smaller discrepancies against Forge's consumer quickstart, both worth reporting
+upstream:
+
+- A sovereignty violation returns **451**, not the documented **403**.
+- `/v1/usage` time filters (`since`/`until`) return an empty list for any range. This
+  fails closed and silently — an empty result reads as "no spend" rather than an error —
+  so nothing here uses them. Forge tracks it as `forge-f22`.
+
+### 13. Egress rules are outside the exit path
 
 If the operator restricted egress so that only the gateway could reach providers, then
 after the exit their surfaces will be blocked by the network rather than by this
