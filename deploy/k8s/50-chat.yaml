@@ -69,7 +69,12 @@ spec:
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: PUBLIC_BASE_URL } }
 
             # One control plane: exactly one route out of the building.
-            - { name: ENDPOINTS, value: "custom" }
+            # custom,agents — NOT just "custom". This list is literal: naming only "custom"
+      # also drops the agents endpoint, and the agents framework is where MCP servers,
+      # memory, tools, file search and web search live. The bypass this closes is the
+      # built-in openAI/anthropic/google/azure/bedrock endpoints, which are absent from
+      # the list and therefore still disabled.
+      - { name: ENDPOINTS, value: "custom,agents" }
             - { name: ALLOW_EMAIL_LOGIN, value: "false" }
             - { name: ALLOW_REGISTRATION, value: "false" }
             - { name: ALLOW_SOCIAL_LOGIN, value: "true" }
