@@ -75,3 +75,21 @@ spec:
         - name: realm
           secret:
             secretName: enterprise-ai-realm
+---
+# Keycloak must be reachable at the SAME public origin as the chat surface: the OIDC
+# client validates that the issuer in the discovery document equals the one it requested,
+# so browser and backchannel cannot use different hostnames. Caddy path-routes /realms
+# and /resources here; everything else goes to chat.
+apiVersion: v1
+kind: Service
+metadata:
+  name: identity-nodeport
+  namespace: enterprise-ai
+spec:
+  type: NodePort
+  selector: { app: identity }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30382
