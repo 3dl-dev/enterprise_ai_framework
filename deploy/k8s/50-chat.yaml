@@ -1,0 +1,101 @@
+# The chat surface.
+#
+# NodePort, fronted by Caddy on the gateway VM which terminates TLS for the public name.
+# ENDPOINTS=custom is load-bearing, not cosmetic: without it LibreChat also offers direct
+# openAI / anthropic / google / azure / bedrock endpoints, which are unmetered, unaudited
+# routes around the gateway (dogfood-findings.md finding 4).
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat
+  namespace: enterprise-ai
+spec:
+  selector: { app: chat }
+  ports: [{ name: http, port: 3080, targetPort: 3080 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chat-nodeport
+  namespace: enterprise-ai
+spec:
+  type: NodePort
+  selector: { app: chat }
+  ports:
+    - name: http
+      port: 3080
+      targetPort: 3080
+      nodePort: 30380
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: chat } }
+  template:
+    metadata:
+      labels: { app: chat }
+      annotations:
+        checksum/config: "REPLACED_BY_DEPLOY"
+    spec:
+      containers:
+        - name: librechat
+          image: ghcr.io/danny-avila/librechat:v0.8.0
+          env:
+            - { name: HOST, value: "0.0.0.0" }
+            - { name: PORT, value: "3080" }
+            - { name: MONGO_URI, value: "mongodb://chatdb:27017/librechat" }
+            - { name: CONFIG_PATH, value: "/app/librechat.yaml" }
+            # Public origin — must match what the browser used, or the OIDC callback and
+            # cookie domain will not line up.
+            - name: DOMAIN_CLIENT
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: PUBLIC_BASE_URL } }
+            - name: DOMAIN_SERVER
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: PUBLIC_BASE_URL } }
+
+            # One control plane: exactly one route out of the building.
+            - { name: ENDPOINTS, value: "custom" }
+            - { name: ALLOW_EMAIL_LOGIN, value: "false" }
+            - { name: ALLOW_REGISTRATION, value: "false" }
+            - { name: ALLOW_SOCIAL_LOGIN, value: "true" }
+            - { name: ALLOW_SOCIAL_REGISTRATION, value: "true" }
+
+            - name: OPENID_ISSUER
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: OPENID_ISSUER } }
+            - { name: OPENID_CLIENT_ID, value: "librechat" }
+            - name: OPENID_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_CLIENT_SECRET } }
+            - { name: OPENID_CALLBACK_URL, value: "/oauth/openid/callback" }
+            - { name: OPENID_SCOPE, value: "openid profile email" }
+            - { name: OPENID_BUTTON_LABEL, value: "Sign in with Enterprise AI" }
+            - name: OPENID_SESSION_SECRET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_SESSION_SECRET } }
+
+            - name: CREDS_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_CREDS_KEY } }
+            - name: CREDS_IV
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_CREDS_IV } }
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_JWT_SECRET } }
+            - name: JWT_REFRESH_SECRET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_JWT_REFRESH_SECRET } }
+            - name: CHAT_VIRTUAL_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_VIRTUAL_KEY } }
+          ports: [{ containerPort: 3080 }]
+          volumeMounts:
+            - { name: config, mountPath: /app/librechat.yaml, subPath: librechat.yaml, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /health, port: 3080 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits:   { memory: "2Gi" }
+      volumes:
+        - name: config
+          configMap:
+            name: chat-config

@@ -1,0 +1,83 @@
+# Valkey (cache) and Mongo (the chat surface's own store).
+#
+# Valkey has no PVC on purpose: it is an exact-match response cache, so losing it costs a
+# cache miss, not data. Mongo does get one — it holds conversations.
+#
+# Same local-path storage warning as Postgres: a k3s-worker rebuild destroys these.
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey
+  namespace: enterprise-ai
+spec:
+  selector: { app: valkey }
+  ports: [{ port: 6379, targetPort: 6379 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: valkey
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: valkey } }
+  template:
+    metadata:
+      labels: { app: valkey }
+    spec:
+      containers:
+        - name: valkey
+          image: valkey/valkey:8-alpine
+          # No persistence: a cache that survives a restart is not worth a volume here.
+          args: ["valkey-server", "--save", "", "--appendonly", "no"]
+          ports: [{ containerPort: 6379 }]
+          readinessProbe:
+            exec: { command: ["valkey-cli", "ping"] }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits:   { memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: chatdb
+  namespace: enterprise-ai
+spec:
+  clusterIP: None
+  selector: { app: chatdb }
+  ports: [{ port: 27017, targetPort: 27017 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: chatdb
+  namespace: enterprise-ai
+spec:
+  serviceName: chatdb
+  replicas: 1
+  selector: { matchLabels: { app: chatdb } }
+  template:
+    metadata:
+      labels: { app: chatdb }
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:7
+          args: ["--quiet"]
+          ports: [{ containerPort: 27017 }]
+          volumeMounts: [{ name: data, mountPath: /data/db }]
+          readinessProbe:
+            exec:
+              command: ["mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "512Mi" }
+            limits:   { memory: "2Gi" }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 10Gi } }

@@ -1,0 +1,77 @@
+# Keycloak.
+#
+# Runs plain HTTP inside the cluster and trusts X-Forwarded-* headers, because TLS is
+# terminated by Caddy on the gateway VM in front of it. KC_HOSTNAME is therefore the
+# PUBLIC url, not the in-cluster one: the OIDC client validates that the issuer in the
+# discovery document equals the one it asked for, so browser and backchannel must agree on
+# a single name. That is the same constraint that forced this in the compose bundle — see
+# dogfood-findings.md finding 5.
+#
+# Consequence worth knowing: until the public name resolves and Caddy fronts it, this
+# comes up healthy but nobody can complete a login.
+apiVersion: v1
+kind: Service
+metadata:
+  name: identity
+  namespace: enterprise-ai
+spec:
+  selector: { app: identity }
+  ports: [{ name: http, port: 8080, targetPort: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: identity
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: identity } }
+  template:
+    metadata:
+      labels: { app: identity }
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.4
+          args: ["start-dev", "--import-realm", "--http-port=8080"]
+          env:
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: IDP_ADMIN_USER } }
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: IDP_ADMIN_PASSWORD } }
+            - name: KC_DB
+              value: postgres
+            - name: KC_DB_URL
+              value: jdbc:postgresql://postgres:5432/identity
+            - name: KC_DB_USERNAME
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: POSTGRES_USER } }
+            - name: KC_DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: POSTGRES_PASSWORD } }
+            - name: KC_HEALTH_ENABLED
+              value: "true"
+            - name: KC_HOSTNAME_STRICT
+              value: "false"
+            # Public URL. TLS terminates at Caddy; Keycloak must still mint absolute URLs
+            # with it or the OIDC issuer check fails.
+            - name: KC_HOSTNAME
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: PUBLIC_BASE_URL } }
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+            - name: KC_HTTP_ENABLED
+              value: "true"
+          ports: [{ containerPort: 8080 }]
+          volumeMounts:
+            - { name: realm, mountPath: /opt/keycloak/data/import, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /realms/enterprise-ai, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests: { cpu: "200m", memory: "768Mi" }
+            limits:   { memory: "2Gi" }
+      volumes:
+        # The realm JSON carries client secrets, so it is a Secret rather than a ConfigMap.
+        - name: realm
+          secret:
+            secretName: enterprise-ai-realm

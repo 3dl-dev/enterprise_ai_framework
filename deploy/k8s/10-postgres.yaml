@@ -1,0 +1,94 @@
+# Postgres — welded (design §7.2). One server, one database per component.
+#
+# STORAGE WARNING: this uses the cluster default `local-path` StorageClass, which lands on
+# k3s-worker's local disk. k3s-worker is cattle and is rebuilt wholesale, which destroys
+# this volume — including the metering ledger and the audit chain. Acceptable for a
+# dogfood, not acceptable for anything real. Replace with a tank-backed PV when the ZFS
+# dataset exists (see mainframe docs/ops/enterprise-ai-tenant.md).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: enterprise-ai
+data:
+  init-databases.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    for db in identity gateway controlplane; do
+        echo "creating database: $db"
+        psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<-EOSQL
+            SELECT 'CREATE DATABASE "$db"'
+            WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$db')\gexec
+            GRANT ALL PRIVILEGES ON DATABASE "$db" TO "$POSTGRES_USER";
+    EOSQL
+    done
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: enterprise-ai
+spec:
+  clusterIP: None          # headless — the StatefulSet addresses it directly
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: enterprise-ai
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: POSTGRES_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: POSTGRES_PASSWORD } }
+            - name: POSTGRES_DB
+              value: postgres
+            # The image only runs initdb scripts on an empty data directory, so this is
+            # first-boot only — matching the compose bundle's behaviour exactly.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: init, mountPath: /docker-entrypoint-initdb.d }
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d postgres"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { memory: "1Gi" }
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-init
+            defaultMode: 0755
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
