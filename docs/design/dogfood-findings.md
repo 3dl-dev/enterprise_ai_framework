@@ -89,9 +89,43 @@ Keycloak's Verify Profile required action halts the login flow at a "complete yo
 account" form when a user has no first or last name. The redirect chain simply stops
 partway with no error. Provisioning now always sets a complete profile.
 
-## Open — behavior to know about, not yet decided
+### 7. The unpriced-model detector counted cache hits as unpriced
 
-### 4. A cache hit bypasses budget enforcement
+A consequence of finding 7: a cache hit is tokens-counted at $0, which is exactly the
+shape the unpriced-model detector looks for. It fired on healthy traffic during the Forge
+integration.
+
+A detector that cries wolf is one people stop reading, and that is precisely how a
+genuinely unpriced model would later slip through unnoticed. Cache hits are now excluded
+from the query.
+
+### 8. Out-of-band keys would have survived the exit
+
+The chat surface's virtual key is minted directly against the gateway by
+`provision-chat-key.sh`, not by the identity reconcile — the surface is a shared client,
+so there is no single user to mint it for. A revoke-all that walked only the control
+plane's own `virtual_key` table would therefore have left it alive: an exit that leaves a
+working credential behind is not an exit.
+
+`/admin/exit/revoke-all` now takes the union of what the control plane recorded and what
+the gateway actually holds, so anything minted out of band is caught too.
+
+
+## Verified — results worth keeping
+
+### 9. Our bill and Forge's agree to the cent
+
+Worth recording as a positive result because it is the number the whole layer exists to
+produce. Our gateway prices from Forge's published rate card; Forge meters independently.
+For the same request (39 input, 27 output on `claude-haiku-4-5`) both compute
+`$0.000184875`. Asserted every run by
+`TestMoneyIsCorrect::test_our_computed_cost_matches_what_forge_billed`, which reconciles a
+live request against Forge's own usage record rather than trusting either side.
+
+
+## Open — behaviour to know about, not yet decided
+
+### 10. A cache hit bypasses budget enforcement
 
 With the exact-match cache on, an identical request is served from cache. Measured
 behaviour, from a two-key probe (same prompt, different virtual keys):
@@ -120,24 +154,14 @@ What remains true and unresolved:
 
 **Not yet decided:** whether budget refusal should precede the cache lookup.
 
-### 4a. The unpriced-model detector counted cache hits as unpriced
-
-A consequence of the above: a cache hit is tokens-counted at $0, which is exactly the
-shape the unpriced-model detector looks for. It fired on healthy traffic during the Forge
-integration.
-
-A detector that cries wolf is one people stop reading, and that is precisely how a
-genuinely unpriced model would later slip through unnoticed. Cache hits are now excluded
-from the query.
-
-### 5. Control-plane admin auth is a shared bearer token
+### 11. Control-plane admin auth is a shared bearer token
 
 `CONTROL_PLANE_ADMIN_TOKEN` is a single static secret, not OIDC-delegated admin identity.
 Acceptable for a single-operator dogfood; it must not survive the row. Every admin action
 is at least attributed in the audit trail — but attributed to `admin`, which is one
 principal by construction.
 
-### 7. The chat surface is not behind TLS, and its session cookies are Secure
+### 12. The chat surface is not behind TLS, and its session cookies are Secure
 
 LibreChat marks `refreshToken` and `token_provider` as Secure. Browsers make a standard
 exception for `localhost`, so signing in at `http://localhost:3080` works — but any
@@ -150,7 +174,7 @@ anything other than localhost. Not done.
 The test suite emulates the browser's localhost exception explicitly rather than
 weakening the surface's cookie flags to suit a stricter HTTP client.
 
-### 8. Chat spend attributes to the surface, not to the person
+### 13. Chat spend attributes to the surface, not to the person
 
 The chat surface is a shared client holding one virtual key, so its traffic lands under
 `chat-surface / chat` rather than under the signed-in user. The coding agents, which hold
@@ -163,18 +187,7 @@ ledger as a username — a corrupted bill is worse than a coarse one. The ledger
 already prefers `end_user` where present, so this becomes correct the moment the surface
 is confirmed to forward it.
 
-### 9. Out-of-band keys would have survived the exit
-
-The chat surface's virtual key is minted directly against the gateway by
-`provision-chat-key.sh`, not by the identity reconcile — the surface is a shared client,
-so there is no single user to mint it for. A revoke-all that walked only the control
-plane's own `virtual_key` table would therefore have left it alive: an exit that leaves a
-working credential behind is not an exit.
-
-`/admin/exit/revoke-all` now takes the union of what the control plane recorded and what
-the gateway actually holds, so anything minted out of band is caught too.
-
-### 10. Forge prices only 12 of its 68 models, and the unpriced ones are the interesting ones
+### 14. Forge prices only 12 of its 68 models, and the unpriced ones are the interesting ones
 
 Wiring Forge as the real upstream ran straight back into finding 1, this time with real
 money and at scale. `GET /v1/models` returns 68 models and carries **no pricing**;
@@ -200,16 +213,7 @@ Forge quotes prices or we add an operator-supplied price override.
 **Mechanism:** `bundle/bin/render-gateway-config.py` generates the gateway catalogue from
 Forge's live catalog joined to its rate card, and refuses to emit an unpriced entry.
 
-### 11. Our bill and Forge's agree to the cent
-
-Worth recording as a positive result because it is the number the whole layer exists to
-produce. Our gateway prices from Forge's published rate card; Forge meters independently.
-For the same request (39 input, 27 output on `claude-haiku-4-5`) both compute
-`$0.000184875`. Asserted every run by
-`TestMoneyIsCorrect::test_our_computed_cost_matches_what_forge_billed`, which reconciles a
-live request against Forge's own usage record rather than trusting either side.
-
-### 12. Sovereignty pinning does not survive our gateway
+### 15. Sovereignty pinning does not survive our gateway
 
 Forge enforces sovereignty per request via an `X-Forge-Sovereignty` header, refusing
 violations with a list of compliant alternatives. Our gateway does not forward caller
@@ -229,7 +233,7 @@ upstream:
   fails closed and silently — an empty result reads as "no spend" rather than an error —
   so nothing here uses them. Forge tracks it as `forge-f22`.
 
-### 13. Unexplained single hermetic-suite failure — watch
+### 16. Unexplained single hermetic-suite failure — watch
 
 The hermetic suite failed once immediately after a live-suite run, during the direnv
 work. The output was not captured, and it has not reproduced across six subsequent runs
@@ -243,9 +247,10 @@ A known coupling *was* found and fixed in the same area: the live suite used to 
 the chat surface's virtual key from `.env`, which the hermetic exit-path test revokes and
 re-mints. The live suite now mints its own dedicated key and revokes it afterwards.
 
-### 14. Egress rules are outside the exit path
+### 17. Egress rules are outside the exit path
 
 If the operator restricted egress so that only the gateway could reach providers, then
 after the exit their surfaces will be blocked by the network rather than by this
 software. Egress control is out of scope for this row, so the exit cannot undo it — the
 generated README says so explicitly rather than leaving it to be discovered.
+
