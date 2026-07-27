@@ -27,35 +27,20 @@ modelSpecs:
   enforce: false        # the full catalogue stays reachable
   prioritize: true      # but open on a sensible default
   list:
-    - name: sonnet-5
-      label: "Claude Sonnet 5"
+    - name: glm-5-2
+      label: "GLM 5.2"
       default: true
-      description: "Balanced default. Frontier quality, mid cost."
-      preset:
-        endpoint: "Enterprise AI"
-        model: claude-sonnet-5
-        artifacts: "default"
-        maxContextTokens: 200000
-    - name: haiku
-      label: "Claude Haiku 4.5"
-      description: "Cheap and fast. Good for bulk and mechanical work."
-      preset:
-        endpoint: "Enterprise AI"
-        model: claude-haiku-4-5
-        artifacts: "default"
-    - name: opus
-      label: "Claude Opus 4.8"
-      description: "Hardest reasoning. Most expensive per token."
-      preset:
-        endpoint: "Enterprise AI"
-        model: claude-opus-4-8
-        artifacts: "default"
-    - name: glm
-      label: "GLM 5.2 (open weights)"
-      description: "Open-weight model via DeepInfra. Roughly a third the cost of Sonnet."
+      description: "Open weights. $0.93/$3.00 per Mtok — about a third of Sonnet 5, a ninth of Opus."
       preset:
         endpoint: "Enterprise AI"
         model: "glm-5.2@deepinfra"
+        artifacts: "default"
+    - name: glm-4-7
+      label: "GLM 4.7 (cheapest)"
+      description: "Open weights. $0.40/$1.75 per Mtok — the cheapest priced model in the catalogue."
+      preset:
+        endpoint: "Enterprise AI"
+        model: "glm-4.7@deepinfra"
         artifacts: "default"
 
 registration:
