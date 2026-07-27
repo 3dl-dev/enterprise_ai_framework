@@ -1,0 +1,68 @@
+# Tank-backed persistent volumes.
+#
+# NOT APPLIED YET — requires the k3s-worker VM to restart so it picks up the virtiofs
+# device staged with `qm set 214 --virtiofs3 dirid=enterprise-ai`. At the time of writing
+# the worker was running live training jobs, and a restart would have destroyed them.
+#
+# Why this matters: the default `local-path` StorageClass puts data on the worker's local
+# disk, and the worker is cattle — `mk-k3s-worker.sh` rebuilds it wholesale. That would
+# erase the metering ledger and the audit chain, which are the two things this product
+# exists to produce. These volumes live on the tank ZFS pool instead and survive a
+# rebuild.
+#
+# `tank/enterprise-ai` is its own dataset rather than a subdirectory of `tank/training`:
+# a metering ledger does not belong in the training-outputs dataset.
+#
+# Static hostPath PVs, following the pattern of mainframe's k8s/tank-pvs.yaml. The
+# storageClassName is a plain string with no matching StorageClass object, deliberately —
+# it keeps these out of local-path's dynamic provisioning so a PVC binds here only by
+# asking for this class by name.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: enterprise-ai-postgres-pv
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+spec:
+  capacity:
+    storage: 20Gi
+  volumeMode: Filesystem
+  accessModes: ["ReadWriteOnce"]
+  # Retain, not Delete: deleting the namespace must not silently destroy the ledger.
+  # Reclaiming it is then a deliberate operator act.
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: tank-enterprise-ai
+  hostPath:
+    path: /data/enterprise-ai/postgres
+    type: DirectoryOrCreate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: ["k3s-worker"]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: enterprise-ai-chatdb-pv
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+spec:
+  capacity:
+    storage: 20Gi
+  volumeMode: Filesystem
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: tank-enterprise-ai
+  hostPath:
+    path: /data/enterprise-ai/chatdb
+    type: DirectoryOrCreate
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: ["k3s-worker"]

@@ -16,6 +16,47 @@ interface:
     externalUrl: ""
   termsOfService:
     externalUrl: ""
+  # Claude-like rendering of code and HTML the model produces. Built into the surface,
+  # off by default, and the single biggest difference in how finished this feels.
+  artifacts: true
+
+# Defaults. Without these the surface opens with nothing selected and the user has to
+# know which of eleven models to pick before they can type anything — which reads as
+# "unconfigured", not "flexible".
+modelSpecs:
+  enforce: false        # the full catalogue stays reachable
+  prioritize: true      # but open on a sensible default
+  list:
+    - name: sonnet-5
+      label: "Claude Sonnet 5"
+      default: true
+      description: "Balanced default. Frontier quality, mid cost."
+      preset:
+        endpoint: "Enterprise AI"
+        model: claude-sonnet-5
+        artifacts: "default"
+        maxContextTokens: 200000
+    - name: haiku
+      label: "Claude Haiku 4.5"
+      description: "Cheap and fast. Good for bulk and mechanical work."
+      preset:
+        endpoint: "Enterprise AI"
+        model: claude-haiku-4-5
+        artifacts: "default"
+    - name: opus
+      label: "Claude Opus 4.8"
+      description: "Hardest reasoning. Most expensive per token."
+      preset:
+        endpoint: "Enterprise AI"
+        model: claude-opus-4-8
+        artifacts: "default"
+    - name: glm
+      label: "GLM 5.2 (open weights)"
+      description: "Open-weight model via DeepInfra. Roughly a third the cost of Sonnet."
+      preset:
+        endpoint: "Enterprise AI"
+        model: "glm-5.2@deepinfra"
+        artifacts: "default"
 
 registration:
   # Only identities from the realm. Belt and braces alongside ALLOW_REGISTRATION=false.
