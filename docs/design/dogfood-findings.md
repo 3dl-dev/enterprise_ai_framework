@@ -91,24 +91,44 @@ partway with no error. Provisioning now always sets a complete profile.
 
 ## Open — behavior to know about, not yet decided
 
-### 4. A cache hit bypasses budget enforcement and writes no spend row
+### 4. A cache hit bypasses budget enforcement
 
-With the exact-match cache on, an identical request is served from cache. Observed
-consequences:
+With the exact-match cache on, an identical request is served from cache. Measured
+behaviour, from a two-key probe (same prompt, different virtual keys):
 
-- An over-budget key is **still served** from cache. No upstream cost is incurred, so
-  this is arguably correct — but "the budget stopped them" is then not quite true, and an
-  operator who disables a user expects silence.
-- Cache hits produce **no spend row**, so the request count in the bill excludes them.
-  Usage is under-reported even though cost is not.
+| key | `cache_hit` | spend | tokens |
+|---|---|---|---|
+| A — populated the cache | — | $0.000189 | 19 |
+| B — hit the cache | `True` | $0 | 19 |
 
-This bit the test suite three separate times: fixed prompts made tests pass once and then
-fail forever after, in a way that reads as flakiness rather than as a cache hit. Any test
-touching metering or enforcement must use unique content.
+So cache hits **do** write a spend row, **correctly attributed to the requesting key**,
+with tokens counted and cost zero. Cost accounting is right: no upstream call was made.
 
-**Not yet decided:** whether budget refusal should precede the cache lookup, and whether
-cache hits should write a zero-cost ledger row so usage counts stay honest. Both are
-plausible; the design doc does not currently rule on either.
+> **Correction.** An earlier revision of this document claimed cache hits produce no
+> spend row at all. That was wrong — it was inferred from a test that failed to find a
+> row, rather than from the ledger. The table above is measured. The practical difference
+> matters: usage counts are *not* under-reported, so the bill is trustworthy.
+
+What remains true and unresolved:
+
+- An over-budget key is **still served** from cache, because the budget is not consulted
+  on a hit. No money is spent, so this is defensible — but "the budget stopped them" is
+  not quite true, and an operator who disables someone expects silence.
+- Any test touching metering or enforcement must use unique content. Fixed prompts made
+  three separate tests pass once and then fail forever after, which reads as flakiness
+  rather than as a cache hit.
+
+**Not yet decided:** whether budget refusal should precede the cache lookup.
+
+### 4a. The unpriced-model detector counted cache hits as unpriced
+
+A consequence of the above: a cache hit is tokens-counted at $0, which is exactly the
+shape the unpriced-model detector looks for. It fired on healthy traffic during the Forge
+integration.
+
+A detector that cries wolf is one people stop reading, and that is precisely how a
+genuinely unpriced model would later slip through unnoticed. Cache hits are now excluded
+from the query.
 
 ### 5. Control-plane admin auth is a shared bearer token
 
@@ -209,7 +229,21 @@ upstream:
   fails closed and silently — an empty result reads as "no spend" rather than an error —
   so nothing here uses them. Forge tracks it as `forge-f22`.
 
-### 13. Egress rules are outside the exit path
+### 13. Unexplained single hermetic-suite failure — watch
+
+The hermetic suite failed once immediately after a live-suite run, during the direnv
+work. The output was not captured, and it has not reproduced across six subsequent runs
+including three full alternating live/hermetic rounds.
+
+Recorded rather than dismissed: a failure seen once and not explained is not a failure
+that has been fixed. If it recurs, capture the output before rerunning — the rerun is
+what destroys the evidence.
+
+A known coupling *was* found and fixed in the same area: the live suite used to borrow
+the chat surface's virtual key from `.env`, which the hermetic exit-path test revokes and
+re-mints. The live suite now mints its own dedicated key and revokes it afterwards.
+
+### 14. Egress rules are outside the exit path
 
 If the operator restricted egress so that only the gateway could reach providers, then
 after the exit their surfaces will be blocked by the network rather than by this

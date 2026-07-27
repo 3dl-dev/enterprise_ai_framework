@@ -20,3 +20,6 @@ bundle/exports/
 bundle/litellm/config.generated.yaml
 bundle/litellm/forge-pricing.cache.json
 bundle/litellm/forge-catalog.cache.json
+
+# direnv local overrides (may contain secrets).
+.envrc.local

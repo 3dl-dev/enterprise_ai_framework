@@ -158,14 +158,47 @@ def main(argv) -> int:
     env = read_env()
     base_url = env.get("FORGE_BASE_URL", "https://forge.3dl.dev").rstrip("/")
 
-    catalog, pricing = load(offline, env)
     base_text = BASE.read_text()
+
+    # The generated entries authenticate with os.environ/FORGE_API_KEY at runtime. With
+    # no key reachable, emitting them produces a catalog that advertises models and then
+    # 401s on every call — worse than not offering them, because the failure surfaces at
+    # request time instead of at configuration time. Cached catalog and prices do not
+    # change this: they let us render *offline*, not *unauthenticated*.
+    if not env.get("FORGE_API_KEY"):
+        OUT.write_text(base_text.replace(MARKER + "\n", "").replace(MARKER, ""))
+        if CATALOG_CACHE.exists():
+            print(
+                "WARNING: Forge is configured on this machine but no FORGE_API_KEY is\n"
+                "         visible, so the catalog has been reduced to fakes only.\n"
+                "         Emitting the models anyway would advertise them and then 401.\n"
+                "         Run `direnv allow` (and `op signin` if needed), or use\n"
+                "         `direnv exec . make up`.",
+                file=sys.stderr,
+            )
+        else:
+            print("no Forge credentials — generated fake-provider-only catalog")
+        return 0
+
+    catalog, pricing = load(offline, env)
 
     if not catalog:
         # No Forge configured at all: strip the marker and ship the fakes only, so the
         # bundle still comes up with no provider account (scope item 8).
         OUT.write_text(base_text.replace(MARKER + "\n", "").replace(MARKER, ""))
-        print("no Forge configuration found — generated fake-provider-only catalog")
+        if CATALOG_CACHE.exists():
+            # Forge *was* configured on this machine before, so silently dropping every
+            # real model would look like the upstream vanished. Almost always this is a
+            # shell without direnv loaded.
+            print(
+                "WARNING: Forge was configured here previously but no credentials are\n"
+                "         visible now, so the catalog has been reduced to fakes only.\n"
+                "         Run `direnv allow` (and `op signin` if needed), or use\n"
+                "         `direnv exec . make up`.",
+                file=sys.stderr,
+            )
+        else:
+            print("no Forge configuration found — generated fake-provider-only catalog")
         return 0
 
     if pricing is None:

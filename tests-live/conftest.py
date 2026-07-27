@@ -60,16 +60,40 @@ def gateway_url(env) -> str:
 
 
 @pytest.fixture(scope="session")
-def virtual_key(env) -> str:
-    """A real virtual key, so tests exercise the whole chain rather than a shortcut.
+def virtual_key(env, gateway_url) -> str:
+    """A dedicated virtual key, minted for this run and revoked after.
 
-    Traffic must go surface -> virtual key -> our gateway -> Forge. Using the gateway
-    master key instead would skip exactly the part we built.
+    Traffic must go surface -> virtual key -> our gateway -> Forge; using the gateway
+    master key would skip exactly the part we built.
+
+    It mints its own rather than borrowing the chat surface's key from .env, because the
+    hermetic suite's exit-path test revokes every key and re-mints them. Sharing that key
+    made this suite fail intermittently when run after `make test` — which is the obvious
+    order to run them in, and an intermittent failure that clears on a rerun is the worst
+    kind: it teaches you to rerun instead of to look.
     """
-    key = env.get("CHAT_VIRTUAL_KEY")
-    if not key:
-        pytest.fail("CHAT_VIRTUAL_KEY missing — run `make up` first")
-    return key
+    import httpx
+
+    alias = "forge-live-test::terminal"
+    master = {"Authorization": f"Bearer {env['GATEWAY_MASTER_KEY']}"}
+
+    # Clear any leftover from an interrupted run so the alias is never doubly minted.
+    httpx.post(f"{gateway_url}/key/delete", headers=master,
+               json={"key_aliases": [alias]}, timeout=60)
+
+    created = httpx.post(
+        f"{gateway_url}/key/generate", headers=master,
+        json={"key_alias": alias, "metadata": {"surface": "terminal", "issuer": "live-tests"}},
+        timeout=60,
+    )
+    if created.status_code != 200:
+        pytest.fail(f"could not mint a virtual key ({created.status_code}); is `make up` done? "
+                    f"{created.text[:200]}")
+
+    yield created.json()["key"]
+
+    httpx.post(f"{gateway_url}/key/delete", headers=master,
+               json={"key_aliases": [alias]}, timeout=60)
 
 
 @pytest.fixture(scope="session")

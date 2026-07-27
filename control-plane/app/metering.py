@@ -97,7 +97,12 @@ async def unpriced_models(since: str | None = None) -> list[dict]:
     This is the leak detector (design §2.5) reduced to the one case this row can check
     without invoice reconciliation.
     """
-    where, params = 'WHERE s.total_tokens > 0', []
+    # Cache hits are excluded: they cost nothing upstream, so $0 against counted tokens is
+    # correct rather than a missing price. Counting them here made the detector fire on
+    # healthy traffic, and a detector that cries wolf is one people stop reading — which
+    # is exactly how a genuinely unpriced model would then slip through.
+    where = "WHERE s.total_tokens > 0 AND lower(COALESCE(s.cache_hit, '')) <> 'true'"
+    params: list = []
     if since:
         where += ' AND s."startTime" >= $1::text::timestamptz'
         params.append(since)
