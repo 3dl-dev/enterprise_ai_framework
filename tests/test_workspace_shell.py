@@ -86,18 +86,26 @@ def _foreign_agents(exclude: set[int] = frozenset()) -> list[str]:
     return found
 
 
+# The credential the control plane presents. The shell server refuses to start without
+# one and refuses every request that does not carry it — see entrypoint.sh for why the
+# pod stopped being loopback-only when the workshop became a tab in the portal.
+TEST_TOKEN = "test-workspace-token"
+
+
 class Shell:
     """A running shell-server plus the temp root it serves."""
 
     def __init__(self, root: Path, port: int, proc: subprocess.Popen):
         self.root, self.port, self.proc = root, port, proc
         self.base = f"http://127.0.0.1:{port}"
+        self.headers = {"X-Workspace-Token": TEST_TOKEN}
 
     def get(self, path: str) -> httpx.Response:
-        return httpx.get(self.base + path, timeout=TIMEOUT)
+        return httpx.get(self.base + path, timeout=TIMEOUT, headers=self.headers)
 
     def post(self, path: str, payload: dict) -> httpx.Response:
-        return httpx.post(self.base + path, json=payload, timeout=TIMEOUT)
+        return httpx.post(self.base + path, json=payload, timeout=TIMEOUT,
+                          headers=self.headers)
 
     def pulse(self) -> dict:
         r = self.get("/api/pulse")
@@ -113,7 +121,11 @@ class Shell:
         """
         with socket.create_connection(("127.0.0.1", self.port), timeout=TIMEOUT) as s:
             s.sendall(
-                f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n".encode()
+                # The token goes on the raw request too. Without it every traversal case
+                # below would be answered 403 by the auth check and would prove only that
+                # the auth check works — never that the path handling is safe.
+                (f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                 f"X-Workspace-Token: {TEST_TOKEN}\r\nConnection: close\r\n\r\n").encode()
             )
             buf = b""
             while chunk := s.recv(65536):
@@ -156,6 +168,7 @@ def shell(tmp_path: Path):
         "WS_PULSE_INTERVAL": str(PULSE_INTERVAL),
         "WS_USER": "tester",
         "WS_PUBLISH_URL": "http://example.invalid",
+        "WS_INTERNAL_TOKEN": TEST_TOKEN,
     }
     proc = subprocess.Popen(
         [sys.executable, str(SERVER)], env=env,
@@ -559,3 +572,39 @@ def test_aider_run_as_a_console_script_is_seen_as_the_agent(shell, tmp_path):
     finally:
         proc.kill()
         proc.wait(timeout=TIMEOUT)
+
+
+def test_the_server_refuses_to_start_without_a_token(tmp_path):
+    """An unauthenticated shell API on the pod network is worse than no workshop.
+
+    The pod stopped being loopback-only when the workshop became a tab in the portal, so
+    this token is the control that survives a NetworkPolicy mistake. Coming up without
+    one must stop the process outright, not log a warning nobody reads.
+    """
+    root = tmp_path / "projects"
+    (root / "alpha").mkdir(parents=True)
+    (root / ".active").write_text("alpha\n")
+    env = {**os.environ, "WS_PROJECTS_ROOT": str(root),
+           "WS_SHELL_PORT": str(_free_port()), "WS_USER": "tester"}
+    env.pop("WS_INTERNAL_TOKEN", None)
+    proc = subprocess.run([sys.executable, str(SERVER)], env=env,
+                          capture_output=True, text=True, timeout=30)
+    assert proc.returncode != 0, "the server started with no token configured"
+    assert "WS_INTERNAL_TOKEN" in (proc.stderr + proc.stdout), (
+        f"it refused, but not in a way that says why: {proc.stderr[-300:]}"
+    )
+
+
+def test_every_route_refuses_a_request_with_no_token(shell):
+    """Reaching the port must not be the same as using it."""
+    for path in ("/", "/api/state", "/api/pulse", "/static/app.js", "/preview/"):
+        r = httpx.get(shell.base + path, timeout=TIMEOUT)
+        assert r.status_code == 403, f"{path} answered {r.status_code} without a token"
+    r = httpx.post(shell.base + "/api/publish", json={}, timeout=TIMEOUT)
+    assert r.status_code == 403, f"publish answered {r.status_code} without a token"
+
+
+def test_a_wrong_token_is_refused(shell):
+    r = httpx.get(shell.base + "/api/state", timeout=TIMEOUT,
+                  headers={"X-Workspace-Token": "not-the-token"})
+    assert r.status_code == 403
