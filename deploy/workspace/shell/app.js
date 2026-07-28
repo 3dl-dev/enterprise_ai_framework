@@ -277,9 +277,27 @@ function stopPreview() {
   syncPreviewGate();
 }
 
+function keepsRunning() {
+  return !!(M.snap && M.snap.keeps_running);
+}
+
 function syncPreviewGate() {
   if (M.drawer === "closed") return;
   const ready = hasIndex() && !previewRunning;
+  // An animating page gets steered to its own tab. Running one here can starve this
+  // tab's main thread, and the browser's own "page isn't responding" dialog is a
+  // frightening way for a child to discover their game has a bug — it names nothing they
+  // recognise and offers no fix. In its own tab the same bug costs them that tab.
+  const live = keepsRunning();
+  $("ready-title").textContent = live
+    ? "Your app is ready. It moves!"
+    : "Your app is ready.";
+  $("ready-note").textContent = live
+    ? "Games and animations run best in their own tab, so a slow one cannot freeze this page."
+    : "It will show up right here.";
+  $("btn-run").classList.toggle("primary", !live);
+  $("btn-run-tab").classList.toggle("primary", live);
+  $("btn-run").textContent = live ? "Run it here anyway" : "Run it here";
   $("preview-ready").hidden = !ready;
   $("preview-empty").hidden = hasIndex();
   $("preview").style.visibility = previewRunning ? "visible" : "hidden";

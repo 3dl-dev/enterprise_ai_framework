@@ -234,11 +234,32 @@ def _fingerprint(entries: list[tuple[str, int, int]]) -> str:
     return h.hexdigest()
 
 
-def _offline_refs(index: Path) -> int:
+# Constructs that mean the page keeps running after it has loaded. A page that only
+# paints once cannot make a tab unresponsive; a page holding an animation loop can, and
+# when it does the browser shows its own "page isn't responding" dialog, which is a
+# frightening way for a nine-year-old to learn their game has a bug in it.
+#
+# This is a HINT, not a verdict — it decides which button is emphasised, never whether
+# something is allowed to run. A static page mislabelled costs one extra click; a heavy
+# page mislabelled costs the tab.
+LIVE_PAGE = re.compile(
+    r"requestAnimationFrame|setInterval\s*\(|while\s*\(\s*(?:true|1)\s*\)"
+    r"|<canvas|webkitRequestAnimationFrame",
+    re.IGNORECASE,
+)
+
+
+def _scan_index(index: Path) -> tuple[int, bool]:
+    """(offline_refs, keeps_running) from one read of index.html."""
     try:
-        return len(OFFLINE_REF.findall(index.read_text(errors="replace")))
+        text = index.read_text(errors="replace")
     except OSError:
-        return 0
+        return 0, False
+    return len(OFFLINE_REF.findall(text)), bool(LIVE_PAGE.search(text))
+
+
+def _offline_refs(index: Path) -> int:
+    return _scan_index(index)[0]
 
 
 def _has_published(project: str) -> bool:
@@ -325,7 +346,7 @@ class Pulse:
         self._busy_at = 0.0
         self._idle_at = 0.0
         self._refs_key: tuple[int, int] | None = None
-        self._refs = 0
+        self._refs: tuple[int, bool] = (0, False)
         self._snap: dict = {}
         try:
             self.sample()
@@ -362,8 +383,8 @@ class Pulse:
                 self._busy, self._idle_at = False, now
         self._prev_jiffies = jiffies
 
-    def _offline_refs_cached(self, index: Path) -> int:
-        """offline_refs, recomputed only when index.html actually changes.
+    def _index_facts(self, index: Path) -> tuple[int, bool]:
+        """(offline_refs, keeps_running), recomputed only when index.html actually changes.
 
         The naive version read and regexed the whole file every single window. AGENTS.md
         rule 1 tells the agent to inline every image, so index.html is routinely megabytes
@@ -375,11 +396,11 @@ class Pulse:
         try:
             st = index.stat()
         except OSError:
-            self._refs_key, self._refs = None, 0
-            return 0
+            self._refs_key, self._refs = None, (0, False)
+            return 0, False
         key = (st.st_mtime_ns, st.st_size)
         if key != self._refs_key:
-            self._refs_key, self._refs = key, _offline_refs(index)
+            self._refs_key, self._refs = key, _scan_index(index)
         return self._refs
 
     def sample(self) -> None:
@@ -405,6 +426,7 @@ class Pulse:
             changed = [rel for rel, m, _ in fresh if m / 1e9 >= cutoff][:3]
 
         self._update_busy(now)
+        refs, keeps_running = self._index_facts(root / "index.html")
         snap = {
             "project": project,
             "rev": self._rev,
@@ -412,7 +434,10 @@ class Pulse:
             "changed": changed,
             "last_change_ms": last_change_ms,
             "has_index": (root / "index.html").is_file(),
-            "offline_refs": self._offline_refs_cached(root / "index.html"),
+            "offline_refs": refs,
+            # Whether the page keeps running once loaded. Drives which of the two run
+            # buttons is the primary one; see LIVE_PAGE.
+            "keeps_running": keeps_running,
             "busy": self._busy,
             "busy_ms": int((now - self._busy_at) * 1000) if self._busy is True else 0,
             "idle_ms": int((now - self._idle_at) * 1000) if self._busy is False else 0,

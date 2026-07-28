@@ -39,6 +39,9 @@ STATE_KEYS = {
 PULSE_TYPES = {
     "project": str, "rev": int, "fp": str, "changed": list,
     "last_change_ms": int, "has_index": bool, "offline_refs": int,
+    # Whether the page keeps running after load. Decides which run button the workshop
+    # emphasises, so a wrong TYPE here silently changes what a child is nudged towards.
+    "keeps_running": bool,
     "busy_ms": int, "idle_ms": int, "published": bool,
     "published_fp": str, "truncated": bool,
 }
@@ -608,3 +611,27 @@ def test_a_wrong_token_is_refused(shell):
     r = httpx.get(shell.base + "/api/state", timeout=TIMEOUT,
                   headers={"X-Workspace-Token": "not-the-token"})
     assert r.status_code == 403
+
+
+def test_a_static_page_is_not_flagged_as_keeps_running(shell):
+    (shell.root / "alpha" / "index.html").write_text("<h1>hello</h1>")
+    p = shell.wait_for(lambda s: s["has_index"], "index.html to appear")
+    assert p["keeps_running"] is False
+
+
+def test_an_animating_page_is_flagged(shell):
+    """The signal that decides whether a child is nudged into a separate tab.
+
+    A page that only paints once cannot make a tab unresponsive. One holding an animation
+    loop can, and when it does the browser puts up its own alarming dialog.
+    """
+    for markup in (
+        "<canvas id=c></canvas>",
+        "<script>requestAnimationFrame(function f(){requestAnimationFrame(f)})</script>",
+        "<script>setInterval(()=>{}, 16)</script>",
+        "<script>while(true){}</script>",
+    ):
+        (shell.root / "alpha" / "index.html").write_text(f"<html>{markup}</html>")
+        p = shell.wait_for(lambda s: s["keeps_running"] is True,
+                           f"keeps_running for {markup[:24]}")
+        assert p["keeps_running"] is True
