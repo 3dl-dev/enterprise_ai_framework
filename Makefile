@@ -1,4 +1,4 @@
-.PHONY: up down logs ps sync spend audit test test-forge forge-config export exit-direct exit nuke
+.PHONY: up down logs ps sync spend audit test test-forge test-workspace forge-config export exit-direct exit nuke
 
 BUNDLE := bundle
 COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env
@@ -65,3 +65,11 @@ test-forge:
 ## Reload Forge credentials from 1Password and regenerate the gateway catalog.
 forge-config:
 	@$(BUNDLE)/bin/render-gateway-config.py
+
+## The IDE surface (browser-terminal aider) against the live k3s cluster, with two real
+## Keycloak users. Needs the workspaces provisioned first:
+##   deploy/bin/ensure-second-user.sh student
+##   deploy/bin/provision-workspace.sh baron && deploy/bin/provision-workspace.sh student
+## Spends a fraction of a cent per run. Kept out of `make test` — it needs a cluster.
+test-workspace:
+	@.venv-test/bin/pytest tests-live/test_workspace.py -v --tb=short -p no:cacheprovider

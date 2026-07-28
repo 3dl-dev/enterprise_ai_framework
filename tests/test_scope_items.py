@@ -33,6 +33,30 @@ pytestmark = pytest.mark.usefixtures("stack_up")
 TIMEOUT = 60.0
 
 
+def gateway_aliases(gateway_url: str, master_headers: dict) -> set[str]:
+    """Every key alias the gateway actually holds.
+
+    Our own ledger saying a key is or is not there is the thing most likely to drift from
+    reality; this is the table that decides whether a request is served.
+    """
+    aliases: set[str] = set()
+    for page in range(1, 51):
+        listed = httpx.get(
+            f"{gateway_url}/key/list",
+            headers=master_headers,
+            # size is capped at 100 by the gateway; exceeding it returns a validation
+            # error rather than a truncated page.
+            params={"return_full_object": "true", "page": page, "size": 100},
+            timeout=TIMEOUT,
+        )
+        assert listed.status_code == 200, listed.text
+        batch = [k for k in listed.json().get("keys", []) if isinstance(k, dict)]
+        aliases |= {k.get("key_alias") for k in batch}
+        if len(batch) < 100:
+            break
+    return aliases
+
+
 # ---------------------------------------------------------------------------
 # Item 1 — one login reaches all three surfaces
 # ---------------------------------------------------------------------------
@@ -242,6 +266,106 @@ class TestItem2VirtualKeys:
         )
         assert r.status_code == 401, f"expected 401, got {r.status_code}: {r.text}"
 
+    def test_issued_key_works_and_stays_joined_to_the_ledger(
+        self, control_plane_url, admin_headers, gateway_url
+    ):
+        """`/admin/keys/issue` is the only path that hands out a raw virtual key.
+
+        It exists for surfaces that are provisioned on demand — the workspace pod has to
+        be given a live key at creation, and by then nobody holds one. Three things have
+        to be true at once or it is a liability rather than a feature:
+
+          1. the key it returns actually authenticates at the gateway;
+          2. it is that user's `<username>::ide` alias, not a shared or master key;
+          3. the ledger's recorded token hash follows the rotation, so budgets keep
+             working. Minting straight at the gateway would leave the hash pointing at a
+             deleted key and `/admin/budget` would fail against a key that is gone —
+             silently, from the operator's side. That is the regression this guards.
+        """
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+        keys = httpx.get(
+            f"{control_plane_url}/admin/keys", headers=admin_headers, timeout=TIMEOUT
+        ).json()
+        users = sorted({k["username"] for k in keys if k["status"] == "active"})
+        if not users:
+            pytest.skip("no realm users yet — create one to exercise this item")
+        username = users[0]
+
+        issued = httpx.post(
+            f"{control_plane_url}/admin/keys/issue",
+            headers=admin_headers, json={"username": username, "surface": "ide"},
+            timeout=TIMEOUT,
+        )
+        assert issued.status_code == 200, issued.text
+        body = issued.json()
+        assert body["key_alias"] == f"{username}::ide", body
+        assert body["key"].startswith("sk-"), body
+
+        info = httpx.get(
+            f"{gateway_url}/key/info", params={"key": body["key"]},
+            headers={"Authorization": f"Bearer {body['key']}"}, timeout=TIMEOUT,
+        )
+        assert info.status_code == 200, f"the issued key does not work: {info.text}"
+        assert info.json()["info"]["key_alias"] == f"{username}::ide"
+
+        # The budget path is what goes stale if the rotation is done outside the ledger,
+        # so exercise it rather than inspecting the hash.
+        budget = httpx.post(
+            f"{control_plane_url}/admin/budget", headers=admin_headers,
+            json={"username": username, "surface": "ide", "max_budget": 5.0},
+            timeout=TIMEOUT,
+        )
+        assert budget.status_code == 200, (
+            f"budget update failed after issuing a key — the ledger's token hash did not "
+            f"follow the rotation: {budget.text}"
+        )
+
+    def test_issue_works_when_the_gateway_holds_no_key_yet(
+        self, control_plane_url, admin_headers, gateway_url, master_headers
+    ):
+        """Issuing must not require something to rotate.
+
+        The gateway answers 404 to a delete that matches nothing, and the first cut of
+        this endpoint let that 404 escape as a 500 — so issuing worked only for a surface
+        that already had a key, and failed in the two states an operator most needs it:
+        the first provision of a surface, and re-provisioning after a revocation.
+        """
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+        alias = f"{DOGFOOD_USER}::terminal"
+        httpx.post(f"{gateway_url}/key/delete", headers=master_headers,
+                   json={"key_aliases": [alias]}, timeout=TIMEOUT)
+
+        issued = httpx.post(
+            f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
+            json={"username": DOGFOOD_USER, "surface": "terminal"}, timeout=TIMEOUT,
+        )
+        assert issued.status_code == 200, (
+            f"issuing with nothing to rotate failed: {issued.status_code} {issued.text}"
+        )
+        assert issued.json()["key_alias"] == alias
+
+    def test_issue_rejects_unknown_users_and_surfaces(self, control_plane_url, admin_headers):
+        bad_surface = httpx.post(
+            f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
+            json={"username": "nobody", "surface": "browser"}, timeout=TIMEOUT,
+        )
+        assert bad_surface.status_code == 400, bad_surface.text
+        unknown = httpx.post(
+            f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
+            json={"username": "no-such-principal", "surface": "ide"}, timeout=TIMEOUT,
+        )
+        assert unknown.status_code == 404, unknown.text
+
+    def test_issue_requires_the_admin_token(self, control_plane_url):
+        """It returns a spendable credential. An unauthenticated caller must get nothing."""
+        r = httpx.post(
+            f"{control_plane_url}/admin/keys/issue",
+            headers={"Authorization": "Bearer not-the-admin-token"},
+            json={"username": "anyone", "surface": "ide"}, timeout=TIMEOUT,
+        )
+        assert r.status_code == 401, r.text
+        assert "sk-" not in r.text, f"the rejection handed back key material: {r.text}"
+
 
 # ---------------------------------------------------------------------------
 # Item 4 — one bill: spend by user and by surface, one query
@@ -440,25 +564,105 @@ class TestItem6RevocationPropagates:
         # Our own ledger saying "revoked" is not the claim — it is the thing most likely
         # to drift from reality. Assert against the gateway's own key set, which is what
         # actually decides whether a request is served.
-        remaining = set()
-        for page in range(1, 51):
-            listed = httpx.get(
-                f"{gateway_url}/key/list",
-                headers=master_headers,
-                # size is capped at 100 by the gateway; exceeding it returns a
-                # validation error rather than a truncated page.
-                params={"return_full_object": "true", "page": page, "size": 100},
-                timeout=TIMEOUT,
-            )
-            assert listed.status_code == 200, listed.text
-            batch = [k for k in listed.json().get("keys", []) if isinstance(k, dict)]
-            remaining |= {k.get("key_alias") for k in batch}
-            if len(batch) < 100:
-                break
+        remaining = gateway_aliases(gateway_url, master_headers)
         for k in active:
             assert k["key_alias"] not in remaining, (
                 f"{k['surface']} key still present on the gateway after revocation"
             )
+
+    def test_issuing_a_key_to_a_disabled_principal_is_refused(
+        self, env, control_plane_url, gateway_url, admin_headers, master_headers
+    ):
+        """`/admin/keys/issue` must not hand a spendable credential to a revoked person.
+
+        This is the one endpoint that returns a raw key, and it is the one path that could
+        undo item 6 in a single call: provisioning a workspace for someone identity has
+        already disabled would mint them a live key seconds after their access was
+        removed, and nothing else in the system would notice — the key is valid, the
+        gateway serves it, and the bill shows a principal who is supposed to be gone.
+
+        The status code is the smaller half of the claim. What actually matters is that
+        no key exists at the gateway afterwards, so this asserts against the gateway's own
+        key table rather than trusting the endpoint's own report of what it did not do.
+        """
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+        alias = f"{DOGFOOD_USER}::ide"
+
+        set_user_enabled(env, DOGFOOD_USER, False)
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+
+        refused = httpx.post(
+            f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
+            json={"username": DOGFOOD_USER, "surface": "ide"}, timeout=TIMEOUT,
+        )
+        assert refused.status_code == 409, (
+            f"issuing to a disabled principal returned {refused.status_code}: {refused.text}"
+        )
+        assert "sk-" not in refused.text, (
+            f"the refusal handed back something key-shaped: {refused.text}"
+        )
+        assert alias not in gateway_aliases(gateway_url, master_headers), (
+            f"{alias} is live at the gateway after issue was refused — the refusal "
+            "happened after the key was minted, which is worse than not refusing at all"
+        )
+
+    def test_revocation_does_not_erase_the_bill(
+        self, env, control_plane_url, gateway_url, admin_headers, master_headers
+    ):
+        """Money spent before a key was revoked must stay attributed to the person.
+
+        This is items 4 and 6 pulling against each other, and it was found the hard way:
+        the bill joined spend rows to the gateway's live key table, and revocation deletes
+        from that table. Every historical row for a revoked key silently became
+        "(unattributed)" — on the cluster, 88% of all recorded spend, after nothing more
+        exotic than reprovisioning a workspace a few times.
+
+        A bill that goes quiet about money that was definitely spent is worse than one
+        that is obviously broken, so this asserts the number survives the revocation.
+        """
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+        issued = httpx.post(
+            f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
+            json={"username": DOGFOOD_USER, "surface": "terminal"}, timeout=TIMEOUT,
+        )
+        assert issued.status_code == 200, issued.text
+        key = issued.json()["key"]
+
+        spent = httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": "bill me"}]},
+            timeout=TIMEOUT,
+        )
+        assert spent.status_code == 200, spent.text
+
+        def terminal_requests() -> int:
+            rows = httpx.get(
+                f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+            ).json()["by_user_and_surface"]
+            return sum(
+                r["requests"] for r in rows
+                if r["username"] == DOGFOOD_USER and r["surface"] == "terminal"
+            )
+
+        before = 0
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            before = terminal_requests()
+            if before:
+                break
+            time.sleep(2)
+        assert before, "the request was never recorded against the terminal surface"
+
+        httpx.post(f"{gateway_url}/key/delete", headers=master_headers,
+                   json={"key_aliases": [f"{DOGFOOD_USER}::terminal"]}, timeout=TIMEOUT)
+
+        after = terminal_requests()
+        assert after >= before, (
+            f"revoking the key erased {before - after} request(s) from the bill; "
+            "spend attribution must not depend on the key still existing"
+        )
 
 
 # ---------------------------------------------------------------------------

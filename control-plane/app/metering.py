@@ -28,6 +28,23 @@ async def pool() -> asyncpg.Pool:
 
 # LiteLLM hashes the key into LiteLLM_SpendLogs.api_key and keeps the alias on
 # LiteLLM_VerificationToken.token. The join is on the hashed token.
+#
+# That join alone is not enough, and the reason is a defect this row hit for real. The
+# join is against a table we DELETE from: revoking a disabled user's keys (scope item 6),
+# rotating a key when a surface is reprovisioned, and the exit path's revoke-all all
+# remove the LiteLLM_VerificationToken row. Every historical spend row for that key then
+# joins to NULL and falls out of the bill as "(unattributed)" — observed on the cluster at
+# 88% of all spend after a handful of workspace reprovisions.
+#
+# The bill going quiet about money that was definitely spent is the worst failure this
+# component has, so attribution is taken from the alias LiteLLM stamps onto the spend row
+# itself at request time, which nothing later deletes. The join survives as a fallback for
+# rows written before that metadata existed.
+_ALIAS = """COALESCE(
+    NULLIF(s.metadata->>'user_api_key_alias', ''),
+    NULLIF(v.key_alias, '')
+)"""
+
 _LEDGER_JOIN = """
 FROM "LiteLLM_SpendLogs" s
 LEFT JOIN "LiteLLM_VerificationToken" v ON v.token = s.api_key
@@ -50,10 +67,10 @@ async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
     SELECT
         COALESCE(
             NULLIF(s.end_user, ''),
-            NULLIF(split_part(v.key_alias, '::', 1), ''),
+            NULLIF(split_part({_ALIAS}, '::', 1), ''),
             '(unattributed)'
         ) AS username,
-        COALESCE(NULLIF(split_part(v.key_alias, '::', 2), ''), '(unknown)') AS surface,
+        COALESCE(NULLIF(split_part({_ALIAS}, '::', 2), ''), '(unknown)') AS surface,
         COUNT(*)                                  AS requests,
         COALESCE(SUM(s.spend), 0)::float8         AS spend,
         COALESCE(SUM(s.prompt_tokens), 0)::bigint AS prompt_tokens,
@@ -77,7 +94,7 @@ async def totals(since: str | None = None) -> dict:
     sql = f"""
     SELECT COUNT(*) AS requests,
            COALESCE(SUM(s.spend), 0)::float8 AS spend,
-           COUNT(DISTINCT v.key_alias) AS active_keys
+           COUNT(DISTINCT {_ALIAS}) AS active_keys
     {_LEDGER_JOIN}
     {where}
     """

@@ -302,3 +302,200 @@ after the exit their surfaces will be blocked by the network rather than by this
 software. Egress control is out of scope for this row, so the exit cannot undo it — the
 generated README says so explicitly rather than leaving it to be discovered.
 
+
+### 21. ttyd on loopback cannot be probed with `tcpSocket`, and the pod CrashLoops
+
+The workspace pod runs ttyd bound to `127.0.0.1` so that the only route to the shell is
+the oauth2-proxy sidecar. The kubelet dials the **pod IP**, so a `tcpSocket` probe on
+7681 is refused every single time, and the container is killed and restarted at exactly
+`failureThreshold x periodSeconds` — forever — while ttyd is in fact perfectly healthy.
+
+The symptom is a pod stuck at `1/2 Running` with a rising restart count and container
+logs that show a clean startup and an exit code of 0.
+
+**Fixed by** an `exec` probe that opens the socket from inside the container
+(`bash -c 'exec 3<>/dev/tcp/127.0.0.1/7681'`). It tests the same thing and it tests it
+from the only place the listener exists.
+
+### 22. An ingress rule with no `from` silently grants pod-to-pod egress
+
+Measured on this cluster's CNI (kube-router, the k3s default). The workspace
+NetworkPolicy denied egress to the whole pod CIDR, and one workspace could still reach
+another workspace's oauth2-proxy on 4180.
+
+The reason is that the CNI accepts a packet as soon as the **destination** pod's ingress
+rules allow it, without also consulting the **source** pod's egress rules. Writing the
+front-door rule the natural way — "port 4180, no `from`, anyone may knock" — therefore
+punched a hole straight through the egress section that was supposed to be the isolation.
+
+Two changes were needed, and neither works without the other:
+
+- the ingress rule names its allowed sources (the LAN and the tailnet) instead of leaving
+  `from` empty;
+- the Service sets `externalTrafficPolicy: Local`. With the default `Cluster`, kube-proxy
+  masquerades every arriving packet to the node's own address, so a workspace pod could
+  simply dial the NodePort and arrive looking like the node — inside the allow-list.
+
+**The lesson that generalises:** a NetworkPolicy's egress section is not self-enforcing.
+Whether it holds depends on the ingress rules of everything it points at and on how the
+Service rewrites source addresses. It is only isolation if you tried it from inside the
+pod, which is what `tests-live/test_workspace.py::test_workspace_cannot_reach_the_cluster`
+does.
+
+### 23. aider drops a completed edit when the model names a file that is not in the chat
+
+The load-bearing measurement for the coding-camp plan: can aider hold an edit format
+against models that arrive as a generic OpenAI endpoint on our gateway, with no
+model-specific tuning in aider's table?
+
+Harness: `tests-live/aider_editformat_probe.sh`, run inside a real workspace pod against
+the real gateway. Three repetitions of two tasks per cell — a single-file bug fix and a
+two-file addition. A cell passes only if the project's own tests pass afterwards, never
+because aider said it succeeded. Streaming on, which is what a person at the terminal
+gets.
+
+| model | `whole` | `diff` | `udiff` |
+|---|---|---|---|
+| `glm-5.2@deepinfra` | 6/6 | **3/6** | 6/6 |
+| `glm-4.7@deepinfra` | 6/6 | 6/6 | 6/6 |
+
+The headline is good: **both open models hold a real edit format through the gateway with
+no aider-side model support at all**, and `whole` — the untuned fallback — never failed.
+The coding-camp plan is not blocked on edit format.
+
+The one failure is worth the whole exercise. Every `glm-5.2` + `diff` failure was the
+same single-file task, all three of them, and every one failed **silently**: aider
+emitted no format complaint, printed a plausible answer, and left the file untouched.
+
+Isolating it: the failure disappears when the second file is already in the chat (3/3
+pass), and it is not about the model's ability to write SEARCH/REPLACE — the block is
+emitted correctly. GLM ends its reply by suggesting `python -m pytest test_app.py`. That
+trips aider's file-mention heuristic; with `--yes-always` aider adds `test_app.py` and
+re-prompts, and the edit from the first reply is discarded. The model's second reply then
+asks for `app.py` to be added, because it is no longer in the chat.
+
+Two contributing factors, both worth knowing:
+
+- **`--yes-always` is not a neutral convenience.** It turns "shall I add this file?" into
+  an automatic re-prompt that can throw away work already done.
+- **`--no-stream` makes it worse.** With streaming off the same cell failed 4/4 rather
+  than 3/3-of-6; the probe defaults to streaming for that reason.
+
+**Acted on by** defaulting `glm-5.2@deepinfra` to `udiff` and `glm-4.7@deepinfra` to
+`diff` in `deploy/workspace/model-settings.yml`, with the measurements recorded in the
+file next to the values they justify.
+
+### 24. GLM reasoning tokens are charged against the same output budget as the answer
+
+`glm-5.2` and `glm-4.7` return `reasoning_content` alongside `content`, and the reasoning
+counts as output tokens. A request with `max_tokens` set small enough comes back
+`finish_reason: length` with a full reasoning trace and an **empty** answer — observed at
+`max_tokens: 20`, where 98 tokens of reasoning were needed before the model would emit
+the two characters it had been asked for.
+
+The failure surfaces as the tool doing nothing rather than as an error. Aider's default
+output allowance for an unknown model is small, so the workspace image pins
+`max_tokens: 16384` for both GLM entries.
+
+### 25. Revoking a key erased the bill for everything it had already spent
+
+The most serious defect this row has produced, and it was silent in the direction that
+matters: the number got smaller and nothing said so.
+
+`GET /admin/spend` attributed spend by joining `LiteLLM_SpendLogs.api_key` to
+`LiteLLM_VerificationToken`, which is the gateway's table of **live** keys. Three
+supported operations delete from that table — revoking a disabled user's keys (item 6),
+the exit path's revoke-all (item 9), and rotating a key when a surface is reprovisioned.
+Every historical spend row belonging to a deleted key then joined to NULL and fell into
+`(unattributed)/(unknown)`.
+
+Found on the cluster while building the IDE surface. After a handful of workspace
+reprovisions the bill read:
+
+```
+(unattributed) / (unknown)    requests=116   spend=0.082114
+         baron / ide          requests=4     spend=0.002115
+```
+
+88% of all money spent, detached from the person who spent it, with no error anywhere.
+Scope item 6 — "disabling a user in the IdP pulls every surface key" — was therefore
+*destroying the audit value of item 4* every time it worked correctly.
+
+**Fixed by** attributing from the alias LiteLLM stamps onto each spend row at request
+time (`metadata->>'user_api_key_alias'`), which no later revocation touches, and keeping
+the token join only as a fallback for rows written before that metadata existed. The same
+bill after the fix, over the same data:
+
+```
+         baron / ide          requests=103   spend=0.075958
+       student / ide          requests=7     spend=0.006080
+(unattributed) / (unknown)    requests=14    spend=0.002190
+```
+
+The 14 that remain are genuinely unattributable — calls made with the gateway master key
+during setup, which belong to no principal.
+
+**Regression test:**
+`TestItem6RevocationPropagates::test_revocation_does_not_erase_the_bill` — spend a
+recorded request through a key, revoke the key, assert the request is still on the bill.
+
+**The lesson that generalises:** a ledger must not be joined to mutable operational
+state. Attribution has to be written down at the moment of the event, because everything
+the event referred to is allowed to be deleted afterwards.
+
+### 26. "Nothing to delete" is not an error, and treating it as one broke first provision
+
+Small, but it is the shape of bug that survives review. `POST /admin/keys/issue` rotates
+by deleting the old key before minting the new one, and the gateway answers **404** to a
+delete matching no alias. That 404 escaped as a 500, so issuing a key worked only for a
+surface that already had one — failing in precisely the two states it exists for: the
+first provision of a surface, and reprovisioning after a revocation.
+
+It stayed hidden because `provision-workspace.sh` calls `/admin/sync` first, which mints
+any missing key, so the happy path always had something to rotate.
+
+**Fixed by** an explicit `missing_ok` on `gateway.delete_by_aliases`, set only by the
+rotation path. Revocation still treats a 404 as worth surfacing, because there it means
+the ledger and the gateway disagree about what exists.
+
+**Regression test:**
+`TestItem2VirtualKeys::test_issue_works_when_the_gateway_holds_no_key_yet`.
+
+### 27. The bill believes the caller about who spent the money
+
+Attribution in `metering.py` ranks `LiteLLM_SpendLogs.end_user` above the username encoded
+in the key alias. `end_user` is whatever the client put in the request body's `user`
+field. It is not authenticated and it is not checked against the key.
+
+So any holder of any virtual key can write any name onto their own spend. From a
+workspace pod, with nothing but the key that pod is issued:
+
+    curl http://gateway:4000/v1/chat/completions \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -d '{"model":"fake-large","messages":[...],"user":"someone-else"}'
+
+and `someone-else` appears on `GET /admin/spend` as a principal. One user can charge their
+spend to another user, or to a name that belongs to nobody. Both surfaces that hold
+per-user keys — the IDE workspace and the terminal agent — run code the user typed, so
+this is reachable by design rather than by compromise.
+
+**This contradicts finding 13**, which closes with "the ledger query already prefers
+`end_user` where present, so this becomes correct the moment the surface is confirmed to
+forward it". That reasoning holds only for a *trusted* surface forwarding an identity it
+authenticated. It is the wrong rule for a surface the user has a shell on. The fix has to
+distinguish the two — an alias-derived username is an assertion by the control plane, an
+`end_user` is an assertion by the caller, and only the first is evidence. Ranking is not
+the mechanism; provenance is.
+
+**Not fixed here.** Filed as `enterpriseaiframework-522`.
+
+**Regression test:**
+`tests-live/test_workspace.py::test_spend_is_attributed_to_the_key_that_paid_for_it`,
+written to the real claim and marked `xfail(strict=True)`. It fails today, deliberately
+and visibly, rather than being softened into the presence check it replaced (a
+`(user, 'ide')` row exists — true while the money lands on a different name). The strict
+marker turns the suite red the moment 522 is fixed and the marker is left behind.
+
+**The lesson that generalises:** a presence check is not an attribution check. "There is a
+row for this user" and "this user's spend is on this row" are different claims, and the
+first one passes for years while the second is false.

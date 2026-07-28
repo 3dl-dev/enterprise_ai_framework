@@ -1,0 +1,221 @@
+# One user's workspace. Rendered by deploy/bin/provision-workspace.sh — the placeholders
+# are substituted literally, so this file is not applyable on its own.
+#
+#   __USER__      Keycloak username, also the PVC/Deployment/Service name suffix
+#   __EMAIL__     that user's email, the only value oauth2-proxy will let through
+#   __IMAGE__     workspace image reference in the rail registry
+#   __NODEPORT__  the port this workspace answers on
+#   __MODEL__     aider's default model, a name from the gateway catalogue
+#   __ISSUER__    OIDC issuer, must be byte-identical to what the browser uses
+#   __REDIRECT__  oauth2-proxy callback URL, must be registered in Keycloak
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ws-__USER__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: workspace
+    workspace.enterprise-ai/user: "__USER__"
+spec:
+  accessModes: [ReadWriteOnce]
+  # local-path, which lives on the node's disk. NON-DURABLE: k3s-worker is cattle and is
+  # rebuilt wholesale. The tank-backed dataset that fixes this is staged behind a reboot
+  # gate; until it lands, treat a workspace as disposable and tell users so.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ws-__USER__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: workspace
+    workspace.enterprise-ai/user: "__USER__"
+spec:
+  type: NodePort
+  # Local, not the default Cluster. With Cluster, kube-proxy masquerades every arriving
+  # packet to the node's own address, so the NetworkPolicy sees "from a node" no matter
+  # who actually connected — and one workspace pod can then reach another workspace's
+  # proxy simply by dialling the NodePort. Local keeps the real client address, which is
+  # what makes the ingress allow-list mean anything. The cost is that this NodePort only
+  # answers on the node the pod is running on.
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/component: workspace
+    workspace.enterprise-ai/user: "__USER__"
+  ports:
+    # 4180 is oauth2-proxy. ttyd's 7681 is deliberately absent and must stay absent:
+    # publishing it would hand anyone who can reach the node a root-of-trust-free shell
+    # holding a key that spends money.
+    - name: https-proxy
+      port: 4180
+      targetPort: 4180
+      nodePort: __NODEPORT__
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ws-__USER__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: workspace
+    workspace.enterprise-ai/user: "__USER__"
+spec:
+  replicas: 1
+  # The PVC is ReadWriteOnce and the shell holds live state. Two replicas of a workspace
+  # is never what anyone wanted, and a rolling update would try to start one.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: workspace
+      workspace.enterprise-ai/user: "__USER__"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: enterprise-ai-framework
+        app.kubernetes.io/component: workspace
+        workspace.enterprise-ai/user: "__USER__"
+      annotations:
+        checksum/key: "__KEYSUM__"
+    spec:
+      serviceAccountName: workspace
+      automountServiceAccountToken: false
+      # Same trick the chat surface uses: the cluster is not on the tailnet, so the
+      # funnel hostname resolves to the public ingress and the connection is reset.
+      # Pinned to the gateway VM's LAN address so the OIDC backchannel goes straight
+      # there over the same hostname the browser used — the issuer string must match on
+      # both sides or the token is rejected.
+      hostAliases:
+        - ip: "192.168.2.42"
+          hostnames: ["gateway.tailcb6ef9.ts.net"]
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        # The PVC arrives owned by root; without this the workspace is read-only to the
+        # user it was created for, which reads as "aider is broken".
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        # ---------------------------------------------------------------- the shell
+        - name: ttyd
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            - { name: WS_USER, value: "__USER__" }
+            - { name: WS_PROJECT_DIR, value: "/workspace/project" }
+            # One route out of the building. The pod has no provider credential of any
+            # kind — this is a virtual key on our own gateway.
+            - { name: OPENAI_API_BASE, value: "http://gateway:4000/v1" }
+            - { name: OPENAI_BASE_URL, value: "http://gateway:4000/v1" }
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: ws-__USER__-key, key: OPENAI_API_KEY }
+            # Aider needs the openai/ prefix to treat the gateway as an OpenAI-compatible
+            # endpoint rather than looking the bare name up in litellm's provider table.
+            - { name: AIDER_MODEL, value: "openai/__MODEL__" }
+          ports:
+            # Named, not published. ttyd binds loopback; this is documentation and a
+            # target for nothing.
+            - { name: ttyd, containerPort: 7681 }
+          volumeMounts:
+            - { name: workspace, mountPath: /workspace }
+            - { name: home, mountPath: /home/coder }
+          resources:
+            # k3s-worker runs live GPU training. A student running `make -j` must not be
+            # able to take the node down with them, so the limit is real and the request
+            # is honest about the steady state.
+            requests: { cpu: "500m", memory: "1Gi", ephemeral-storage: "1Gi" }
+            limits:   { cpu: "1",    memory: "2Gi", ephemeral-storage: "4Gi" }
+          # An exec probe, not tcpSocket. The kubelet dials the POD IP, and ttyd listens
+          # on loopback only — a tcpSocket probe is refused every time, so the container
+          # is killed and restarted forever while ttyd is in fact healthy. Observed, not
+          # theorised: the first cut of this file used tcpSocket and CrashLooped at
+          # exactly failureThreshold x periodSeconds.
+          startupProbe:
+            exec:
+              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7681"]
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7681"]
+            periodSeconds: 30
+            failureThreshold: 3
+        # ---------------------------------------------------------------- the front door
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1-alpine
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            readOnlyRootFilesystem: true
+          args:
+            - --provider=oidc
+            - --oidc-issuer-url=__ISSUER__
+            - --client-id=workspace
+            - --redirect-url=__REDIRECT__
+            - --scope=openid email profile
+            - --http-address=0.0.0.0:4180
+            - --upstream=http://127.0.0.1:7681
+            # ttyd is a websocket application. Without this the page loads and the
+            # terminal never connects, which looks like a broken shell rather than a
+            # proxy setting.
+            - --proxy-websockets=true
+            # THE authorization decision. One file, one address: this user's. There is
+            # deliberately no --email-domain — setting it to '*' makes every
+            # authenticated user in the realm valid here regardless of this file, which
+            # would hand any user a shell holding somebody else's spendable key.
+            - --authenticated-emails-file=/etc/oauth2-proxy/authorized-emails
+            - --skip-provider-button=true
+            - --reverse-proxy=true
+            - --session-store-type=cookie
+            - --cookie-name=_ws___USER___auth
+            # The NodePort is plain HTTP on the LAN, so a Secure cookie would never be
+            # sent back and login would loop forever. Put TLS in front of this before it
+            # is reachable from anywhere untrusted, and flip this back to true.
+            - --cookie-secure=false
+            - --cookie-samesite=lax
+            - --cookie-expire=8h
+            - --silence-ping-logging=true
+          env:
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef: { name: ws-__USER__-key, key: OAUTH2_PROXY_CLIENT_SECRET }
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef: { name: ws-__USER__-key, key: OAUTH2_PROXY_COOKIE_SECRET }
+          ports:
+            - { name: proxy, containerPort: 4180 }
+          volumeMounts:
+            - { name: authorized, mountPath: /etc/oauth2-proxy, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /ping, port: 4180 }
+            periodSeconds: 10
+            failureThreshold: 12
+          resources:
+            requests: { cpu: "25m", memory: "32Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+      volumes:
+        - name: workspace
+          persistentVolumeClaim: { claimName: ws-__USER__ }
+        # $HOME is not on the PVC. aider's caches and pip's build dirs go here and are
+        # rebuilt on restart; keeping them out of the PVC means the durable volume holds
+        # the user's code and nothing else.
+        - name: home
+          emptyDir: { sizeLimit: 2Gi }
+        - name: authorized
+          secret:
+            secretName: ws-__USER__-key
+            items:
+              - { key: AUTHORIZED_EMAILS, path: authorized-emails }

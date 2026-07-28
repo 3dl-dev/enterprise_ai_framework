@@ -44,3 +44,57 @@ is a complete uninstall.
 - **The generated catalogue still carries the three fake-provider models**, which point at
   a service that is not deployed here. They 500 if selected. Harmless but untidy — the
   cluster should render a Forge-only catalogue.
+
+## The IDE surface — browser-terminal aider
+
+A per-user pod running **real terminal aider** under `ttyd`, behind oauth2-proxy against
+Keycloak. Not `aider --browser` (its Streamlit GUI drops most slash commands) and not an
+MCP wrapper (one-shot `--message` throws away the context accumulation and the
+apply/lint/test/repair loop, which is the product).
+
+```bash
+deploy/bin/kaniko-build.sh deploy/workspace 192.168.2.43:30500/enterprise-ai-workspace:$(git rev-parse --short HEAD)
+deploy/bin/ensure-second-user.sh student          # a second realm user, for the isolation check
+deploy/bin/provision-workspace.sh baron
+deploy/bin/provision-workspace.sh student
+make test-workspace                               # drives both, as a person would
+```
+
+`provision-workspace.sh` is idempotent and is the mechanism the on-click provisioning API
+will call. Each run rotates that user's `<username>::ide` virtual key through the control
+plane, so the pod never holds a shared key and the ledger's token hash stays correct.
+
+| | |
+|---|---|
+| URL | `http://<k3s-worker>:<nodeport>` — allocated per user, stable across reprovisions |
+| Auth | oauth2-proxy → Keycloak, then an allow-list containing exactly that user's email |
+| Key | `<username>::ide`, minted by `POST /admin/keys/issue` at provision time |
+| Model | `glm-5.2@deepinfra` by default; `--model` overrides from the gateway catalogue |
+| Budget | 0.5 CPU / 1Gi requested, 1 CPU / 2Gi limit, 4Gi ephemeral |
+
+### What is deliberately closed
+
+- **ttyd binds loopback.** No Service anywhere exposes 7681. The only published port is
+  oauth2-proxy's. Changing `--interface lo` removes the entire access control.
+- **No service-account token, no RBAC.** `automountServiceAccountToken: false` on both
+  the ServiceAccount and the pod.
+- **NetworkPolicy** allows DNS, the gateway on 4000, the public TLS edge for the OIDC
+  backchannel, and the public internet. Everything private is excluded — the API server,
+  Postgres, the control plane, and every other workspace. Verified by trying it from
+  inside the shell, not by reading this table.
+- **Non-root, no privilege escalation, all capabilities dropped, RuntimeDefault seccomp.**
+
+### Known gaps
+
+- **Workspaces are not durable.** `local-path` lives on `k3s-worker`, which is cattle and
+  is rebuilt wholesale. A workspace does not survive that. The tank-backed dataset that
+  fixes it is staged behind a reboot gate.
+- **The NodePort is plain HTTP**, so the session cookie is set with `--cookie-secure=false`
+  and travels in clear on the LAN. Put TLS in front before this is reachable from anywhere
+  untrusted, and flip the flag back.
+- **`externalTrafficPolicy: Local`** means each workspace answers only on the node its pod
+  runs on. That is what keeps the NetworkPolicy honest; it also means the URL changes node
+  if the pod is rescheduled.
+- **No idle reclaim.** Pods run until deleted:
+  `kubectl -n enterprise-ai delete deploy,svc,pvc,secret -l workspace.enterprise-ai/user=<name>`.
+- **No entry point from the chat surface.** Reaching a workspace means knowing its URL.

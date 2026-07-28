@@ -67,15 +67,26 @@ async def generate_key(
     return resp.json()
 
 
-async def delete_by_aliases(aliases: list[str]) -> dict:
+async def delete_by_aliases(aliases: list[str], *, missing_ok: bool = False) -> dict:
     """Hard-revoke by alias. Used when identity says the principal is gone or disabled.
 
     Deleting by alias rather than by key value is what lets the control plane avoid
     holding the raw virtual keys at all.
+
+    The gateway answers 404 when none of the aliases exist. For revocation that is worth
+    surfacing — it means our ledger and the gateway disagree about what exists. For a
+    rotation it is not: "there was nothing to delete" is a perfectly good outcome, and
+    treating it as an error makes issuing the FIRST key for a surface fail. Callers say
+    which case they are in rather than every caller learning this the hard way.
     """
     if not aliases:
         return {"deleted_keys": []}
-    resp = await _request("POST", "/key/delete", json={"key_aliases": aliases})
+    try:
+        resp = await _request("POST", "/key/delete", json={"key_aliases": aliases})
+    except httpx.HTTPStatusError as exc:
+        if missing_ok and exc.response.status_code == 404:
+            return {"deleted_keys": []}
+        raise
     return resp.json()
 
 
