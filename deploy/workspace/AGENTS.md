@@ -13,8 +13,17 @@ suggestions; every one of them exists because breaking it produces a blank page 
    file the preview opens and the file the share link serves. No build step, no bundler, no
    framework, no `src/` directory.
 
-3. **Write the whole file in one operation.** Never assemble it with repeated appends. The
-   preview shows whatever is on disk at that moment, and a half-written file reads as broken.
+3. **Edit in place; do not rewrite the whole file to change part of it.** Write the file
+   out in full when you first create it, then make later changes as targeted edits. You can
+   only emit about 32,000 tokens in one reply — roughly 100KB — so a project that grows past
+   that cannot be rewritten whole, and trying is how a working page comes back truncated.
+   Change the part that needs changing.
+
+   (This rule used to say the opposite: "write the whole file in one operation, never
+   assemble it with repeated appends", because a half-written file showed up in the live
+   preview and looked broken. The preview no longer runs until somebody presses Run, so
+   that reason is gone — and the rule was capping every project at one reply's worth of
+   output.)
 
 4. **Never start a server.** No `npm run dev`, no `python -m http.server`, no watcher, no
    background process. The page is opened directly; a server is never the answer here.

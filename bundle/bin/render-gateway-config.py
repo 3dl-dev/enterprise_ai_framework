@@ -189,6 +189,14 @@ def yaml_entry(model: dict, price: dict, base_url: str) -> str:
     mid = model["id"]
     inp = price["input_per_mtok"] / 1_000_000
     out = price["output_per_mtok"] / 1_000_000
+    # Cached prompt tokens cost a fraction of fresh ones — Forge quotes glm-5.2 at 0.18
+    # against 0.93 — and without these fields LiteLLM bills every cached token at the full
+    # input rate. The provider was already charging the discount; only OUR ledger was
+    # missing it, which makes the bill overstate exactly when caching is working best.
+    # Measured end to end first: deepseek-v3.2@deepinfra reported 20,992 of 21,020 prompt
+    # tokens cached on a repeat call, so the number really does arrive.
+    cache_read = price.get("cache_read_per_mtok") or 0
+    cache_write = price.get("cache_write_per_mtok") or 0
     lines = [
         f"  - model_name: {mid}",
         "    litellm_params:",
@@ -198,11 +206,24 @@ def yaml_entry(model: dict, price: dict, base_url: str) -> str:
         "      api_key: os.environ/FORGE_API_KEY",
         f"      input_cost_per_token: {inp:.12f}",
         f"      output_cost_per_token: {out:.12f}",
+    ]
+    lines += [
         "      extra_headers:",
         # Attribution. Without it Forge records a token bill with no idea which part of
         # the system spent it.
         "        X-Forge-Project: enterprise-ai-framework",
         "    model_info:",
+        f"      input_cost_per_token: {inp:.12f}",
+        f"      output_cost_per_token: {out:.12f}",
+    ]
+    # In model_info, not litellm_params. Placed in litellm_params first and measured the
+    # result: cached tokens were billed at ZERO rather than at the quoted read rate, so
+    # the ledger under-reported by the whole discount instead of applying it.
+    if cache_read:
+        lines.append(f"      cache_read_input_token_cost: {cache_read / 1_000_000:.12f}")
+    if cache_write:
+        lines.append(f"      cache_creation_input_token_cost: {cache_write / 1_000_000:.12f}")
+    lines += [
         f"      sovereignty: {model.get('sovereignty', 'unknown')}",
         f"      max_context_window: {model.get('max_context_window', 0)}",
         f"      upstream_path: {model.get('path', 'unknown')}",
