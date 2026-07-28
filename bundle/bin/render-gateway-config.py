@@ -8,20 +8,33 @@ Why generated rather than hand-written:
 
 - Forge's docs are explicit that `GET /v1/models` is the source of truth, not a pinned
   list. A hardcoded catalog goes stale silently.
-- **Every entry must carry a real price.** A model the gateway cannot price still serves
-  traffic and still counts tokens, but records spend as $0 — so budgets never trip and
-  the bill under-reports, with nothing anywhere reporting an error. We learned that the
-  hard way on the fake provider; doing it against real money across 68 models would be
-  considerably worse.
+- **Every entry must carry a real price**, so that spend is attributable and a budget
+  means something.
 
-So a model is included only if Forge quotes a real per-token price for it. Anything
-unpriced is excluded and listed, loudly. Excluding a model is visible and annoying;
-including it at $0 is invisible and wrong.
+WHERE PRICES COME FROM, AND A BELIEF THAT WAS WRONG
 
-Prices come from `/v1/pricing`, which is admin-gated. That is a setup-time read on the
-operator's machine, not a runtime credential — the admin key is never written to .env and
-never reaches a container. The response is cached so re-rendering does not require the
-admin key again.
+This read `/v1/pricing`, which lists only prices a human has explicitly SET — twelve of
+them — and excluded everything else on the stated grounds that an unpriced model "meters
+at $0, so budgets never trip and the bill under-reports". That was asserted here
+confidently and was not true. Forge charges request-time cost and draws budgets down for
+models with no PriceRecord; that was demonstrated by running a real counter down with
+kimi-k2-thinking, which has none. Only the rollups reported $0, and that was a Forge bug,
+since fixed. The rule cost us 143 models for a reason that did not hold.
+
+Prices now come from `/v1/pricing/effective`, which answers for every model in the
+catalogue and says where each number came from:
+
+    source: "default"  a price a human set explicitly (a PriceRecord)
+    source: "catalog"  the provider's own published rate
+
+Both are real prices and both are billed, so both are included. `source` is kept on each
+entry so the policy is one line to change if a deployment ever wants only human-priced
+models exposed — that is a judgement about who gets to introduce a cost, not about
+whether the number exists.
+
+The endpoint is admin-gated: a setup-time read on the operator's machine, not a runtime
+credential. The admin key is never written to .env and never reaches a container. The
+response is cached so re-rendering does not require it again.
 
 Usage:
     render-gateway-config.py [--offline]
@@ -47,18 +60,18 @@ MARKER = "# @GENERATED_UPSTREAMS@"
 
 # Why a model Forge quotes at exactly $0 is still left out.
 #
-# Zero is a real price here — those models run on hardware the operator already owns, so
-# their marginal token cost genuinely is nothing. But the ledger cannot tell "free" from
-# "we never learned the price": both meter at $0, both make a budget impossible to trip,
-# and /admin/unpriced flags both. Until spend can distinguish them, a $0 model is left out
-# rather than quietly uncapped.
+# The old reason — "we cannot tell free from unpriced" — no longer applies:
+# /v1/pricing/effective answers for every model and says where the number came from, so
+# nothing is unpriced any more. What survives is narrower and is a property of zero
+# itself: a model that costs nothing contributes nothing to spend, so no budget can ever
+# bind on it. These run on hardware the operator already owns, so zero is honest. It is
+# the CAP that cannot be expressed, not the price that is missing.
 #
-# This string was referenced in the report below and never defined, so the generator
-# crashed with a NameError the first time Forge actually quoted something at zero — which
-# it now does for four media models. The catalogue had already been written by then, so
-# the failure looked like a broken run rather than a broken sentence.
+# Worth exposing anyway for a deployment that does not need per-model caps — free
+# inference on your own hardware is the good case, not the dangerous one. Left out here
+# because this bundle's whole claim is that a budget means something.
 ZERO_PRICE_IS_REAL_BUT_EXCLUDED = (
-    "real hardware cost, but $0 makes budgets untrippable"
+    "free on owned hardware — real, but no budget can bind on $0"
 )
 
 # How a fake catalogue entry is recognised: by who serves it.
@@ -151,7 +164,7 @@ def load(offline: bool, env: dict):
     ak = admin_key(env)
     if ak:
         try:
-            pricing = fetch(f"{base_url}/v1/pricing", ak)
+            pricing = fetch(f"{base_url}/v1/pricing/effective", ak)
             PRICE_CACHE.write_text(json.dumps(pricing, indent=2))
         except urllib.error.HTTPError as exc:
             print(f"warning: could not read /v1/pricing ({exc.code}); using cache", file=sys.stderr)
@@ -257,15 +270,32 @@ def main(argv) -> int:
 
     prices = {p["model_id"]: p for p in pricing}
 
-    included, excluded_unpriced, excluded_zero = [], [], []
+    # POLICY: expose everything Forge can price, whoever priced it.
+    #
+    # `source` distinguishes a price a human set ("default") from the provider's own
+    # published rate ("catalog"). Both are charged and both draw budgets down, so both
+    # are exposed. Set HUMAN_PRICED_ONLY to require somebody to have signed off on a
+    # model's cost before it is offered — a judgement about who may introduce a cost,
+    # not about whether the number exists.
+    human_priced_only = os.environ.get("HUMAN_PRICED_ONLY", "").lower() in ("1", "true", "yes")
+
+    included, excluded_unpriced, excluded_zero, excluded_policy = [], [], [], []
+    by_source: dict[str, int] = {}
     for m in sorted(catalog, key=lambda x: x["id"]):
         p = prices.get(m["id"])
-        if p is None:
+        if p is None or p.get("priced") is False:
             excluded_unpriced.append(m["id"])
+        elif human_priced_only and p.get("source") != "default":
+            excluded_policy.append(m["id"])
         elif p["input_per_mtok"] == 0 and p["output_per_mtok"] == 0:
+            # Still excluded, and now for the ONLY reason that survives: a model that
+            # costs nothing contributes nothing to spend, so a budget cannot bind on it.
+            # These run on hardware the operator already owns, so zero is honest — it is
+            # the cap that cannot be expressed, not the price that is missing.
             excluded_zero.append(m["id"])
         else:
             included.append(yaml_entry(m, p, base_url))
+            by_source[p.get("source", "?")] = by_source.get(p.get("source", "?"), 0) + 1
 
     block = "\n".join(included) if included else ""
     # Real models exist, so the fake upstreams come OUT.
@@ -278,12 +308,16 @@ def main(argv) -> int:
     # broken one. Fallback or supplement, not both.
     OUT.write_text(_without_fakes(base_text).replace(MARKER, block))
 
-    print(f"gateway catalog: {len(included)} Forge models included, priced from /v1/pricing")
+    sources = ", ".join(f"{n} {k}-priced" for k, n in sorted(by_source.items()))
+    print(f"gateway catalog: {len(included)} Forge models included ({sources})")
+    if excluded_policy:
+        print(f"\n  excluded by HUMAN_PRICED_ONLY ({len(excluded_policy)}): "
+              "priced by the provider catalogue, not by a person here")
     if excluded_zero:
         print(f"\n  excluded, quoted at $0 ({ZERO_PRICE_IS_REAL_BUT_EXCLUDED}):")
         print("    " + ", ".join(excluded_zero))
     if excluded_unpriced:
-        print(f"\n  excluded, NO PRICE QUOTED BY FORGE ({len(excluded_unpriced)}):")
+        print(f"\n  excluded, FORGE CANNOT PRICE ({len(excluded_unpriced)}):")
         for i in range(0, len(excluded_unpriced), 4):
             print("    " + ", ".join(excluded_unpriced[i:i + 4]))
         print(
