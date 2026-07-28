@@ -4,13 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Workshop</title>
+<!-- data: URI, not a file request. The pod has no egress; a remote favicon is a broken
+     favicon and a console error a nine-year-old cannot read. -->
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🦄</text></svg>">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 
-<header class="bar">
-  <div class="brand"><span class="mark">🦄</span><span>Workshop</span></div>
+<a class="skip" href="#terminal-frame">Skip to the terminal</a>
+
+<header id="bar">
+  <div class="brand"><span class="mark">🦄</span><span class="brand-word">Workshop</span></div>
 
   <div class="project-switch">
     <button class="chip" id="project-button" aria-haspopup="listbox" aria-expanded="false">
@@ -23,95 +27,225 @@
 
   <div class="spacer"></div>
 
-  <div class="agent-state" id="agent-state" title="Which model is building for you"></div>
-
-  <button class="btn ghost icon" id="tab-guide" title="Ideas (?)"><span>Ideas</span></button>
-  <button class="btn ghost icon" id="tab-settings" title="Settings"><span>Settings</span></button>
-  <button class="btn primary" id="publish"><span class="label">Share it</span></button>
+  <button class="btn ghost" id="btn-fill" hidden><span class="label">Fill the screen</span></button>
+  <button class="btn ghost" id="btn-settings">Settings</button>
+  <button class="btn primary" id="btn-share"><span class="label">Show someone</span></button>
 </header>
 
-<main class="grid" id="grid">
+<div id="ribbon">
+  <span class="dot" id="ribbon-dot" data-tone="grey" aria-hidden="true"></span>
+  <span id="ribbon-phrase" role="status" aria-live="polite" aria-atomic="true"></span>
+  <span id="ribbon-elapsed" aria-hidden="true"></span>
+  <span class="spacer"></span>
+  <button class="btn ghost small" id="btn-stuck">Stuck?</button>
+  <button class="btn ghost small" id="btn-look" aria-expanded="false" aria-controls="stage-preview">
+    Look<span class="badge" id="look-badge" hidden></span>
+  </button>
+</div>
 
-  <section class="pane" id="pane-agent">
-    <div class="pane-head">
-      <h2>Build</h2>
-      <span class="hint">say what you want, in normal words</span>
+<main id="stage" data-drawer="closed">
+
+  <section class="pane" id="stage-terminal">
+    <!-- background on the ELEMENT, not just the stylesheet: the frame paints before its
+         document does, and without this there is a white flash on every terminal reload. -->
+    <iframe id="terminal-frame" src="/terminal/" title="Coding agent" style="background:var(--term-bg)"></iframe>
+
+    <!-- Failure bars. Never auto-reload either surface: reloading the page discards a
+         half-typed prompt, and reloading ttyd silently destroys the conversation because
+         ttyd spawns a fresh shell per websocket. -->
+    <div class="failbar" id="bar-lost" hidden role="alert">
+      <span>Lost contact with the workshop.</span>
+      <button class="btn small" id="btn-reload-page">Reload the page</button>
     </div>
-    <iframe id="terminal" src="/terminal/" title="Coding agent"></iframe>
+    <div class="failbar" id="bar-stuck" hidden role="alert">
+      <span>The workshop reconnected. Your terminal may be stuck.<em>This starts a fresh agent chat.</em></span>
+      <button class="btn small" id="btn-restart-term">Restart the terminal</button>
+    </div>
+
+    <!-- Not a <dialog>: its whole message is "click the dark box behind me and type",
+         and a focus trap makes that impossible. -->
+    <div id="curtain" hidden role="dialog" aria-modal="false" aria-labelledby="curtain-h">
+      <div class="curtain-card">
+        <h2 id="curtain-h">This is where you tell the computer what to make.</h2>
+        <p class="lede">The dark box behind this is listening. Click it, type a sentence, and press Enter.</p>
+        <p class="note">Say it in normal words. Like one of these:</p>
+        <ul id="curtain-ideas"></ul>
+        <button class="btn primary" id="curtain-go">OK, I'm ready</button>
+      </div>
+    </div>
   </section>
 
-  <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" tabindex="0"
-       aria-label="Drag to resize, or use the arrow keys"></div>
-
-  <section class="pane" id="pane-preview">
-    <div class="pane-head">
-      <h2>Look</h2>
+  <aside id="stage-preview" class="drawer" role="complementary" aria-label="Preview">
+    <div class="drawer-head">
+      <span class="drawer-label">LOOK</span>
+      <span class="mono" id="preview-file">index.html</span>
       <span class="spacer"></span>
-      <label class="toggle" title="Reload every few seconds while you build">
-        <input type="checkbox" id="autorefresh"><span class="track"></span><span class="tlabel">live</span>
-      </label>
-      <button class="btn small ghost" id="refresh" title="Reload (R)">Reload</button>
-      <button class="btn small ghost" id="popout" title="Open in a new tab">Open ↗</button>
+      <button class="btn small ghost" id="btn-reload">Reload</button>
+      <button class="btn small ghost" id="btn-popout">Open ↗</button>
+      <button class="btn small ghost" id="btn-hide">Hide</button>
+      <div class="progress" id="drawer-progress" hidden aria-hidden="true"></div>
     </div>
     <div class="preview-wrap">
-      <iframe id="preview" src="/preview/" title="Your app"></iframe>
+      <!-- No allow-same-origin. The preview must never be able to script, navigate or
+           freeze the Workshop hosting it: that failure is unrecoverable, a broken preview
+           is not. The cost is that contentDocument is unreadable, so every fact about the
+           preview comes from /api/pulse and never from a DOM sentinel. -->
+      <iframe id="preview" src="about:blank" title="Your app"
+              sandbox="allow-scripts allow-modals allow-popups allow-pointer-lock allow-forms"></iframe>
       <div class="empty" id="preview-empty" hidden>
-        <div class="empty-art">✨</div>
-        <h3>Nothing here yet</h3>
-        <p>Ask for something on the left, and it appears here.</p>
-        <button class="btn" id="empty-ideas">Show me ideas</button>
+        <svg class="empty-glyph" viewBox="0 0 24 24" width="40" height="40" aria-hidden="true">
+          <rect x="2.6" y="4" width="18.8" height="16" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+          <path d="M2.6 8.6h18.8" stroke="currentColor" stroke-width="1.4"/>
+          <circle cx="5.7" cy="6.3" r=".75" fill="currentColor"/>
+          <circle cx="8.1" cy="6.3" r=".75" fill="currentColor"/>
+        </svg>
+        <h3>Nothing to look at yet.</h3>
+        <p>When the agent makes a page, it turns up here.</p>
+        <button class="btn" id="empty-ideas">What could I make?</button>
       </div>
     </div>
-  </section>
+  </aside>
 </main>
 
-<!-- Slide-over -->
-<div class="scrim" id="scrim" hidden></div>
-<aside class="panel" id="panel" hidden aria-hidden="true">
-  <button class="close" id="panel-close" aria-label="Close">
-    <svg viewBox="0 0 14 14" aria-hidden="true"><path d="M1 1l12 12M13 1L1 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-  </button>
+<!-- ------------------------------------------------------------------ Stuck? -->
 
-  <section id="panel-guide">
-    <h3>What do you want to make?</h3>
-    <p class="lede">Pick one — it goes straight to the agent.</p>
-    <ul class="ideas" id="ideas"></ul>
-    <h3>If it goes wrong</h3>
-    <ul class="tips">
-      <li><strong>Nothing in Look?</strong> Ask for “put it all in one index.html”.</li>
-      <li><strong>Broken?</strong> Say what you see: “the unicorn runs off the screen”.</li>
-      <li><strong>Want a change?</strong> Just say it. “Make the sky purple.”</li>
-      <li><strong>Gone too far?</strong> Ask it to “undo the last change”.</li>
-    </ul>
-  </section>
+<dialog class="dlg sheet" id="dlg-stuck">
+  <form method="dialog">
+    <div class="sheet-top">
+      <h2>Stuck?</h2>
+      <button class="btn ghost small" value="cancel" type="submit">Close</button>
+    </div>
+    <p class="lede">Pick the one that sounds like you.</p>
+    <p class="lead-in" id="stuck-lead" hidden>There's nothing to show yet — it needs an index.html.</p>
 
-  <section id="panel-settings" hidden>
-    <h3>Share</h3>
-    <div class="share-card" id="share-card">
-      <p class="note" id="published-state"></p>
-      <div class="linkrow">
-        <input id="published-url" readonly aria-label="Your share link">
-        <button class="btn small" id="copy-url">Copy</button>
-        <button class="btn small ghost" id="open-url">Open ↗</button>
+    <details data-stuck="1">
+      <summary>Nothing shows up in Look</summary>
+      <div class="d-body">
+        <p>It needs to put everything in one file called index.html.</p>
+        <button class="btn small" type="button" data-copy="Put the whole thing in one index.html I can open in a browser.">Copy the sentence</button>
       </div>
+    </details>
+
+    <details data-stuck="2">
+      <summary>The page is blank or broken</summary>
+      <div class="d-body">
+        <p>Say what you see, in your own words. Like: the unicorn runs off the screen and never comes back. That is the whole trick.</p>
+      </div>
+    </details>
+
+    <details data-stuck="3">
+      <summary>It says it needs the internet</summary>
+      <div class="d-body">
+        <p>This room has no internet, so anything the page loads from the web comes up blank.</p>
+        <button class="btn small" type="button" data-copy="Do not load anything from the internet. Put all the code, styles and pictures inside the index.html itself.">Copy the sentence</button>
+      </div>
+    </details>
+
+    <details data-stuck="4">
+      <summary>I want to change something</summary>
+      <div class="d-body">
+        <p>Just say it. Make the sky purple. Make it faster. Add a score.</p>
+      </div>
+    </details>
+
+    <details data-stuck="5">
+      <summary>I made it worse</summary>
+      <div class="d-body">
+        <p>Ask for it back.</p>
+        <button class="btn small" type="button" data-copy="Undo your last change and put it back how it was before.">Copy the sentence</button>
+      </div>
+    </details>
+
+    <details data-stuck="6">
+      <summary>It's taking forever</summary>
+      <div class="d-body">
+        <p>Click the dark box and press Escape to stop it. Then ask for something smaller.</p>
+      </div>
+    </details>
+
+    <details data-stuck="7">
+      <summary>The dark box isn't doing anything</summary>
+      <div class="d-body">
+        <p>Restart it. Your files are safe — only the conversation goes.</p>
+        <button class="btn small" type="button" id="stuck-restart">Restart the agent</button>
+      </div>
+    </details>
+
+    <details data-stuck="8">
+      <summary>What could I make?</summary>
+      <div class="d-body">
+        <ul class="ideas" id="stuck-ideas"></ul>
+      </div>
+    </details>
+  </form>
+</dialog>
+
+<!-- ------------------------------------------------------------------ Share -->
+
+<dialog class="dlg" id="dlg-share">
+  <div id="share-ok">
+    <h2 class="hero">It's live.</h2>
+    <p class="note">Anyone with this link can open it. They do not need to log in.</p>
+    <input id="share-url" readonly aria-label="Your share link">
+    <p class="linkline"><a id="share-link" href="#" target="_blank" rel="noopener"></a></p>
+    <menu>
+      <button class="btn ghost" type="button" id="share-done">Done</button>
+      <button class="btn ghost" type="button" id="share-open">Open it</button>
+      <button class="btn primary" type="button" id="share-copy"><span class="label">Copy link</span></button>
+    </menu>
+    <p class="note">Made more changes? Press Show someone again to update it.</p>
+  </div>
+  <div id="share-err" hidden>
+    <h2>That didn't work.</h2>
+    <pre class="cmd-out" id="share-err-out"></pre>
+    <menu>
+      <button class="btn" type="button" id="share-err-close">Close</button>
+    </menu>
+  </div>
+</dialog>
+
+<!-- ------------------------------------------------------------------ Settings -->
+
+<dialog class="dlg" id="dlg-settings">
+  <form method="dialog">
+    <div class="sheet-top">
+      <h2>Settings</h2>
+      <button class="btn ghost small" value="cancel" type="submit">Close</button>
     </div>
 
     <h3>Model</h3>
     <div class="radios" id="model-radios"></div>
     <p class="note">Takes effect the next time the agent starts.</p>
 
-    <h3 class="danger-head">This project</h3>
+    <h3>This project</h3>
     <p class="note" id="project-note"></p>
     <div class="btnrow">
-      <button class="btn small" id="reset-project">Start over</button>
-      <button class="btn small danger" id="delete-project">Delete</button>
+      <button class="btn small" type="button" id="reset-project">Start over</button>
+      <button class="btn small danger" type="button" id="delete-project">Delete</button>
     </div>
     <p class="note">Starting over empties it but keeps every earlier version in history.
       Deleting removes it and its share link for good.</p>
-  </section>
-</aside>
+  </form>
+</dialog>
 
-<!-- Real dialogs, not window.prompt -->
+<!-- ------------------------------------------------------------------ Copy fallback -->
+
+<!-- Served over plain HTTP at a bare IP, so window.isSecureContext is false and
+     navigator.clipboard is undefined. This dialog is the guarantee that no copy path
+     ever dead-ends. -->
+<dialog class="dlg" id="dlg-copy">
+  <form method="dialog">
+    <h3>Copy this</h3>
+    <p class="note">Press Ctrl+C (⌘C on a Mac) to copy it. Then click the dark box and press Ctrl+V.</p>
+    <textarea id="copy-text" readonly rows="4" aria-label="Text to copy"></textarea>
+    <menu>
+      <button class="btn primary" value="ok" type="submit">Done</button>
+    </menu>
+  </form>
+</dialog>
+
+<!-- ------------------------------------------------------------------ unchanged -->
+
 <dialog class="dlg" id="dlg-new">
   <form method="dialog">
     <h3>Start something new</h3>

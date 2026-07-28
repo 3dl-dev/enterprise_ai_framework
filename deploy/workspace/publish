@@ -19,14 +19,36 @@ set -euo pipefail
 USER_NAME="${WS_USER:-coder}"
 PROJECTS_ROOT="${WS_PROJECTS_ROOT:-/workspace/projects}"
 ACTIVE="$(cat "${PROJECTS_ROOT}/.active" 2>/dev/null || echo my-first-project)"
-PROJECT="${WS_PROJECT_DIR:-${PROJECTS_ROOT}/${ACTIVE}}"
+
+# ACTIVE decides BOTH what gets published and where it lands. It used to decide only the
+# destination, while the source came from WS_PROJECT_DIR — a value fixed at the moment the
+# terminal connected. ttyd spawns one shell per websocket and switching project in the UI
+# does not disturb an already-open one, so the two disagreed as soon as anyone switched
+# without reloading the terminal: the OLD project's files were copied to the NEW project's
+# public link. The parent opens a link to the wrong game and the child cannot see why.
+PROJECT="${PROJECTS_ROOT}/${ACTIVE}"
 SRC="$(cd "${1:-$PROJECT}" 2>/dev/null && pwd)" || { echo "publish: no such directory: ${1:-$PROJECT}" >&2; exit 1; }
+
+# An explicit argument may narrow what is published (`publish dist`) but must never widen
+# it to somebody else's project — the destination below is fixed to ACTIVE, so anything
+# outside it would be published under the wrong name.
+PROJECT_REAL="$(cd "$PROJECT" 2>/dev/null && pwd)" || PROJECT_REAL="$PROJECT"
+if [[ "$SRC" != "$PROJECT_REAL" && "$SRC" != "$PROJECT_REAL"/* ]]; then
+    echo "publish: ${SRC} is not inside the active project (${ACTIVE})." >&2
+    echo "         Publishing it would put it under '${ACTIVE}' and mislabel whose work it is." >&2
+    echo "         Switch project first, or pass a path inside ${PROJECT_REAL}." >&2
+    exit 1
+fi
+
+# /published in the pod, where the no-login web server reads from. Overridable ONLY so
+# this script can be exercised outside a pod; nothing in the deployment sets it.
+PUBLISHED_ROOT="${WS_PUBLISHED_ROOT:-/published}"
 
 # Each project gets its own published path. The first version published every project to
 # the same place, so a second game replaced the link a parent had already been sent.
-DEST="/published/${USER_NAME}/${ACTIVE}"
+DEST="${PUBLISHED_ROOT}/${USER_NAME}/${ACTIVE}"
 
-if [[ ! -d /published ]]; then
+if [[ ! -d "$PUBLISHED_ROOT" ]]; then
     echo "publish: this workspace has no published volume mounted." >&2
     echo "         Ask the operator to re-provision it." >&2
     exit 1

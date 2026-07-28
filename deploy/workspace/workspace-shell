@@ -1,14 +1,14 @@
 #!/bin/bash
 # The shell every browser terminal lands in.
 #
-# It starts aider immediately rather than dropping to a prompt: the point of this surface
-# is the coding agent, and a bare shell is a step the user has to know to take. Set
+# It starts the agent immediately rather than dropping to a prompt: the point of this
+# surface is the coding agent, and a bare shell is a step the user has to know to take. Set
 # WS_NO_AUTOSTART=1 on the pod to land in a plain shell instead — useful for debugging the
 # image without fighting a running agent for the terminal.
 #
-# aider is deliberately NOT exec'd. When it exits — /exit, Ctrl-C, or a crash — the user
+# The agent is deliberately NOT exec'd. When it exits — /exit, Ctrl-C, or a crash — the user
 # drops into a real shell instead of a dead browser tab, which is the difference between
-# "I quit the agent" and "the product is broken". They can type `aider` to start again.
+# "I quit the agent" and "the product is broken". They can type the name to start again.
 # Resolve the ACTIVE project on every connection. ttyd spawns a fresh shell per
 # websocket, so reloading the terminal pane is what makes a project switch take effect —
 # no signal or restart needed.
@@ -19,6 +19,14 @@ mkdir -p "${WS_PROJECT_DIR}"
 cd "${WS_PROJECT_DIR}" 2>/dev/null || cd /workspace
 
 export PS1='\[\e[1;36m\]${WS_USER:-coder}\[\e[0m\]:\w\$ '
+
+# Deliberately duplicated from entrypoint.sh, which exports the same value. This is the
+# line closest to where opencode actually launches, so it holds even if the variable is
+# lost between the entrypoint and here. It is a belt on top of braces, not a repair:
+# opencode 1.18.7 reads /etc/opencode/opencode.json unaided — see the note in
+# entrypoint.sh, which corrects an earlier claim to the contrary.
+: "${OPENCODE_CONFIG:=/etc/opencode/opencode.json}"
+export OPENCODE_CONFIG
 
 if [ -z "${WS_NO_AUTOSTART:-}" ]; then
     # Confirmation behaviour is set in the image (AIDER_YES_ALWAYS), not here, so that a

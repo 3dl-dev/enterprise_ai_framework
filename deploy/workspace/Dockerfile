@@ -41,10 +41,19 @@ RUN pip install --no-cache-dir "aider-chat==${AIDER_VERSION}" pytest
 # this gateway (see model-settings.yml) and a known-good fallback costs one binary.
 #
 # The standalone installer is used rather than npm so the image needs no Node runtime.
-RUN curl -fsSL https://opencode.ai/install | bash \
+#
+# PINNED, like ttyd and aider beside it. It was not, and that is worse here than for
+# either of them: opencode's config loader hard-errors on any key it does not recognise
+# and exits non-zero, so a schema change in a release we never chose turns the camp
+# terminal into a stack trace on boot. Every config claim in this image — that
+# `instructions` resolves, that the provider block is accepted — was verified against
+# this exact version and is only true of it. Bump deliberately, then re-verify with
+# `opencode debug config`.
+ARG OPENCODE_VERSION=1.18.7
+RUN curl -fsSL https://opencode.ai/install | VERSION="${OPENCODE_VERSION}" bash \
     && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode \
     && rm -rf /root/.opencode \
-    && /usr/local/bin/opencode --version
+    && /usr/local/bin/opencode --version | grep -qx "${OPENCODE_VERSION}"
 
 # Runs as an unprivileged user. The pod additionally has no service-account token, no
 # route to the API server and no route to any other workspace — but a container that
@@ -66,7 +75,19 @@ COPY model-settings.yml model-metadata.json /etc/aider/
 #     longer see. Context is from the Forge catalogue. Output is the FULL provider budget,
 #     not half: these models spend part of the same budget reasoning, so a short cap
 #     truncates the answer after the thinking rather than shortening it.
+#   - OPENCODE_CONFIG (exported by entrypoint.sh and workspace-shell) names this file
+#     explicitly. That is belt-and-braces, NOT a repair: opencode 1.18.7 already reads
+#     /etc/opencode/opencode.json on its own, verified by running `opencode debug config`
+#     in the running pod with OPENCODE_CONFIG unset and getting the full provider and
+#     model back. An earlier revision of this comment claimed the file "is never read at
+#     all" without the variable; that was inferred from a laptop repro that did not use
+#     this path, and it is wrong. The variable earns its place by covering the routes
+#     that skip both scripts — `kubectl exec` being the one that matters.
+#   - AGENTS.md is the agent's standing instructions, pulled in by the "instructions" key.
+#     It lives here rather than in the project directory on purpose: a file in the project
+#     root gets read as work the child asked for, gets published, and gets committed.
 COPY opencode.json /etc/opencode/opencode.json
+COPY AGENTS.md /etc/opencode/AGENTS.md
 COPY entrypoint.sh workspace-shell publish shell-server.py /usr/local/bin/
 COPY shell/ /usr/local/bin/shell/
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/workspace-shell /usr/local/bin/publish /usr/local/bin/shell-server.py

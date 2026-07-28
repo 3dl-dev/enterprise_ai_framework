@@ -20,6 +20,7 @@ ROUTES (all behind oauth2-proxy)
   /               the shell UI
   /preview/       the project directory, served raw so the child sees their own app
   /api/state      what exists right now: has an index.html, is it published, which model
+  /api/pulse      what is happening right now: revision, what changed, is the agent working
   /api/publish    run `publish`, return the parent-facing link
   /api/model      read/write the agent's model
   /api/projects   create a project and switch to it
@@ -29,11 +30,14 @@ ROUTES (all behind oauth2-proxy)
   /terminal/      NOT handled here — oauth2-proxy routes it straight to ttyd
 """
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +47,10 @@ ACTIVE_FILE = PROJECTS_ROOT / ".active"
 USER = os.environ.get("WS_USER", "coder")
 PUBLISH_URL = os.environ.get("WS_PUBLISH_URL", "")
 PUBLISHED_ROOT = Path("/published") / USER
+
+# Publish bookkeeping lives OUTSIDE any project directory, so the agent never sees it,
+# never edits it, and it is never published or committed alongside the child's work.
+META_ROOT = PROJECTS_ROOT / ".meta"
 
 # Project names become directory names and URL segments, so they are constrained rather
 # than sanitised — a rejected name is easy to explain, a silently rewritten one is not.
@@ -61,13 +69,21 @@ def slugify(name: str) -> str:
 
 
 def active_project() -> str:
+    # Hidden directories are NOT projects, and the filter is load-bearing rather than
+    # tidy: .meta lives in this root, "." sorts before every letter and digit, so an
+    # unfiltered sort picks it first. The one time this fallback runs — .active naming a
+    # directory that is gone — the workshop would silently adopt ".meta" as the active
+    # project, show a project name that is not in its own menu, serve the publish
+    # bookkeeping through /preview, and let "Start over" empty it. list_projects() has
+    # always filtered these; this must agree with it.
     try:
         name = ACTIVE_FILE.read_text().strip()
-        if name and (PROJECTS_ROOT / name).is_dir():
+        if name and not name.startswith(".") and (PROJECTS_ROOT / name).is_dir():
             return name
     except OSError:
         pass
-    existing = sorted(p.name for p in PROJECTS_ROOT.glob("*") if p.is_dir())
+    existing = sorted(p.name for p in PROJECTS_ROOT.glob("*")
+                      if p.is_dir() and not p.name.startswith("."))
     return existing[0] if existing else "my-first-project"
 
 
@@ -120,6 +136,322 @@ def _set_agent_model(model_id: str) -> None:
     data = json.loads(cfg.read_text()) if cfg.exists() else {}
     data["model"] = f"enterprise-ai/{model_id}"
     cfg.write_text(json.dumps(data, indent=2) + "\n")
+
+
+# ---------------------------------------------------------------------- pulse
+#
+# /api/pulse answers "what is happening right now" so the UI can narrate it. It is a
+# 1 Hz POLL, deliberately, and there is no SSE endpoint. A server-sent stream is lower
+# latency and fewer requests, but a buffered stream through oauth2-proxy fails as
+# "nothing ever happens" — indistinguishable from a hung agent — whereas a poll fails as
+# "slightly late". On the eve of shipping to a room of nine-year-olds, the boring
+# transport wins.
+#
+# Everything here is computed by ONE background sampler on a fixed window, never
+# per-request. That keeps the endpoint O(1) and — the real reason — makes `busy` depend
+# on a known time window rather than on however often a particular browser happens to
+# poll.
+
+SCAN_CAP = 2000
+SCAN_EXCLUDE = {".git", "node_modules", "__pycache__", ".meta"}
+AGENT_NAMES = {"opencode", "aider"}
+
+# The sampler's window. Overridable ONLY so the tests can run a fast clock; production
+# leaves it at 1.0 and the busy threshold below is expressed as a rate so the meaning of
+# "busy" does not change when the window does.
+PULSE_INTERVAL = float(os.environ.get("WS_PULSE_INTERVAL", "1.0"))
+
+# Jiffies per second of agent CPU that counts as working. opencode's TUI burns a trickle
+# redrawing on a keystroke; real work is an order of magnitude above this.
+BUSY_JIFFIES_PER_S = 6.0
+
+# `changed` means "files in the current writing burst", not "the three newest files that
+# exist". Without a recency window a project containing three old files would forever
+# report three changed files, and the Ribbon would read "Writing 3 files…" while the
+# agent sat idle. 4000 ms matches the window the Ribbon itself uses to decide the phrase.
+CHANGED_WINDOW_MS = 4000
+
+# No file has ever changed. Deliberately a large int rather than null: the client compares
+# `last_change_ms < 4000`, and in JavaScript `null < 4000` is TRUE — a null here would
+# claim a write that never happened.
+NEVER_MS = 10 ** 9
+
+# A reference the pod cannot load. There is no egress except the AI gateway, so a model
+# that emits a CDN <script src> produces a blank page with no explanation — the single
+# most likely camp-day failure. Counting these turns it into a sentence a child can act on.
+OFFLINE_REF = re.compile(
+    r"""<(?:script|link|img|source|iframe|audio|video)\b[^>]*?\b"""
+    r"""(?:src|href)\s*=\s*["']?(?:https?:)?//""",
+    re.IGNORECASE,
+)
+
+
+def _scan(root: Path) -> tuple[list[tuple[str, int, int]], bool]:
+    """(relpath, mtime_ns, size) for every file under root, plus whether the cap was hit.
+
+    os.scandir rather than os.walk because stat comes back with the directory entry, so a
+    project is one syscall per file rather than two.
+    """
+    entries: list[tuple[str, int, int]] = []
+    stack = [str(root)]
+    while stack:
+        try:
+            it = os.scandir(stack.pop())
+        except OSError:
+            # The project can be deleted or reset underneath the sampler at any moment.
+            # A vanished directory is a normal event here, not an error.
+            continue
+        with it:
+            for e in it:
+                if e.name in SCAN_EXCLUDE:
+                    continue
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        stack.append(e.path)
+                        continue
+                    if not e.is_file(follow_symlinks=False):
+                        continue
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                entries.append((os.path.relpath(e.path, root), st.st_mtime_ns, st.st_size))
+                if len(entries) >= SCAN_CAP:
+                    return sorted(entries), True
+    return sorted(entries), False
+
+
+def _fingerprint(entries: list[tuple[str, int, int]]) -> str:
+    h = hashlib.sha1()
+    for rel, mtime_ns, size in entries:
+        h.update(f"{rel}\0{mtime_ns}\0{size}\0".encode())
+    return h.hexdigest()
+
+
+def _offline_refs(index: Path) -> int:
+    try:
+        return len(OFFLINE_REF.findall(index.read_text(errors="replace")))
+    except OSError:
+        return 0
+
+
+def _has_published(project: str) -> bool:
+    """Whether anything is sitting in this project's published slot.
+
+    Wrapped because /published is a separate mounted volume that this process does not
+    own. A permission problem there raised out of the sampler, and the sampler's first
+    call happens during construction — so a mis-mounted publish volume stopped the whole
+    shell from starting: no UI, no /api/state, no preview, on a pod whose terminal was
+    fine. Losing the published flag costs one button label; losing the server costs the
+    workshop.
+    """
+    pub = PUBLISHED_ROOT / project
+    try:
+        return pub.is_dir() and any(pub.iterdir())
+    except OSError:
+        return False
+
+
+def _agent_jiffies() -> int | None:
+    """Total CPU jiffies burned by the coding agent, or None if it cannot be observed.
+
+    Deliberately NOT /proc/<pid>/io, which would be the obvious choice: it requires
+    PTRACE_MODE_READ, and shell-server and opencode are siblings under entrypoint.sh
+    rather than ancestor and descendant, so Yama ptrace_scope=1 (the Debian default)
+    returns EACCES. /proc/<pid>/stat is world-readable and works.
+    """
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return None
+    uid = os.getuid()
+    total = 0
+    found = False
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = [a for a in fh.read().split(b"\0") if a]
+            if not argv:
+                continue
+            name = os.path.basename(argv[0].decode("utf-8", "replace"))
+            if name not in AGENT_NAMES:
+                # opencode is a standalone binary, so argv[0] IS "opencode". aider is a
+                # pip console script, so the kernel runs it through its shebang and argv
+                # reads "/usr/local/bin/python /usr/local/bin/aider" — argv[0] is the
+                # interpreter and the name never matched. Checked on the real layout:
+                # a shebang script reports its interpreter, not itself. Without this the
+                # entire WS_AGENT=aider path reports busy: null forever, which the Ribbon
+                # renders as "cannot observe" — no writing phrases, no elapsed counter.
+                if len(argv) < 2 or not name.startswith("python"):
+                    continue
+                if os.path.basename(argv[1].decode("utf-8", "replace")) not in AGENT_NAMES:
+                    continue
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/stat") as fh:
+                stat_line = fh.read()
+            # The comm field is parenthesised AND may contain spaces and parens, so the
+            # only safe split is after the LAST ") ". Index 0 is then field 3, which puts
+            # utime at 11 and stime at 12. Get this wrong and everything downstream is wrong.
+            fields = stat_line.rsplit(") ", 1)[1].split()
+            total += int(fields[11]) + int(fields[12])
+            found = True
+        except (OSError, ValueError, IndexError):
+            # The process exited between listdir and read. Normal, not an error.
+            continue
+    return total if found else None
+
+
+class Pulse:
+    """The 1 Hz sampler. One thread, one lock, one snapshot dict handed to every request."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._rev = 0
+        self._fp: str | None = None
+        self._project: str | None = None
+        self._prev_jiffies: int | None = None
+        self._over = 0
+        self._under = 0
+        self._busy: bool | None = None
+        self._busy_at = 0.0
+        self._idle_at = 0.0
+        self._refs_key: tuple[int, int] | None = None
+        self._refs = 0
+        self._snap: dict = {}
+        try:
+            self.sample()
+        except Exception:
+            # Same reason run() swallows: this runs at import, before the socket is even
+            # bound, so anything that escapes here means the server never starts at all.
+            # An empty first snapshot degrades the Ribbon to today's behaviour, which the
+            # client's failure register already handles; a dead process does not.
+            pass
+
+    def _update_busy(self, now: float) -> None:
+        jiffies = _agent_jiffies()
+        if jiffies is None:
+            # No agent process, or /proc unreadable. Report null and never guess — a
+            # fabricated "still working" on a dead agent is exactly the failure this
+            # product exists to avoid.
+            self._busy = None
+            self._prev_jiffies = None
+            self._over = self._under = 0
+            return
+        if self._prev_jiffies is not None:
+            # Negative when the set of agent pids changed under us; that is not work.
+            delta = max(0, jiffies - self._prev_jiffies)
+            if delta / max(PULSE_INTERVAL, 1e-6) >= BUSY_JIFFIES_PER_S:
+                self._over, self._under = self._over + 1, 0
+            else:
+                self._under, self._over = self._under + 1, 0
+            # Latch on two consecutive samples in each direction, so a single keystroke
+            # repaint cannot read as "thinking" and one quiet tick mid-write cannot read
+            # as "finished".
+            if self._over >= 2 and self._busy is not True:
+                self._busy, self._busy_at = True, now
+            elif self._under >= 2 and self._busy is not False:
+                self._busy, self._idle_at = False, now
+        self._prev_jiffies = jiffies
+
+    def _offline_refs_cached(self, index: Path) -> int:
+        """offline_refs, recomputed only when index.html actually changes.
+
+        The naive version read and regexed the whole file every single window. AGENTS.md
+        rule 1 tells the agent to inline every image, so index.html is routinely megabytes
+        of base64 — measured at 5% of a core, permanently, on a 4 MB file with the agent
+        sitting idle, and this pod shares its CPU with the agent. Keyed on (mtime_ns,
+        size), which is the same signal the fingerprint uses, so a changed file is never
+        served a stale count.
+        """
+        try:
+            st = index.stat()
+        except OSError:
+            self._refs_key, self._refs = None, 0
+            return 0
+        key = (st.st_mtime_ns, st.st_size)
+        if key != self._refs_key:
+            self._refs_key, self._refs = key, _offline_refs(index)
+        return self._refs
+
+    def sample(self) -> None:
+        now = time.time()
+        project = active_project()
+        root = PROJECTS_ROOT / project
+        entries, truncated = _scan(root)
+        fp = _fingerprint(entries)
+
+        # The first sample of a process establishes the baseline; it is not a change.
+        # Without this every browser opening the page would see rev tick once for nothing.
+        if self._fp is not None and fp != self._fp:
+            self._rev += 1
+        self._fp, self._project = fp, project
+
+        newest = max((m for _, m, _ in entries), default=None)
+        if newest is None:
+            last_change_ms, changed = NEVER_MS, []
+        else:
+            last_change_ms = max(0, int((now - newest / 1e9) * 1000))
+            fresh = sorted(entries, key=lambda e: e[1], reverse=True)
+            cutoff = now - CHANGED_WINDOW_MS / 1000
+            changed = [rel for rel, m, _ in fresh if m / 1e9 >= cutoff][:3]
+
+        self._update_busy(now)
+        snap = {
+            "project": project,
+            "rev": self._rev,
+            "fp": fp,
+            "changed": changed,
+            "last_change_ms": last_change_ms,
+            "has_index": (root / "index.html").is_file(),
+            "offline_refs": self._offline_refs_cached(root / "index.html"),
+            "busy": self._busy,
+            "busy_ms": int((now - self._busy_at) * 1000) if self._busy is True else 0,
+            "idle_ms": int((now - self._idle_at) * 1000) if self._busy is False else 0,
+            "published": _has_published(project),
+            "published_fp": read_published_fp(project),
+            "truncated": truncated,
+        }
+        with self._lock:
+            self._snap = snap
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return dict(self._snap)
+
+    def run(self) -> None:
+        while True:
+            time.sleep(PULSE_INTERVAL)
+            try:
+                self.sample()
+            except Exception:
+                # This thread must outlive every possible filesystem race — a deleted
+                # project, a file swapped mid-stat, a permission change. If it dies the UI
+                # goes silent forever, which is worse than any single bad sample.
+                pass
+
+
+def read_published_fp(project: str) -> str:
+    try:
+        return json.loads((META_ROOT / f"{project}.json").read_text()).get("published_fp", "")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return ""
+
+
+def write_published_fp(project: str) -> None:
+    try:
+        META_ROOT.mkdir(parents=True, exist_ok=True)
+        entries, _ = _scan(PROJECTS_ROOT / project)
+        (META_ROOT / f"{project}.json").write_text(
+            json.dumps({"published_fp": _fingerprint(entries)}) + "\n")
+    except OSError:
+        # Losing this only costs the "Update the link" hint. It must never fail a publish
+        # that actually succeeded.
+        pass
+
+
+PULSE = Pulse()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -185,23 +517,45 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_file(f) if f else self._send(403, b"denied", "text/plain")
         elif route == "/api/state":
             active = active_project()
-            pub = PUBLISHED_ROOT / active
             self._json(200, {
                 "user": USER,
                 "project": active,
                 "projects": list_projects(),
                 "has_index": (project_dir() / "index.html").is_file(),
-                "published": pub.is_dir() and any(pub.iterdir()),
+                # Via the guarded helper, not a bare iterdir(). An unreadable /published
+                # took the sampler down for exactly this reason; the same volume, the same
+                # OSError, would otherwise take /api/state down with it — and /api/state is
+                # what the UI falls back to when everything else fails.
+                "published": _has_published(active),
                 # Each project publishes to its own path, so making a second thing no
                 # longer overwrites the first one a parent was sent.
                 "published_url": f"{PUBLISH_URL}/live/{USER}/{active}/" if PUBLISH_URL else "",
                 "model": _agent_model(),
                 "models": MODELS,
             })
+        elif route == "/api/pulse":
+            # The handler does no work: the sampler already computed this. Everything here
+            # is additive, so a pulse failure can never break project switching.
+            self._json(200, PULSE.snapshot())
         elif route.startswith("/preview"):
             rel = route[len("/preview"):] or "/"
+            # Percent-decode before doing anything else. A browser escapes any character
+            # it must, so "my sprite.png" arrives as "my%20sprite.png" and, undecoded,
+            # named a file that does not exist — the image was broken in Look and perfect
+            # in the published copy, which a child has no way to make sense of. Decoding
+            # first also means the refusals below see the real name: ".%67it" is .git.
+            # Traversal stays safe because _safe_join resolves and then checks containment
+            # rather than inspecting the string.
+            rel = urllib.parse.unquote(rel)
             if rel.endswith("/"):
                 rel += "index.html"
+            # The preview is a sandboxed opaque origin that can still fetch same-server
+            # paths. It has no business reading the repo internals or our publish
+            # bookkeeping, so those are refused by name before the path is even resolved.
+            segments = [s for s in rel.split("/") if s]
+            if segments and segments[0] in (".git", ".meta"):
+                self._send(404, b"not found", "text/plain; charset=utf-8")
+                return
             f = self._safe_join(project_dir(), rel)
             if f is None:
                 self._send(403, b"denied", "text/plain; charset=utf-8")
@@ -275,7 +629,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             shutil.rmtree(PROJECTS_ROOT / name)
             shutil.rmtree(PUBLISHED_ROOT / name, ignore_errors=True)
-            if active_project() == name or not ACTIVE_FILE.exists():
+            # Otherwise a project made again under the same name inherits the old
+            # fingerprint and claims to be published when nothing is there.
+            (META_ROOT / f"{name}.json").unlink(missing_ok=True)
+            # Repair .active by reading the FILE, not by asking active_project(): the
+            # directory is already gone, so active_project() has fallen back and can never
+            # equal `name` again. Comparing against its answer meant .active was left
+            # naming a deleted project for the rest of the session — and the terminal,
+            # which reads .active directly and mkdir -p's it, then quietly resurrected the
+            # thing that was just deleted.
+            try:
+                pointer = ACTIVE_FILE.read_text().strip()
+            except OSError:
+                pointer = ""
+            if not pointer or not (PROJECTS_ROOT / pointer).is_dir():
                 ACTIVE_FILE.write_text(list_projects()[0]["name"] + "\n")
             self._json(200, {"ok": True, "message": f"Deleted '{name}'.",
                              "project": active_project()})
@@ -284,6 +651,10 @@ class Handler(BaseHTTPRequestHandler):
             proc = subprocess.run(["/usr/local/bin/publish"], capture_output=True,
                                   text=True, timeout=120, cwd=str(project_dir()))
             ok = proc.returncode == 0
+            if ok:
+                # Remember what was published so the share button can tell "Live" from
+                # "Update the link" without re-reading the published copy.
+                write_published_fp(active_project())
             self._json(200 if ok else 400, {
                 "ok": ok,
                 # The command's own words. It already explains the index.html requirement
@@ -306,6 +677,14 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     PROJECTS_ROOT.mkdir(parents=True, exist_ok=True)
     project_dir().mkdir(parents=True, exist_ok=True)
+    # Daemon so a shutdown is never held open by the sampler. It re-reads the active
+    # project every tick, which is what moves it to a new project within one window of a
+    # switch — no signalling, nothing to get out of step.
+    try:
+        PULSE.sample()
+    except Exception:
+        pass  # As in __init__: a bad sample must never stop the server binding its port.
+    threading.Thread(target=PULSE.run, daemon=True).start()
     # Loopback only. oauth2-proxy shares this pod's network namespace and is the only
     # thing that can reach it; binding wider would put an unauthenticated API on the node.
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
