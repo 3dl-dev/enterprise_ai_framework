@@ -1,4 +1,4 @@
-.PHONY: up down logs ps sync spend audit test test-forge test-browser test-workspace forge-config export exit-direct exit nuke
+.PHONY: up down logs ps sync spend audit test test-forge test-e2e test-browser test-workspace forge-config export exit-direct exit nuke
 
 BUNDLE := bundle
 COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env
@@ -77,6 +77,12 @@ forge-config:
 ##   deploy/bin/ensure-second-user.sh student
 ##   deploy/bin/provision-workspace.sh baron && deploy/bin/provision-workspace.sh student
 ## Spends a fraction of a cent per run. Kept out of `make test` — it needs a cluster.
+## The whole journey in a real browser with a real account and real money: one login,
+## chat signed in, the agent typed at until it writes a file, the run gate, running it,
+## publishing, and fetching that link with NO session at all. Slow; waits on a model.
+test-e2e:
+	@.venv-test/bin/pytest tests-live/test_e2e_journey.py -v --tb=short -p no:cacheprovider
+
 test-browser:
 	@.venv-test/bin/pytest tests-live/test_browser.py -v --tb=short -p no:cacheprovider
 
