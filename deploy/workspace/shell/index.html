@@ -10,88 +10,133 @@
 <body>
 
 <header class="bar">
-  <div class="brand"><span class="mark">🦄</span> Workshop</div>
-  <div class="who" id="who"></div>
-  <select id="project-picker" title="Which project you are working on"></select>
-  <button class="btn small ghost" id="new-project" title="Start something new">+ New</button>
+  <div class="brand"><span class="mark">🦄</span><span>Workshop</span></div>
+
+  <div class="project-switch">
+    <button class="chip" id="project-button" aria-haspopup="listbox" aria-expanded="false">
+      <span class="chip-dot" id="project-dot"></span>
+      <span id="project-name">…</span>
+      <svg class="chev" viewBox="0 0 10 6" aria-hidden="true"><path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+    </button>
+    <div class="menu" id="project-menu" role="listbox" hidden></div>
+  </div>
+
   <div class="spacer"></div>
-  <button class="btn ghost" id="tab-guide" aria-pressed="true">Ideas</button>
-  <button class="btn ghost" id="tab-settings" aria-pressed="false">Settings</button>
-  <button class="btn primary" id="publish">Share it</button>
+
+  <div class="agent-state" id="agent-state" title="Which model is building for you"></div>
+
+  <button class="btn ghost icon" id="tab-guide" title="Ideas (?)"><span>Ideas</span></button>
+  <button class="btn ghost icon" id="tab-settings" title="Settings"><span>Settings</span></button>
+  <button class="btn primary" id="publish"><span class="label">Share it</span></button>
 </header>
 
-<main class="grid">
+<main class="grid" id="grid">
 
-  <!-- Left: the agent -->
   <section class="pane" id="pane-agent">
     <div class="pane-head">
       <h2>Build</h2>
-      <span class="hint">type what you want, in normal words</span>
+      <span class="hint">say what you want, in normal words</span>
     </div>
-    <!-- ttyd is reached through oauth2-proxy at /terminal/, so the iframe inherits the
-         session that is already established; there is no second login. -->
     <iframe id="terminal" src="/terminal/" title="Coding agent"></iframe>
   </section>
 
-  <!-- Right: what they made -->
+  <div class="splitter" id="splitter" role="separator" aria-orientation="vertical" tabindex="0"
+       aria-label="Drag to resize, or use the arrow keys"></div>
+
   <section class="pane" id="pane-preview">
     <div class="pane-head">
       <h2>Look</h2>
       <span class="spacer"></span>
-      <label class="auto"><input type="checkbox" id="autorefresh"> keep refreshing</label>
-      <button class="btn small" id="refresh">Refresh</button>
-      <button class="btn small ghost" id="popout">Open in a tab</button>
+      <label class="toggle" title="Reload every few seconds while you build">
+        <input type="checkbox" id="autorefresh"><span class="track"></span><span class="tlabel">live</span>
+      </label>
+      <button class="btn small ghost" id="refresh" title="Reload (R)">Reload</button>
+      <button class="btn small ghost" id="popout" title="Open in a new tab">Open ↗</button>
     </div>
     <div class="preview-wrap">
       <iframe id="preview" src="/preview/" title="Your app"></iframe>
+      <div class="empty" id="preview-empty" hidden>
+        <div class="empty-art">✨</div>
+        <h3>Nothing here yet</h3>
+        <p>Ask for something on the left, and it appears here.</p>
+        <button class="btn" id="empty-ideas">Show me ideas</button>
+      </div>
     </div>
   </section>
-
-  <!-- Slide-over panel: guidance and settings -->
-  <aside class="panel" id="panel" hidden>
-    <button class="close" id="panel-close" aria-label="Close">×</button>
-
-    <div id="panel-guide">
-      <h3>What do you want to make?</h3>
-      <p class="lede">Click one to copy it, then paste it into <strong>Build</strong> on the left.</p>
-      <ul class="ideas" id="ideas"></ul>
-      <h3>When it goes wrong</h3>
-      <ul class="tips">
-        <li><strong>Nothing in Look?</strong> Ask for “put it all in an index.html”.</li>
-        <li><strong>Broken?</strong> Say what you see: “the unicorn moves off the screen”.</li>
-        <li><strong>Want a change?</strong> Just say it. “Make the sky purple.”</li>
-        <li><strong>Undo?</strong> Ask: “undo the last change”.</li>
-      </ul>
-    </div>
-
-    <div id="panel-settings" hidden>
-      <h3>Settings</h3>
-      <label class="field">
-        <span>Which model builds for you</span>
-        <select id="model"></select>
-      </label>
-      <p class="note" id="model-note">Applies next time the agent starts.</p>
-      <h3>This project</h3>
-      <p class="note" id="project-note"></p>
-      <div class="btnrow">
-        <button class="btn small" id="reset-project">Start this one over</button>
-        <button class="btn small danger" id="delete-project">Delete it</button>
-      </div>
-      <p class="note">Starting over empties the project but keeps its history, so it can
-      be recovered. Deleting removes it and its share link for good.</p>
-
-      <h3>Your link</h3>
-      <p class="note">Anyone with this can open what you made. No login.</p>
-      <div class="linkrow">
-        <input id="published-url" readonly>
-        <button class="btn small" id="copy-url">Copy</button>
-      </div>
-      <p class="note" id="published-state"></p>
-    </div>
-  </aside>
 </main>
 
-<div class="toast" id="toast" hidden></div>
+<!-- Slide-over -->
+<div class="scrim" id="scrim" hidden></div>
+<aside class="panel" id="panel" hidden aria-hidden="true">
+  <button class="close" id="panel-close" aria-label="Close">
+    <svg viewBox="0 0 14 14" aria-hidden="true"><path d="M1 1l12 12M13 1L1 13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+  </button>
+
+  <section id="panel-guide">
+    <h3>What do you want to make?</h3>
+    <p class="lede">Pick one — it goes straight to the agent.</p>
+    <ul class="ideas" id="ideas"></ul>
+    <h3>If it goes wrong</h3>
+    <ul class="tips">
+      <li><strong>Nothing in Look?</strong> Ask for “put it all in one index.html”.</li>
+      <li><strong>Broken?</strong> Say what you see: “the unicorn runs off the screen”.</li>
+      <li><strong>Want a change?</strong> Just say it. “Make the sky purple.”</li>
+      <li><strong>Gone too far?</strong> Ask it to “undo the last change”.</li>
+    </ul>
+  </section>
+
+  <section id="panel-settings" hidden>
+    <h3>Share</h3>
+    <div class="share-card" id="share-card">
+      <p class="note" id="published-state"></p>
+      <div class="linkrow">
+        <input id="published-url" readonly aria-label="Your share link">
+        <button class="btn small" id="copy-url">Copy</button>
+        <button class="btn small ghost" id="open-url">Open ↗</button>
+      </div>
+    </div>
+
+    <h3>Model</h3>
+    <div class="radios" id="model-radios"></div>
+    <p class="note">Takes effect the next time the agent starts.</p>
+
+    <h3 class="danger-head">This project</h3>
+    <p class="note" id="project-note"></p>
+    <div class="btnrow">
+      <button class="btn small" id="reset-project">Start over</button>
+      <button class="btn small danger" id="delete-project">Delete</button>
+    </div>
+    <p class="note">Starting over empties it but keeps every earlier version in history.
+      Deleting removes it and its share link for good.</p>
+  </section>
+</aside>
+
+<!-- Real dialogs, not window.prompt -->
+<dialog class="dlg" id="dlg-new">
+  <form method="dialog">
+    <h3>Start something new</h3>
+    <p class="note">Give it a name. Spaces and capitals are fine.</p>
+    <input id="new-name" placeholder="space cats" autocomplete="off" maxlength="40">
+    <p class="err" id="new-err" hidden></p>
+    <menu>
+      <button class="btn ghost" value="cancel" type="submit">Cancel</button>
+      <button class="btn primary" id="new-go" value="ok" type="submit">Make it</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog class="dlg" id="dlg-confirm">
+  <form method="dialog">
+    <h3 id="confirm-title">Are you sure?</h3>
+    <p class="note" id="confirm-body"></p>
+    <menu>
+      <button class="btn ghost" value="cancel" type="submit">Never mind</button>
+      <button class="btn danger solid" id="confirm-go" value="ok" type="submit">Yes, do it</button>
+    </menu>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" hidden role="status"></div>
 
 <script src="/static/app.js"></script>
 </body>
