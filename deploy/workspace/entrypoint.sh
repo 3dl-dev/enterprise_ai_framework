@@ -82,8 +82,13 @@ cd "${PROJECT}"
 #   scrollOnUserInput    keep the viewport at the bottom as output streams, otherwise a
 #                        long reply leaves the view parked and reads as a frozen terminal
 #   disableLeaveAlert    no "are you sure you want to leave" on a tab close
+# The shell UI and the live preview. Loopback only; oauth2-proxy is the front door for
+# every route in this pod.
+/usr/local/bin/shell-server.py &
+
 exec /usr/local/bin/ttyd \
     --port 7681 \
+    --base-path /terminal \
     --interface lo \
     --writable \
     --ping-interval 30 \

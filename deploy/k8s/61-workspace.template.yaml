@@ -173,7 +173,12 @@ spec:
             - --redirect-url=__REDIRECT__
             - --scope=openid email profile
             - --http-address=0.0.0.0:4180
-            - --upstream=http://127.0.0.1:7681
+            # Most specific first: oauth2-proxy matches upstreams in order. /terminal/
+            # is ttyd (which now serves under that base path); everything else is the
+            # shell UI, which also serves /preview/ and /api/. One session covers all of
+            # it because they share this pod and this proxy.
+            - --upstream=http://127.0.0.1:7681/terminal/
+            - --upstream=http://127.0.0.1:7682
             # ttyd is a websocket application. Without this the page loads and the
             # terminal never connects, which looks like a broken shell rather than a
             # proxy setting.

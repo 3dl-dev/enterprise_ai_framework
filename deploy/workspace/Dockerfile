@@ -67,8 +67,9 @@ COPY model-settings.yml model-metadata.json /etc/aider/
 #     not half: these models spend part of the same budget reasoning, so a short cap
 #     truncates the answer after the thinking rather than shortening it.
 COPY opencode.json /etc/opencode/opencode.json
-COPY entrypoint.sh workspace-shell publish /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/workspace-shell /usr/local/bin/publish
+COPY entrypoint.sh workspace-shell publish shell-server.py /usr/local/bin/
+COPY shell/ /usr/local/bin/shell/
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/workspace-shell /usr/local/bin/publish /usr/local/bin/shell-server.py
 
 USER coder
 WORKDIR /workspace

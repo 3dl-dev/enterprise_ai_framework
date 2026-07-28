@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workshop</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🦄</text></svg>">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand"><span class="mark">🦄</span> Workshop</div>
+  <div class="who" id="who"></div>
+  <div class="spacer"></div>
+  <button class="btn ghost" id="tab-guide" aria-pressed="true">Ideas</button>
+  <button class="btn ghost" id="tab-settings" aria-pressed="false">Settings</button>
+  <button class="btn primary" id="publish">Share it</button>
+</header>
+
+<main class="grid">
+
+  <!-- Left: the agent -->
+  <section class="pane" id="pane-agent">
+    <div class="pane-head">
+      <h2>Build</h2>
+      <span class="hint">type what you want, in normal words</span>
+    </div>
+    <!-- ttyd is reached through oauth2-proxy at /terminal/, so the iframe inherits the
+         session that is already established; there is no second login. -->
+    <iframe id="terminal" src="/terminal/" title="Coding agent"></iframe>
+  </section>
+
+  <!-- Right: what they made -->
+  <section class="pane" id="pane-preview">
+    <div class="pane-head">
+      <h2>Look</h2>
+      <span class="spacer"></span>
+      <label class="auto"><input type="checkbox" id="autorefresh"> keep refreshing</label>
+      <button class="btn small" id="refresh">Refresh</button>
+      <button class="btn small ghost" id="popout">Open in a tab</button>
+    </div>
+    <div class="preview-wrap">
+      <iframe id="preview" src="/preview/" title="Your app"></iframe>
+    </div>
+  </section>
+
+  <!-- Slide-over panel: guidance and settings -->
+  <aside class="panel" id="panel" hidden>
+    <button class="close" id="panel-close" aria-label="Close">×</button>
+
+    <div id="panel-guide">
+      <h3>What do you want to make?</h3>
+      <p class="lede">Click one to copy it, then paste it into <strong>Build</strong> on the left.</p>
+      <ul class="ideas" id="ideas"></ul>
+      <h3>When it goes wrong</h3>
+      <ul class="tips">
+        <li><strong>Nothing in Look?</strong> Ask for “put it all in an index.html”.</li>
+        <li><strong>Broken?</strong> Say what you see: “the unicorn moves off the screen”.</li>
+        <li><strong>Want a change?</strong> Just say it. “Make the sky purple.”</li>
+        <li><strong>Undo?</strong> Ask: “undo the last change”.</li>
+      </ul>
+    </div>
+
+    <div id="panel-settings" hidden>
+      <h3>Settings</h3>
+      <label class="field">
+        <span>Which model builds for you</span>
+        <select id="model"></select>
+      </label>
+      <p class="note" id="model-note">Applies next time the agent starts.</p>
+      <h3>Your link</h3>
+      <p class="note">Anyone with this can open what you made. No login.</p>
+      <div class="linkrow">
+        <input id="published-url" readonly>
+        <button class="btn small" id="copy-url">Copy</button>
+      </div>
+      <p class="note" id="published-state"></p>
+    </div>
+  </aside>
+</main>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
