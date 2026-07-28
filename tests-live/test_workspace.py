@@ -20,9 +20,12 @@ Two things are being proved, and they fail in different directions:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
+import time
+import uuid
 
 import pytest
 
@@ -34,6 +37,22 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 def strip(text: str) -> str:
     return ANSI.sub("", text)
+
+
+def probe(session: dict, script: str, marker_file: str = "/tmp/probe.out",
+          settle: float = 5.0, timeout: float = 240.0) -> str:
+    """Run `script` in the shell, then read its result back in a SECOND round trip.
+
+    A terminal echoes what you type. Any assertion made against the transcript of the
+    command that produced the answer is satisfied by the echo of the command itself —
+    `make test; echo EXIT=$?` puts "EXIT=" on screen whether or not make ever ran. So the
+    script writes its answer to a file, and the answer is read with `cat`, whose own echo
+    contains only the path. Every probe in this module goes through here for that reason.
+    """
+    run_in_terminal(session["url"], session["client"],
+                    [f"rm -f {marker_file}; " + script], settle=settle, timeout=timeout)
+    return strip(run_in_terminal(session["url"], session["client"], [f"cat {marker_file}"],
+                                 settle=4, timeout=90))
 
 
 def kubectl(*args: str) -> str:
@@ -126,12 +145,43 @@ def test_owner_gets_a_real_shell(sessions):
 
 
 def test_a_build_command_runs(sessions):
-    """`make test` — the outcome says the user must be able to build and run, not just chat."""
+    """`make test` — the outcome says the user must be able to build and run, not just chat.
+
+    Asserted on the build's effect on disk, not on the transcript. The first cut of this
+    test typed `make test; echo EXIT=$?` and asserted "EXIT=" appeared: the terminal
+    echoes the line you type, so that substring was on screen before make had done
+    anything at all, and the test would have passed against a pod with no make, no
+    pytest, and no project. The evidence used instead is pytest's own cache — deleted
+    first, so its reappearance carrying this project's node ids means pytest collected and
+    ran these tests during THIS command — plus the recorded exit status and the run
+    summary, read back in a second round trip.
+
+    Pass or fail is deliberately not asserted: the seeded `add()` is wrong on purpose and
+    the aider test leaves the file in whichever state it finished in. What is being proved
+    is that the toolchain runs, so the assertion is that make reported a pytest verdict
+    (0 or 1) rather than falling over (2 = no such target, 127 = no such command).
+    """
     for name, s in sessions.items():
-        out = strip(run_in_terminal(
-            s["url"], s["client"], ["make test; echo EXIT=$?"], settle=5, timeout=180))
-        assert "EXIT=" in out, f"{name}: the build command never returned\n{out[-800:]}"
-        assert "pytest" in out, f"{name}: make did not run pytest\n{out[-800:]}"
+        out = probe(s, (
+            "cd /workspace/project && rm -rf .pytest_cache /tmp/build.log && "
+            "{ make test >/tmp/build.log 2>&1; echo rc=$? >/tmp/build.out; } && "
+            "cat /tmp/build.log >> /tmp/build.out && "
+            "cat .pytest_cache/v/cache/nodeids >> /tmp/build.out 2>&1"
+        ), marker_file="/tmp/build.out", settle=6, timeout=240)
+
+        rc = re.search(r"rc=(\d+)", out)
+        assert rc, f"{name}: the build command never recorded an exit status\n{out[-800:]}"
+        assert rc.group(1) in ("0", "1"), (
+            f"{name}: `make test` exited {rc.group(1)} — the toolchain did not run "
+            f"(2 = no such make target, 127 = command not found)\n{out[-800:]}"
+        )
+        assert re.search(r"\d+ (passed|failed)", out), (
+            f"{name}: no pytest run summary — make did not actually run the tests\n{out[-800:]}"
+        )
+        assert "test_app.py::test_add" in out, (
+            f"{name}: pytest left no fresh collection cache, so it did not collect and run "
+            f"this project's tests in that command\n{out[-800:]}"
+        )
 
 
 @pytest.mark.slow
@@ -149,18 +199,29 @@ def test_aider_completes_a_real_edit(sessions):
             "git commit -qam 'break add() again' && make test; echo BROKEN=$?",
         ], settle=5, timeout=120)
 
-        out = strip(run_in_terminal(s["url"], s["client"], [
+        transcript = strip(run_in_terminal(s["url"], s["client"], [
             "aider --yes-always app.py",
             "Fix the add function in app.py so that the tests pass.",
             "/exit",
-            "make test; echo AFTER=$?",
         ], settle=15, timeout=900))
 
-        assert "Applied edit" in out or "add(a, b)" in out, (
-            f"{name}: aider produced no edit\n{out[-1500:]}"
+        # The claim is that the file on disk changed and the project now builds — not
+        # that certain words appeared on screen. `"add(a, b)" in transcript` was standing
+        # in for the first half and is satisfied by aider merely quoting the unmodified
+        # file back, which is exactly what it does when an edit silently fails to apply
+        # (dogfood-findings.md records that failure mode on this surface).
+        out = probe(s, (
+            "cd /workspace/project && "
+            "{ make test >/tmp/after.log 2>&1; echo AFTER=$? >/tmp/after.out; } && "
+            'printf "SUM=%s\\n" "$(make run 2>&1 | tail -1)" >> /tmp/after.out'
+        ), marker_file="/tmp/after.out", settle=6, timeout=240)
+
+        assert "SUM=5" in out, (
+            f"{name}: add() still does not add after aider's edit — the file on disk was "
+            f"not fixed\n{out[-600:]}\naider said:\n{transcript[-1500:]}"
         )
         assert "AFTER=0" in out, (
-            f"{name}: the tests still fail after aider's edit\n{out[-1500:]}"
+            f"{name}: the tests still fail after aider's edit\n{out[-600:]}"
         )
 
 
@@ -168,32 +229,49 @@ def test_aider_completes_a_real_edit(sessions):
 
 def test_each_pod_holds_only_its_own_ide_key(sessions):
     """Asked from inside the user's own shell, so it is the key the user actually has."""
-    master = secret("enterprise-ai-secrets", "GATEWAY_MASTER_KEY")
-    probe = (
+    master_digest = hashlib.sha256(
+        secret("enterprise-ai-secrets", "GATEWAY_MASTER_KEY").encode()
+    ).hexdigest()
+
+    ask_alias = (
         'curl -sS http://gateway:4000/key/info '
         '-H "Authorization: Bearer $OPENAI_API_KEY" '
         '| python -c "import sys,json; print(\'ALIAS=\'+str(json.load(sys.stdin)'
-        '[\'info\'][\'key_alias\']))"'
+        '[\'info\'][\'key_alias\']))" > /tmp/keyinfo.out 2>&1'
     )
     for name, s in sessions.items():
-        out = strip(run_in_terminal(s["url"], s["client"], [probe], settle=4, timeout=120))
+        out = probe(s, ask_alias, marker_file="/tmp/keyinfo.out", settle=4, timeout=120)
         assert f"ALIAS={name}::ide" in out, (
             f"{name}'s pod is not holding {name}::ide\n{out[-800:]}"
         )
 
-        leaked = strip(run_in_terminal(
-            s["url"], s["client"],
-            ['test "$OPENAI_API_KEY" = "%s" && echo MASTER || echo NOT_MASTER' % master],
-            settle=3, timeout=90))
-        assert "NOT_MASTER" in leaked, f"{name}'s pod holds the gateway master key"
+        # The comparison is made here, not in the pod, for two reasons. The master key
+        # must not be typed into a shell the user owns — the earlier version of this test
+        # put it in the pod's transcript and shell history to compare it, which is a real
+        # leak in a test that exists to prove there is no leak. And a pod-side
+        # `... && echo MASTER || echo NOT_MASTER` is satisfied by the terminal echoing the
+        # line that contains both words, so it passed no matter what the key was.
+        digest = probe(
+            s, 'printf %s "$OPENAI_API_KEY" | sha256sum | cut -d" " -f1 > /tmp/keyhash.out',
+            marker_file="/tmp/keyhash.out", settle=3, timeout=90)
+        found = re.search(r"\b([0-9a-f]{64})\b", digest)
+        assert found, f"{name}: could not read the pod's key digest\n{digest[-400:]}"
+
+        # Positive control first. An inequality on its own is the weakest possible
+        # assertion: a stray newline anywhere in the pipeline makes every digest differ
+        # from every other, and the test would report "not the master key" while
+        # measuring nothing. Pinning the digest to the key this user was actually issued
+        # proves the comparison is capable of being equal before it is trusted to be
+        # unequal.
+        own = hashlib.sha256(secret(f"ws-{name}-key", "OPENAI_API_KEY").encode()).hexdigest()
+        assert found.group(1) == own, (
+            f"{name}'s pod is not holding the key the control plane issued it"
+        )
+        assert found.group(1) != master_digest, f"{name}'s pod holds the gateway master key"
 
 
-def test_spend_is_attributed_to_the_right_principal(sessions):
-    """The one bill: whatever the workspaces spent lands under `<user>/ide`.
-
-    Read through the control plane rather than the gateway, because the claim being made
-    is about the ledger the operator actually reads.
-    """
+def spend_rows() -> list[dict]:
+    """The bill as the operator reads it — through the control plane, not the gateway."""
     token = secret("enterprise-ai-secrets", "CONTROL_PLANE_ADMIN_TOKEN")
     raw = subprocess.run(
         ["kubectl", "-n", NS, "exec", "deploy/control-plane", "--",
@@ -204,11 +282,17 @@ def test_spend_is_attributed_to_the_right_principal(sessions):
          "print(r.text)"],
         capture_output=True, text=True, check=True,
     ).stdout
-    spend = json.loads(raw)
-    rows = {
-        (r.get("username"), r.get("surface")): r
-        for r in spend.get("by_user_and_surface", [])
-    }
+    return json.loads(raw).get("by_user_and_surface", [])
+
+
+def test_the_ide_surface_is_metered(sessions):
+    """Every workspace's traffic reaches the one bill under its own `<user>/ide` row.
+
+    This is a presence check and it is labelled as one. It proves the surface is metered
+    at all; it does NOT prove the row's principal is the key's owner. That stronger claim
+    is the next test, and it currently fails.
+    """
+    rows = {(r.get("username"), r.get("surface")) for r in spend_rows()}
     for name in sessions:
         assert (name, "ide") in rows, (
             f"no ide-surface spend row for {name}; the surface is not being metered.\n"
@@ -216,25 +300,119 @@ def test_spend_is_attributed_to_the_right_principal(sessions):
         )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="enterpriseaiframework-522: metering.py ranks the caller-supplied end_user "
+           "above the key alias, so a workspace can bill its spend to any name it likes",
+)
+def test_spend_is_attributed_to_the_key_that_paid_for_it(sessions):
+    """The bill names the principal who spent the money, not a name the caller chose.
+
+    "There is an ide row for this user" was standing in for this claim and is not it: the
+    row can exist while the money lands somewhere else. The gap is real and was
+    demonstrated — a workspace pod, using nothing but its own issued key, puts an
+    arbitrary string in the bill by sending `{"user": "..."}` in the request body, because
+    `metering.py` prefers `end_user` over the alias the key carries. One user can
+    therefore charge their spend to another user, or to a name that belongs to nobody.
+
+    The defect is filed as enterpriseaiframework-522 and is not fixed here. This test is
+    written to the real claim and marked strict-xfail so the suite records the truth
+    instead of passing over it — when 522 lands, this turns green and the strict marker
+    fails the run until the marker is removed.
+    """
+    name, s = next(iter(sessions.items()))
+    sentinel = f"not-a-principal-{uuid.uuid4().hex[:10]}"
+
+    before = sum(
+        r["requests"] for r in spend_rows()
+        if r.get("username") == name and r.get("surface") == "ide"
+    )
+
+    # fake-large is the in-cluster provider: this must not depend on an upstream account,
+    # and the claim under test is about attribution, not about who serves the tokens.
+    call = (
+        'curl -sS -o /tmp/attr.body -w "HTTP=%{http_code}\\n" '
+        'http://gateway:4000/v1/chat/completions '
+        '-H "Authorization: Bearer $OPENAI_API_KEY" '
+        '-H "Content-Type: application/json" '
+        '-d \'{"model":"fake-large","messages":[{"role":"user","content":"bill me"}],'
+        f'"user":"{sentinel}"}}\' > /tmp/attr.out 2>&1'
+    )
+    result = probe(s, call, marker_file="/tmp/attr.out", settle=5, timeout=180)
+    assert "HTTP=200" in result, (
+        f"{name}: the metered request never completed, so this proves nothing about "
+        f"attribution\n{result[-600:]}"
+    )
+
+    # Wait for the ledger to catch up, then read it once. Asserting before the row lands
+    # would make a strict-xfail test pass for the wrong reason.
+    deadline = time.monotonic() + 90
+    rows: list[dict] = []
+    while time.monotonic() < deadline:
+        rows = spend_rows()
+        landed = sum(
+            r["requests"] for r in rows
+            if r.get("username") == name and r.get("surface") == "ide"
+        )
+        if landed > before or any(r.get("username") == sentinel for r in rows):
+            break
+        time.sleep(3)
+    else:
+        pytest.fail("the request never reached the bill under any name")
+
+    assert sentinel not in {r.get("username") for r in rows}, (
+        f"a workspace billed its spend to '{sentinel}', a principal that does not exist. "
+        f"The row must carry the owner of the key that paid — {name}."
+    )
+
+
 # ---------------------------------------------------------------- the isolation
 
 def test_one_user_cannot_open_another_users_workspace(users):
-    """A full SSO round trip, not just a missing cookie.
+    """A full SSO round trip, in BOTH directions.
 
     Checking only that the request 302s would prove nothing: the user already has a live
     Keycloak session, so a browser follows that redirect, gets a fresh code, and lands
     back. The authorization decision happens after that, and this test makes it happen.
-    """
-    a, b = users[0], users[1]
-    client = login(workspace_url(a["name"]), a["name"], a["password"])
-    assert client.get(workspace_url(a["name"]) + "/").status_code == 200
 
-    intruding = client.get(workspace_url(b["name"]) + "/")  # follows redirects, as a browser does
-    assert intruding.status_code == 403, (
-        f"{a['name']} reached {b['name']}'s workspace with status "
-        f"{intruding.status_code} at {intruding.url}"
-    )
-    assert "xterm" not in intruding.text.lower()
+    Both directions, because the refusal is made by the *destination* workspace's own
+    oauth2-proxy against its own allow-list, and those manifests are rendered per user.
+    Proving a → b is refused says only that b's allow-list is right; a stray
+    `--email-domain=*` on a's proxy would leave a's workspace open to every account in
+    the realm and a one-directional test would still be green. The pair is the claim.
+
+    /ws is probed as well as /. The page is not the asset — the websocket is the thing
+    that yields a shell, and a proxy that guards the page while forwarding the upgrade
+    would look correct in a browser and be completely open.
+    """
+    for me, them in ((users[0], users[1]), (users[1], users[0])):
+        mine, theirs = workspace_url(me["name"]), workspace_url(them["name"])
+        client = login(mine, me["name"], me["password"])
+        try:
+            own = client.get(mine + "/")
+            # Establishes that the login actually took. Without this, a client whose SSO
+            # exchange silently failed would be refused everywhere and the test below
+            # would pass while proving nothing about authorization.
+            assert own.status_code == 200, (
+                f"{me['name']} could not open their own workspace: {own.status_code}"
+            )
+            assert "ttyd - terminal" in own.text.lower(), (
+                f"{me['name']} did not land on their terminal; got {own.url}"
+            )
+
+            for path in ("/", "/ws"):
+                # follow_redirects is on, as in a browser: the intruder's live Keycloak
+                # session satisfies the redirect and the proxy then has to decide.
+                intruding = client.get(theirs + path)
+                assert intruding.status_code == 403, (
+                    f"{me['name']} reached {them['name']}'s workspace{path} with status "
+                    f"{intruding.status_code} at {intruding.url}"
+                )
+                assert "ttyd" not in intruding.text.lower(), (
+                    f"{me['name']} was served {them['name']}'s terminal"
+                )
+        finally:
+            client.close()
 
 
 def test_users_cannot_read_each_others_files(sessions):
@@ -256,54 +434,71 @@ def test_users_cannot_read_each_others_files(sessions):
 
 
 def test_workspace_cannot_reach_the_cluster(sessions):
-    """Tried from inside the user's shell. Every one of these must fail.
+    """Tried from inside EVERY user's shell. Every one of these must fail.
+
+    From both pods, not one. The NetworkPolicy is symmetric by construction today, but
+    whether a packet arrives is decided by the *destination* pod's ingress rules and by
+    its Service's externalTrafficPolicy, and both of those are rendered per user from a
+    template. A one-sided probe cannot see a per-user rendering error — it would report
+    the same "blocked" whether the other side is fenced or wide open, because the leg it
+    tests is the one that happens to be correct.
 
     The gateway is the single exception, and it is checked too — an isolation test that
     passes because the pod has no network at all is not evidence of anything.
     """
-    name, s = next(iter(sessions.items()))
-    other = [n for n in sessions if n != name][0]
-    other_ip = kubectl("get", "pod", "-l", f"workspace.enterprise-ai/user={other}",
-                       "-o", "jsonpath={.items[0].status.podIP}")
+    for name, s in sessions.items():
+        other = [n for n in sessions if n != name][0]
+        other_ip = kubectl("get", "pod", "-l", f"workspace.enterprise-ai/user={other}",
+                           "-o", "jsonpath={.items[0].status.podIP}")
+        assert other_ip, f"could not resolve {other}'s pod IP; the probe would be vacuous"
 
-    blocked = {
-        "kubernetes API (service)": "curl -sSk -m 6 https://10.43.0.1/version",
-        "kubernetes API (node)": "curl -sSk -m 6 https://192.168.2.43:6443/version",
-        "control plane": "curl -sS -m 6 http://control-plane:8000/health",
-        "the other workspace's proxy": f"curl -sS -m 6 http://{other_ip}:4180/ping",
-        "the other workspace's ttyd": f"curl -sS -m 6 http://{other_ip}:7681/",
-    }
-    # Run the probe and read the answer in two separate round trips. A terminal echoes
-    # what you type, so a one-shot `cmd && echo REACHED` puts the word REACHED into the
-    # transcript whether or not anything was reached — a test that would have passed for
-    # the wrong reason in one direction and failed for the wrong reason in the other.
-    script = "; ".join(
-        f'{cmd} >/dev/null 2>&1 && echo "REACHED::{label}" >> /tmp/netprobe.out '
-        f'|| echo "blocked::{label}" >> /tmp/netprobe.out'
-        for label, cmd in blocked.items()
-    )
-    run_in_terminal(s["url"], s["client"], ["rm -f /tmp/netprobe.out; " + script],
-                    settle=5, timeout=240)
-    out = strip(run_in_terminal(s["url"], s["client"], ["cat /tmp/netprobe.out"],
-                                settle=4, timeout=90))
-    for label in blocked:
-        assert f"REACHED::{label}" not in out, f"{name}'s workspace can reach {label}\n{out[-900:]}"
-        assert f"blocked::{label}" in out, f"probe for {label} did not run\n{out[-900:]}"
+        blocked = {
+            "kubernetes API (service)": "curl -sSk -m 6 https://10.43.0.1/version",
+            "kubernetes API (node)": "curl -sSk -m 6 https://192.168.2.43:6443/version",
+            "control plane": "curl -sS -m 6 http://control-plane:8000/health",
+            f"{other}'s proxy": f"curl -sS -m 6 http://{other_ip}:4180/ping",
+            f"{other}'s ttyd": f"curl -sS -m 6 http://{other_ip}:7681/",
+        }
+        script = "; ".join(
+            f'{cmd} >/dev/null 2>&1 && echo "REACHED::{label}" >> /tmp/netprobe.out '
+            f'|| echo "blocked::{label}" >> /tmp/netprobe.out'
+            for label, cmd in blocked.items()
+        )
+        out = probe(s, script, marker_file="/tmp/netprobe.out", settle=5, timeout=240)
+        for label in blocked:
+            assert f"REACHED::{label}" not in out, (
+                f"{name}'s workspace can reach {label}\n{out[-900:]}"
+            )
+            assert f"blocked::{label}" in out, f"probe for {label} did not run\n{out[-900:]}"
 
-    reachable = strip(run_in_terminal(s["url"], s["client"], [
-        'curl -sS -m 15 -o /dev/null -w "GATEWAY=%{http_code}\\n" '
-        'http://gateway:4000/health/liveliness'
-    ], settle=5, timeout=120))
-    assert "GATEWAY=200" in reachable, f"the gateway is not reachable either\n{reachable[-500:]}"
+        reachable = probe(s, (
+            'curl -sS -m 15 -o /dev/null -w "GATEWAY=%{http_code}\\n" '
+            'http://gateway:4000/health/liveliness > /tmp/gw.out 2>&1'
+        ), marker_file="/tmp/gw.out", settle=5, timeout=120)
+        assert "GATEWAY=200" in reachable, (
+            f"{name}'s workspace cannot reach the gateway either, so the result above is "
+            f"not evidence of a fence\n{reachable[-500:]}"
+        )
 
 
 def test_workspace_has_no_service_account_token(sessions):
-    name, s = next(iter(sessions.items()))
-    out = strip(run_in_terminal(
-        s["url"], s["client"],
-        ["ls /var/run/secrets/kubernetes.io/serviceaccount 2>&1 || echo NO_TOKEN"],
-        settle=3, timeout=90))
-    assert "NO_TOKEN" in out or "No such file" in out, f"a service-account token is mounted\n{out}"
+    """Every pod, and read back through a file.
+
+    `ls ... || echo NO_TOKEN` asserted against the transcript passes on the echo of the
+    line that contains "NO_TOKEN" — even with a token mounted and listed. The listing
+    itself is what gets asserted on here, and a mounted token is a per-user manifest
+    error, so both pods are asked.
+    """
+    for name, s in sessions.items():
+        out = probe(
+            s,
+            "ls -A /var/run/secrets/kubernetes.io/serviceaccount > /tmp/sa.out 2>&1; "
+            "cat /var/run/secrets/kubernetes.io/serviceaccount/token >> /tmp/sa.out 2>&1",
+            marker_file="/tmp/sa.out", settle=3, timeout=90)
+        assert "No such file" in out, (
+            f"{name}: a service-account token directory is mounted\n{out[-500:]}"
+        )
+        assert "eyJ" not in out, f"{name}: a service-account token is readable\n{out[-300:]}"
 
 
 def test_workspace_pods_are_bounded(users):

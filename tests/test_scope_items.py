@@ -33,6 +33,30 @@ pytestmark = pytest.mark.usefixtures("stack_up")
 TIMEOUT = 60.0
 
 
+def gateway_aliases(gateway_url: str, master_headers: dict) -> set[str]:
+    """Every key alias the gateway actually holds.
+
+    Our own ledger saying a key is or is not there is the thing most likely to drift from
+    reality; this is the table that decides whether a request is served.
+    """
+    aliases: set[str] = set()
+    for page in range(1, 51):
+        listed = httpx.get(
+            f"{gateway_url}/key/list",
+            headers=master_headers,
+            # size is capped at 100 by the gateway; exceeding it returns a validation
+            # error rather than a truncated page.
+            params={"return_full_object": "true", "page": page, "size": 100},
+            timeout=TIMEOUT,
+        )
+        assert listed.status_code == 200, listed.text
+        batch = [k for k in listed.json().get("keys", []) if isinstance(k, dict)]
+        aliases |= {k.get("key_alias") for k in batch}
+        if len(batch) < 100:
+            break
+    return aliases
+
+
 # ---------------------------------------------------------------------------
 # Item 1 — one login reaches all three surfaces
 # ---------------------------------------------------------------------------
@@ -340,6 +364,7 @@ class TestItem2VirtualKeys:
             json={"username": "anyone", "surface": "ide"}, timeout=TIMEOUT,
         )
         assert r.status_code == 401, r.text
+        assert "sk-" not in r.text, f"the rejection handed back key material: {r.text}"
 
 
 # ---------------------------------------------------------------------------
@@ -539,25 +564,47 @@ class TestItem6RevocationPropagates:
         # Our own ledger saying "revoked" is not the claim — it is the thing most likely
         # to drift from reality. Assert against the gateway's own key set, which is what
         # actually decides whether a request is served.
-        remaining = set()
-        for page in range(1, 51):
-            listed = httpx.get(
-                f"{gateway_url}/key/list",
-                headers=master_headers,
-                # size is capped at 100 by the gateway; exceeding it returns a
-                # validation error rather than a truncated page.
-                params={"return_full_object": "true", "page": page, "size": 100},
-                timeout=TIMEOUT,
-            )
-            assert listed.status_code == 200, listed.text
-            batch = [k for k in listed.json().get("keys", []) if isinstance(k, dict)]
-            remaining |= {k.get("key_alias") for k in batch}
-            if len(batch) < 100:
-                break
+        remaining = gateway_aliases(gateway_url, master_headers)
         for k in active:
             assert k["key_alias"] not in remaining, (
                 f"{k['surface']} key still present on the gateway after revocation"
             )
+
+    def test_issuing_a_key_to_a_disabled_principal_is_refused(
+        self, env, control_plane_url, gateway_url, admin_headers, master_headers
+    ):
+        """`/admin/keys/issue` must not hand a spendable credential to a revoked person.
+
+        This is the one endpoint that returns a raw key, and it is the one path that could
+        undo item 6 in a single call: provisioning a workspace for someone identity has
+        already disabled would mint them a live key seconds after their access was
+        removed, and nothing else in the system would notice — the key is valid, the
+        gateway serves it, and the bill shows a principal who is supposed to be gone.
+
+        The status code is the smaller half of the claim. What actually matters is that
+        no key exists at the gateway afterwards, so this asserts against the gateway's own
+        key table rather than trusting the endpoint's own report of what it did not do.
+        """
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+        alias = f"{DOGFOOD_USER}::ide"
+
+        set_user_enabled(env, DOGFOOD_USER, False)
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+
+        refused = httpx.post(
+            f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
+            json={"username": DOGFOOD_USER, "surface": "ide"}, timeout=TIMEOUT,
+        )
+        assert refused.status_code == 409, (
+            f"issuing to a disabled principal returned {refused.status_code}: {refused.text}"
+        )
+        assert "sk-" not in refused.text, (
+            f"the refusal handed back something key-shaped: {refused.text}"
+        )
+        assert alias not in gateway_aliases(gateway_url, master_headers), (
+            f"{alias} is live at the gateway after issue was refused — the refusal "
+            "happened after the key was minted, which is worse than not refusing at all"
+        )
 
     def test_revocation_does_not_erase_the_bill(
         self, env, control_plane_url, gateway_url, admin_headers, master_headers

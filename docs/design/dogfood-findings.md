@@ -460,3 +460,42 @@ the ledger and the gateway disagree about what exists.
 
 **Regression test:**
 `TestItem2VirtualKeys::test_issue_works_when_the_gateway_holds_no_key_yet`.
+
+### 27. The bill believes the caller about who spent the money
+
+Attribution in `metering.py` ranks `LiteLLM_SpendLogs.end_user` above the username encoded
+in the key alias. `end_user` is whatever the client put in the request body's `user`
+field. It is not authenticated and it is not checked against the key.
+
+So any holder of any virtual key can write any name onto their own spend. From a
+workspace pod, with nothing but the key that pod is issued:
+
+    curl http://gateway:4000/v1/chat/completions \
+      -H "Authorization: Bearer $OPENAI_API_KEY" \
+      -d '{"model":"fake-large","messages":[...],"user":"someone-else"}'
+
+and `someone-else` appears on `GET /admin/spend` as a principal. One user can charge their
+spend to another user, or to a name that belongs to nobody. Both surfaces that hold
+per-user keys — the IDE workspace and the terminal agent — run code the user typed, so
+this is reachable by design rather than by compromise.
+
+**This contradicts finding 13**, which closes with "the ledger query already prefers
+`end_user` where present, so this becomes correct the moment the surface is confirmed to
+forward it". That reasoning holds only for a *trusted* surface forwarding an identity it
+authenticated. It is the wrong rule for a surface the user has a shell on. The fix has to
+distinguish the two — an alias-derived username is an assertion by the control plane, an
+`end_user` is an assertion by the caller, and only the first is evidence. Ranking is not
+the mechanism; provenance is.
+
+**Not fixed here.** Filed as `enterpriseaiframework-522`.
+
+**Regression test:**
+`tests-live/test_workspace.py::test_spend_is_attributed_to_the_key_that_paid_for_it`,
+written to the real claim and marked `xfail(strict=True)`. It fails today, deliberately
+and visibly, rather than being softened into the presence check it replaced (a
+`(user, 'ide')` row exists — true while the money lands on a different name). The strict
+marker turns the suite red the moment 522 is fixed and the marker is left behind.
+
+**The lesson that generalises:** a presence check is not an attribution check. "There is a
+row for this user" and "this user's spend is on this row" are different claims, and the
+first one passes for years while the second is false.
