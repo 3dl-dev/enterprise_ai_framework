@@ -59,10 +59,24 @@ if [ -z "${WS_NO_AUTOSTART:-}" ]; then
     # below, and a session that cannot be resumed after a reload is the bug being fixed.
     touch "$MARK" 2>/dev/null || true
 
+    # THE MODEL IS PASSED EXPLICITLY, NOT LEFT TO THE CONFIG
+    #
+    # A resumed session carries the model it was started with, so writing a new one into
+    # opencode.json changed nothing that a user could see: they picked GLM 4.7 in
+    # Settings, the file said 4.7, and the terminal came back still saying 5.2. Measured,
+    # not assumed. --model overrides the session, which makes the setting mean what it
+    # says while keeping the conversation.
+    MODELARG=""
+    CFG_MODEL="$(python3 -c "
+import json,sys
+try:    print(json.load(open('opencode.json')).get('model',''))
+except Exception: print('')" 2>/dev/null)"
+    [ -n "$CFG_MODEL" ] && MODELARG="--model $CFG_MODEL"
+
     case "${WS_AGENT:-opencode}" in
         aider)    aider || true ;;
         none)     : ;;
-        *)        opencode $RESUME || true ;;
+        *)        opencode $RESUME $MODELARG || true ;;
     esac
     echo
     echo "agent exited — you are in a shell."

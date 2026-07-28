@@ -196,3 +196,65 @@ def test_portal_static_never_serves_source(client, base_url):
         assert not re.search(r"^\s*(def|import|from)\s", body, re.M) or "<!DOCTYPE" in body, (
             f"{path} returned something that looks like Python: {body[:200]}"
         )
+
+
+# ------------------------------------------------------------------ operator console
+
+@pytest.fixture(scope="module")
+def operator(base_url) -> httpx.Client:
+    user = _secret("enterprise-ai-secrets", "BOOTSTRAP_USER")
+    password = _secret("enterprise-ai-secrets", "BOOTSTRAP_PASSWORD")
+    c = httpx.Client(verify=False, follow_redirects=True, timeout=60.0)
+    landing = c.get(f"{base_url}/portal/")
+    m = _FORM.search(landing.text)
+    assert m, "no login form"
+    c.post(m.group(1).replace("&amp;", "&"), data={"username": user, "password": password})
+    return c
+
+
+def test_a_camper_cannot_see_the_operator_console(client, base_url):
+    """404, not 403.
+
+    A non-operator has no business learning that an operator console exists at this path,
+    and a 403 says it does.
+    """
+    for path in ("/portal/api/admin/overview", "/portal/api/admin/audit"):
+        r = client.get(f"{base_url}{path}")
+        assert r.status_code == 404, f"{path} answered {r.status_code} to a camper"
+
+
+def test_the_operator_sees_everyone(operator, base_url):
+    r = operator.get(f"{base_url}/portal/api/admin/overview")
+    assert r.status_code == 200, r.text[:300]
+    d = r.json()
+    names = {p["username"] for p in d["people"]}
+    assert {"baron", "student"} <= names, f"the console is missing people: {names}"
+    assert d["totals"]["spend"] >= 0
+    # A shared surface key is not a person and must not be listed as one.
+    assert "chat-surface" not in names, "the shared chat key was listed as a person"
+
+
+def test_the_operator_console_is_read_only(operator, base_url):
+    """Seeing the bill must not confer the ability to change anything.
+
+    The admin token is still the only thing that can mint, revoke or re-budget; this view
+    exists so that reading the numbers does not require holding it.
+    """
+    for path in ("/portal/api/admin/overview", "/portal/api/admin/audit"):
+        r = operator.post(f"{base_url}{path}", json={})
+        assert r.status_code in (404, 405), f"{path} accepted a POST ({r.status_code})"
+    # And the real admin API stays shut to a browser session.
+    r = operator.get(f"{base_url}/admin/keys", follow_redirects=False)
+    assert "application/json" not in r.headers.get("content-type", "")
+
+
+def test_the_operator_console_reports_whether_the_audit_chain_holds(operator, base_url):
+    r = operator.get(f"{base_url}/portal/api/admin/audit?limit=5")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["verified"]["ok"] is True, f"the audit chain does not verify: {d['verified']}"
+    assert len(d["entries"]) <= 5
+    for e in d["entries"]:
+        # The window shows what happened, not the evidence. Producing evidence is the
+        # export, and that still needs the admin token.
+        assert "detail" not in e and "hash" not in e

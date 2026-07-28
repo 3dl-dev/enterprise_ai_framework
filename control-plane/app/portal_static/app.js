@@ -54,8 +54,9 @@ function compact(n) {
   return String(v);
 }
 
-function sinceParam() {
-  const v = $("since").value;
+function sinceParam(id = "since") {
+  const el = $(id);
+  const v = el ? el.value : "";
   if (!v) return "";
   const now = Date.now();
   const ms = { "24h": 864e5, "7d": 6048e5, "30d": 2592e6 }[v];
@@ -78,6 +79,7 @@ async function loadMe() {
   wire("mi-published", L.published);
   if (L.signout) $("signout").href = L.signout;
   LINKS = L;
+  IS_ADMIN = me.is_admin === true;
   mountFrames();
   return me;
 }
@@ -97,6 +99,7 @@ function wire(id, href) {
    whole change exists to remove. */
 
 let LINKS = {};
+let IS_ADMIN = false;
 const TAB_KEY = "eai.tab.v1";
 
 function mountFrames() {
@@ -157,7 +160,7 @@ $("mi-settings").addEventListener("click", () => {
   toggleMenu(false);
   // Refresh on open rather than on page load: these numbers go stale while somebody is
   // working, and the settings sheet is the only place they are visible.
-  loadSpend(); loadPublished(); loadKeys();
+  loadSpend(); loadPublished(); loadKeys(); loadAdmin();
   $("dlg-settings").showModal();
 });
 $("settings-close").addEventListener("click", () => $("dlg-settings").close());
@@ -322,6 +325,66 @@ $("close-key").addEventListener("click", () => {
   $("new-key").textContent = "";
   $("dlg-key").close();
 });
+
+/* ---------------------------------------------------------------- operator
+
+   Only renders for a name in PORTAL_ADMINS. A non-operator gets 404 from the endpoint —
+   not 403 — so the panel simply never appears rather than advertising that it exists. */
+
+async function loadAdmin() {
+  // Ask only if we are told we may. The endpoint still enforces it — this just avoids a
+  // 404 in every camper's console for a panel they were never going to see.
+  if (!IS_ADMIN) { $("panel-admin").hidden = true; return; }
+  let d;
+  try { d = await get("/portal/api/admin/overview" + sinceParam("admin-since")); }
+  catch { $("panel-admin").hidden = true; return; }
+  $("panel-admin").hidden = false;
+  $("admin-total").textContent = money(d.totals?.spend);
+
+  const body = $("admin-rows");
+  body.innerHTML = "";
+  for (const p of d.people || []) {
+    const tr = document.createElement("tr");
+    const tokens = (p.prompt_tokens || 0) + (p.completion_tokens || 0);
+    const caps = Object.values(p.budgets || {})
+      .map((b) => b.max_budget).filter((x) => x != null);
+    const cap = caps.length ? money(Math.min(...caps)) : "—";
+    tr.innerHTML =
+      "<td></td><td class='surfaces'></td>" +
+      `<td class="num">${compact(p.requests)}</td>` +
+      `<td class="num">${compact(tokens)}</td>` +
+      `<td class="num">${money(p.spend)}</td>` +
+      `<td class="num">${cap}</td>`;
+    // textContent throughout: these are usernames and key aliases, not markup.
+    tr.children[0].textContent = p.username;
+    tr.children[1].textContent = (p.surfaces || []).map((s) => s.surface).join(", ") || "—";
+    body.appendChild(tr);
+  }
+
+  const unpriced = d.unpriced_models || [];
+  $("admin-unpriced").hidden = unpriced.length === 0;
+  if (unpriced.length) {
+    $("admin-unpriced").textContent =
+      `${unpriced.length} model(s) served traffic at $0, so this total under-reports and ` +
+      `budgets cannot trip on them: ${unpriced.slice(0, 6).join(", ")}` +
+      (unpriced.length > 6 ? "…" : "");
+  }
+
+  try {
+    const a = await get("/portal/api/admin/audit?limit=1");
+    const v = a.verified || {};
+    const okay = v.ok === true;
+    // Do not interpolate a count that may not be there — it rendered as
+    // "Audit chain verifies. entries." which reads like a truncated sentence.
+    $("admin-audit").textContent = okay
+      ? "Audit chain verifies."
+      : `Audit chain DOES NOT verify${v.broken_at ? ` (break at #${v.broken_at})` : ""} `
+        + "— investigate before trusting these numbers.";
+    $("admin-audit").classList.toggle("bad", !okay);
+  } catch { $("admin-audit").textContent = ""; }
+}
+
+$("admin-since").addEventListener("change", loadAdmin);
 
 /* ---------------------------------------------------------------- boot */
 

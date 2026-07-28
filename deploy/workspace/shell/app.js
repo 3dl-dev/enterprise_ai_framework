@@ -920,9 +920,23 @@ async function load() {
     span.appendChild(subEl);
     l.append(input, span);
     input.addEventListener("change", async (e) => {
+      // Ask first, because switching costs the conversation. opencode pins the model to
+      // the session, so a new model means a new session — there is no version of this
+      // that keeps both.
+      if (!await confirmDialog({
+        title: "Switch the model?",
+        body: "This starts a fresh chat with the agent. Your files are not touched — only "
+            + "the conversation ends.",
+        danger: "Switch and start fresh",
+      })) { await load(); return; }
       const { ok, data } = await api.post("api/model", { model: e.target.value });
-      toast(data.message || "Saved.", ok);
-      if (ok) await load();
+      if (!ok) { toast(data.message || "Could not switch model.", false); return; }
+      // Reconnect so the change takes effect NOW. opencode reads its model at startup, and
+      // ttyd gives every websocket its own shell — so reloading this frame IS the restart.
+      // It costs nothing any more, because the agent resumes the session it was in.
+      $("terminal-frame").src = "terminal/";
+      toast(data.message || "Switched.");
+      await load();
     });
     radios.appendChild(l);
   }

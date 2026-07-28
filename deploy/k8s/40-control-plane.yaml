@@ -107,6 +107,12 @@ spec:
             # adding a camper needs no configuration in this file — which is what the old
             # hand-maintained WORKSPACE_PORTS list required, and forgetting to update it
             # sent somebody to a link that hung.
+            # Who sees the operator console. Explicit usernames, not a Keycloak role and
+            # not the admin token: this is a READ-ONLY view of the bill, and seeing it
+            # should not require holding the credential that can revoke every key.
+            # Empty means no console at all, which is the safe direction to fail.
+            - name: PORTAL_ADMINS
+              value: "baron"
             - name: WORKSPACE_INTERNAL_TOKEN
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: WORKSPACE_INTERNAL_TOKEN } }
           ports: [{ containerPort: 8000 }]

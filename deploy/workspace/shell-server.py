@@ -132,10 +132,18 @@ def _agent_model() -> str:
 
 
 def _set_agent_model(model_id: str) -> None:
-    """Write the model into the project config the agent reads on next start.
+    """Write the model into the project config the agent reads when it starts.
 
-    Deliberately does not restart or signal a running agent: yanking the model out from
-    under an in-flight conversation is worse than the change taking effect next time.
+    A model change also asks for a FRESH session, and that is not a preference — it is
+    what opencode does. The model is pinned to the session, so a resumed one comes back on
+    the model it was started with. Measured directly: `opencode --continue --model
+    glm-4.7` paints "GLM 4.7" and then "GLM 5.2" as the session loads over it. Writing the
+    config and reconnecting therefore changed nothing a user could see, which is exactly
+    what "why doesn't the setting do anything" looked like.
+
+    So switching models starts a new chat. The client says so before doing it. Files are
+    untouched — this only ends the conversation, and a setting that silently does nothing
+    is worse than one that tells you its price.
     """
     if model_id not in {m["id"] for m in MODELS}:
         raise ValueError(f"unknown model: {model_id}")
@@ -727,8 +735,12 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, OSError) as exc:
                 self._json(400, {"ok": False, "message": str(exc)})
                 return
+            # Same flag "New chat" uses: the next terminal connection starts clean, which
+            # is the only way the new model actually applies.
+            META_ROOT.mkdir(parents=True, exist_ok=True)
+            (META_ROOT / f"{active_project()}.new-session").write_text("1\n")
             self._json(200, {"ok": True, "model": _agent_model(),
-                             "message": "Saved. It applies the next time the agent starts."})
+                             "message": "Switched. Starting a fresh chat on the new model."})
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 

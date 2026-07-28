@@ -316,7 +316,11 @@ def test_the_agent_actually_boots_in_the_terminal(browser, workshop_url, account
         if "Ask anything" in buf or "GLM" in buf:
             break
     assert buf.strip(), "the terminal never painted anything at all"
-    assert "Ask anything" in buf, f"opencode never reached its prompt. Buffer:\n{buf[:600]}"
+    # A fresh project shows the placeholder; one with history shows the resumed
+    # conversation instead, because the terminal continues the last session rather than
+    # starting a new agent every connection. Both are a booted agent.
+    assert ("Ask anything" in buf) or ("ctrl+p commands" in buf), (
+        f"opencode never reached a usable prompt. Buffer:\n{buf[:600]}")
     assert "GLM" in buf, (
         "the agent started but shows no model — its provider config did not resolve, "
         f"which is a terminal that cannot spend. Buffer:\n{buf[:600]}"

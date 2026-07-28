@@ -34,7 +34,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse
 
-from . import chat_identity, gateway, issuance, metering
+from . import chat_identity, db, gateway, issuance, metering
 
 router = APIRouter()
 
@@ -95,6 +95,28 @@ async def portal_static(name: str, user: str = Depends(require_user)):
     return FileResponse(target)
 
 
+# WHO IS AN OPERATOR
+#
+# An explicit list, not a Keycloak role, and not "whoever holds the admin token".
+#
+# The admin token is a shared static secret that no browser has (finding 11); it stays the
+# only way to reach /admin/*. This list governs a strictly READ-ONLY view of the same
+# numbers, so that seeing the bill does not require handing somebody the credential that
+# can also revoke every key in the deployment.
+#
+# Empty by default. A deployment that forgets to set it gets no operator console, which is
+# the safe direction to fail.
+ADMINS = {a.strip() for a in os.environ.get("PORTAL_ADMINS", "").split(",") if a.strip()}
+
+
+def require_admin_user(request: Request, user: str = Depends(require_user)) -> str:
+    if user not in ADMINS:
+        # 404 rather than 403: a non-operator has no business learning that an operator
+        # console exists at this path.
+        raise HTTPException(404, "not found")
+    return user
+
+
 # ---------------------------------------------------------------- me
 
 @router.get("/portal/api/me")
@@ -109,6 +131,10 @@ async def me(request: Request, user: str = Depends(require_user)):
     return {
         "username": user,
         "email": email,
+        # So the page knows whether to ask for the operator console at all. Without it the
+        # page fetches, gets the correct 404, and every camper's console fills with a
+        # failed request — indistinguishable from a real one when reading logs.
+        "is_admin": user in ADMINS,
         "links": {
             "chat": PUBLIC_BASE_URL or "/",
             "workspace": await _workspace_url(user),
@@ -229,3 +255,97 @@ async def my_published(user: str = Depends(require_user)):
         # the page rather than turning the whole portal into an error state.
         pass
     return {"username": user, "projects": sorted(items, key=lambda x: x["name"])}
+
+
+# ---------------------------------------------------------------- operator
+
+@router.get("/portal/api/admin/overview")
+async def admin_overview(since: str | None = None,
+                         admin: str = Depends(require_admin_user)):
+    """Everyone's usage, in one call.
+
+    The same query that produces a user's own bill, unfiltered — so the operator view and
+    the personal view can never disagree about what somebody spent. Chat identifiers are
+    resolved to usernames here for the same reason they are in /portal/api/spend: the raw
+    value is LibreChat's internal id, and a column of hex is not a bill anybody can read.
+    """
+    rows = await metering.spend_by_user_and_surface(since)
+    people: dict[str, dict] = {}
+    for r in rows:
+        who = chat_identity.resolve(r.get("username") or "") or "(unattributed)"
+        # The shared chat key's own alias is not a person. Rows land here when the chat
+        # surface made a call without forwarding who it was for — titling, for instance.
+        # Listing "chat-surface" beside real names invites somebody to read it as one.
+        if who == "chat-surface":
+            who = "(chat surface, no user)"
+        acc = people.setdefault(who, {
+            "username": who, "requests": 0, "spend": 0.0,
+            "prompt_tokens": 0, "completion_tokens": 0, "surfaces": {},
+        })
+        surface = r.get("surface") or "(unknown)"
+        s = acc["surfaces"].setdefault(surface, {"requests": 0, "spend": 0.0})
+        for k in ("requests", "spend", "prompt_tokens", "completion_tokens"):
+            acc[k] += r.get(k) or 0
+        s["requests"] += r.get("requests") or 0
+        s["spend"] += r.get("spend") or 0.0
+
+    keys = await gateway.list_keys()
+    budgets: dict[str, dict] = {}
+    for k in keys:
+        alias = k.get("key_alias") or ""
+        owner, _, surface = alias.partition("::")
+        # `chat-surface` is a shared surface key, not a person. It has to be skipped here
+        # as well as in the spend loop, or it reappears as a row with no traffic — a name
+        # in a list of people that is not one.
+        if not owner or owner == "chat-surface":
+            continue
+        budgets.setdefault(owner, {})[surface] = {
+            "max_budget": k.get("max_budget"), "spend": k.get("spend"),
+        }
+
+    # Somebody with a key and no traffic still belongs on this page — "who exists" and
+    # "who spent" are different questions, and an operator needs the first one too.
+    for owner in budgets:
+        people.setdefault(owner, {"username": owner, "requests": 0, "spend": 0.0,
+                                  "prompt_tokens": 0, "completion_tokens": 0, "surfaces": {}})
+
+    for name, person in people.items():
+        person["budgets"] = budgets.get(name, {})
+        person["surfaces"] = [
+            {"surface": s, **v} for s, v in sorted(person["surfaces"].items())
+        ]
+
+    unpriced = await metering.unpriced_models(since)
+    return {
+        "since": since,
+        "totals": await metering.totals(since),
+        "people": sorted(people.values(), key=lambda p: -p["spend"]),
+        # Travels with the number, not on a page nobody opens: a bill quietly missing a
+        # model is worse than one that is obviously incomplete.
+        "unpriced_models": unpriced,
+        "viewer": admin,
+    }
+
+
+@router.get("/portal/api/admin/audit")
+async def admin_audit(limit: int = 50, admin: str = Depends(require_admin_user)):
+    """The tail of the audit trail, plus whether the chain still verifies."""
+    limit = max(1, min(limit, 200))
+    pool = await db.pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT seq, ts, actor, action, target FROM audit_event "
+            "ORDER BY seq DESC LIMIT $1",
+            limit,
+        )
+    # `detail` and `hash` are deliberately not selected. This is a read-only window for an
+    # operator, not the export — /admin/export/audit is the thing that produces evidence,
+    # and it still needs the admin token.
+    return {
+        "verified": await db.verify_chain(),
+        "entries": [
+            {"seq": r["seq"], "ts": str(r["ts"]), "actor": r["actor"],
+             "action": r["action"], "target": r["target"]}
+            for r in rows
+        ],
+    }

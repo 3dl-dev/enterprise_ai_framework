@@ -327,3 +327,13 @@ dialog:not([open]) { display: none !important; }
   .brandname { display: none; }
   .dlg.sheet .grid { grid-template-columns: 1fr; }
 }
+
+/* The operator console. Spans both columns: it is a table of everyone, not a card. */
+.panel.wide { grid-column: 1 / -1; }
+.tbl .surfaces { color: var(--ink-3); font-size: 12px; }
+.warn {
+  margin: 12px 0 0; padding: 9px 11px; border-radius: 8px;
+  background: rgba(245,176,69,.10); border: 1px solid var(--warn);
+  color: var(--warn); font-size: 12.5px;
+}
+.note.bad { color: var(--danger); }

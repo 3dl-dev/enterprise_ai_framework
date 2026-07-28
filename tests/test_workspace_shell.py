@@ -665,3 +665,30 @@ def test_the_fresh_chat_flag_is_not_visible_to_the_agent_or_the_preview(shell):
     assert shell.get("/preview/.meta/").status_code in (403, 404)
     p = shell.pulse()
     assert all(not c.startswith(".meta") for c in p["changed"]), p["changed"]
+
+
+def test_switching_model_also_asks_for_a_fresh_session(shell):
+    """opencode pins the model to the session.
+
+    A resumed session comes back on the model it started with — measured directly:
+    `opencode --continue --model glm-4.7` paints "GLM 4.7" and then "GLM 5.2" as the
+    session loads over it. So writing the config alone changed nothing a user could see,
+    which is what "the setting does nothing" was. The change has to end the session too.
+    """
+    project = shell.get("/api/state").json()["project"]
+    flag = shell.root / ".meta" / f"{project}.new-session"
+    assert not flag.exists()
+    r = shell.post("/api/model", {"model": "glm-4.7@deepinfra"})
+    assert r.status_code == 200, r.text
+    assert shell.get("/api/state").json()["model"] == "glm-4.7@deepinfra"
+    assert flag.is_file(), (
+        "the model was written but no fresh session was asked for, so the agent would "
+        "resume on the old model and the setting would appear to do nothing"
+    )
+
+
+def test_an_unknown_model_is_refused_and_changes_nothing(shell):
+    before = shell.get("/api/state").json()["model"]
+    r = shell.post("/api/model", {"model": "definitely-not-a-model"})
+    assert r.status_code == 400
+    assert shell.get("/api/state").json()["model"] == before
