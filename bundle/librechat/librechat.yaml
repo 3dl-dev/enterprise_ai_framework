@@ -47,6 +47,19 @@ registration:
   # Only identities from the realm. Belt and braces alongside ALLOW_REGISTRATION=false.
   socialLogins: ["openid"]
 
+mcpServers:
+  # The trivial MCP server (enterpriseaiframework-12b). Proves the wiring ONCE — one
+  # tool, `echo`, that returns a value the model cannot produce on its own
+  # (`ECHO:<input>`) — before web-search, skills and code-execution are built as real
+  # MCP servers on the same path. Deployed as its own Service in the cluster
+  # (deploy/k8s/06-mcp-echo.yaml, source in mcp-echo/), reached over streamable-http so
+  # LibreChat calls it as a network peer rather than spawning it as a subprocess inside
+  # its own container.
+  echo:
+    type: streamable-http
+    url: "http://mcp-echo:8080/mcp"
+    chatMenu: true
+
 endpoints:
   custom:
     - name: "Enterprise AI"

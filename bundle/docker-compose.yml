@@ -165,6 +165,21 @@ services:
   # LibreChat's own store. Mongo is LibreChat's requirement, not ours — it holds
   # conversations, not control-plane state. Postgres stays welded for everything that is
   # ours (ledger, audit, principals).
+  # The trivial MCP server (enterpriseaiframework-12b), mirrored here so the compose
+  # bundle and the cluster (deploy/k8s/06-mcp-echo.yaml) do not diverge: librechat.yaml
+  # is the one file both environments mount, and LibreChat tries to connect every
+  # configured mcpServers entry at startup regardless of whether ENDPOINTS includes
+  # `agents` — an mcpServers entry with no matching compose service would leave `chat`
+  # trying to resolve a hostname that does not exist in this network.
+  mcp-echo:
+    build: ../mcp-echo
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   chatdb:
     image: mongo:7
     command: ["--quiet"]
@@ -237,6 +252,8 @@ services:
       identity:
         condition: service_healthy
       gateway:
+        condition: service_healthy
+      mcp-echo:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
