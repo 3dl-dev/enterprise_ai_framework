@@ -84,6 +84,54 @@ for (const idea of IDEAS) {
   $("ideas").appendChild(li);
 }
 
+/* ------------------------------------------------------------------ projects */
+
+/* Switching a project only has to change one file and reload two iframes: ttyd spawns a
+ * fresh shell per websocket, so a terminal reload lands in the new directory by itself. */
+function reloadPanes() {
+  $("terminal").src = "/terminal/";
+  refreshPreview();
+}
+
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  return { ok: r.ok, data: await r.json().catch(() => ({})) };
+}
+
+$("project-picker").addEventListener("change", async (e) => {
+  const { ok, data } = await post("/api/switch", { name: e.target.value });
+  toast(data.message || (ok ? "Switched." : "Could not switch."), ok);
+  if (ok) { await loadState(); reloadPanes(); }
+});
+
+$("new-project").addEventListener("click", async () => {
+  const name = prompt("What are you making? (letters, numbers and dashes)", "");
+  if (!name) return;
+  const { ok, data } = await post("/api/projects", { name });
+  toast(data.message || (ok ? "Made it." : "Could not make it."), ok);
+  if (ok) { await loadState(); reloadPanes(); }
+});
+
+$("reset-project").addEventListener("click", async () => {
+  const cur = $("project-picker").value;
+  if (!confirm(`Empty "${cur}" and start over?\n\nYour old versions stay in git history.`)) return;
+  const { ok, data } = await post("/api/reset", {});
+  toast(data.message || (ok ? "Cleared." : "Could not clear."), ok);
+  if (ok) { await loadState(); reloadPanes(); }
+});
+
+$("delete-project").addEventListener("click", async () => {
+  const cur = $("project-picker").value;
+  if (!confirm(`Delete "${cur}" for good?\n\nIts share link stops working too.`)) return;
+  const { ok, data } = await post("/api/delete", { name: cur });
+  toast(data.message || (ok ? "Deleted." : "Could not delete."), ok);
+  if (ok) { await loadState(); reloadPanes(); }
+});
+
 /* ------------------------------------------------------------------ state */
 
 async function loadState() {
@@ -95,6 +143,21 @@ async function loadState() {
     return;
   }
   $("who").textContent = s.user;
+
+  const picker = $("project-picker");
+  picker.innerHTML = "";
+  for (const pr of s.projects) {
+    const o = document.createElement("option");
+    o.value = pr.name;
+    // A tick for anything already shared, so a child can tell at a glance which of their
+    // projects a parent can actually open.
+    o.textContent = pr.published ? `${pr.name} ✓` : pr.name;
+    o.selected = pr.name === s.project;
+    picker.appendChild(o);
+  }
+  $("project-note").textContent = s.has_index
+    ? `"${s.project}" has an index.html, so it can be shared.`
+    : `"${s.project}" has no index.html yet — ask the agent for one.`;
 
   const sel = $("model");
   sel.innerHTML = "";

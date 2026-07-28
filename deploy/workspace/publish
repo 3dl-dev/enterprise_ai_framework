@@ -17,9 +17,14 @@
 set -euo pipefail
 
 USER_NAME="${WS_USER:-coder}"
-PROJECT="${WS_PROJECT_DIR:-/workspace/project}"
+PROJECTS_ROOT="${WS_PROJECTS_ROOT:-/workspace/projects}"
+ACTIVE="$(cat "${PROJECTS_ROOT}/.active" 2>/dev/null || echo my-first-project)"
+PROJECT="${WS_PROJECT_DIR:-${PROJECTS_ROOT}/${ACTIVE}}"
 SRC="$(cd "${1:-$PROJECT}" 2>/dev/null && pwd)" || { echo "publish: no such directory: ${1:-$PROJECT}" >&2; exit 1; }
-DEST="/published/${USER_NAME}"
+
+# Each project gets its own published path. The first version published every project to
+# the same place, so a second game replaced the link a parent had already been sent.
+DEST="/published/${USER_NAME}/${ACTIVE}"
 
 if [[ ! -d /published ]]; then
     echo "publish: this workspace has no published volume mounted." >&2
@@ -52,6 +57,6 @@ rsync -a --delete \
 echo
 echo "  Published. Anyone with this link can open it — no login needed:"
 echo
-echo "      ${WS_PUBLISH_URL:-http://<ask the operator>}/live/${USER_NAME}/"
+echo "      ${WS_PUBLISH_URL:-http://<ask the operator>}/live/${USER_NAME}/${ACTIVE}/"
 echo
 echo "  Run 'publish' again to replace it with your latest version."

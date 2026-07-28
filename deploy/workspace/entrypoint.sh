@@ -9,68 +9,35 @@
 set -euo pipefail
 
 WS_USER="${WS_USER:-coder}"
-PROJECT="${WS_PROJECT_DIR:-/workspace/project}"
 
-if [[ ! -d "${PROJECT}/.git" ]]; then
-    echo "==> seeding ${PROJECT}"
-    mkdir -p "${PROJECT}"
-    cd "${PROJECT}"
-    git init -q -b main
-    git config user.email "${WS_USER}@workspace.local"
-    git config user.name "${WS_USER}"
-    git config --global --add safe.directory "${PROJECT}" 2>/dev/null || true
+# Projects, plural. A child makes several things across a camp, and the first version of
+# this had exactly one project directory and one publish slot — so a second game silently
+# destroyed the first. Each project is its own directory and its own git repo, and gets
+# its own share link.
+PROJECTS_ROOT="${WS_PROJECTS_ROOT:-/workspace/projects}"
+ACTIVE_FILE="${PROJECTS_ROOT}/.active"
 
-    cat > README.md <<'EOF'
-# Workspace
+mkdir -p "${PROJECTS_ROOT}"
+git config --global --add safe.directory '*' 2>/dev/null || true
+git config --global user.email "${WS_USER}@workspace.local" 2>/dev/null || true
+git config --global user.name "${WS_USER}" 2>/dev/null || true
+git config --global init.defaultBranch main 2>/dev/null || true
 
-A real terminal, a real git repo, and a real `aider` wired to the gateway.
-
-    aider                 # start the coding agent (your own virtual key, your own budget)
-    make test             # run the tests
-    /add app.py           # inside aider: put a file in the chat
-    /help                 # inside aider: every slash command, because this is real aider
-
-`app.py` has a deliberate bug: `add()` subtracts. `make test` fails until it is fixed.
-EOF
-
-    cat > app.py <<'EOF'
-"""Tiny sample project. add() is deliberately wrong so there is something to fix."""
-
-
-def add(a, b):
-    return a - b
-
-
-def greet(name):
-    return f"hello, {name}"
-EOF
-
-    cat > test_app.py <<'EOF'
-from app import add, greet
-
-
-def test_add():
-    assert add(2, 3) == 5
-
-
-def test_greet():
-    assert greet("world") == "hello, world"
-EOF
-
-    cat > Makefile <<'EOF'
-.PHONY: test run
-
-test:
-	pytest -q
-
-run:
-	python -c "import app; print(app.add(2, 3))"
-EOF
-
-    git add -A
-    git commit -q -m "Seed workspace"
-    echo "==> seeded"
+# First boot: one empty project, deliberately EMPTY. The old seed was a Flask app with a
+# broken add() — a test fixture. It anchored the agent on files nobody asked about, so
+# "make me a game" came back asking to add app.py to the chat. Nothing to anchor on is
+# strictly better than the wrong thing.
+if [[ ! -s "${ACTIVE_FILE}" ]]; then
+    FIRST="my-first-project"
+    mkdir -p "${PROJECTS_ROOT}/${FIRST}"
+    ( cd "${PROJECTS_ROOT}/${FIRST}" && git init -q -b main 2>/dev/null || true )
+    printf '%s\n' "${FIRST}" > "${ACTIVE_FILE}"
+    echo "==> created ${PROJECTS_ROOT}/${FIRST}"
 fi
+
+PROJECT="${PROJECTS_ROOT}/$(cat "${ACTIVE_FILE}")"
+export WS_PROJECT_DIR="${PROJECT}"
+mkdir -p "${PROJECT}"
 
 cd "${PROJECT}"
 

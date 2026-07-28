@@ -191,3 +191,15 @@ select, input[readonly] {
 }
 .toast.bad { border-left-color: var(--accent); }
 .toast a { color: var(--accent); }
+
+/* ---------------------------------------------------------------- projects */
+
+#project-picker {
+  width: auto;
+  max-width: 14rem;
+  font-size: .85rem;
+  padding: .3rem .5rem;
+}
+.btnrow { display: flex; gap: .4rem; margin: .2rem 0 .4rem; }
+.btn.danger { border-color: #6b3040; color: #ff9db4; }
+.btn.danger:hover { background: #3a2029; }

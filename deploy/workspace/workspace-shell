@@ -9,7 +9,14 @@
 # aider is deliberately NOT exec'd. When it exits — /exit, Ctrl-C, or a crash — the user
 # drops into a real shell instead of a dead browser tab, which is the difference between
 # "I quit the agent" and "the product is broken". They can type `aider` to start again.
-cd "${WS_PROJECT_DIR:-/workspace/project}" 2>/dev/null || cd /workspace
+# Resolve the ACTIVE project on every connection. ttyd spawns a fresh shell per
+# websocket, so reloading the terminal pane is what makes a project switch take effect —
+# no signal or restart needed.
+PROJECTS_ROOT="${WS_PROJECTS_ROOT:-/workspace/projects}"
+ACTIVE="$(cat "${PROJECTS_ROOT}/.active" 2>/dev/null || echo my-first-project)"
+export WS_PROJECT_DIR="${PROJECTS_ROOT}/${ACTIVE}"
+mkdir -p "${WS_PROJECT_DIR}"
+cd "${WS_PROJECT_DIR}" 2>/dev/null || cd /workspace
 
 export PS1='\[\e[1;36m\]${WS_USER:-coder}\[\e[0m\]:\w\$ '
 

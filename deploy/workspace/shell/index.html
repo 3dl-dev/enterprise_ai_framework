@@ -12,6 +12,8 @@
 <header class="bar">
   <div class="brand"><span class="mark">🦄</span> Workshop</div>
   <div class="who" id="who"></div>
+  <select id="project-picker" title="Which project you are working on"></select>
+  <button class="btn small ghost" id="new-project" title="Start something new">+ New</button>
   <div class="spacer"></div>
   <button class="btn ghost" id="tab-guide" aria-pressed="true">Ideas</button>
   <button class="btn ghost" id="tab-settings" aria-pressed="false">Settings</button>
@@ -69,6 +71,15 @@
         <select id="model"></select>
       </label>
       <p class="note" id="model-note">Applies next time the agent starts.</p>
+      <h3>This project</h3>
+      <p class="note" id="project-note"></p>
+      <div class="btnrow">
+        <button class="btn small" id="reset-project">Start this one over</button>
+        <button class="btn small danger" id="delete-project">Delete it</button>
+      </div>
+      <p class="note">Starting over empties the project but keeps its history, so it can
+      be recovered. Deleting removes it and its share link for good.</p>
+
       <h3>Your link</h3>
       <p class="note">Anyone with this can open what you made. No login.</p>
       <div class="linkrow">
