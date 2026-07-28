@@ -1,0 +1,47 @@
+# Build recipe for the mcp-echo image — no Docker socket, no privileged container.
+#
+# To rebuild after editing app.py:
+#   kubectl -n enterprise-ai create configmap mcp-echo-src \
+#     --from-file=Dockerfile=mcp-echo/Dockerfile --from-file=app.py=mcp-echo/app.py \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#   # bump the --destination tag below, then:
+#   kubectl apply -f mcp-echo/kaniko-job.yaml
+#   kubectl -n enterprise-ai wait --for=condition=complete job/kaniko-build-mcp-echo --timeout=120s
+#   # then bump the image tag in deploy/k8s/06-mcp-echo.yaml and re-apply.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kaniko-build-mcp-echo
+  namespace: enterprise-ai
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:v1.23.2
+          args:
+            - "--context=dir:///workspace"
+            - "--dockerfile=/workspace/Dockerfile"
+            - "--destination=192.168.2.43:30500/enterprise-ai-mcp-echo:12b2"
+            - "--insecure"
+            - "--skip-tls-verify"
+            - "--insecure-pull"
+          volumeMounts:
+            # subPath mounts bind each file directly rather than through the
+            # ConfigMap's default symlink-forest (`..data/<key>`) — the plain
+            # volume mount put a dangling symlink into the build context, which
+            # kaniko's COPY then baked into the image verbatim, and the
+            # container failed to start with "can't open file '/app/app.py'".
+            - name: src
+              mountPath: /workspace/Dockerfile
+              subPath: Dockerfile
+            - name: src
+              mountPath: /workspace/app.py
+              subPath: app.py
+      volumes:
+        - name: src
+          configMap:
+            name: mcp-echo-src
