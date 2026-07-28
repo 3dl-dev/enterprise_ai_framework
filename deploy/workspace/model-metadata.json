@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "Aider resolves model metadata through litellm's built-in table. Nothing in that",
+    "table matches a model arriving as a generic OpenAI endpoint on our gateway, so",
+    "without this file aider assumes an 8k context and prices everything at zero.",
+    "The 8k assumption is the damaging one: aider silently truncates the repo map and",
+    "the chat history to fit, and the model then edits files it can no longer see.",
+    "",
+    "Context windows are copied from the gateway catalogue (deploy: gateway-config",
+    "ConfigMap, model_info.max_context_window) and must be kept in agreement with it.",
+    "Costs are deliberately zero here: the gateway is the meter. A second, client-side",
+    "cost estimate that disagrees with the bill is worse than no estimate at all."
+  ],
+  "openai/glm-5.2@deepinfra": {
+    "max_input_tokens": 200000,
+    "max_output_tokens": 32768,
+    "input_cost_per_token": 0,
+    "output_cost_per_token": 0,
+    "litellm_provider": "openai",
+    "mode": "chat"
+  },
+  "openai/glm-4.7@deepinfra": {
+    "max_input_tokens": 128000,
+    "max_output_tokens": 32768,
+    "input_cost_per_token": 0,
+    "output_cost_per_token": 0,
+    "litellm_provider": "openai",
+    "mode": "chat"
+  },
+  "openai/claude-sonnet-4-6": {
+    "max_input_tokens": 200000,
+    "max_output_tokens": 32768,
+    "input_cost_per_token": 0,
+    "output_cost_per_token": 0,
+    "litellm_provider": "openai",
+    "mode": "chat"
+  },
+  "openai/fake-large": {
+    "max_input_tokens": 32000,
+    "max_output_tokens": 4096,
+    "input_cost_per_token": 0,
+    "output_cost_per_token": 0,
+    "litellm_provider": "openai",
+    "mode": "chat"
+  }
+}

@@ -242,6 +242,81 @@ class TestItem2VirtualKeys:
         )
         assert r.status_code == 401, f"expected 401, got {r.status_code}: {r.text}"
 
+    def test_issued_key_works_and_stays_joined_to_the_ledger(
+        self, control_plane_url, admin_headers, gateway_url
+    ):
+        """`/admin/keys/issue` is the only path that hands out a raw virtual key.
+
+        It exists for surfaces that are provisioned on demand — the workspace pod has to
+        be given a live key at creation, and by then nobody holds one. Three things have
+        to be true at once or it is a liability rather than a feature:
+
+          1. the key it returns actually authenticates at the gateway;
+          2. it is that user's `<username>::ide` alias, not a shared or master key;
+          3. the ledger's recorded token hash follows the rotation, so budgets keep
+             working. Minting straight at the gateway would leave the hash pointing at a
+             deleted key and `/admin/budget` would fail against a key that is gone —
+             silently, from the operator's side. That is the regression this guards.
+        """
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+        keys = httpx.get(
+            f"{control_plane_url}/admin/keys", headers=admin_headers, timeout=TIMEOUT
+        ).json()
+        users = sorted({k["username"] for k in keys if k["status"] == "active"})
+        if not users:
+            pytest.skip("no realm users yet — create one to exercise this item")
+        username = users[0]
+
+        issued = httpx.post(
+            f"{control_plane_url}/admin/keys/issue",
+            headers=admin_headers, json={"username": username, "surface": "ide"},
+            timeout=TIMEOUT,
+        )
+        assert issued.status_code == 200, issued.text
+        body = issued.json()
+        assert body["key_alias"] == f"{username}::ide", body
+        assert body["key"].startswith("sk-"), body
+
+        info = httpx.get(
+            f"{gateway_url}/key/info", params={"key": body["key"]},
+            headers={"Authorization": f"Bearer {body['key']}"}, timeout=TIMEOUT,
+        )
+        assert info.status_code == 200, f"the issued key does not work: {info.text}"
+        assert info.json()["info"]["key_alias"] == f"{username}::ide"
+
+        # The budget path is what goes stale if the rotation is done outside the ledger,
+        # so exercise it rather than inspecting the hash.
+        budget = httpx.post(
+            f"{control_plane_url}/admin/budget", headers=admin_headers,
+            json={"username": username, "surface": "ide", "max_budget": 5.0},
+            timeout=TIMEOUT,
+        )
+        assert budget.status_code == 200, (
+            f"budget update failed after issuing a key — the ledger's token hash did not "
+            f"follow the rotation: {budget.text}"
+        )
+
+    def test_issue_rejects_unknown_users_and_surfaces(self, control_plane_url, admin_headers):
+        bad_surface = httpx.post(
+            f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
+            json={"username": "nobody", "surface": "browser"}, timeout=TIMEOUT,
+        )
+        assert bad_surface.status_code == 400, bad_surface.text
+        unknown = httpx.post(
+            f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
+            json={"username": "no-such-principal", "surface": "ide"}, timeout=TIMEOUT,
+        )
+        assert unknown.status_code == 404, unknown.text
+
+    def test_issue_requires_the_admin_token(self, control_plane_url):
+        """It returns a spendable credential. An unauthenticated caller must get nothing."""
+        r = httpx.post(
+            f"{control_plane_url}/admin/keys/issue",
+            headers={"Authorization": "Bearer not-the-admin-token"},
+            json={"username": "anyone", "surface": "ide"}, timeout=TIMEOUT,
+        )
+        assert r.status_code == 401, r.text
+
 
 # ---------------------------------------------------------------------------
 # Item 4 — one bill: spend by user and by surface, one query

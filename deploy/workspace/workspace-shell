@@ -1,0 +1,6 @@
+#!/bin/bash
+# The shell every browser terminal lands in. Starts in the project so `aider` and
+# `make test` work with no ceremony.
+cd "${WS_PROJECT_DIR:-/workspace/project}" 2>/dev/null || cd /workspace
+export PS1='\[\e[1;36m\]${WS_USER:-coder}\[\e[0m\]:\w\$ '
+exec /bin/bash --norc -i

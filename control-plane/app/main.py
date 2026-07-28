@@ -204,6 +204,102 @@ async def list_keys(username: str | None = None):
     return [dict(r) for r in rows]
 
 
+class IssueKeyRequest(BaseModel):
+    username: str
+    surface: str
+
+
+class IssuedKey(BaseModel):
+    username: str
+    surface: str
+    key_alias: str
+    key: str
+    max_budget: float | None = None
+    rotated: bool
+
+
+@app.post("/admin/keys/issue", response_model=IssuedKey,
+          dependencies=[Depends(require_admin)])
+async def issue_key(req: IssueKeyRequest):
+    """Mint a surface key and hand back the raw value exactly once.
+
+    /admin/sync deliberately drops the raw key on the floor — the control plane must not
+    become a place worth stealing. That works while every surface is configured by an
+    operator who can read the key off the gateway. It does not work for a surface that is
+    *provisioned on demand*: the IDE workspace pod has to be handed a live key at the
+    moment it is created, and by then nobody holds one.
+
+    So this is the one path that returns a raw key, and it is a rotation rather than a
+    read: the old key for that (principal, surface) is deleted at the gateway before the
+    new one exists. Consequences, stated because they are the reason this is not just a
+    getter —
+      * a leaked pod manifest cannot outlive the next reprovision;
+      * anything still holding the previous key stops working, which is correct: two
+        live keys for one surface would make spend attribution a guess again;
+      * the ledger's token hash is updated in the same call, so /admin/budget keeps
+        working. Minting straight at the gateway instead would leave the recorded hash
+        pointing at a deleted key, and budget updates would fail against a key that no
+        longer exists — silently, from the operator's point of view.
+    """
+    if req.surface not in gateway.SURFACES:
+        raise HTTPException(400, f"unknown surface: {req.surface}")
+
+    pool = await db.pool()
+    async with pool.acquire() as conn:
+        principal = await conn.fetchrow(
+            "SELECT id, idp_user_id, enabled FROM principal WHERE username = $1",
+            req.username,
+        )
+        if principal is None:
+            raise HTTPException(404, f"no such principal: {req.username} (run /admin/sync)")
+        if not principal["enabled"]:
+            # Handing a spendable key to a principal identity has disabled is the exact
+            # failure scope item 6 exists to prevent.
+            raise HTTPException(409, f"{req.username} is disabled in the identity provider")
+
+        existing = await conn.fetchrow(
+            "SELECT max_budget, status FROM virtual_key "
+            "WHERE principal_id = $1 AND surface = $2",
+            principal["id"], req.surface,
+        )
+
+    alias = gateway.key_alias(req.username, req.surface)
+    max_budget = float(existing["max_budget"]) if existing and existing["max_budget"] is not None else None
+
+    await gateway.delete_by_aliases([alias])
+    created = await gateway.generate_key(
+        username=req.username,
+        surface=req.surface,
+        idp_user_id=principal["idp_user_id"],
+        max_budget=max_budget,
+    )
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO virtual_key
+                (principal_id, surface, key_alias, gateway_token_hash, max_budget, status)
+            VALUES ($1, $2, $3, $4, $5, 'active')
+            ON CONFLICT (principal_id, surface) DO UPDATE
+                SET gateway_token_hash = EXCLUDED.gateway_token_hash,
+                    key_alias = EXCLUDED.key_alias,
+                    status = 'active',
+                    revoked_at = NULL,
+                    max_budget = EXCLUDED.max_budget
+            """,
+            principal["id"], req.surface, alias, created.get("token"), max_budget,
+        )
+
+    await db.audit(
+        "admin", "key.issue", req.username,
+        surface=req.surface, rotated=existing is not None, max_budget=max_budget,
+    )
+    return IssuedKey(
+        username=req.username, surface=req.surface, key_alias=alias,
+        key=created["key"], max_budget=max_budget, rotated=existing is not None,
+    )
+
+
 class BudgetRequest(BaseModel):
     username: str
     surface: str | None = None

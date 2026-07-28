@@ -1,0 +1,59 @@
+# Aider edit-format tuning for models arriving as a generic OpenAI endpoint.
+#
+# Aider picks an edit format from a table keyed on model name. Our models reach it as
+# `openai/<gateway model name>`, which matches nothing in that table, so it falls back to
+# `whole` — reprint every edited file in full. That works, and it is why the surface is
+# usable untuned, but it burns output tokens in proportion to file size and it is the
+# format most likely to truncate on a long file.
+#
+# The formats below are what was MEASURED against this gateway, not what the aider docs
+# recommend in general. tests-live/aider_editformat_probe.sh is the harness; 3 repetitions
+# x 2 tasks per cell, streaming on (the interactive default), verdict = the project's own
+# tests passing afterwards:
+#
+#     model      whole   diff   udiff
+#     glm-5.2      6/6    3/6     6/6
+#     glm-4.7      6/6    6/6     6/6
+#
+# glm-5.2 + diff is the one that matters, and it is worse than the 3/6 suggests: every
+# failure was the SAME single-file task, all three of them, and every one of them failed
+# SILENTLY — aider reported no format complaint, printed a plausible answer, and left the
+# file untouched. Cause is in dogfood-findings.md; it is an interaction between aider's
+# file-mention heuristic and GLM's habit of naming the test file in its reply, not a
+# malformed edit block. Hence udiff here.
+#
+# GLM is a reasoning model: it returns `reasoning_content` alongside `content`, and the
+# reasoning is charged as output tokens. A small max_tokens produces replies that are all
+# reasoning and no content, which surfaces as aider silently doing nothing. That is the
+# single most important line in this file.
+- name: openai/glm-5.2@deepinfra
+  edit_format: udiff
+  use_repo_map: true
+  examples_as_sys_msg: true
+  send_undo_reply: false
+  lazy: false
+  extra_params:
+    max_tokens: 16384
+
+- name: openai/glm-4.7@deepinfra
+  edit_format: diff
+  use_repo_map: true
+  examples_as_sys_msg: true
+  send_undo_reply: false
+  lazy: false
+  extra_params:
+    max_tokens: 16384
+
+# Not measured — no Claude model has been run through this surface yet. `diff` is aider's
+# own default for the Claude family; treat this entry as a starting point, not evidence.
+- name: openai/claude-sonnet-4-6
+  edit_format: diff
+  use_repo_map: true
+  extra_params:
+    max_tokens: 16384
+
+# The in-cluster fake provider. It cannot edit anything — it echoes. It is here so the
+# workspace can be smoke-tested with no provider account and no spend.
+- name: openai/fake-large
+  edit_format: whole
+  use_repo_map: false

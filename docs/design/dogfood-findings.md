@@ -302,3 +302,97 @@ after the exit their surfaces will be blocked by the network rather than by this
 software. Egress control is out of scope for this row, so the exit cannot undo it — the
 generated README says so explicitly rather than leaving it to be discovered.
 
+
+### 21. ttyd on loopback cannot be probed with `tcpSocket`, and the pod CrashLoops
+
+The workspace pod runs ttyd bound to `127.0.0.1` so that the only route to the shell is
+the oauth2-proxy sidecar. The kubelet dials the **pod IP**, so a `tcpSocket` probe on
+7681 is refused every single time, and the container is killed and restarted at exactly
+`failureThreshold x periodSeconds` — forever — while ttyd is in fact perfectly healthy.
+
+The symptom is a pod stuck at `1/2 Running` with a rising restart count and container
+logs that show a clean startup and an exit code of 0.
+
+**Fixed by** an `exec` probe that opens the socket from inside the container
+(`bash -c 'exec 3<>/dev/tcp/127.0.0.1/7681'`). It tests the same thing and it tests it
+from the only place the listener exists.
+
+### 22. An ingress rule with no `from` silently grants pod-to-pod egress
+
+Measured on this cluster's CNI (kube-router, the k3s default). The workspace
+NetworkPolicy denied egress to the whole pod CIDR, and one workspace could still reach
+another workspace's oauth2-proxy on 4180.
+
+The reason is that the CNI accepts a packet as soon as the **destination** pod's ingress
+rules allow it, without also consulting the **source** pod's egress rules. Writing the
+front-door rule the natural way — "port 4180, no `from`, anyone may knock" — therefore
+punched a hole straight through the egress section that was supposed to be the isolation.
+
+Two changes were needed, and neither works without the other:
+
+- the ingress rule names its allowed sources (the LAN and the tailnet) instead of leaving
+  `from` empty;
+- the Service sets `externalTrafficPolicy: Local`. With the default `Cluster`, kube-proxy
+  masquerades every arriving packet to the node's own address, so a workspace pod could
+  simply dial the NodePort and arrive looking like the node — inside the allow-list.
+
+**The lesson that generalises:** a NetworkPolicy's egress section is not self-enforcing.
+Whether it holds depends on the ingress rules of everything it points at and on how the
+Service rewrites source addresses. It is only isolation if you tried it from inside the
+pod, which is what `tests-live/test_workspace.py::test_workspace_cannot_reach_the_cluster`
+does.
+
+### 23. aider drops a completed edit when the model names a file that is not in the chat
+
+The load-bearing measurement for the coding-camp plan: can aider hold an edit format
+against models that arrive as a generic OpenAI endpoint on our gateway, with no
+model-specific tuning in aider's table?
+
+Harness: `tests-live/aider_editformat_probe.sh`, run inside a real workspace pod against
+the real gateway. Three repetitions of two tasks per cell — a single-file bug fix and a
+two-file addition. A cell passes only if the project's own tests pass afterwards, never
+because aider said it succeeded. Streaming on, which is what a person at the terminal
+gets.
+
+| model | `whole` | `diff` | `udiff` |
+|---|---|---|---|
+| `glm-5.2@deepinfra` | 6/6 | **3/6** | 6/6 |
+| `glm-4.7@deepinfra` | 6/6 | 6/6 | 6/6 |
+
+The headline is good: **both open models hold a real edit format through the gateway with
+no aider-side model support at all**, and `whole` — the untuned fallback — never failed.
+The coding-camp plan is not blocked on edit format.
+
+The one failure is worth the whole exercise. Every `glm-5.2` + `diff` failure was the
+same single-file task, all three of them, and every one failed **silently**: aider
+emitted no format complaint, printed a plausible answer, and left the file untouched.
+
+Isolating it: the failure disappears when the second file is already in the chat (3/3
+pass), and it is not about the model's ability to write SEARCH/REPLACE — the block is
+emitted correctly. GLM ends its reply by suggesting `python -m pytest test_app.py`. That
+trips aider's file-mention heuristic; with `--yes-always` aider adds `test_app.py` and
+re-prompts, and the edit from the first reply is discarded. The model's second reply then
+asks for `app.py` to be added, because it is no longer in the chat.
+
+Two contributing factors, both worth knowing:
+
+- **`--yes-always` is not a neutral convenience.** It turns "shall I add this file?" into
+  an automatic re-prompt that can throw away work already done.
+- **`--no-stream` makes it worse.** With streaming off the same cell failed 4/4 rather
+  than 3/3-of-6; the probe defaults to streaming for that reason.
+
+**Acted on by** defaulting `glm-5.2@deepinfra` to `udiff` and `glm-4.7@deepinfra` to
+`diff` in `deploy/workspace/model-settings.yml`, with the measurements recorded in the
+file next to the values they justify.
+
+### 24. GLM reasoning tokens are charged against the same output budget as the answer
+
+`glm-5.2` and `glm-4.7` return `reasoning_content` alongside `content`, and the reasoning
+counts as output tokens. A request with `max_tokens` set small enough comes back
+`finish_reason: length` with a full reasoning trace and an **empty** answer — observed at
+`max_tokens: 20`, where 98 tokens of reasoning were needed before the model would emit
+the two characters it had been asked for.
+
+The failure surfaces as the tool doing nothing rather than as an error. Aider's default
+output allowance for an unknown model is small, so the workspace image pins
+`max_tokens: 16384` for both GLM entries.
