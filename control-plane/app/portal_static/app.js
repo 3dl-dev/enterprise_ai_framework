@@ -41,7 +41,10 @@ function money(n) {
   const v = Number(n || 0);
   if (v === 0) return "$0.00";
   if (v < 0.01) return "$" + v.toFixed(5).replace(/0+$/, "").replace(/\.$/, ".0");
-  return "$" + v.toFixed(v < 1 ? 4 : 2);
+  if (v < 1) return "$" + v.toFixed(4);
+  // Grouped above a thousand. A budget sentinel rendered "cap $1000000.00", which is
+  // a number nobody can read at a glance and looks like a bug rather than a cap.
+  return "$" + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function compact(n) {
@@ -199,8 +202,9 @@ async function loadKeys() {
     const alias = document.createElement("div"); alias.className = "alias";
     alias.textContent = k.alias;
     const meta = document.createElement("div"); meta.className = "meta";
-    const budget = k.max_budget == null ? "no cap" : `cap ${money(k.max_budget)}`;
-    meta.textContent = `${SURFACE_BLURB[k.surface] || ""} ${budget}`.trim();
+    const budget = k.max_budget == null ? "no limit set" : `limit ${money(k.max_budget)}`;
+    const blurb = SURFACE_BLURB[k.surface] || "";
+    meta.textContent = blurb ? `${blurb} · ${budget}` : budget;
     col.append(alias, meta);
     const rot = document.createElement("button");
     rot.className = "btn small";

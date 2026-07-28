@@ -14,6 +14,9 @@ if [[ ! -d "$VENV" ]]; then
     python3 -m venv "$VENV"
     "$VENV/bin/pip" install --quiet --upgrade pip
     "$VENV/bin/pip" install --quiet pytest==8.4.2 httpx==0.28.1
+    # playwright drives the browser suite (make test-browser). Installed here so the
+    # venv is complete; the browser binaries are a separate `playwright install`.
+    "$VENV/bin/pip" install --quiet playwright
 fi
 
 exec "$VENV/bin/pytest" tests/ -v --tb=short "$@"

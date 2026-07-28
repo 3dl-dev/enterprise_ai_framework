@@ -1,4 +1,4 @@
-.PHONY: up down logs ps sync spend audit test test-forge test-workspace forge-config export exit-direct exit nuke
+.PHONY: up down logs ps sync spend audit test test-forge test-browser test-workspace forge-config export exit-direct exit nuke
 
 BUNDLE := bundle
 COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env
@@ -66,10 +66,19 @@ test-forge:
 forge-config:
 	@$(BUNDLE)/bin/render-gateway-config.py
 
+## Drive both UIs in a real Chromium against the live cluster: signs in, asserts on the
+## rendered DOM, fails on any console error, and reads the terminal's xterm buffer to
+## prove the agent actually booted. HTTP-level tests cannot see any of that — they prove
+## a file was served, not that its JavaScript runs.
+## Screenshots land in $$BROWSER_SHOT_DIR (default /tmp/eai-shots).
+
 ## The IDE surface (browser-terminal aider) against the live k3s cluster, with two real
 ## Keycloak users. Needs the workspaces provisioned first:
 ##   deploy/bin/ensure-second-user.sh student
 ##   deploy/bin/provision-workspace.sh baron && deploy/bin/provision-workspace.sh student
 ## Spends a fraction of a cent per run. Kept out of `make test` — it needs a cluster.
+test-browser:
+	@.venv-test/bin/pytest tests-live/test_browser.py -v --tb=short -p no:cacheprovider
+
 test-workspace:
 	@.venv-test/bin/pytest tests-live/test_workspace.py -v --tb=short -p no:cacheprovider
