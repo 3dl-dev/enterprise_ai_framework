@@ -713,6 +713,14 @@ class Handler(BaseHTTPRequestHandler):
                 "message": (proc.stdout or proc.stderr).strip()[-600:],
                 "url": f"{PUBLISH_URL}/live/{USER}/{active_project()}/" if ok and PUBLISH_URL else "",
             })
+        elif parsed.path == "/api/session/new":
+            # Ask for a clean agent on the NEXT terminal connection. It cannot be done to
+            # a running one: ttyd spawns the shell per websocket, so the switch happens
+            # when the client reloads that frame — which is exactly what the UI does next.
+            META_ROOT.mkdir(parents=True, exist_ok=True)
+            (META_ROOT / f"{active_project()}.new-session").write_text("1\n")
+            self._json(200, {"ok": True, "message": "Starting a fresh chat with the agent."})
+
         elif parsed.path == "/api/model":
             try:
                 _set_agent_model(body.get("model", ""))

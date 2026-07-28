@@ -143,9 +143,15 @@ def test_03_code_tab_boots_the_agent_at_the_right_size(signed_in):
     while time.time() < deadline:
         page.wait_for_timeout(3000)
         buf = _terminal_text(page)
-        if "Ask anything" in buf or "GLM" in buf:
+        if "GLM" in buf:
             break
-    assert "Ask anything" in buf, f"the agent never reached its prompt:\n{buf[:500]}"
+    # Two legitimate shapes. A fresh project shows the placeholder; one with history shows
+    # the resumed conversation instead, because the terminal now continues the last
+    # session rather than starting a new agent on every connection. Asserting on the
+    # placeholder alone made a working resume look like a broken boot.
+    ready = ("Ask anything" in buf) or ("ctrl+p commands" in buf)
+    assert ready, f"the agent never reached a usable prompt:\n{buf[:600]}"
+    assert "GLM" in buf, f"the agent started but resolved no model:\n{buf[:600]}"
 
     tf = _frame(page, "/workshop/terminal", timeout=10)
     dims = tf.evaluate("""() => {

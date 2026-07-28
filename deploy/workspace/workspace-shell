@@ -35,10 +35,34 @@ if [ -z "${WS_NO_AUTOSTART:-}" ]; then
     # WS_AGENT selects what the terminal opens into. opencode by default: it is
     # autonomous and explores the repo itself, where aider requires you to nominate
     # files first. aider stays installed and is one word away.
+    # RESUMING
+    #
+    # ttyd spawns a fresh shell per websocket, so every page load, tab switch and reload
+    # started a brand new agent and silently dropped the conversation the user was in the
+    # middle of. `opencode --continue` picks the last session back up.
+    #
+    # It is conditional, because --continue with nothing to continue does not fail
+    # quietly: it paints "Unexpected server error" in a red box, which would be the first
+    # thing a child ever saw. The marker is written by us rather than inferred from
+    # `opencode session list`, because that list is global — a fresh project would see
+    # another project's sessions and resume the wrong conversation.
+    MARK="${PROJECTS_ROOT}/.meta/${ACTIVE}.session"
+    NEWFLAG="${PROJECTS_ROOT}/.meta/${ACTIVE}.new-session"
+    mkdir -p "${PROJECTS_ROOT}/.meta" 2>/dev/null || true
+
+    RESUME=""
+    if [ -f "$MARK" ] && [ ! -f "$NEWFLAG" ]; then
+        RESUME="--continue"
+    fi
+    rm -f "$NEWFLAG"
+    # Before launching, not after: a reload kills this shell without running anything
+    # below, and a session that cannot be resumed after a reload is the bug being fixed.
+    touch "$MARK" 2>/dev/null || true
+
     case "${WS_AGENT:-opencode}" in
         aider)    aider || true ;;
         none)     : ;;
-        *)        opencode || true ;;
+        *)        opencode $RESUME || true ;;
     esac
     echo
     echo "agent exited — you are in a shell."

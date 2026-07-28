@@ -111,6 +111,13 @@ spec:
             - { name: WS_USER, value: "__USER__" }
             - { name: WS_PROJECT_DIR, value: "/workspace/project" }
             - { name: WS_PUBLISH_URL, value: "__PUBLISH_URL__" }
+            # opencode keeps its sessions in an sqlite db under XDG_DATA_HOME. That
+            # defaulted to $HOME, which is an emptyDir on this pod — so "resume my last
+            # session" was erased by every restart, including every routine reprovision.
+            # Pointed at the PVC it survives, which is the whole point of the feature.
+            # Deliberately NOT inside /workspace/projects: it is ours, not the child's,
+            # and must never be scanned, published or committed with their work.
+            - { name: XDG_DATA_HOME, value: "/workspace/.agent-state" }
             # The credential the control plane presents on every request. entrypoint.sh
             # refuses to start without it rather than coming up unauthenticated.
             - name: WS_INTERNAL_TOKEN

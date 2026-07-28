@@ -20,6 +20,30 @@
 
 const $ = (id) => document.getElementById(id);
 
+/* RE-FIT THE TERMINAL AFTER IT (RE)CONNECTS
+ *
+ * ttyd sizes its terminal once, from whatever the frame measured at the moment its client
+ * started, and then only ever re-fits on a window resize. On a reconnect — a project
+ * switch, "New chat", a reload of this frame — the client starts before the surrounding
+ * layout has settled, measures a taller box than it ends up with, and reports rows it
+ * does not have. Measured: 50 rows in a pane that fits 38, unchanged viewport. The
+ * agent then draws its input box below the visible area, which is what "the input box is
+ * off screen" was.
+ *
+ * Nothing signals the child afterwards, because the WINDOW never resized — only the
+ * element did. So the nudge is ours to send. Twice: once on the next frame, once after
+ * the transition that animates the drawer, since either can be the one that settles last.
+ */
+function refitTerminal() {
+  const f = $("terminal-frame");
+  if (!f) return;
+  const nudge = () => {
+    try { f.contentWindow?.dispatchEvent(new Event("resize")); } catch {}
+  };
+  requestAnimationFrame(nudge);
+  setTimeout(nudge, 400);
+}
+
 /* Framed by the portal, rather than opened on its own. Used only to drop the duplicate
  * wordmark; everything else behaves identically in both modes, because a surface that
  * behaves differently depending on how it was reached is a surface nobody can support. */
@@ -747,6 +771,21 @@ function openStuck(reason) {
   }
   $("dlg-stuck").showModal();
 }
+$("terminal-frame").addEventListener("load", refitTerminal);
+$("btn-new-session").addEventListener("click", async () => {
+  if (!await confirmDialog({
+    title: "Start a fresh chat?",
+    body: "The agent forgets what you have been talking about. Your files stay exactly as "
+        + "they are — this only clears the conversation.",
+    danger: "Start fresh",
+  })) return;
+  const { ok, data } = await api.post("api/session/new", {});
+  if (!ok) { toast(data.message || "Could not start a fresh chat.", false); return; }
+  // The switch takes effect on the next connection, and reloading the frame IS the next
+  // connection — ttyd gives every websocket its own shell.
+  $("terminal-frame").src = "terminal/";
+  toast(data.message);
+});
 $("btn-stuck").addEventListener("click", () => openStuck());
 
 async function restartAgent() {

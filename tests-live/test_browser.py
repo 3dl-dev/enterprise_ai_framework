@@ -52,6 +52,26 @@ def browser():
         b.close()
 
 
+# Every context opened by a test, closed after it.
+#
+# They used to leak. Each one signs in and opens a terminal, and every terminal
+# connection spawns its own agent process inside a pod capped at one CPU — so by the end
+# of a run a dozen agents were competing, the pod started answering 429, and a terminal
+# that normally appears in five seconds had not appeared in thirteen. That looked exactly
+# like a product bug and was not one.
+_CONTEXTS = []
+
+
+@pytest.fixture(autouse=True)
+def _close_contexts():
+    yield
+    while _CONTEXTS:
+        try:
+            _CONTEXTS.pop().close()
+        except Exception:
+            pass
+
+
 class Page:
     """A page plus everything that went wrong while it loaded."""
 
@@ -85,6 +105,7 @@ class Page:
 
 def _signed_in_portal(browser, base_url, account) -> Page:
     ctx = browser.new_context(ignore_https_errors=True, viewport={"width": 1440, "height": 900})
+    _CONTEXTS.append(ctx)
     p = Page(ctx.new_page())
     p.page.goto(f"{base_url}/portal/", wait_until="domcontentloaded", timeout=45000)
     if p.page.locator("#username, input[name='username']").count():
@@ -182,6 +203,7 @@ def test_portal_never_scrolls_sideways(browser, base_url, account, size):
     """The Workshop shipped a header that overflowed below 560px. Check the whole range."""
     w, h = size
     ctx = browser.new_context(ignore_https_errors=True, viewport={"width": w, "height": h})
+    _CONTEXTS.append(ctx)
     p = Page(ctx.new_page())
     p.page.goto(f"{base_url}/portal/", wait_until="domcontentloaded", timeout=45000)
     if p.page.locator("input[name='username']").count():
@@ -194,7 +216,6 @@ def test_portal_never_scrolls_sideways(browser, base_url, account, size):
         "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
     p.page.screenshot(path=f"{SHOTS}/portal-{w}x{h}.png", full_page=True)
     assert overflow <= 0, f"page scrolls sideways by {overflow}px at {w}x{h}"
-    ctx.close()
 
 
 # ---------------------------------------------------------------- workshop
@@ -212,6 +233,7 @@ def workshop_url(base_url) -> str:
 
 def _signed_in_workshop(browser, workshop_url, account) -> Page:
     ctx = browser.new_context(ignore_https_errors=True, viewport={"width": 1440, "height": 900})
+    _CONTEXTS.append(ctx)
     p = Page(ctx.new_page())
     p.page.goto(f"{workshop_url}/", wait_until="domcontentloaded", timeout=60000)
     if p.page.locator("input[name='username']").count():
@@ -229,17 +251,32 @@ def test_workshop_renders_with_no_javascript_errors(browser, workshop_url, accou
     p.assert_clean("workshop")
 
 
-def test_workshop_terminal_is_the_hero_and_the_drawer_is_shut(browser, workshop_url, account):
+def _close_drawer(page):
+    """Put the layout in a known state.
+
+    The drawer opens by itself once the project has something to show, which is correct
+    and is the feature — but it means "at rest" depends on whether an earlier test built
+    something. These tests asserted a fixed layout and so passed alone and failed in the
+    suite: order-dependence, not a product bug.
+    """
+    page.evaluate("""() => {
+        const el = document.querySelector('[data-drawer]');
+        if (el && el.dataset.drawer !== 'closed') document.getElementById('btn-look')?.click();
+    }""")
+    page.wait_for_timeout(1200)
+
+
+def test_workshop_terminal_is_the_hero_with_the_drawer_shut(browser, workshop_url, account):
     """The whole point of the rebuild: no preview squatting on half the screen at rest."""
     p = _signed_in_workshop(browser, workshop_url, account)
-    p.page.wait_for_timeout(3000)
+    p.page.wait_for_timeout(4000)
+    _close_drawer(p.page)
     term = p.page.locator("#terminal-frame, iframe[src*='terminal']").first
     assert term.count(), "no terminal iframe on the page at all"
     box = term.bounding_box()
     width = p.page.evaluate("() => document.documentElement.clientWidth")
     assert box and box["width"] > width * 0.75, (
-        f"terminal is only {box['width'] if box else 0}px of {width} — "
-        "something is still taking the other half at rest"
+        f"terminal is only {box['width'] if box else 0}px of {width} with the drawer shut"
     )
 
 
@@ -284,3 +321,53 @@ def test_the_agent_actually_boots_in_the_terminal(browser, workshop_url, account
         "the agent started but shows no model — its provider config did not resolve, "
         f"which is a terminal that cannot spend. Buffer:\n{buf[:600]}"
     )
+
+
+def _term_dims(page):
+    for f in page.frames:
+        if f.url and "/workshop/terminal" in f.url:
+            return f.evaluate("""() => {
+                const t = window.term || (window.tty && window.tty.term);
+                if (!t) return null;
+                const el = t.element;
+                return {cols: t.cols, rows: t.rows,
+                        paneH: Math.round(el ? el.clientHeight : 0),
+                        cellH: t._core?._renderService?.dimensions?.css?.cell?.height || null};
+            }""")
+    return None
+
+
+def test_the_terminal_keeps_its_size_across_a_reconnect(browser, workshop_url, account):
+    """ttyd fits once, from whatever the frame measured when its client started.
+
+    On a reconnect — a project switch, New chat, a reload of that frame — it starts before
+    the surrounding layout settles, measures a taller box than it ends up with, and reports
+    rows it does not have. Measured before the fix: 50 rows in a pane that fits 38, with an
+    unchanged viewport. The agent then drew its input box below the visible area.
+
+    Nothing signals it afterwards, because the WINDOW never resized — only the element did.
+    """
+    p = _signed_in_workshop(browser, workshop_url, account)
+    p.page.wait_for_timeout(11000)
+    # Fix the layout before measuring: the drawer opens on its own when the project has
+    # something to show, and a pane that changes width between the two measurements would
+    # make this test fail for a reason that is not the bug it is guarding.
+    _close_drawer(p.page)
+    p.page.wait_for_timeout(2500)
+    first = _term_dims(p.page)
+    assert first, "no terminal on first connect"
+
+    p.page.evaluate("() => { document.getElementById('terminal-frame').src = 'terminal/'; }")
+    p.page.wait_for_timeout(13000)
+    again = _term_dims(p.page)
+    assert again, "no terminal after reconnect"
+
+    assert again["rows"] == first["rows"] and again["cols"] == first["cols"], (
+        f"the terminal resized itself on reconnect: {first} -> {again}"
+    )
+    if again["cellH"]:
+        used = again["rows"] * again["cellH"]
+        assert used <= again["paneH"] + again["cellH"], (
+            f"{again['rows']} rows of {again['cellH']}px = {used}px overflows a "
+            f"{again['paneH']}px pane — the prompt is drawn off screen"
+        )

@@ -635,3 +635,33 @@ def test_an_animating_page_is_flagged(shell):
         p = shell.wait_for(lambda s: s["keeps_running"] is True,
                            f"keeps_running for {markup[:24]}")
         assert p["keeps_running"] is True
+
+
+def test_asking_for_a_fresh_chat_leaves_a_flag_for_the_next_connection(shell):
+    """The switch cannot be applied to a running agent.
+
+    ttyd gives every websocket its own shell, so a new session begins when the client
+    reconnects. The endpoint's whole job is to leave a note for that next shell.
+    """
+    project = shell.get("/api/state").json()["project"]
+    flag = shell.root / ".meta" / f"{project}.new-session"
+    assert not flag.exists()
+    r = shell.post("/api/session/new", {})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert flag.is_file(), "no flag was left for the next terminal connection"
+
+
+def test_the_fresh_chat_flag_is_per_project(shell):
+    """Asking for a clean agent in one project must not reset another."""
+    shell.post("/api/projects", {"name": "second"})
+    shell.post("/api/session/new", {})
+    assert (shell.root / ".meta" / "second.new-session").is_file()
+    assert not (shell.root / ".meta" / "alpha.new-session").exists()
+
+
+def test_the_fresh_chat_flag_is_not_visible_to_the_agent_or_the_preview(shell):
+    """.meta is ours. It must never be scanned, served or published with a child's work."""
+    shell.post("/api/session/new", {})
+    assert shell.get("/preview/.meta/").status_code in (403, 404)
+    p = shell.pulse()
+    assert all(not c.startswith(".meta") for c in p["changed"]), p["changed"]
