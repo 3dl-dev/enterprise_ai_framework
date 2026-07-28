@@ -54,7 +54,10 @@ def client(base_url, creds) -> httpx.Client:
     done = c.post(action, data={"username": user, "password": password},
                   headers={"Content-Type": "application/x-www-form-urlencoded"})
     assert done.status_code == 200, f"login POST returned {done.status_code}"
-    assert "password" not in done.text.lower() or "Everything in one place" in done.text, (
+    # Keyed on the tab bar, which is the shell of the signed-in app. The previous
+    # version looked for the absence of the word "password" — which the account link in
+    # the user menu now contains, so a perfectly good login read as a failure.
+    assert 'id="tab-chat"' in done.text, (
         "still on a login form after submitting credentials — the login did not take"
     )
     return c
@@ -63,7 +66,28 @@ def client(base_url, creds) -> httpx.Client:
 def test_the_page_loads_after_one_login(client, base_url):
     r = client.get(f"{base_url}/portal/")
     assert r.status_code == 200
-    assert "Everything in one place" in r.text
+    for marker in ('id="tab-chat"', 'id="tab-code"', 'id="dlg-settings"'):
+        assert marker in r.text, f"the signed-in shell is missing {marker}"
+
+
+def test_the_workshop_is_served_on_this_origin(client, base_url, creds):
+    """No LAN address, no second site. The Code tab is a path on the same host."""
+    r = client.get(f"{base_url}/workshop/api/state")
+    assert r.status_code == 200, f"/workshop/ did not serve this user: {r.status_code}"
+    assert r.json()["user"] == creds[0], (
+        f"the proxy served {r.json().get('user')!r} to {creds[0]} — it is routing on "
+        "something other than the authenticated identity"
+    )
+
+
+def test_the_workshop_shell_is_rewritten_for_the_prefix(client, base_url):
+    """Its URLs are relative to <base>; serving it under /workshop/ is that one attribute."""
+    r = client.get(f"{base_url}/workshop/")
+    assert r.status_code == 200
+    assert '<base href="/workshop/">' in r.text, (
+        "the base was not rewritten, so every relative URL in the shell will escape the "
+        "prefix and 404"
+    )
 
 
 def test_assets_are_served(client, base_url):
