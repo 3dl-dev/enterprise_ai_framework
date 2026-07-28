@@ -76,13 +76,23 @@ def signed_in(page_ctx, base_url, account):
 
 
 def _frame(page, needle, timeout=60):
+    """Find a frame, or say why it is missing.
+
+    These steps run IN ORDER and share one browser: step 7 publishes what step 4 built,
+    inside the tab step 3 opened. Selecting a single step with -k gets a bare
+    AttributeError on None three frames later, which reads as a product failure and is
+    not one. Named here so the next person loses a minute, not an hour.
+    """
     end = time.time() + timeout
     while time.time() < end:
         for f in page.frames:
             if needle in (f.url or ""):
                 return f
         page.wait_for_timeout(500)
-    return None
+    raise AssertionError(
+        f"no frame matching {needle!r} after {timeout}s. These steps run in order and "
+        f"share one browser — if you selected a single test, run the whole module."
+    )
 
 
 def _terminal_text(page) -> str:
@@ -249,10 +259,23 @@ def test_06_running_it_renders_what_the_agent_built(signed_in):
 def test_07_publishing_gives_a_link_a_parent_can_open_with_no_account(signed_in, base_url, account):
     page = signed_in
     wf = _frame(page, "/workshop/", timeout=15)
+
+    # Wait for the button to be WIRED, not merely present.
+    #
+    # This step failed once and passed on a re-run, which makes it a broken test rather
+    # than a passing one. The race is here: the click was fired through evaluate() as soon
+    # as the element existed, and if app.js had not yet attached its handler the click
+    # went nowhere — after which the poll below could only ever time out. Waiting on the
+    # state the handler needs, and clicking again if nothing happened, removes both the
+    # race and the silent-failure mode.
+    wf.wait_for_function(
+        "() => { const b = document.getElementById('btn-share');"
+        "return b && !b.disabled; }", timeout=30000)
     wf.evaluate("() => document.getElementById('btn-share').click()")
 
     url = ""
-    deadline = time.time() + 90
+    reclicked = False
+    deadline = time.time() + 120
     while time.time() < deadline:
         page.wait_for_timeout(2000)
         url = wf.evaluate("""() => {
@@ -263,8 +286,15 @@ def test_07_publishing_gives_a_link_a_parent_can_open_with_no_account(signed_in,
         }""") or ""
         if "/live/" in url:
             break
+        # One retry, once, if the first click clearly did nothing.
+        if not reclicked and time.time() > deadline - 75:
+            reclicked = True
+            wf.evaluate("() => document.getElementById('btn-share').click()")
     page.screenshot(path=f"{SHOTS}/e2e-07-shared.png")
-    assert "/live/" in url, f"publishing produced no shareable link (got {url!r})"
+    assert "/live/" in url, (
+        f"publishing produced no shareable link (got {url!r}). "
+        f"Terminal said:\n{_terminal_text(page)[-300:]}"
+    )
     assert f"/live/{account[0]}/" in url, f"the link is not this user's: {url}"
 
     # The whole point: no cookies, no session, nothing. A parent has no account.
