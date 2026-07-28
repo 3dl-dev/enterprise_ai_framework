@@ -45,6 +45,22 @@ PRICE_CACHE = BUNDLE / "litellm" / "forge-pricing.cache.json"
 CATALOG_CACHE = BUNDLE / "litellm" / "forge-catalog.cache.json"
 MARKER = "# @GENERATED_UPSTREAMS@"
 
+# Why a model Forge quotes at exactly $0 is still left out.
+#
+# Zero is a real price here — those models run on hardware the operator already owns, so
+# their marginal token cost genuinely is nothing. But the ledger cannot tell "free" from
+# "we never learned the price": both meter at $0, both make a budget impossible to trip,
+# and /admin/unpriced flags both. Until spend can distinguish them, a $0 model is left out
+# rather than quietly uncapped.
+#
+# This string was referenced in the report below and never defined, so the generator
+# crashed with a NameError the first time Forge actually quoted something at zero — which
+# it now does for four media models. The catalogue had already been written by then, so
+# the failure looked like a broken run rather than a broken sentence.
+ZERO_PRICE_IS_REAL_BUT_EXCLUDED = (
+    "real hardware cost, but $0 makes budgets untrippable"
+)
+
 # How a fake catalogue entry is recognised: by who serves it.
 FAKE_UPSTREAM = "fakeprovider:8080"
 
