@@ -26,6 +26,11 @@
 # reasoning is charged as output tokens. A small max_tokens produces replies that are all
 # reasoning and no content, which surfaces as aider silently doing nothing. That is the
 # single most important line in this file.
+# max_tokens matches max_output_tokens in model-metadata.json (32768), not half of it.
+# These models emit reasoning into the SAME output budget as the answer, so a cap that
+# looks generous for a non-reasoning model leaves a reasoning model short mid-edit — the
+# answer gets truncated after the thinking, which presents as the agent stopping partway
+# through a change rather than as a limit being hit.
 - name: openai/glm-5.2@deepinfra
   edit_format: udiff
   use_repo_map: true
@@ -33,7 +38,7 @@
   send_undo_reply: false
   lazy: false
   extra_params:
-    max_tokens: 16384
+    max_tokens: 32768
 
 - name: openai/glm-4.7@deepinfra
   edit_format: diff
@@ -42,7 +47,7 @@
   send_undo_reply: false
   lazy: false
   extra_params:
-    max_tokens: 16384
+    max_tokens: 32768
 
 # Not measured — no Claude model has been run through this surface yet. `diff` is aider's
 # own default for the Claude family; treat this entry as a starting point, not evidence.
@@ -50,7 +55,7 @@
   edit_format: diff
   use_repo_map: true
   extra_params:
-    max_tokens: 16384
+    max_tokens: 32768
 
 # The in-cluster fake provider. It cannot edit anything — it echoes. It is here so the
 # workspace can be smoke-tested with no provider account and no spend.

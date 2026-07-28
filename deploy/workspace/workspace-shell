@@ -1,6 +1,26 @@
 #!/bin/bash
-# The shell every browser terminal lands in. Starts in the project so `aider` and
-# `make test` work with no ceremony.
+# The shell every browser terminal lands in.
+#
+# It starts aider immediately rather than dropping to a prompt: the point of this surface
+# is the coding agent, and a bare shell is a step the user has to know to take. Set
+# WS_NO_AUTOSTART=1 on the pod to land in a plain shell instead — useful for debugging the
+# image without fighting a running agent for the terminal.
+#
+# aider is deliberately NOT exec'd. When it exits — /exit, Ctrl-C, or a crash — the user
+# drops into a real shell instead of a dead browser tab, which is the difference between
+# "I quit the agent" and "the product is broken". They can type `aider` to start again.
 cd "${WS_PROJECT_DIR:-/workspace/project}" 2>/dev/null || cd /workspace
+
 export PS1='\[\e[1;36m\]${WS_USER:-coder}\[\e[0m\]:\w\$ '
+
+if [ -z "${WS_NO_AUTOSTART:-}" ]; then
+    # Confirmation behaviour is set in the image (AIDER_YES_ALWAYS), not here, so that a
+    # user who types `aider` by hand after this exits gets identical behaviour rather than
+    # a quieter or noisier agent depending on how it was started.
+    aider || true
+    echo
+    echo "aider exited — you are in a shell. Type 'aider' to start it again."
+    echo
+fi
+
 exec /bin/bash --norc -i

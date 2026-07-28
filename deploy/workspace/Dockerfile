@@ -58,7 +58,25 @@ ENV HOME=/home/coder \
     AIDER_ANALYTICS_DISABLE=1 \
     AIDER_CHECK_UPDATE=false \
     AIDER_SHOW_MODEL_WARNINGS=false \
-    AIDER_GITIGNORE=false
+    AIDER_GITIGNORE=false \
+    # Auto-confirm. The terminal drops straight into aider, so a confirmation prompt is
+    # the first thing a user would meet and the least useful. Set in the image rather
+    # than on the launch line so `aider` typed by hand behaves the same way.
+    #
+    # Worth being clear about what this trades: aider will edit files, create files and
+    # run its own commands without asking. That is bounded by the pod — non-root, network
+    # fenced, no cluster credential, its own PVC — and every change lands as a git commit
+    # in the workspace repo, so `git log` and `git revert` are the undo. It is NOT bounded
+    # for shell commands aider chooses to run inside the pod.
+    AIDER_YES_ALWAYS=1 \
+    # Without this the terminal fills with files nobody asked for. GLM habitually ends a
+    # reply suggesting a command like `pytest test_app.py`; that trips aider's
+    # file-mention heuristic, and because YES_ALWAYS auto-confirms, aider adds the file
+    # and dumps its contents into the buffer. Measured during the edit-format probe as
+    # the cause of every glm-5.2 diff failure — the suggestion also discarded the edit.
+    AIDER_SUGGEST_SHELL_COMMANDS=false \
+    # Same class: a URL in a reply becomes an auto-confirmed fetch-and-dump.
+    AIDER_DETECT_URLS=false
 
 EXPOSE 7681
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]

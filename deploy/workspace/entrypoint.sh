@@ -74,6 +74,14 @@ fi
 
 cd "${PROJECT}"
 
+# Client options, explained here because they cannot be commented inline — a `#` inside a
+# backslash-continued command breaks the continuation and ttyd starts with no command.
+#
+#   scrollback=10000     a coding agent emits a lot of lines; the default is small enough
+#                        that one long reply pushes the start of the answer out of history
+#   scrollOnUserInput    keep the viewport at the bottom as output streams, otherwise a
+#                        long reply leaves the view parked and reads as a frozen terminal
+#   disableLeaveAlert    no "are you sure you want to leave" on a tab close
 exec /usr/local/bin/ttyd \
     --port 7681 \
     --interface lo \
@@ -81,4 +89,7 @@ exec /usr/local/bin/ttyd \
     --ping-interval 30 \
     --client-option "titleFixed=workspace: ${WS_USER}" \
     --client-option "fontSize=14" \
+    --client-option "scrollback=10000" \
+    --client-option "scrollOnUserInput=true" \
+    --client-option "disableLeaveAlert=true" \
     /usr/local/bin/workspace-shell
