@@ -296,6 +296,30 @@ class TestItem2VirtualKeys:
             f"follow the rotation: {budget.text}"
         )
 
+    def test_issue_works_when_the_gateway_holds_no_key_yet(
+        self, control_plane_url, admin_headers, gateway_url, master_headers
+    ):
+        """Issuing must not require something to rotate.
+
+        The gateway answers 404 to a delete that matches nothing, and the first cut of
+        this endpoint let that 404 escape as a 500 — so issuing worked only for a surface
+        that already had a key, and failed in the two states an operator most needs it:
+        the first provision of a surface, and re-provisioning after a revocation.
+        """
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+        alias = f"{DOGFOOD_USER}::terminal"
+        httpx.post(f"{gateway_url}/key/delete", headers=master_headers,
+                   json={"key_aliases": [alias]}, timeout=TIMEOUT)
+
+        issued = httpx.post(
+            f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
+            json={"username": DOGFOOD_USER, "surface": "terminal"}, timeout=TIMEOUT,
+        )
+        assert issued.status_code == 200, (
+            f"issuing with nothing to rotate failed: {issued.status_code} {issued.text}"
+        )
+        assert issued.json()["key_alias"] == alias
+
     def test_issue_rejects_unknown_users_and_surfaces(self, control_plane_url, admin_headers):
         bad_surface = httpx.post(
             f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
@@ -534,6 +558,64 @@ class TestItem6RevocationPropagates:
             assert k["key_alias"] not in remaining, (
                 f"{k['surface']} key still present on the gateway after revocation"
             )
+
+    def test_revocation_does_not_erase_the_bill(
+        self, env, control_plane_url, gateway_url, admin_headers, master_headers
+    ):
+        """Money spent before a key was revoked must stay attributed to the person.
+
+        This is items 4 and 6 pulling against each other, and it was found the hard way:
+        the bill joined spend rows to the gateway's live key table, and revocation deletes
+        from that table. Every historical row for a revoked key silently became
+        "(unattributed)" — on the cluster, 88% of all recorded spend, after nothing more
+        exotic than reprovisioning a workspace a few times.
+
+        A bill that goes quiet about money that was definitely spent is worse than one
+        that is obviously broken, so this asserts the number survives the revocation.
+        """
+        httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
+        issued = httpx.post(
+            f"{control_plane_url}/admin/keys/issue", headers=admin_headers,
+            json={"username": DOGFOOD_USER, "surface": "terminal"}, timeout=TIMEOUT,
+        )
+        assert issued.status_code == 200, issued.text
+        key = issued.json()["key"]
+
+        spent = httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": "bill me"}]},
+            timeout=TIMEOUT,
+        )
+        assert spent.status_code == 200, spent.text
+
+        def terminal_requests() -> int:
+            rows = httpx.get(
+                f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+            ).json()["by_user_and_surface"]
+            return sum(
+                r["requests"] for r in rows
+                if r["username"] == DOGFOOD_USER and r["surface"] == "terminal"
+            )
+
+        before = 0
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            before = terminal_requests()
+            if before:
+                break
+            time.sleep(2)
+        assert before, "the request was never recorded against the terminal surface"
+
+        httpx.post(f"{gateway_url}/key/delete", headers=master_headers,
+                   json={"key_aliases": [f"{DOGFOOD_USER}::terminal"]}, timeout=TIMEOUT)
+
+        after = terminal_requests()
+        assert after >= before, (
+            f"revoking the key erased {before - after} request(s) from the bill; "
+            "spend attribution must not depend on the key still existing"
+        )
 
 
 # ---------------------------------------------------------------------------

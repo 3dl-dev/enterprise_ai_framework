@@ -396,3 +396,67 @@ the two characters it had been asked for.
 The failure surfaces as the tool doing nothing rather than as an error. Aider's default
 output allowance for an unknown model is small, so the workspace image pins
 `max_tokens: 16384` for both GLM entries.
+
+### 25. Revoking a key erased the bill for everything it had already spent
+
+The most serious defect this row has produced, and it was silent in the direction that
+matters: the number got smaller and nothing said so.
+
+`GET /admin/spend` attributed spend by joining `LiteLLM_SpendLogs.api_key` to
+`LiteLLM_VerificationToken`, which is the gateway's table of **live** keys. Three
+supported operations delete from that table — revoking a disabled user's keys (item 6),
+the exit path's revoke-all (item 9), and rotating a key when a surface is reprovisioned.
+Every historical spend row belonging to a deleted key then joined to NULL and fell into
+`(unattributed)/(unknown)`.
+
+Found on the cluster while building the IDE surface. After a handful of workspace
+reprovisions the bill read:
+
+```
+(unattributed) / (unknown)    requests=116   spend=0.082114
+         baron / ide          requests=4     spend=0.002115
+```
+
+88% of all money spent, detached from the person who spent it, with no error anywhere.
+Scope item 6 — "disabling a user in the IdP pulls every surface key" — was therefore
+*destroying the audit value of item 4* every time it worked correctly.
+
+**Fixed by** attributing from the alias LiteLLM stamps onto each spend row at request
+time (`metadata->>'user_api_key_alias'`), which no later revocation touches, and keeping
+the token join only as a fallback for rows written before that metadata existed. The same
+bill after the fix, over the same data:
+
+```
+         baron / ide          requests=103   spend=0.075958
+       student / ide          requests=7     spend=0.006080
+(unattributed) / (unknown)    requests=14    spend=0.002190
+```
+
+The 14 that remain are genuinely unattributable — calls made with the gateway master key
+during setup, which belong to no principal.
+
+**Regression test:**
+`TestItem6RevocationPropagates::test_revocation_does_not_erase_the_bill` — spend a
+recorded request through a key, revoke the key, assert the request is still on the bill.
+
+**The lesson that generalises:** a ledger must not be joined to mutable operational
+state. Attribution has to be written down at the moment of the event, because everything
+the event referred to is allowed to be deleted afterwards.
+
+### 26. "Nothing to delete" is not an error, and treating it as one broke first provision
+
+Small, but it is the shape of bug that survives review. `POST /admin/keys/issue` rotates
+by deleting the old key before minting the new one, and the gateway answers **404** to a
+delete matching no alias. That 404 escaped as a 500, so issuing a key worked only for a
+surface that already had one — failing in precisely the two states it exists for: the
+first provision of a surface, and reprovisioning after a revocation.
+
+It stayed hidden because `provision-workspace.sh` calls `/admin/sync` first, which mints
+any missing key, so the happy path always had something to rotate.
+
+**Fixed by** an explicit `missing_ok` on `gateway.delete_by_aliases`, set only by the
+rotation path. Revocation still treats a 404 as worth surfacing, because there it means
+the ledger and the gateway disagree about what exists.
+
+**Regression test:**
+`TestItem2VirtualKeys::test_issue_works_when_the_gateway_holds_no_key_yet`.

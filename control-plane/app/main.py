@@ -266,7 +266,11 @@ async def issue_key(req: IssueKeyRequest):
     alias = gateway.key_alias(req.username, req.surface)
     max_budget = float(existing["max_budget"]) if existing and existing["max_budget"] is not None else None
 
-    await gateway.delete_by_aliases([alias])
+    # missing_ok: there may be no key to rotate. That is the normal state the first time
+    # a surface is provisioned, and it is also the state after a revocation, so treating
+    # "nothing to delete" as an error makes this endpoint fail in exactly the two cases
+    # an operator most needs it to work.
+    await gateway.delete_by_aliases([alias], missing_ok=True)
     created = await gateway.generate_key(
         username=req.username,
         surface=req.surface,

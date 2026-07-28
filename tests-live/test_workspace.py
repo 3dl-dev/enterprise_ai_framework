@@ -273,11 +273,19 @@ def test_workspace_cannot_reach_the_cluster(sessions):
         "the other workspace's proxy": f"curl -sS -m 6 http://{other_ip}:4180/ping",
         "the other workspace's ttyd": f"curl -sS -m 6 http://{other_ip}:7681/",
     }
+    # Run the probe and read the answer in two separate round trips. A terminal echoes
+    # what you type, so a one-shot `cmd && echo REACHED` puts the word REACHED into the
+    # transcript whether or not anything was reached — a test that would have passed for
+    # the wrong reason in one direction and failed for the wrong reason in the other.
     script = "; ".join(
-        f'{cmd} >/dev/null 2>&1 && echo "REACHED::{label}" || echo "blocked::{label}"'
+        f'{cmd} >/dev/null 2>&1 && echo "REACHED::{label}" >> /tmp/netprobe.out '
+        f'|| echo "blocked::{label}" >> /tmp/netprobe.out'
         for label, cmd in blocked.items()
     )
-    out = strip(run_in_terminal(s["url"], s["client"], [script], settle=5, timeout=240))
+    run_in_terminal(s["url"], s["client"], ["rm -f /tmp/netprobe.out; " + script],
+                    settle=5, timeout=240)
+    out = strip(run_in_terminal(s["url"], s["client"], ["cat /tmp/netprobe.out"],
+                                settle=4, timeout=90))
     for label in blocked:
         assert f"REACHED::{label}" not in out, f"{name}'s workspace can reach {label}\n{out[-900:]}"
         assert f"blocked::{label}" in out, f"probe for {label} did not run\n{out[-900:]}"
