@@ -23,3 +23,6 @@ bundle/litellm/forge-catalog.cache.json
 
 # direnv local overrides (may contain secrets).
 .envrc.local
+
+# Workflow agent worktrees — transient, and each is its own git repo.
+.claude/worktrees/
