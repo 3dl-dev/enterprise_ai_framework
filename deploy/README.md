@@ -22,10 +22,11 @@ is a complete uninstall.
 
 | What | How | Why |
 |---|---|---|
+| **Portal** | NodePort 30460 | `/portal/*` on the same origin. The signed-in front door: links to every surface, your spend, your keys, your published work, and the account console. oauth2-proxy sidecar on the control-plane pod authenticates first |
 | Chat | NodePort 30380 | Gateway VM Caddy `:8081`, behind Tailscale Funnel on `:8443` |
 | Identity | NodePort 30382 | Same origin as chat — Caddy routes `/realms/*` and `/resources/*` here. They **must** share an origin or the OIDC issuer check fails |
 | Gateway | NodePort 30400 | LAN/tailnet only — not published to the internet |
-| Control plane | ClusterIP only | Its admin API is a shared static token (finding 11); reach it with `kubectl -n enterprise-ai port-forward svc/control-plane 8081:8000` |
+| Control plane | ClusterIP only | Its **admin** API is a shared static token (finding 11) and stays unpublished; reach it with `kubectl -n enterprise-ai port-forward svc/control-plane 8081:8000`. Only `/portal/*` is routed publicly, and signing in there confers no operator capability |
 
 ## Known gaps
 

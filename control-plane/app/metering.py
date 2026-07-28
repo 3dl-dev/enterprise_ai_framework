@@ -51,6 +51,38 @@ LEFT JOIN "LiteLLM_VerificationToken" v ON v.token = s.api_key
 """
 
 
+# WHICH KEYS MAY NAME SOMEONE OTHER THAN THEMSELVES
+#
+# `end_user` is whatever the caller put in the request body's "user" field. For a surface
+# that serves many people through ONE key it is the only way to tell them apart, and the
+# chat surface is exactly that: LibreChat authenticates the person, then forwards them as
+# `user`. For a per-user key it is redundant, because the alias already says who holds it.
+#
+# Trusting it everywhere meant the caller chose the name on the bill. Demonstrated on this
+# cluster with a legitimate `baron::ide` key and a body of {"user":"veracity-probe-xyz"}:
+# the spend appeared under `veracity-probe-xyz`. The money could not escape the key's own
+# budget — caps bind to the key — but attribution is the product, and attribution was
+# forgeable by anybody holding any key.
+#
+# So end_user is honoured only for keys minted AS shared surfaces, and ignored everywhere
+# else in favour of the alias. Defaults to the one shared key we mint (provision-chat-key.sh
+# and post-deploy.sh both use this alias); override for a deployment that adds another.
+#
+# Failing closed is the point: an alias that is absent, deleted, or simply not on this list
+# falls through to the alias-derived name, which the holder cannot choose.
+SHARED_SURFACE_ALIASES = [
+    a.strip() for a in os.environ.get(
+        "SHARED_SURFACE_ALIASES", "chat-surface::chat"
+    ).split(",") if a.strip()
+]
+
+# Only a key on that list gets to speak for someone else.
+_TRUSTED_END_USER = f"""CASE
+    WHEN {_ALIAS} = ANY($SHARED::text[]) THEN NULLIF(s.end_user, '')
+    ELSE NULL
+END"""
+
+
 async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
     """The single query the scope item names. One row per (user, surface)."""
     where, params = "", []
@@ -58,15 +90,15 @@ async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
         where = 'WHERE s."startTime" >= $1::text::timestamptz'
         params.append(since)
 
-    # Attribution precedence: the end user the surface forwarded, then the user encoded
-    # in the key alias. A surface that serves many people through one shared virtual key
-    # (the chat surface does) is only distinguishable via end_user, while a per-user key
-    # (the coding agents) carries it in the alias. Preferring end_user makes both work
-    # without the caller needing to know which kind of surface it is looking at.
+    # Attribution precedence: the end user a SHARED surface forwarded, then the user
+    # encoded in the key alias. See SHARED_SURFACE_ALIASES — a per-user key naming
+    # somebody else is ignored, because otherwise the caller picks who gets billed.
+    params.append(SHARED_SURFACE_ALIASES)
+    trusted = _TRUSTED_END_USER.replace("$SHARED", f"${len(params)}")
     sql = f"""
     SELECT
         COALESCE(
-            NULLIF(s.end_user, ''),
+            {trusted},
             NULLIF(split_part({_ALIAS}, '::', 1), ''),
             '(unattributed)'
         ) AS username,

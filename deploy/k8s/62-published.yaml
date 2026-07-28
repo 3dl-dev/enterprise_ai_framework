@@ -109,6 +109,22 @@ data:
             autoindex_localtime on;
         }
 
+        # The same tree as /live/, listed as JSON, for the portal's "your work" panel.
+        #
+        # Deliberately a SEPARATE path rather than content negotiation on /live/, because
+        # the two have different audiences: /live/ is the link a parent opens, and a
+        # parent must never be shown a machine listing. Nothing outside the cluster can
+        # reach this — the gateway's Caddy routes /live/* to this server and nothing else,
+        # so /listing/ has no public route. It is still only a directory listing of files
+        # that are already served publicly one path over; there is nothing here that
+        # /live/ does not already give away.
+        location /listing/ {
+            alias /usr/share/nginx/html/live/;
+            autoindex on;
+            autoindex_format json;
+            autoindex_localtime on;
+        }
+
         # Published pages are static and change when a child republishes; caching them
         # means a parent refreshing sees yesterday's version and thinks it is broken.
         add_header Cache-Control "no-store";

@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from . import db, export, gateway, identity, metering
+from . import db, export, gateway, identity, issuance, metering, portal
 
 bearer = HTTPBearer(auto_error=True)
 
@@ -44,6 +44,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="control-plane", lifespan=lifespan)
+
+# The portal — the user-facing face of this service. Mounted here rather than shipped as a
+# separate deployment because the standing constraint is one control plane, not twelve
+# consoles, and a portal that was its own service would have been the fifth front door.
+# Its routes authenticate from the sidecar proxy; /admin/* below is untouched and still
+# requires the shared admin token.
+app.include_router(portal.router)
 
 
 # ---------------------------------------------------------------- health
@@ -229,79 +236,10 @@ async def issue_key(req: IssueKeyRequest):
     *provisioned on demand*: the IDE workspace pod has to be handed a live key at the
     moment it is created, and by then nobody holds one.
 
-    So this is the one path that returns a raw key, and it is a rotation rather than a
-    read: the old key for that (principal, surface) is deleted at the gateway before the
-    new one exists. Consequences, stated because they are the reason this is not just a
-    getter —
-      * a leaked pod manifest cannot outlive the next reprovision;
-      * anything still holding the previous key stops working, which is correct: two
-        live keys for one surface would make spend attribution a guess again;
-      * the ledger's token hash is updated in the same call, so /admin/budget keeps
-        working. Minting straight at the gateway instead would leave the recorded hash
-        pointing at a deleted key, and budget updates would fail against a key that no
-        longer exists — silently, from the operator's point of view.
+    The mechanics live in `issuance.issue` because the portal lets a user rotate their
+    own key and must do it the identical way; see that module for why each step is there.
     """
-    if req.surface not in gateway.SURFACES:
-        raise HTTPException(400, f"unknown surface: {req.surface}")
-
-    pool = await db.pool()
-    async with pool.acquire() as conn:
-        principal = await conn.fetchrow(
-            "SELECT id, idp_user_id, enabled FROM principal WHERE username = $1",
-            req.username,
-        )
-        if principal is None:
-            raise HTTPException(404, f"no such principal: {req.username} (run /admin/sync)")
-        if not principal["enabled"]:
-            # Handing a spendable key to a principal identity has disabled is the exact
-            # failure scope item 6 exists to prevent.
-            raise HTTPException(409, f"{req.username} is disabled in the identity provider")
-
-        existing = await conn.fetchrow(
-            "SELECT max_budget, status FROM virtual_key "
-            "WHERE principal_id = $1 AND surface = $2",
-            principal["id"], req.surface,
-        )
-
-    alias = gateway.key_alias(req.username, req.surface)
-    max_budget = float(existing["max_budget"]) if existing and existing["max_budget"] is not None else None
-
-    # missing_ok: there may be no key to rotate. That is the normal state the first time
-    # a surface is provisioned, and it is also the state after a revocation, so treating
-    # "nothing to delete" as an error makes this endpoint fail in exactly the two cases
-    # an operator most needs it to work.
-    await gateway.delete_by_aliases([alias], missing_ok=True)
-    created = await gateway.generate_key(
-        username=req.username,
-        surface=req.surface,
-        idp_user_id=principal["idp_user_id"],
-        max_budget=max_budget,
-    )
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO virtual_key
-                (principal_id, surface, key_alias, gateway_token_hash, max_budget, status)
-            VALUES ($1, $2, $3, $4, $5, 'active')
-            ON CONFLICT (principal_id, surface) DO UPDATE
-                SET gateway_token_hash = EXCLUDED.gateway_token_hash,
-                    key_alias = EXCLUDED.key_alias,
-                    status = 'active',
-                    revoked_at = NULL,
-                    max_budget = EXCLUDED.max_budget
-            """,
-            principal["id"], req.surface, alias, created.get("token"), max_budget,
-        )
-
-    await db.audit(
-        "admin", "key.issue", req.username,
-        surface=req.surface, rotated=existing is not None, max_budget=max_budget,
-    )
-    return IssuedKey(
-        username=req.username, surface=req.surface, key_alias=alias,
-        key=created["key"], max_budget=max_budget, rotated=existing is not None,
-    )
+    return IssuedKey(**await issuance.issue(req.username, req.surface, actor="admin"))
 
 
 class BudgetRequest(BaseModel):

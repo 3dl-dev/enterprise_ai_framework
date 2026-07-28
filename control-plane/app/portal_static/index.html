@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your account</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>◆</text></svg>">
+<link rel="stylesheet" href="/portal/static/style.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand"><span class="mark">◆</span><span>Enterprise AI</span></div>
+  <div class="spacer"></div>
+  <div class="who" id="who" hidden>
+    <span class="avatar" id="avatar"></span>
+    <span class="names"><strong id="username">…</strong><span id="email"></span></span>
+  </div>
+  <a class="btn ghost" id="signout" href="/portal/oauth2/sign_out">Sign out</a>
+</header>
+
+<main>
+  <section class="lede">
+    <h1>Everything in one place</h1>
+    <p>One login, one bill, one trail — across every surface you use.</p>
+  </section>
+
+  <!-- The four front doors that used to be four separate URLs. -->
+  <section class="cards" id="cards">
+    <a class="card" id="card-chat" href="#" target="_blank" rel="noopener">
+      <span class="glyph">💬</span>
+      <h2>Chat</h2>
+      <p>Ask, research, write. Skills, tools and memory.</p>
+      <span class="go">Open<span class="arr">→</span></span>
+    </a>
+    <a class="card" id="card-workspace" href="#" target="_blank" rel="noopener">
+      <span class="glyph">⌨️</span>
+      <h2>Workshop</h2>
+      <p>A coding agent in a real terminal, with a live preview.</p>
+      <span class="go">Open<span class="arr">→</span></span>
+      <span class="muted-note" id="no-workspace" hidden>No workspace yet</span>
+    </a>
+    <a class="card" id="card-published" href="#" target="_blank" rel="noopener">
+      <span class="glyph">🌍</span>
+      <h2>Shared work</h2>
+      <p>What you have published, as anyone else sees it.</p>
+      <span class="go">Open<span class="arr">→</span></span>
+    </a>
+  </section>
+
+  <div class="grid">
+
+    <section class="panel" id="panel-spend">
+      <div class="panel-head">
+        <h3>Your spend</h3>
+        <select id="since" aria-label="Time range">
+          <option value="">All time</option>
+          <option value="24h">Last 24 hours</option>
+          <option value="7d">Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+        </select>
+      </div>
+      <div class="total"><span class="amount" id="spend-total">—</span><span class="unit">spent</span></div>
+      <table class="tbl" id="spend-table">
+        <thead><tr><th>Surface</th><th class="num">Requests</th><th class="num">Tokens</th><th class="num">Spend</th></tr></thead>
+        <tbody id="spend-rows"></tbody>
+      </table>
+      <p class="empty" id="spend-empty" hidden>Nothing yet. Spend appears here as you use the surfaces above.</p>
+      <p class="note">Attributed from the key that made each request. Nobody else can bill you.</p>
+    </section>
+
+    <section class="panel" id="panel-work">
+      <div class="panel-head"><h3>Your published projects</h3></div>
+      <ul class="worklist" id="worklist"></ul>
+      <p class="empty" id="work-empty" hidden>Nothing shared yet. Press <strong>Share it</strong> in the Workshop and it turns up here.</p>
+      <p class="note">These links need no login — that is the point. Anyone holding one can open it.</p>
+    </section>
+
+    <section class="panel" id="panel-keys">
+      <div class="panel-head"><h3>Your API keys</h3></div>
+      <p class="note top">One key per surface, spending against your own budget through the gateway. No provider credential ever reaches your machine.</p>
+      <ul class="keylist" id="keylist"></ul>
+      <p class="empty" id="keys-empty" hidden>No keys issued yet.</p>
+    </section>
+
+    <section class="panel" id="panel-account">
+      <div class="panel-head"><h3>Account</h3></div>
+      <ul class="linklist">
+        <li><a id="link-password" href="#" target="_blank" rel="noopener">
+          <strong>Change your password</strong><span>Also two-factor, and the devices you are signed in on.</span></a></li>
+        <li><a id="link-account" href="#" target="_blank" rel="noopener">
+          <strong>Manage your account</strong><span>Name, email and sessions.</span></a></li>
+      </ul>
+    </section>
+
+  </div>
+</main>
+
+<dialog class="dlg" id="dlg-key">
+  <h3 id="dlg-key-title">Your new key</h3>
+  <p class="note">Copy it now. It is stored only as a hash, so it cannot be shown again.</p>
+  <div class="secret"><code id="new-key"></code></div>
+  <menu>
+    <button class="btn" id="copy-key">Copy</button>
+    <button class="btn primary" id="close-key" autofocus>Done</button>
+  </menu>
+</dialog>
+
+<dialog class="dlg" id="dlg-confirm">
+  <form method="dialog">
+    <h3 id="confirm-title">Are you sure?</h3>
+    <p class="note" id="confirm-body"></p>
+    <menu>
+      <button class="btn ghost" value="cancel" type="submit">Never mind</button>
+      <button class="btn danger" id="confirm-go" value="ok" type="submit">Yes</button>
+    </menu>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" hidden role="status"></div>
+<div class="failbar" id="failbar" hidden role="alert">Lost contact with the control plane. <button class="linkish" id="retry">Try again</button></div>
+
+<script src="/portal/static/app.js"></script>
+</body>
+</html>

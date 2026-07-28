@@ -1,0 +1,241 @@
+/* The portal. Same token set as the Workshop shell, deliberately: a person moving
+ * between the two surfaces should not feel they changed products. If the Workshop's
+ * palette changes, change it here in the same commit. */
+
+:root {
+  color-scheme: dark;
+  --bg:          #0B0B0F;
+  --bg-sunken:   #08080B;
+  --surface:     #131318;
+  --surface-2:   #1A1A21;
+  --surface-3:   #22222B;
+  --line-soft:   #1F1F27;
+  --line:        #2A2A34;
+  --line-strong: #3A3A47;
+  --ink:         #F2F1F6;
+  --ink-2:       #C9C7D4;
+  --ink-3:       #8B8899;
+  --ink-4:       #63606F;
+  --accent:      #FF6FA5;
+  --accent-hi:   #FF87B4;
+  --accent-ink:  #2A0A17;
+  --accent-a:    rgba(255,111,165,.14);
+  --ok:          #3DDC97;
+  --ok-a:        rgba(61,220,151,.13);
+  --warn:        #F5B045;
+  --danger:      #FF5C7A;
+  --danger-a:    rgba(255,92,122,.13);
+  --focus:       #8B7BFF;
+  --sh-1: 0 1px 2px rgba(0,0,0,.40);
+  --sh-2: 0 4px 12px -2px rgba(0,0,0,.50), 0 1px 2px rgba(0,0,0,.40);
+  --sh-3: 0 18px 48px -12px rgba(0,0,0,.70), 0 2px 8px rgba(0,0,0,.45);
+  --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --ease: cubic-bezier(.2,.7,.2,1);
+}
+
+/* [hidden] is a user-agent rule, so any author rule that sets display beats it. Every
+ * hideable element here has one. Without this line, "hidden" hides nothing — a bug that
+ * shipped once in the Workshop and showed every empty state at once. */
+[hidden] { display: none !important; }
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.55 var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+a { color: inherit; text-decoration: none; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 6px; }
+
+/* ---------------------------------------------------------------- bar */
+
+.bar {
+  display: flex; align-items: center; gap: 12px;
+  height: 56px; padding: 0 20px;
+  background: linear-gradient(180deg, var(--surface) 0%, rgba(19,19,24,.86) 100%);
+  border-bottom: 1px solid var(--line-soft);
+  position: sticky; top: 0; z-index: 20;
+  backdrop-filter: blur(8px);
+}
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 620; letter-spacing: -.01em; }
+.brand .mark { color: var(--accent); font-size: 15px; }
+.spacer { flex: 1; }
+.who { display: flex; align-items: center; gap: 10px; }
+.avatar {
+  width: 30px; height: 30px; border-radius: 50%;
+  display: grid; place-items: center;
+  background: linear-gradient(145deg, var(--accent) 0%, #A45BFF 100%);
+  color: var(--accent-ink); font-weight: 700; font-size: 13px;
+}
+.names { display: flex; flex-direction: column; line-height: 1.2; }
+.names strong { font-size: 13.5px; font-weight: 600; }
+.names span { font-size: 11.5px; color: var(--ink-3); }
+
+/* ---------------------------------------------------------------- layout */
+
+main { max-width: 1080px; margin: 0 auto; padding: 40px 20px 72px; }
+.lede { margin-bottom: 28px; }
+.lede h1 { margin: 0 0 6px; font-size: 30px; font-weight: 660; letter-spacing: -.025em; }
+.lede p { margin: 0; color: var(--ink-3); font-size: 15px; }
+
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 28px; }
+.card {
+  position: relative; display: flex; flex-direction: column; gap: 6px;
+  padding: 20px; border-radius: 14px;
+  background: var(--surface); border: 1px solid var(--line);
+  box-shadow: var(--sh-1);
+  transition: transform .18s var(--ease), border-color .18s var(--ease), box-shadow .18s var(--ease);
+}
+.card:hover { transform: translateY(-2px); border-color: var(--line-strong); box-shadow: var(--sh-2); }
+.card .glyph { font-size: 22px; }
+.card h2 { margin: 4px 0 0; font-size: 16px; font-weight: 620; }
+.card p { margin: 0; color: var(--ink-3); font-size: 13.5px; min-height: 2.8em; }
+.card .go { margin-top: 6px; font-size: 13px; color: var(--accent); font-weight: 560; }
+.card .arr { display: inline-block; margin-left: 5px; transition: transform .18s var(--ease); }
+.card:hover .arr { transform: translateX(3px); }
+.card.disabled { opacity: .55; pointer-events: none; }
+.muted-note { font-size: 12px; color: var(--ink-4); }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+.panel {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 14px; padding: 18px 20px 20px;
+}
+.panel-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+.panel-head h3 { margin: 0; font-size: 14px; font-weight: 620; letter-spacing: .01em; }
+.panel-head select {
+  margin-left: auto; background: var(--surface-2); color: var(--ink-2);
+  border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px;
+  font: inherit; font-size: 12.5px;
+}
+
+/* ---------------------------------------------------------------- spend */
+
+.total { display: flex; align-items: baseline; gap: 8px; margin-bottom: 14px; }
+.amount { font-size: 32px; font-weight: 640; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+.unit { color: var(--ink-3); font-size: 13px; }
+
+.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
+.tbl th {
+  text-align: left; font-weight: 560; color: var(--ink-4); font-size: 11.5px;
+  text-transform: uppercase; letter-spacing: .05em; padding: 0 0 7px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.tbl td { padding: 9px 0; border-bottom: 1px solid var(--line-soft); color: var(--ink-2); }
+.tbl tr:last-child td { border-bottom: 0; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.surface-tag {
+  display: inline-block; padding: 2px 8px; border-radius: 999px;
+  background: var(--surface-3); color: var(--ink-2); font-size: 11.5px; font-weight: 560;
+}
+
+/* ---------------------------------------------------------------- lists */
+
+.worklist, .keylist, .linklist { list-style: none; margin: 0; padding: 0; }
+.worklist li, .keylist li {
+  display: flex; align-items: center; gap: 10px;
+  padding: 11px 0; border-bottom: 1px solid var(--line-soft);
+}
+.worklist li:last-child, .keylist li:last-child { border-bottom: 0; }
+.worklist .name, .keylist .alias { font-weight: 560; font-size: 13.5px; }
+.worklist .name { font-family: var(--font-mono); }
+.keylist .alias { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-2); }
+.keylist .meta { font-size: 12px; color: var(--ink-4); }
+.grow { flex: 1; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
+
+.linklist li { border-bottom: 1px solid var(--line-soft); }
+.linklist li:last-child { border-bottom: 0; }
+.linklist a { display: flex; flex-direction: column; gap: 2px; padding: 12px 0; }
+.linklist strong { font-size: 13.5px; font-weight: 560; }
+.linklist span { font-size: 12.5px; color: var(--ink-3); }
+.linklist a:hover strong { color: var(--accent); }
+
+.note { color: var(--ink-4); font-size: 12px; margin: 14px 0 0; }
+.note.top { margin: -4px 0 12px; }
+.empty { color: var(--ink-3); font-size: 13px; margin: 4px 0 0; }
+
+/* ---------------------------------------------------------------- buttons */
+
+.btn {
+  appearance: none; border: 1px solid var(--line-strong); background: var(--surface-2);
+  color: var(--ink); font: inherit; font-size: 13px; font-weight: 560;
+  padding: 7px 13px; border-radius: 9px; cursor: pointer;
+  transition: background .15s var(--ease), border-color .15s var(--ease), transform .1s var(--ease);
+}
+.btn:hover { background: var(--surface-3); }
+.btn:active { transform: translateY(1px); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--ink-3); }
+.btn.ghost:hover { background: var(--surface-2); color: var(--ink); }
+.btn.small { padding: 5px 10px; font-size: 12.5px; }
+.btn.primary {
+  background: linear-gradient(145deg, var(--accent-hi) 0%, var(--accent) 100%);
+  border-color: transparent; color: var(--accent-ink); font-weight: 620;
+}
+.btn.danger { background: var(--danger-a); border-color: var(--danger); color: var(--danger); }
+.btn[disabled] { opacity: .5; cursor: default; }
+.linkish {
+  background: none; border: 0; color: inherit; font: inherit;
+  text-decoration: underline; cursor: pointer; padding: 0;
+}
+
+/* ---------------------------------------------------------------- dialogs */
+
+.dlg {
+  border: 1px solid var(--line-strong); background: var(--surface);
+  color: var(--ink); border-radius: 14px; padding: 22px;
+  max-width: 460px; width: calc(100vw - 32px); box-shadow: var(--sh-3);
+}
+.dlg::backdrop { background: rgba(0,0,0,.6); backdrop-filter: blur(2px); }
+.dlg h3 { margin: 0 0 6px; font-size: 16px; font-weight: 620; }
+.dlg menu { display: flex; gap: 8px; justify-content: flex-end; margin: 18px 0 0; padding: 0; }
+.secret {
+  margin-top: 14px; padding: 12px; border-radius: 9px;
+  background: var(--bg-sunken); border: 1px solid var(--line);
+  font-family: var(--font-mono); font-size: 12.5px; word-break: break-all; color: var(--ok);
+}
+
+/* ---------------------------------------------------------------- toast + failbar */
+
+.toast {
+  position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+  background: var(--surface-3); border: 1px solid var(--line-strong);
+  padding: 11px 16px; border-radius: 10px; box-shadow: var(--sh-3);
+  font-size: 13.5px; z-index: 60; max-width: min(560px, calc(100vw - 32px));
+  animation: rise .2s var(--ease);
+}
+.toast.bad { border-color: var(--danger); color: var(--danger); }
+@keyframes rise { from { opacity: 0; transform: translate(-50%, 8px); } }
+
+.failbar {
+  position: fixed; left: 0; right: 0; bottom: 0;
+  background: var(--danger-a); border-top: 1px solid var(--danger);
+  color: var(--danger); padding: 10px 16px; text-align: center; font-size: 13px; z-index: 70;
+}
+
+/* ---------------------------------------------------------------- responsive
+ * The Workshop shipped with a header that overflowed below 560px because its rules
+ * stopped at 720. These go all the way down. */
+
+@media (max-width: 900px) {
+  .cards { grid-template-columns: 1fr; }
+  .grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 620px) {
+  main { padding: 28px 14px 60px; }
+  .lede h1 { font-size: 24px; }
+  .names span { display: none; }
+}
+@media (max-width: 420px) {
+  .bar { padding: 0 12px; gap: 8px; }
+  .brand span:last-child { display: none; }
+  .names strong { max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: .001ms !important; transition-duration: .001ms !important; }
+}
