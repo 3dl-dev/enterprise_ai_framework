@@ -19,6 +19,40 @@ interface:
   # Claude-like rendering of code and HTML the model produces. Built into the surface,
   # off by default, and the single biggest difference in how finished this feels.
   artifacts: true
+  # Surfaces the memories panel in Settings so a user can see/edit what was stored.
+  # Purely a UI toggle — does not gate whether memory is extracted (see `memory` below).
+  memories: true
+
+# LibreChat's native memory (api/server/routes/memories.js + the `memory` Mongo
+# collection in data-schemas) — CONFIGURED, not built. A durable per-user preference
+# stated in one conversation is available in every later conversation because it is
+# read from Mongo on every turn (api/server/controllers/agents/client.js #useMemory),
+# not from anything held in the chat process — a deployment restart does not lose it.
+#
+# `agent.provider` must equal an `endpoints.custom[].name` below EXACTLY
+# (server/services/Endpoints/index.js#getProviderConfig falls through to
+# getCustomEndpointConfig by exact string match when the provider isn't one of the
+# built-in EModelEndpoint/Providers names) — so the memory-extraction agent is routed
+# through our own gateway on the chat surface's virtual key, same as any other model
+# call: same ledger, same audit trail, no second credential.
+#
+# Model choice: glm-5.2@deepinfra, not the cheaper glm-4.7 — memory extraction is a
+# tool call (`set_memory`/`delete_memory`) on every turn, and glm-5.2 is the model
+# this bundle has actually measured invoking tools reliably (wave 1). Getting this
+# wrong is silent (the model just answers instead of calling the tool) rather than a
+# visible error, so it is not a place to guess.
+#
+# Left on the library's default instructions/behavior (see librechat's
+# getDefaultInstructions): memory is written only when the user explicitly asks to be
+# remembered ("remember that...", "don't forget..."), not opportunistically mined from
+# every message — matching the item's own scenario ("a user tells the chat a durable
+# preference").
+memory:
+  personalize: true
+  messageWindowSize: 5
+  agent:
+    provider: "Enterprise AI"
+    model: "glm-5.2@deepinfra"
 
 # Defaults. Without these the surface opens with nothing selected and the user has to
 # know which of eleven models to pick before they can type anything — which reads as
