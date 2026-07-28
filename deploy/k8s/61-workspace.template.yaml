@@ -114,6 +114,7 @@ spec:
           env:
             - { name: WS_USER, value: "__USER__" }
             - { name: WS_PROJECT_DIR, value: "/workspace/project" }
+            - { name: WS_PUBLISH_URL, value: "__PUBLISH_URL__" }
             # One route out of the building. The pod has no provider credential of any
             # kind — this is a virtual key on our own gateway.
             - { name: OPENAI_API_BASE, value: "http://gateway:4000/v1" }
@@ -130,6 +131,11 @@ spec:
             - { name: ttyd, containerPort: 7681 }
           volumeMounts:
             - { name: workspace, mountPath: /workspace }
+            # Published output. RWO is node-scoped in Kubernetes, so several pods on the
+            # SAME node may mount it — true today because there is one worker. If a second
+            # worker is ever added, workspaces scheduled there lose publishing and this
+            # has to become a real upload service instead of a shared mount.
+            - { name: published, mountPath: /published }
             - { name: home, mountPath: /home/coder }
           resources:
             # k3s-worker runs live GPU training. A student running `make -j` must not be
@@ -207,6 +213,9 @@ spec:
             requests: { cpu: "25m", memory: "32Mi" }
             limits:   { cpu: "200m", memory: "128Mi" }
       volumes:
+        - name: published
+          persistentVolumeClaim:
+            claimName: published
         - name: workspace
           persistentVolumeClaim: { claimName: ws-__USER__ }
         # $HOME is not on the PVC. aider's caches and pip's build dirs go here and are

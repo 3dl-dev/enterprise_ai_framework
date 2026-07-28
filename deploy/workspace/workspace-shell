@@ -17,9 +17,18 @@ if [ -z "${WS_NO_AUTOSTART:-}" ]; then
     # Confirmation behaviour is set in the image (AIDER_YES_ALWAYS), not here, so that a
     # user who types `aider` by hand after this exits gets identical behaviour rather than
     # a quieter or noisier agent depending on how it was started.
-    aider || true
+    # WS_AGENT selects what the terminal opens into. opencode by default: it is
+    # autonomous and explores the repo itself, where aider requires you to nominate
+    # files first. aider stays installed and is one word away.
+    case "${WS_AGENT:-opencode}" in
+        aider)    aider || true ;;
+        none)     : ;;
+        *)        opencode || true ;;
+    esac
     echo
-    echo "aider exited — you are in a shell. Type 'aider' to start it again."
+    echo "agent exited — you are in a shell."
+    echo "  opencode   autonomous agent (default)"
+    echo "  aider      pair-programmer, needs files added to the chat"
     echo
 fi
 

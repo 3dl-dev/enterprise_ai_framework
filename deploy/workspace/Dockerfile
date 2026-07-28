@@ -22,7 +22,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git make gcc g++ libc6-dev \
-        jq less nano vim-tiny procps tini \
+        jq less nano vim-tiny procps tini rsync \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL -o /usr/local/bin/ttyd \
@@ -35,6 +35,17 @@ RUN curl -fsSL -o /usr/local/bin/ttyd \
 # command that actually runs, which is half the outcome this image exists for.
 RUN pip install --no-cache-dir "aider-chat==${AIDER_VERSION}" pytest
 
+# OpenCode (MIT) — an autonomous terminal agent, the Claude Code shape: it explores the
+# repo itself rather than asking which files to add to the chat, which is the thing aider
+# structurally will not do. Both are installed. Aider stays because it is measured against
+# this gateway (see model-settings.yml) and a known-good fallback costs one binary.
+#
+# The standalone installer is used rather than npm so the image needs no Node runtime.
+RUN curl -fsSL https://opencode.ai/install | bash \
+    && install -m 0755 /root/.opencode/bin/opencode /usr/local/bin/opencode \
+    && rm -rf /root/.opencode \
+    && /usr/local/bin/opencode --version
+
 # Runs as an unprivileged user. The pod additionally has no service-account token, no
 # route to the API server and no route to any other workspace — but a container that
 # starts as root is one CVE away from all of that mattering, so it does not start as root.
@@ -43,8 +54,21 @@ RUN useradd --create-home --uid 1000 --shell /bin/bash coder \
     && chown coder:coder /workspace
 
 COPY model-settings.yml model-metadata.json /etc/aider/
-COPY entrypoint.sh workspace-shell /usr/local/bin/
-RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/workspace-shell
+# Global opencode config. NOTE: opencode validates this against a strict schema and
+# rejects unknown keys, including a "_comment" field — so the reasoning lives here:
+#
+#   - baseURL/apiKey come from the pod env. The pod holds a per-user virtual key and no
+#     provider credential, so this is the only route out and every request is metered,
+#     budgeted and audited against the signed-in user.
+#   - Limits are stated explicitly because the gateway presents these models as a generic
+#     OpenAI endpoint; nothing upstream knows their real shape, and a client that assumes
+#     a small context silently truncates history until the agent edits files it can no
+#     longer see. Context is from the Forge catalogue. Output is the FULL provider budget,
+#     not half: these models spend part of the same budget reasoning, so a short cap
+#     truncates the answer after the thinking rather than shortening it.
+COPY opencode.json /etc/opencode/opencode.json
+COPY entrypoint.sh workspace-shell publish /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/workspace-shell /usr/local/bin/publish
 
 USER coder
 WORKDIR /workspace

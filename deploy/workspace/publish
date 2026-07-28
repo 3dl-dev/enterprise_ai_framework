@@ -1,0 +1,57 @@
+#!/bin/bash
+# publish — copy this project somewhere a parent can open it.
+#
+#   publish            publish the whole project
+#   publish dist       publish just ./dist
+#
+# WHY IT IS AN EXPLICIT COMMAND
+#
+# Everything else in this workspace sits behind a login. A parent has no account, so the
+# only way they see anything is if it is copied OUT of the authenticated area into a
+# volume served with no authentication at all. That is a one-way door, so it is never
+# automatic: nothing leaves unless a person types this word.
+#
+# What lands there is static files served by a plain web server with no interpreter, and
+# no workspace volume is mounted alongside it — so a published page cannot reach back
+# into anybody's work.
+set -euo pipefail
+
+USER_NAME="${WS_USER:-coder}"
+PROJECT="${WS_PROJECT_DIR:-/workspace/project}"
+SRC="$(cd "${1:-$PROJECT}" 2>/dev/null && pwd)" || { echo "publish: no such directory: ${1:-$PROJECT}" >&2; exit 1; }
+DEST="/published/${USER_NAME}"
+
+if [[ ! -d /published ]]; then
+    echo "publish: this workspace has no published volume mounted." >&2
+    echo "         Ask the operator to re-provision it." >&2
+    exit 1
+fi
+
+if [[ ! -f "$SRC/index.html" ]]; then
+    echo "publish: $SRC has no index.html, so a browser would have nothing to open."
+    echo
+    echo "  Ask the agent: \"put the game in an index.html I can open in a browser\""
+    exit 1
+fi
+
+SIZE_KB=$(du -sk --exclude=.git --exclude=node_modules "$SRC" | cut -f1)
+if (( SIZE_KB > 20480 )); then
+    echo "publish: that folder is ${SIZE_KB}KB, larger than this is meant for." >&2
+    echo "         Publish a built folder rather than the whole project." >&2
+    exit 1
+fi
+
+echo "==> publishing $SRC"
+mkdir -p "$DEST"
+# --delete so republishing REPLACES rather than layering a new version over an old one;
+# a stale file left behind is how a parent ends up looking at last week's version.
+rsync -a --delete \
+    --exclude=.git --exclude=node_modules --exclude=__pycache__ --exclude='*.pyc' \
+    "$SRC"/ "$DEST"/
+
+echo
+echo "  Published. Anyone with this link can open it — no login needed:"
+echo
+echo "      ${WS_PUBLISH_URL:-http://<ask the operator>}/live/${USER_NAME}/"
+echo
+echo "  Run 'publish' again to replace it with your latest version."

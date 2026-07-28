@@ -1,0 +1,117 @@
+# Published work — the thing a kid sends to a parent.
+#
+# THE CONSTRAINT THAT SHAPES THIS: a parent has no Keycloak account. Everything else in
+# this namespace sits behind oauth2-proxy and is unreachable to them. So publishing means
+# copying built output OUT of the authenticated workspace into a volume that is served
+# with NO authentication at all.
+#
+# That is a deliberate one-way door and it is worth being explicit about:
+#   - Only what a user explicitly publishes leaves. Nothing is published by default.
+#   - The published volume holds static files only. It is served by a plain web server
+#     with no interpreter, so a published file cannot execute anything server-side.
+#   - The workspace PVCs are NOT mounted here. A bug in this server cannot read a
+#     workspace, only what was copied into the published volume.
+#   - Each user writes to their own subdirectory, so publishing cannot overwrite another
+#     child's work.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: published
+  namespace: enterprise-ai
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: published
+  namespace: enterprise-ai
+spec:
+  type: NodePort
+  selector: { app: published }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      nodePort: 30450
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: published
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: published } }
+  template:
+    metadata:
+      labels: { app: published }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        seccompProfile: { type: RuntimeDefault }
+      # No cluster credential. This pod serves files to the open internet; it has no
+      # business holding a token that can talk to the API server.
+      automountServiceAccountToken: false
+      containers:
+        - name: web
+          # nginx-unprivileged: a plain static file server, no interpreter, non-root.
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+            readOnlyRootFilesystem: false
+          ports: [{ name: http, containerPort: 8080 }]
+          volumeMounts:
+            - { name: published, mountPath: /usr/share/nginx/html/live, readOnly: true }
+            - { name: conf, mountPath: /etc/nginx/conf.d/default.conf, subPath: default.conf, readOnly: true }
+          resources:
+            requests: { cpu: "25m", memory: "32Mi" }
+            limits:   { memory: "128Mi" }
+          readinessProbe:
+            httpGet: { path: /live/, port: 8080 }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+      volumes:
+        - name: published
+          persistentVolumeClaim:
+            claimName: published
+        - name: conf
+          configMap:
+            name: published-nginx
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: published-nginx
+  namespace: enterprise-ai
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        server_name _;
+
+        # Directory listing at /live/ so a kid can see everything they have published,
+        # and a parent given the top-level link can find the right one.
+        # alias + autoindex, deliberately WITHOUT try_files: a try_files chain ending in
+        # =404 intercepts the request before autoindex can list the directory, so an
+        # empty published volume 404s instead of showing an empty index — which reads as
+        # the server being broken rather than as nobody having published yet.
+        location /live/ {
+            alias /usr/share/nginx/html/live/;
+            index index.html;
+            autoindex on;
+            autoindex_exact_size off;
+            autoindex_localtime on;
+        }
+
+        # Published pages are static and change when a child republishes; caching them
+        # means a parent refreshing sees yesterday's version and thinks it is broken.
+        add_header Cache-Control "no-store";
+
+        location = / { return 302 /live/; }
+    }

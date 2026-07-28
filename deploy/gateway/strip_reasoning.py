@@ -1,45 +1,72 @@
-"""Strip provider reasoning traces from responses at the gateway.
+"""Gateway response hygiene: strip reasoning traces, normalise artifact fences.
 
-WHY THIS IS AT THE GATEWAY AND NOT IN A SURFACE
+Both problems are provider/model behaviour rather than client behaviour, so both are
+fixed here once instead of in every surface that renders model output.
+
+REASONING
 
 GLM models served through DeepInfra return their chain of thought in a separate
-`reasoning_content` field alongside the answer. Three things make that a gateway problem
-rather than a client one:
+`reasoning_content` field. Measured against this gateway, the provider ignores every
+documented way to turn it off — `reasoning_effort: none`, `thinking: {type: disabled}`,
+`chat_template_kwargs: {thinking: false}` all come back unchanged. Aider renders it
+unconditionally (base_coder.py prepends it, with no flag), and so would any other client.
 
-1. The provider will not turn it off. Measured against this gateway: `reasoning_effort:
-   none`, `thinking: {type: disabled}` and `chat_template_kwargs: {thinking: false}` all
-   come back with reasoning_content unchanged.
-2. Aider renders it unconditionally — `base_coder.py` prepends the formatted reasoning to
-   every displayed response, with no flag to suppress it.
-3. It is not one client's problem. Any surface that shows model output shows this, so
-   fixing it in a surface means fixing it again in the next surface.
+Stripping it here does NOT stop the model reasoning and does NOT stop you paying for
+those tokens — they are generated and billed upstream either way. Token counts in the
+metering ledger are deliberately untouched: a gateway that hid reasoning AND stopped
+counting it would understate the bill, which is the failure this project cares most about.
 
-Stripping here fixes the chat surface, the coding agent, and anything added later, once.
+ARTIFACT FENCES
 
-WHAT THIS DOES NOT DO
+The chat surface renders runnable programs using Anthropic's artifact format — a
+`:::artifact{...}` opening fence. Claude models emit it natively; it is their own
+convention. Models trained without it approximate it, and GLM emits `::artifact{...}`
+with two colons, consistently, however firmly the system prompt states three. The parser
+does not match, so the user is shown raw HTML instead of a running program.
 
-It does not stop the model reasoning, and it does not stop you paying for those tokens —
-they are generated upstream and billed as output either way. It only stops them being
-displayed. Reducing the spend needs a model that reasons less, or a provider that honours
-a disable flag; neither is available in the priced catalogue today.
-
-The token counts in the metering ledger are untouched, so the bill still reflects what was
-actually generated. A gateway that hid reasoning AND stopped counting it would understate
-spend, which is the failure mode this project cares most about.
+Prompting was tried first, twice, and does not hold. This rewrite is deterministic and
+model-agnostic, so the next model with its own near-miss is covered by the same rule.
 """
+
+import re
 
 from litellm.integrations.custom_logger import CustomLogger
 
 # Providers are inconsistent about which of these they populate.
 _REASONING_FIELDS = ("reasoning_content", "reasoning")
 
+# One-to-four colons directly before `artifact{`, not preceded by another colon or a word
+# character. Narrow on purpose: ordinary prose containing colons is not a match.
+_OPEN_FENCE = re.compile(r"(?<![:\w]):{1,4}artifact\{")
+
+# The longest tail that could still grow into an opening fence on the next chunk.
+_FENCE_TARGET = ":::artifact{"
+
+
+def _normalise_fences(text: str) -> str:
+    if "artifact{" not in text:
+        return text
+    return _OPEN_FENCE.sub(":::artifact{", text)
+
+
+def _split_pending_fence(text: str) -> tuple[str, str]:
+    """Split off a trailing fragment that might be the start of a fence.
+
+    Returns (carry, emit). A chunk ending in `::art` must not be emitted yet — the rest
+    of the fence arrives next. Anything that cannot become a fence is emitted immediately
+    so streaming stays responsive.
+    """
+    for n in range(min(len(text), len(_FENCE_TARGET) - 1), 0, -1):
+        tail = text[-n:]
+        # A tail is pending if it is a prefix of the fence, allowing for the two-colon
+        # variant we are correcting (`::a`, `::art`, …) as well as the correct one.
+        if _FENCE_TARGET.startswith(tail) or _FENCE_TARGET[1:].startswith(tail):
+            return tail, text[:-n]
+    return "", text
+
 
 def _strip(obj) -> None:
-    """Remove reasoning fields from a message or delta, in place.
-
-    Handles both pydantic-style objects and plain dicts because LiteLLM hands back
-    different shapes on the streaming and non-streaming paths.
-    """
+    """Remove reasoning fields from a message or delta, in place."""
     if obj is None:
         return
     for field in _REASONING_FIELDS:
@@ -50,30 +77,102 @@ def _strip(obj) -> None:
             try:
                 setattr(obj, field, None)
             except (AttributeError, ValueError):
-                # A frozen or computed attribute: leave it rather than fail the request.
-                # Showing reasoning is a cosmetic defect; a 500 is not.
+                # Frozen or computed attribute. Showing reasoning is cosmetic; a 500 is
+                # not, so leave it rather than fail the request.
                 pass
+
+
+def _get_delta(choice):
+    delta = getattr(choice, "delta", None)
+    if delta is None and isinstance(choice, dict):
+        delta = choice.get("delta")
+    return delta
+
+
+def _get_content(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get("content")
+    return getattr(obj, "content", None)
+
+
+def _set_content(obj, value) -> None:
+    if isinstance(obj, dict):
+        obj["content"] = value
+        return
+    try:
+        obj.content = value
+    except (AttributeError, ValueError):
+        pass
 
 
 def _strip_response(response):
     for choice in getattr(response, "choices", None) or []:
         _strip(getattr(choice, "message", None))
-        _strip(getattr(choice, "delta", None))
+        _strip(_get_delta(choice))
         if isinstance(choice, dict):
             _strip(choice.get("message"))
-            _strip(choice.get("delta"))
+    return response
+
+
+def _rewrite_whole(response):
+    """Non-streaming: the complete text is present, so rewrite it directly."""
+    for choice in getattr(response, "choices", None) or []:
+        for holder in (getattr(choice, "message", None),
+                       choice.get("message") if isinstance(choice, dict) else None):
+            text = _get_content(holder)
+            if isinstance(text, str) and text:
+                _set_content(holder, _normalise_fences(text))
     return response
 
 
 class StripReasoning(CustomLogger):
     async def async_post_call_success_hook(self, data, user_api_key_dict, response):
-        return _strip_response(response)
+        return _rewrite_whole(_strip_response(response))
 
     async def async_post_call_streaming_iterator_hook(
         self, user_api_key_dict, response, request_data
     ):
+        """Rewrite fences across chunk boundaries without dropping text.
+
+        Two mechanisms working together:
+          - a carry string holds a trailing fragment that could still become a fence,
+            and prepends it to the next chunk;
+          - one chunk of delay, so that when the stream ends there is always a chunk
+            left to attach the final carry to. Without the delay the carry has nowhere
+            to go and would be silently swallowed.
+        """
+        carry = ""
+        pending = None
+
         async for chunk in response:
-            yield _strip_response(chunk)
+            chunk = _strip_response(chunk)
+
+            for choice in getattr(chunk, "choices", None) or []:
+                delta = _get_delta(choice)
+                text = _get_content(delta)
+                if not isinstance(text, str) or not text:
+                    continue
+                carry, emit = _split_pending_fence(_normalise_fences(carry + text))
+                _set_content(delta, emit)
+
+            if pending is not None:
+                yield pending
+            pending = chunk
+
+        if pending is not None:
+            if carry:
+                # Flush the held fragment onto the last chunk. It was never a fence, so
+                # it is ordinary text and must still reach the user.
+                for choice in getattr(pending, "choices", None) or []:
+                    delta = _get_delta(choice)
+                    text = _get_content(delta)
+                    if isinstance(text, str):
+                        _set_content(delta, text + carry)
+                        carry = ""
+                        break
+            yield pending
 
 
 handler = StripReasoning()

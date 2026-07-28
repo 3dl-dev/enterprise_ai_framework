@@ -185,6 +185,11 @@ print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')" \
 
 KEYSUM=$(printf '%s' "$VKEY" | sha256sum | cut -c1-16)
 
+# Where a published page can be opened from. Deliberately NOT behind oauth2-proxy: the
+# audience is parents, who have no account. Override to a funnel-fronted URL when one
+# exists; the LAN NodePort is the honest default.
+PUBLISH_URL="${PUBLISH_URL:-https://gateway.tailcb6ef9.ts.net:8443}"
+
 # ---------------------------------------------------------------- apply
 kubectl apply -f deploy/k8s/60-workspace-common.yaml >/dev/null
 
@@ -196,6 +201,7 @@ sed -e "s|__USER__|${USER_NAME}|g" \
     -e "s|__ISSUER__|${ISSUER}|g" \
     -e "s|__REDIRECT__|${REDIRECT}|g" \
     -e "s|__KEYSUM__|${KEYSUM}|g" \
+    -e "s|__PUBLISH_URL__|${PUBLISH_URL}|g" \
     deploy/k8s/61-workspace.template.yaml | kubectl apply -f - >/dev/null
 
 kubectl -n "$NS" rollout status "deployment/ws-${USER_NAME}" --timeout=600s
