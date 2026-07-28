@@ -45,12 +45,40 @@ PRICE_CACHE = BUNDLE / "litellm" / "forge-pricing.cache.json"
 CATALOG_CACHE = BUNDLE / "litellm" / "forge-catalog.cache.json"
 MARKER = "# @GENERATED_UPSTREAMS@"
 
-# Models Forge quotes at exactly zero are served from hardware the operator already owns,
-# so their marginal token cost really is zero. That is a different thing from "we do not
-# know the price", but our unpriced-model detector cannot tell them apart from the ledger
-# alone — it would flag every local model forever. They are left out until the local-model
-# story (own hardware, capex not per-token) is built properly.
-ZERO_PRICE_IS_REAL_BUT_EXCLUDED = "served from owned hardware; zero marginal cost needs capex accounting, not a token price"
+# How a fake catalogue entry is recognised: by who serves it.
+FAKE_UPSTREAM = "fakeprovider:8080"
+
+
+def _without_fakes(text: str) -> str:
+    """Drop every catalogue entry served by the fake provider.
+
+    Keyed on the UPSTREAM, not the model name, because the name is not a reliable signal:
+    the base file also maps `claude-opus-5` to the fake provider, so the Anthropic-native
+    inbound path has something to answer with when there is no provider account. In a
+    cluster that has real models that entry is a trap — it is the only claude-opus-5 in
+    the catalogue, so selecting it returns "ack <hex>" from a stub while looking like a
+    frontier model. Removing by name would have left it exactly where it was.
+
+    Done textually because the base file is a commented template, and round-tripping it
+    through a YAML parser would discard the comments explaining every decision in it.
+    """
+    lines = text.splitlines(keepends=True)
+    out, i = [], 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("- model_name:"):
+            j = i + 1
+            while j < len(lines) and not lines[j].lstrip().startswith("- model_name:"):
+                if lines[j].strip() == MARKER:
+                    break
+                j += 1
+            block = "".join(lines[i:j])
+            if FAKE_UPSTREAM not in block:
+                out.append(block)
+            i = j
+            continue
+        out.append(lines[i])
+        i += 1
+    return "".join(out)
 
 
 def read_env() -> dict:
@@ -224,7 +252,15 @@ def main(argv) -> int:
             included.append(yaml_entry(m, p, base_url))
 
     block = "\n".join(included) if included else ""
-    OUT.write_text(base_text.replace(MARKER, block))
+    # Real models exist, so the fake upstreams come OUT.
+    #
+    # They are the no-provider-account fallback (scope item 8), never a supplement. Left
+    # in alongside real models they are simply two more entries in the picker that answer
+    # every prompt with "ack <hex>" — and worse, LibreChat's titleModel pointed at one,
+    # so every conversation in the cluster was named by a stub. The chats were real; only
+    # their titles came from the fake provider, which made a working history read as a
+    # broken one. Fallback or supplement, not both.
+    OUT.write_text(_without_fakes(base_text).replace(MARKER, block))
 
     print(f"gateway catalog: {len(included)} Forge models included, priced from /v1/pricing")
     if excluded_zero:

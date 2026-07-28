@@ -121,6 +121,14 @@ function showTab(which) {
   $("tab-chat").setAttribute("aria-selected", String(!code));
   $("tab-code").setAttribute("aria-selected", String(code));
   loadFrame(which);
+  // Tell the frame to re-measure once it is actually on screen. A frame laid out while
+  // its tab was hidden measures zero width, and ttyd sizes its terminal to whatever it
+  // measured — which is how the prompt ends up off-screen. Same-origin, so this is a
+  // plain event; wrapped because a frame that has not finished loading has no window yet.
+  requestAnimationFrame(() => {
+    const f = which === "code" ? $("frame-code") : $("frame-chat");
+    try { f.contentWindow?.dispatchEvent(new Event("resize")); } catch {}
+  });
   localStorage.setItem(TAB_KEY, which);
   document.title = code ? "Code — Enterprise AI" : "Chat — Enterprise AI";
 }

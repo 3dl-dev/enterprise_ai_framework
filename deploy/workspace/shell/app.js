@@ -251,13 +251,52 @@ function activeProject() { return (M.snap && M.snap.project) || STATE.project ||
 
 let previewLoading = false;
 
+/* WHY THE PREVIEW DOES NOT START BY ITSELF
+ *
+ * It used to: the drawer revealed and the generated page began running immediately. That
+ * is the nicer behaviour right up to the first heavy app, and then it is the worst one.
+ * A generated voxel game redrawing ~20,000 cells a frame took the tab's main thread and
+ * did not give it back — the terminal stopped responding, Chrome offered to kill the
+ * page, and the preview showed nothing. Reproduced twice off a real project.
+ *
+ * The sandbox does not help: it is an authority boundary, not a CPU budget. Nor can a
+ * watchdog help, because the thread a watchdog would run on is the thread being starved.
+ * So the one thing that reliably works is not starting it without being asked.
+ *
+ * The reveal still happens — the drawer opens the moment something exists, which is the
+ * whole point of it. What changed is that it reveals an offer rather than a running app.
+ */
+let previewRunning = false;
+
+function stopPreview() {
+  previewRunning = false;
+  previewLoading = false;
+  $("preview").src = "about:blank";
+  $("drawer-progress").hidden = true;
+  $("btn-stop").hidden = true;
+  syncPreviewGate();
+}
+
+function syncPreviewGate() {
+  if (M.drawer === "closed") return;
+  const ready = hasIndex() && !previewRunning;
+  $("preview-ready").hidden = !ready;
+  $("preview-empty").hidden = hasIndex();
+  $("preview").style.visibility = previewRunning ? "visible" : "hidden";
+  $("btn-stop").hidden = !previewRunning;
+}
+
 function loadPreview() {
   // Cache-bust rather than reload(): a plain reload can come from cache, and a child who
   // sees no change concludes their edit did nothing.
   const u = new URL("preview/", document.baseURI);
   u.searchParams.set("_", Date.now());
   previewLoading = true;
+  previewRunning = true;
   $("drawer-progress").hidden = false;
+  $("preview-ready").hidden = true;
+  $("preview").style.visibility = "visible";
+  $("btn-stop").hidden = false;
   $("preview").src = u.toString();
 }
 
@@ -271,12 +310,15 @@ $("preview").addEventListener("load", () => {
 function syncEmpty() {
   if (M.drawer === "closed") return;
   const empty = !hasIndex();
-  $("preview-empty").hidden = !empty;
+  $("preview-empty").hidden = !empty || !previewRunning;
+  syncPreviewGate();
   // Never read contentDocument to decide this — the preview is sandboxed without
   // allow-same-origin and touching it throws. /api/pulse is the only source of truth.
   if (empty && !M.previewRetried && $("preview").src.includes("preview/")) {
     M.previewRetried = true;
-    setTimeout(() => { if (M.drawer !== "closed" && hasIndex()) loadPreview(); }, 1500);
+    setTimeout(() => {
+      if (M.drawer !== "closed" && hasIndex() && previewRunning) loadPreview();
+    }, 1500);
   }
   if (!empty) M.previewRetried = false;
 }
@@ -300,7 +342,7 @@ function openDrawer({ first = false } = {}) {
   if (first) drawerEl.classList.add("first");
   setTimeout(() => drawerEl.classList.remove("anim-in", "first"), animDur(first) + 60);
   M.previewRetried = false;
-  loadPreview();
+  syncPreviewGate();
   syncChrome();
 }
 
@@ -315,6 +357,7 @@ function closeDrawer() {
     // Thirty children in one room, and a game that keeps playing its audio from behind a
     // closed drawer is a real problem.
     $("preview").src = "about:blank";
+    previewRunning = false;
     syncChrome();
   };
   // A timer rather than animationend: if the animation is suppressed (reduced motion, a
@@ -375,6 +418,11 @@ $("btn-fill").addEventListener("click", () => {
 // User intent always overrides the machine: this reloads now, whatever the settle gate says.
 $("btn-reload").addEventListener("click", () => { M.dirty = false; loadPreview(); });
 $("btn-popout").addEventListener("click", () => window.open("preview/", "_blank", "noopener"));
+$("btn-run").addEventListener("click", loadPreview);
+// noopener so it lands in its own browsing context — the heavy case belongs anywhere but
+// the tab holding the terminal.
+$("btn-run-tab").addEventListener("click", () => window.open("preview/", "_blank", "noopener"));
+$("btn-stop").addEventListener("click", stopPreview);
 $("empty-ideas").addEventListener("click", () => openStuck());
 
 /* ------------------------------------------------------------------ settle gate */
@@ -416,7 +464,9 @@ function evaluateGate() {
   if (M.dirty && M.drawer !== "closed") {
     if (document.visibilityState !== "visible") return;   // exactly one reload on return
     M.dirty = false;
-    loadPreview();
+    // Only refresh something already running. Auto-STARTING on a file change is the
+    // behaviour that froze the tab, and an agent mid-write changes files constantly.
+    if (previewRunning) loadPreview(); else syncPreviewGate();
   }
 }
 
@@ -510,7 +560,9 @@ function projectSwitchReset(s, firstEver) {
     return;
   }
   if (s.has_index && !isDismissed(s.project)) {
-    if (M.drawer === "closed") openDrawer({ first: true }); else loadPreview();
+    if (M.drawer === "closed") openDrawer({ first: true });
+    else if (previewRunning) loadPreview();
+    else syncPreviewGate();
   } else {
     closeDrawer();
   }
@@ -700,6 +752,7 @@ $("stuck-restart").addEventListener("click", restartAgent);
 function reloadPanes() {
   $("terminal-frame").src = "terminal/";
   $("preview").src = "about:blank";
+  previewRunning = false;      // a project switch must not leave the gate claiming it runs
   if (M.havePulse !== true) {
     // No pulse to resolve the switch for us, so decide from /api/state right now.
     if (STATE.has_index && !isDismissed(STATE.project)) openDrawer({ first: true });

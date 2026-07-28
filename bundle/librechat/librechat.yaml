@@ -136,10 +136,18 @@ endpoints:
       baseURL: "http://gateway:4000/v1"
       models:
         # Fetched from the gateway so the catalogue has exactly one source.
-        default: ["fake-large", "fake-small", "claude-opus-5"]
+        default: ["glm-5.2@deepinfra", "glm-4.7@deepinfra"]
         fetch: true
       titleConvo: true
-      titleModel: "fake-small"
+      # The model that NAMES a conversation. It was "fake-small", which is the local
+      # bundle's stub provider — harmless on a laptop, and the reason every conversation
+      # in the cluster was titled "[fake-provider fake-gpt-small] ack <hex>". The chats
+      # themselves were real; only their names came from a stub, which made a working
+      # history look like a broken one.
+      #
+      # Titling is one short call per conversation, so it goes to the cheaper of the two
+      # real models rather than the default one.
+      titleModel: "glm-4.7@deepinfra"
       modelDisplayLabel: "Enterprise AI"
       # NOTE: chat spend currently attributes to the chat surface as a whole, not to the
       # individual signed-in user. Forwarding the user via addParams was tried and

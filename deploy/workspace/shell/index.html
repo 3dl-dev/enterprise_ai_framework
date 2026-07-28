@@ -85,6 +85,7 @@
       <span class="drawer-label">LOOK</span>
       <span class="mono" id="preview-file">index.html</span>
       <span class="spacer"></span>
+      <button class="btn small ghost" id="btn-stop" hidden>Stop</button>
       <button class="btn small ghost" id="btn-reload">Reload</button>
       <button class="btn small ghost" id="btn-popout">Open ↗</button>
       <button class="btn small ghost" id="btn-hide">Hide</button>
@@ -92,11 +93,25 @@
     </div>
     <div class="preview-wrap">
       <!-- No allow-same-origin. The preview must never be able to script, navigate or
-           freeze the Workshop hosting it: that failure is unrecoverable, a broken preview
-           is not. The cost is that contentDocument is unreadable, so every fact about the
-           preview comes from /api/pulse and never from a DOM sentinel. -->
+           read the Workshop hosting it. The cost is that contentDocument is unreadable, so
+           every fact about the preview comes from /api/pulse and never from a DOM sentinel.
+           
+           SANDBOX IS NOT A CPU BUDGET. It stops the page reaching out; it does not stop it
+           taking the thread. A generated voxel game redrawing ~20,000 cells a frame froze
+           the whole tab — terminal included — and no in-page "stop" could help, because a
+           starved main thread cannot run the handler that would rescue it. That is why the
+           app below is not started until somebody asks for it. -->
       <iframe id="preview" src="about:blank" title="Your app"
               sandbox="allow-scripts allow-modals allow-popups allow-pointer-lock allow-forms"></iframe>
+      <div class="ready" id="preview-ready" hidden>
+        <div class="ready-glyph">▶</div>
+        <h3 id="ready-title">Your app is ready.</h3>
+        <p>Running it here uses this tab. If it is a big one, its own tab is happier.</p>
+        <div class="ready-actions">
+          <button class="btn primary" id="btn-run">Run it here</button>
+          <button class="btn" id="btn-run-tab">Open in its own tab ↗</button>
+        </div>
+      </div>
       <div class="empty" id="preview-empty" hidden>
         <svg class="empty-glyph" viewBox="0 0 24 24" width="40" height="40" aria-hidden="true">
           <rect x="2.6" y="4" width="18.8" height="16" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.4"/>

@@ -556,3 +556,18 @@ input, textarea, select {
  * stay: they are about THIS project, not about the product. */
 body.embedded .brand { display: none; }
 body.embedded .bar { padding-left: 14px; }
+
+/* The run gate. Shown where the app would be, until somebody asks for it — see the note
+ * in app.js about why a generated page is not started on its own. */
+.ready {
+  position: absolute; inset: 0; display: grid; place-content: center; justify-items: center;
+  gap: 10px; text-align: center; padding: 28px; background: var(--surface);
+}
+.ready[hidden] { display: none !important; }
+.ready-glyph {
+  width: 46px; height: 46px; border-radius: 50%; display: grid; place-content: center;
+  background: var(--accent-a); color: var(--accent); font-size: 17px; padding-left: 3px;
+}
+.ready h3 { margin: 4px 0 0; font-size: 16px; font-weight: 620; }
+.ready p { margin: 0; color: var(--ink-3); font-size: 13px; max-width: 34ch; }
+.ready-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
