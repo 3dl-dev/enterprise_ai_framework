@@ -31,6 +31,7 @@ ROUTES (all behind oauth2-proxy)
 """
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -104,6 +105,12 @@ def list_projects() -> list[dict]:
     return out
 STATIC = Path(__file__).resolve().parent / "shell"
 PORT = int(os.environ.get("WS_SHELL_PORT", "7682"))
+
+# The credential the control plane presents. See entrypoint.sh for why this pod is no
+# longer loopback-only and what the two replacement controls are. Empty means refuse
+# everything rather than allow everything — an unauthenticated shell API on the pod
+# network is worse than a workshop that will not load.
+INTERNAL_TOKEN = os.environ.get("WS_INTERNAL_TOKEN", "")
 
 # Offered in Settings. Kept in step with the gateway catalogue; the agent config declares
 # the same two with their real context and output limits.
@@ -506,9 +513,24 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------------------- routes
 
+    def _authorised(self) -> bool:
+        """Every request must carry the pod's own token.
+
+        Compared with compare_digest: the check runs on every asset the browser fetches,
+        which is exactly the shape that makes a naive == comparison measurable.
+        """
+        if not INTERNAL_TOKEN:
+            return False
+        sent = self.headers.get("X-Workspace-Token", "")
+        return hmac.compare_digest(sent, INTERNAL_TOKEN)
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         route = parsed.path
+
+        if not self._authorised():
+            self._send(403, b"denied", "text/plain; charset=utf-8")
+            return
 
         if route in ("/", "/index.html"):
             self._serve_file(STATIC / "index.html")
@@ -577,6 +599,10 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
         except json.JSONDecodeError:
             body = {}
+
+        if not self._authorised():
+            self._send(403, b"denied", "text/plain; charset=utf-8")
+            return
 
         if parsed.path == "/api/projects":
             raw = (body.get("name") or "").strip()
@@ -685,6 +711,13 @@ if __name__ == "__main__":
     except Exception:
         pass  # As in __init__: a bad sample must never stop the server binding its port.
     threading.Thread(target=PULSE.run, daemon=True).start()
-    # Loopback only. oauth2-proxy shares this pod's network namespace and is the only
-    # thing that can reach it; binding wider would put an unauthenticated API on the node.
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    if not INTERNAL_TOKEN:
+        raise SystemExit(
+            "refusing to start: WS_INTERNAL_TOKEN is not set. It is the credential the "
+            "control plane presents; without it this would be an unauthenticated shell "
+            "API on the pod network."
+        )
+    # Bound to every interface, guarded by the token above and by a NetworkPolicy that
+    # admits only the control-plane pod. entrypoint.sh explains why loopback stopped
+    # being possible and why that trade was made deliberately.
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

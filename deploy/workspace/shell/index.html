@@ -3,11 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Every URL below is RELATIVE to this base, never root-relative. The workshop is
+     served two ways: standalone at / (this value), and proxied by the portal under
+     /workshop/ so it can be a tab rather than a second website. The proxy rewrites this
+     one attribute; nothing else in the page knows or cares which mode it is in. -->
+<base href="/">
 <title>Workshop</title>
 <!-- data: URI, not a file request. The pod has no egress; a remote favicon is a broken
      favicon and a console error a nine-year-old cannot read. -->
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🦄</text></svg>">
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="static/style.css">
 </head>
 <body>
 
@@ -48,7 +53,7 @@
   <section class="pane" id="stage-terminal">
     <!-- background on the ELEMENT, not just the stylesheet: the frame paints before its
          document does, and without this there is a white flash on every terminal reload. -->
-    <iframe id="terminal-frame" src="/terminal/" title="Coding agent" style="background:var(--term-bg)"></iframe>
+    <iframe id="terminal-frame" src="terminal/" title="Coding agent" style="background:var(--term-bg)"></iframe>
 
     <!-- Failure bars. Never auto-reload either surface: reloading the page discards a
          half-typed prompt, and reloading ttyd silently destroys the conversation because
@@ -272,6 +277,6 @@
 
 <div class="toast" id="toast" hidden role="status"></div>
 
-<script src="/static/app.js"></script>
+<script src="static/app.js"></script>
 </body>
 </html>

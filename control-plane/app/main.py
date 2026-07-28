@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from . import db, export, gateway, identity, issuance, metering, portal
+from . import db, export, gateway, identity, issuance, metering, portal, workshop
 
 bearer = HTTPBearer(auto_error=True)
 
@@ -51,6 +51,9 @@ app = FastAPI(title="control-plane", lifespan=lifespan)
 # Its routes authenticate from the sidecar proxy; /admin/* below is untouched and still
 # requires the shared admin token.
 app.include_router(portal.router)
+# The workshop, proxied so it can be a tab on this origin instead of a LAN address that
+# hangs from any other network. See workshop.py for what replaced the per-pod proxy.
+app.include_router(workshop.router)
 
 
 # ---------------------------------------------------------------- health

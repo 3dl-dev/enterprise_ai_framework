@@ -70,11 +70,11 @@ spec:
 
             # One control plane: exactly one route out of the building.
             # custom,agents — NOT just "custom". This list is literal: naming only "custom"
-      # also drops the agents endpoint, and the agents framework is where MCP servers,
-      # memory, tools, file search and web search live. The bypass this closes is the
-      # built-in openAI/anthropic/google/azure/bedrock endpoints, which are absent from
-      # the list and therefore still disabled.
-      - { name: ENDPOINTS, value: "custom,agents" }
+            # also drops the agents endpoint, and the agents framework is where MCP servers,
+            # memory, tools, file search and web search live. The bypass this closes is the
+            # built-in openAI/anthropic/google/azure/bedrock endpoints, which are absent from
+            # the list and therefore still disabled.
+            - { name: ENDPOINTS, value: "custom,agents" }
             - { name: ALLOW_EMAIL_LOGIN, value: "false" }
             - { name: ALLOW_REGISTRATION, value: "false" }
             - { name: ALLOW_SOCIAL_LOGIN, value: "true" }
@@ -88,6 +88,14 @@ spec:
             - { name: OPENID_CALLBACK_URL, value: "/oauth/openid/callback" }
             - { name: OPENID_SCOPE, value: "openid profile email" }
             - { name: OPENID_BUTTON_LABEL, value: "Sign in with Enterprise AI" }
+            # Skip the login page entirely and go straight to Keycloak.
+            #
+            # There is exactly one way to sign in here, so the page only ever offered a
+            # single button — and inside the portal's Chat tab it was worse than
+            # redundant: you had already authenticated to reach the tab, so being asked
+            # to "sign in" again is the seam this whole surface exists to remove. The
+            # redirect is silent because the Keycloak session already exists.
+            - { name: OPENID_AUTO_REDIRECT, value: "true" }
             - name: OPENID_SESSION_SECRET
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_SESSION_SECRET } }
 

@@ -2,12 +2,8 @@
 # are substituted literally, so this file is not applyable on its own.
 #
 #   __USER__      Keycloak username, also the PVC/Deployment/Service name suffix
-#   __EMAIL__     that user's email, the only value oauth2-proxy will let through
 #   __IMAGE__     workspace image reference in the rail registry
-#   __NODEPORT__  the port this workspace answers on
 #   __MODEL__     aider's default model, a name from the gateway catalogue
-#   __ISSUER__    OIDC issuer, must be byte-identical to what the browser uses
-#   __REDIRECT__  oauth2-proxy callback URL, must be registered in Keycloak
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -38,25 +34,25 @@ metadata:
     app.kubernetes.io/component: workspace
     workspace.enterprise-ai/user: "__USER__"
 spec:
-  type: NodePort
-  # Local, not the default Cluster. With Cluster, kube-proxy masquerades every arriving
-  # packet to the node's own address, so the NetworkPolicy sees "from a node" no matter
-  # who actually connected — and one workspace pod can then reach another workspace's
-  # proxy simply by dialling the NodePort. Local keeps the real client address, which is
-  # what makes the ingress allow-list mean anything. The cost is that this NodePort only
-  # answers on the node the pod is running on.
-  externalTrafficPolicy: Local
+  # ClusterIP. There is no NodePort and there must not be one.
+  #
+  # This used to publish oauth2-proxy on a per-user NodePort, which made the workshop a
+  # separate website on a LAN address — unreachable from any other network, where it did
+  # not fail cleanly but hung until the browser gave up. The portal proxies it now, on the
+  # same origin as chat, so there is nothing here for a node to publish.
+  #
+  # Both ports are reachable only from the control-plane pod; see the NetworkPolicy in
+  # 60-workspace-common.yaml, and workshop.py for what guards them beyond that.
   selector:
     app.kubernetes.io/component: workspace
     workspace.enterprise-ai/user: "__USER__"
   ports:
-    # 4180 is oauth2-proxy. ttyd's 7681 is deliberately absent and must stay absent:
-    # publishing it would hand anyone who can reach the node a root-of-trust-free shell
-    # holding a key that spends money.
-    - name: https-proxy
-      port: 4180
-      targetPort: 4180
-      nodePort: __NODEPORT__
+    - name: shell
+      port: 7682
+      targetPort: 7682
+    - name: ttyd
+      port: 7681
+      targetPort: 7681
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -115,6 +111,11 @@ spec:
             - { name: WS_USER, value: "__USER__" }
             - { name: WS_PROJECT_DIR, value: "/workspace/project" }
             - { name: WS_PUBLISH_URL, value: "__PUBLISH_URL__" }
+            # The credential the control plane presents on every request. entrypoint.sh
+            # refuses to start without it rather than coming up unauthenticated.
+            - name: WS_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef: { name: enterprise-ai-secrets, key: WORKSPACE_INTERNAL_TOKEN }
             # One route out of the building. The pod has no provider credential of any
             # kind — this is a virtual key on our own gateway.
             - { name: OPENAI_API_BASE, value: "http://gateway:4000/v1" }
@@ -158,65 +159,6 @@ spec:
               command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/7681"]
             periodSeconds: 30
             failureThreshold: 3
-        # ---------------------------------------------------------------- the front door
-        - name: oauth2-proxy
-          image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1-alpine
-          imagePullPolicy: IfNotPresent
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: { drop: ["ALL"] }
-            readOnlyRootFilesystem: true
-          args:
-            - --provider=oidc
-            - --oidc-issuer-url=__ISSUER__
-            - --client-id=workspace
-            - --redirect-url=__REDIRECT__
-            - --scope=openid email profile
-            - --http-address=0.0.0.0:4180
-            # Most specific first: oauth2-proxy matches upstreams in order. /terminal/
-            # is ttyd (which now serves under that base path); everything else is the
-            # shell UI, which also serves /preview/ and /api/. One session covers all of
-            # it because they share this pod and this proxy.
-            - --upstream=http://127.0.0.1:7681/terminal/
-            - --upstream=http://127.0.0.1:7682
-            # ttyd is a websocket application. Without this the page loads and the
-            # terminal never connects, which looks like a broken shell rather than a
-            # proxy setting.
-            - --proxy-websockets=true
-            # THE authorization decision. One file, one address: this user's. There is
-            # deliberately no --email-domain — setting it to '*' makes every
-            # authenticated user in the realm valid here regardless of this file, which
-            # would hand any user a shell holding somebody else's spendable key.
-            - --authenticated-emails-file=/etc/oauth2-proxy/authorized-emails
-            - --skip-provider-button=true
-            - --reverse-proxy=true
-            - --session-store-type=cookie
-            - --cookie-name=_ws___USER___auth
-            # The NodePort is plain HTTP on the LAN, so a Secure cookie would never be
-            # sent back and login would loop forever. Put TLS in front of this before it
-            # is reachable from anywhere untrusted, and flip this back to true.
-            - --cookie-secure=false
-            - --cookie-samesite=lax
-            - --cookie-expire=8h
-            - --silence-ping-logging=true
-          env:
-            - name: OAUTH2_PROXY_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef: { name: ws-__USER__-key, key: OAUTH2_PROXY_CLIENT_SECRET }
-            - name: OAUTH2_PROXY_COOKIE_SECRET
-              valueFrom:
-                secretKeyRef: { name: ws-__USER__-key, key: OAUTH2_PROXY_COOKIE_SECRET }
-          ports:
-            - { name: proxy, containerPort: 4180 }
-          volumeMounts:
-            - { name: authorized, mountPath: /etc/oauth2-proxy, readOnly: true }
-          readinessProbe:
-            httpGet: { path: /ping, port: 4180 }
-            periodSeconds: 10
-            failureThreshold: 12
-          resources:
-            requests: { cpu: "25m", memory: "32Mi" }
-            limits:   { cpu: "200m", memory: "128Mi" }
       volumes:
         - name: published
           persistentVolumeClaim:
@@ -228,8 +170,3 @@ spec:
         # the user's code and nothing else.
         - name: home
           emptyDir: { sizeLimit: 2Gi }
-        - name: authorized
-          secret:
-            secretName: ws-__USER__-key
-            items:
-              - { key: AUTHORIZED_EMAILS, path: authorized-emails }

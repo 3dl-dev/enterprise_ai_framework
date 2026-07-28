@@ -93,8 +93,8 @@ def _signed_in_portal(browser, base_url, account) -> Page:
             p.page.fill("input[name='username']", account[0])
             p.page.fill("input[name='password']", account[1])
             p.page.click("input[type='submit'], button[type='submit']")
-            p.page.wait_for_load_state("networkidle", timeout=45000)
-    p.page.wait_for_load_state("networkidle", timeout=45000)
+            p.page.wait_for_load_state("load", timeout=45000)
+    p.page.wait_for_load_state("load", timeout=45000)
     return p
 
 
@@ -108,14 +108,37 @@ def test_portal_renders_with_no_javascript_errors(browser, base_url, account):
 
 def test_portal_shows_the_signed_in_user(browser, base_url, account):
     p = _signed_in_portal(browser, base_url, account)
-    p.page.wait_for_selector("#who:not([hidden])", timeout=20000)
+    p.page.wait_for_selector("#tab-chat", timeout=20000)
+    p.page.click("#avatar-btn")
+    p.page.wait_for_selector("#user-menu:not([hidden])", timeout=8000)
     assert p.page.inner_text("#username").strip() == account[0]
+
+
+def _open_settings(p):
+    p.page.wait_for_selector("#tab-chat", timeout=20000)
+    p.page.click("#avatar-btn")
+    p.page.wait_for_selector("#user-menu:not([hidden])", timeout=8000)
+    p.page.click("#mi-settings")
+    p.page.wait_for_function("() => document.getElementById('dlg-settings').open", timeout=8000)
+    p.page.wait_for_timeout(2500)   # the three panels fetch independently
+
+
+def test_settings_is_closed_until_asked_for(browser, base_url, account):
+    """It is a sheet over the work, not the page you land on.
+
+    Regression: .sheet sets display:flex, which beats the user-agent rule that hides a
+    closed <dialog> — so settings rendered permanently on top of the surfaces.
+    """
+    p = _signed_in_portal(browser, base_url, account)
+    p.page.wait_for_selector("#tab-chat", timeout=20000)
+    assert p.page.evaluate("() => !document.getElementById('dlg-settings').open")
+    assert p.page.locator("#dlg-settings").is_hidden()
 
 
 def test_portal_panels_actually_populate(browser, base_url, account):
     """The panels are rendered by fetch. If the JS is broken they stay at their placeholders."""
     p = _signed_in_portal(browser, base_url, account)
-    p.page.wait_for_selector("#who:not([hidden])", timeout=20000)
+    _open_settings(p)
 
     total = p.page.inner_text("#spend-total").strip()
     assert total != "—", "spend never rendered — the placeholder is still there"
@@ -127,23 +150,19 @@ def test_portal_panels_actually_populate(browser, base_url, account):
     keys = p.page.locator("#keylist li").count()
     assert keys > 0, "no API keys rendered"
 
-    # Every card must have a real destination, not the '#' it ships with in the markup.
-    for card in ("card-chat", "card-published"):
-        href = p.page.get_attribute(f"#{card}", "href")
-        assert href and href != "#", f"{card} was never wired to a URL"
-
 
 def test_portal_hidden_elements_are_genuinely_hidden(browser, base_url, account):
     """The [hidden] display bug shipped once already; prove it as rendered, not as CSS."""
     p = _signed_in_portal(browser, base_url, account)
-    p.page.wait_for_selector("#who:not([hidden])", timeout=20000)
-    for sel in ("#failbar", "#toast"):
+    p.page.wait_for_selector("#tab-chat", timeout=20000)
+    for sel in ("#failbar", "#toast", "#user-menu"):
         assert p.page.locator(sel).is_hidden(), f"{sel} is visible on a healthy page"
 
 
 def test_portal_key_rotation_dialog_opens_and_can_be_dismissed(browser, base_url, account):
     """Exercises a native <dialog> and the confirm path WITHOUT actually rotating a key."""
     p = _signed_in_portal(browser, base_url, account)
+    _open_settings(p)
     p.page.wait_for_selector("#keylist li", timeout=20000)
     p.page.locator("#keylist li button", has_text="Rotate").first.click()
     p.page.wait_for_selector("#dlg-confirm[open]", timeout=8000)
@@ -169,8 +188,8 @@ def test_portal_never_scrolls_sideways(browser, base_url, account, size):
         p.page.fill("input[name='username']", account[0])
         p.page.fill("input[name='password']", account[1])
         p.page.click("input[type='submit'], button[type='submit']")
-    p.page.wait_for_load_state("networkidle", timeout=45000)
-    p.page.wait_for_selector("#who:not([hidden])", timeout=20000)
+    p.page.wait_for_load_state("load", timeout=45000)
+    p.page.wait_for_selector("#tab-chat", timeout=20000)
     overflow = p.page.evaluate(
         "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
     p.page.screenshot(path=f"{SHOTS}/portal-{w}x{h}.png", full_page=True)
@@ -181,12 +200,14 @@ def test_portal_never_scrolls_sideways(browser, base_url, account, size):
 # ---------------------------------------------------------------- workshop
 
 @pytest.fixture(scope="session")
-def workshop_url() -> str:
-    port = subprocess.run(
-        ["kubectl", "-n", NS, "get", "svc", "ws-student",
-         "-o", "jsonpath={.spec.ports[0].nodePort}"],
-        capture_output=True, text=True, timeout=60, check=True).stdout.strip()
-    return f"http://192.168.2.44:{port}"
+def workshop_url(base_url) -> str:
+    """The workshop has no URL of its own any more.
+
+    It used to be a per-user NodePort on a LAN address — a different origin, plain HTTP,
+    unroutable from anywhere else, and it did not fail cleanly from another network: it
+    hung until the browser gave up. It is now proxied onto this origin so it can be a tab.
+    """
+    return f"{base_url}/workshop"
 
 
 def _signed_in_workshop(browser, workshop_url, account) -> Page:
@@ -197,8 +218,8 @@ def _signed_in_workshop(browser, workshop_url, account) -> Page:
         p.page.fill("input[name='username']", account[0])
         p.page.fill("input[name='password']", account[1])
         p.page.click("input[type='submit'], button[type='submit']")
-        p.page.wait_for_load_state("networkidle", timeout=60000)
-    p.page.wait_for_load_state("networkidle", timeout=60000)
+        p.page.wait_for_load_state("load", timeout=60000)
+    p.page.wait_for_load_state("load", timeout=60000)
     return p
 
 
@@ -212,7 +233,7 @@ def test_workshop_terminal_is_the_hero_and_the_drawer_is_shut(browser, workshop_
     """The whole point of the rebuild: no preview squatting on half the screen at rest."""
     p = _signed_in_workshop(browser, workshop_url, account)
     p.page.wait_for_timeout(3000)
-    term = p.page.locator("#terminal, iframe[title*='agent' i], iframe[src*='/terminal']").first
+    term = p.page.locator("#terminal-frame, iframe[src*='terminal']").first
     assert term.count(), "no terminal iframe on the page at all"
     box = term.bounding_box()
     width = p.page.evaluate("() => document.documentElement.clientWidth")

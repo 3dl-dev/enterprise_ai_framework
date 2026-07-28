@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Provision one user's browser-terminal workspace.
 #
-#   deploy/bin/provision-workspace.sh <keycloak-username> [--nodeport N] [--model NAME]
+#   deploy/bin/provision-workspace.sh <keycloak-username> [--model NAME]
 #
 # Repeatable and idempotent: run it twice and you get the same workspace with a freshly
 # rotated virtual key. This is the mechanism the on-click provisioning API will call; it
@@ -13,9 +13,10 @@
 #   1. The pod holds THAT user's own `<username>::ide` virtual key, minted through the
 #      control plane so the ledger's token hash stays correct. Never the gateway master
 #      key. Never a key shared between users.
-#   2. ttyd is not reachable. It binds loopback inside the pod; the only published port
-#      is oauth2-proxy, which requires a Keycloak login AND an exact match against this
-#      one user's email before it will proxy a single byte.
+#   2. ttyd is not published. The Service is ClusterIP with no NodePort, the
+#      NetworkPolicy admits 7681/7682 only from the control-plane pod, and ttyd itself
+#      demands a credential that only the portal holds. The portal decides WHICH pod you
+#      reach from your authenticated name, so a request cannot name somebody else's.
 #   3. The pod cannot reach the Kubernetes API, another workspace, or anything else we
 #      run except the gateway. See the NetworkPolicy in 60-workspace-common.yaml.
 set -euo pipefail
@@ -30,13 +31,11 @@ IMAGE="${WORKSPACE_IMAGE:-${REGISTRY}/${IMAGE_NAME}:${WORKSPACE_TAG}}"
 REALM="${IDP_REALM:-enterprise-ai}"
 CLIENT_ID=workspace
 
-USER_NAME="${1:?usage: provision-workspace.sh <keycloak-username> [--nodeport N] [--model NAME]}"
+USER_NAME="${1:?usage: provision-workspace.sh <keycloak-username> [--model NAME]}"
 shift
-NODEPORT=""
 MODEL="${WORKSPACE_MODEL:-glm-5.2@deepinfra}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --nodeport) NODEPORT="$2"; shift 2 ;;
         --model)    MODEL="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -51,29 +50,7 @@ ISSUER="$(secret OPENID_ISSUER)"
 # one is named so the OIDC redirect URI is a single fixed string.
 WORKSPACE_HOST="${WORKSPACE_HOST:-192.168.2.44}"
 
-# ---------------------------------------------------------------- port allocation
-if [[ -z "$NODEPORT" ]]; then
-    existing=$(kubectl -n "$NS" get svc "ws-${USER_NAME}" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)
-    if [[ -n "$existing" ]]; then
-        NODEPORT="$existing"
-    else
-        # Deterministic from the username so a reprovision keeps the same URL, with a
-        # linear probe because a hash collision must not silently steal another
-        # workspace's port. 30400 is the gateway's and is skipped by construction.
-        base=$(( 30410 + $(printf '%s' "$USER_NAME" | cksum | cut -d' ' -f1) % 80 ))
-        taken=$(kubectl get svc -A -o jsonpath='{range .items[*].spec.ports[*]}{.nodePort}{"\n"}{end}' | sort -u)
-        for i in $(seq 0 79); do
-            candidate=$(( 30410 + (base - 30410 + i) % 80 ))
-            if ! grep -qx "$candidate" <<<"$taken"; then NODEPORT=$candidate; break; fi
-        done
-        [[ -n "$NODEPORT" ]] || { echo "no free NodePort in 30410-30489" >&2; exit 1; }
-    fi
-fi
-WORKSPACE_URL="http://${WORKSPACE_HOST}:${NODEPORT}"
-REDIRECT="${WORKSPACE_URL}/oauth2/callback"
-
 echo "==> workspace for ${USER_NAME}"
-echo "    url      ${WORKSPACE_URL}"
 echo "    image    ${IMAGE}"
 echo "    model    ${MODEL}"
 
@@ -107,44 +84,11 @@ UID_=$(kc -G "${IDP}/admin/realms/${REALM}/users" \
 [[ -n "$UID_" ]] || { echo "no such user in realm ${REALM}: ${USER_NAME}" >&2; exit 1; }
 EMAIL=$(kc "${IDP}/admin/realms/${REALM}/users/${UID_}" \
         | python3 -c 'import sys,json; print(json.load(sys.stdin).get("email") or "")')
-# oauth2-proxy authorizes on the email claim. A user with no email would be authenticated
-# and then rejected by an empty allowlist, which is safe but reads as a broken login.
-[[ -n "$EMAIL" ]] || { echo "user ${USER_NAME} has no email; oauth2-proxy authorizes on it" >&2; exit 1; }
+# Not used to authorize anything here any more, but a realm account with no email is
+# broken in the chat surface and the account console too, so it is still worth refusing
+# loudly at the point somebody is being set up.
+[[ -n "$EMAIL" ]] || { echo "user ${USER_NAME} has no email; fix the realm account first" >&2; exit 1; }
 echo "    identity ${USER_NAME} <${EMAIL}>"
-
-# ---------------------------------------------------------------- the oauth2-proxy client
-CID=$(kc -G "${IDP}/admin/realms/${REALM}/clients" --data-urlencode "clientId=${CLIENT_ID}" \
-      | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d[0]["id"] if d else "")')
-if [[ -z "$CID" ]]; then
-    echo "==> creating the ${CLIENT_ID} client"
-    kc -X POST "${IDP}/admin/realms/${REALM}/clients" -d "$(python3 -c '
-import json, sys
-print(json.dumps({
-    "clientId": sys.argv[1], "name": "Workspace (browser terminal)",
-    "protocol": "openid-connect", "publicClient": False, "standardFlowEnabled": True,
-    "directAccessGrantsEnabled": False, "serviceAccountsEnabled": False,
-    "redirectUris": [sys.argv[2]], "webOrigins": [sys.argv[3]],
-}))' "$CLIENT_ID" "$REDIRECT" "$WORKSPACE_URL")" >/dev/null
-    CID=$(kc -G "${IDP}/admin/realms/${REALM}/clients" --data-urlencode "clientId=${CLIENT_ID}" \
-          | python3 -c 'import sys,json; print(json.load(sys.stdin)[0]["id"])')
-else
-    # One client, many workspaces: each provision adds its own callback. The client is
-    # shared, but it grants nothing on its own — authorization is the per-pod email
-    # allowlist, not the client.
-    kc "${IDP}/admin/realms/${REALM}/clients/${CID}" \
-      | REDIRECT="$REDIRECT" ORIGIN="$WORKSPACE_URL" python3 -c '
-import json, os, sys
-c = json.load(sys.stdin)
-r = sorted(set(c.get("redirectUris") or []) | {os.environ["REDIRECT"]})
-w = sorted(set(c.get("webOrigins") or []) | {os.environ["ORIGIN"]})
-print(json.dumps({"redirectUris": r, "webOrigins": w}))' > /tmp/ws-client-$$.json
-    kc -X PUT "${IDP}/admin/realms/${REALM}/clients/${CID}" -d "@/tmp/ws-client-$$.json" >/dev/null
-    rm -f "/tmp/ws-client-$$.json"
-fi
-CLIENT_SECRET=$(kc "${IDP}/admin/realms/${REALM}/clients/${CID}/client-secret" \
-                | python3 -c 'import sys,json; print(json.load(sys.stdin)["value"])')
-[[ -n "$CLIENT_SECRET" ]] || { echo "could not read the ${CLIENT_ID} client secret" >&2; exit 1; }
-echo "    client   ${CLIENT_ID} callback registered"
 
 # ---------------------------------------------------------------- the virtual key
 # Through the control plane, never straight at the gateway: minting at the gateway would
@@ -174,13 +118,12 @@ fi
 echo "    key      ${VALIAS} (rotated)"
 
 # ---------------------------------------------------------------- the pod's secret
+# Only the spendable key. The pod no longer authenticates anybody itself — the portal
+# does, and reaches this workspace over a ClusterIP the NetworkPolicy admits only from
+# the control plane — so there is no client secret, no cookie secret and no email
+# allow-list to keep in sync here.
 kubectl -n "$NS" create secret generic "ws-${USER_NAME}-key" \
     --from-literal=OPENAI_API_KEY="$VKEY" \
-    --from-literal=OAUTH2_PROXY_CLIENT_SECRET="$CLIENT_SECRET" \
-    --from-literal=OAUTH2_PROXY_COOKIE_SECRET="$(python3 -c '
-import base64, secrets
-print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')" \
-    --from-literal=AUTHORIZED_EMAILS="$EMAIL" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 KEYSUM=$(printf '%s' "$VKEY" | sha256sum | cut -c1-16)
@@ -194,12 +137,8 @@ PUBLISH_URL="${PUBLISH_URL:-https://gateway.tailcb6ef9.ts.net:8443}"
 kubectl apply -f deploy/k8s/60-workspace-common.yaml >/dev/null
 
 sed -e "s|__USER__|${USER_NAME}|g" \
-    -e "s|__EMAIL__|${EMAIL}|g" \
     -e "s|__IMAGE__|${IMAGE}|g" \
-    -e "s|__NODEPORT__|${NODEPORT}|g" \
     -e "s|__MODEL__|${MODEL}|g" \
-    -e "s|__ISSUER__|${ISSUER}|g" \
-    -e "s|__REDIRECT__|${REDIRECT}|g" \
     -e "s|__KEYSUM__|${KEYSUM}|g" \
     -e "s|__PUBLISH_URL__|${PUBLISH_URL}|g" \
     deploy/k8s/61-workspace.template.yaml | kubectl apply -f - >/dev/null
@@ -207,5 +146,5 @@ sed -e "s|__USER__|${USER_NAME}|g" \
 kubectl -n "$NS" rollout status "deployment/ws-${USER_NAME}" --timeout=600s
 
 echo
-echo "  ${USER_NAME}: ${WORKSPACE_URL}"
-echo "  sign in with the same Keycloak account used at ${PUBLIC_BASE_URL}"
+echo "  ${USER_NAME}: ${PUBLIC_BASE_URL}/portal/  ->  the Code tab"
+echo "  one login, same account as chat. The workshop has no URL of its own."

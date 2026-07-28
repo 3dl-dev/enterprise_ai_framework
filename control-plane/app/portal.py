@@ -45,9 +45,6 @@ PUBLISHED_URL = os.environ.get("PUBLISHED_INTERNAL_URL", "http://published")
 IDP_URL = os.environ.get("IDP_PUBLIC_URL", "")
 IDP_REALM = os.environ.get("IDP_REALM", "enterprise-ai")
 
-# Where each surface lives for a signed-in person. Workspaces are per-user NodePorts, so
-# the base is configured and the port is discovered per user at request time.
-WORKSPACE_HOST = os.environ.get("WORKSPACE_HOST", "")
 
 
 def require_user(request: Request) -> str:
@@ -126,25 +123,14 @@ async def me(request: Request, user: str = Depends(require_user)):
 
 
 async def _workspace_url(user: str) -> str:
-    """This user's workspace, if one is provisioned.
+    """This user's workspace, on this origin.
 
-    Read from the Service rather than guessed, because the NodePort is allocated per user
-    and a guessed port silently sends somebody to a different child's workspace login.
+    Always the same path for everybody. It used to be a per-user NodePort on a LAN
+    address, which meant a hand-maintained map here, a link that only worked from one
+    network, and — for anyone else — a page that hung rather than failed. The proxy picks
+    the pod from the authenticated name, so there is nothing per-user in the URL.
     """
-    if not WORKSPACE_HOST:
-        return ""
-    port = await _workspace_nodeport(user)
-    return f"http://{WORKSPACE_HOST}:{port}" if port else ""
-
-
-async def _workspace_nodeport(user: str) -> int | None:
-    # The pod has no Kubernetes API access by design, so the mapping is supplied as
-    # configuration rather than discovered. WORKSPACE_PORTS is "user:port,user:port".
-    for pair in os.environ.get("WORKSPACE_PORTS", "").split(","):
-        name, _, port = pair.partition(":")
-        if name.strip() == user and port.strip().isdigit():
-            return int(port)
-    return None
+    return "/workshop/"
 
 
 @router.get("/portal/api/spend")

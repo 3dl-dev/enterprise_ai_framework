@@ -53,6 +53,21 @@ spec:
       ports:
         - { protocol: TCP, port: 4180 }
 
+    # The portal, serving this workshop as a tab on the public origin. ONLY the
+    # control-plane pod, and only these two ports.
+    #
+    # The `from` selector is the entire control. Per the CNI note above, kube-router
+    # resolves a packet on the DESTINATION's ingress rules without consulting the
+    # source's egress — so an empty `from` here would open every workspace's terminal to
+    # every other workspace, which is a shell holding a spendable key. Named, and tested
+    # in tests-live/test_workspace_isolation.py rather than assumed.
+    - from:
+        - podSelector:
+            matchLabels: { app: control-plane }
+      ports:
+        - { protocol: TCP, port: 7681 }
+        - { protocol: TCP, port: 7682 }
+
   egress:
     # DNS.
     - to:

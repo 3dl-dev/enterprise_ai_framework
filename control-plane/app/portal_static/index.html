@@ -10,44 +10,55 @@
 <body>
 
 <header class="bar">
-  <div class="brand"><span class="mark">◆</span><span>Enterprise AI</span></div>
+  <div class="brand"><span class="mark">◆</span><span class="brandname">Enterprise AI</span></div>
+
+  <!-- Two surfaces, one page. Closest thing to claude.ai: you do not get bounced to
+       another app, and the tab you were last on is where you come back. -->
+  <nav class="tabs" role="tablist" aria-label="Surfaces">
+    <button class="tab" id="tab-chat" role="tab" aria-selected="true" aria-controls="view-chat">Chat</button>
+    <button class="tab" id="tab-code" role="tab" aria-selected="false" aria-controls="view-code">Code</button>
+  </nav>
+
   <div class="spacer"></div>
-  <div class="who" id="who" hidden>
-    <span class="avatar" id="avatar"></span>
-    <span class="names"><strong id="username">…</strong><span id="email"></span></span>
+
+  <div class="usermenu">
+    <button class="avatar-btn" id="avatar-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Account and settings">
+      <span class="avatar" id="avatar"></span>
+    </button>
+    <div class="menu" id="user-menu" role="menu" hidden>
+      <div class="menu-head">
+        <strong id="username">…</strong>
+        <span id="email"></span>
+      </div>
+      <button class="menu-item" id="mi-settings" role="menuitem">Settings</button>
+      <a class="menu-item" id="mi-account" role="menuitem" target="_blank" rel="noopener">Account &amp; password ↗</a>
+      <a class="menu-item" id="mi-published" role="menuitem" target="_blank" rel="noopener">Your shared work ↗</a>
+      <div class="menu-sep"></div>
+      <a class="menu-item" id="signout" role="menuitem" href="/portal/oauth2/sign_out">Sign out</a>
+    </div>
   </div>
-  <a class="btn ghost" id="signout" href="/portal/oauth2/sign_out">Sign out</a>
 </header>
 
+<!-- The surfaces themselves. Both are iframes on this origin, kept alive across tab
+     switches: reloading chat every time somebody looks at their code would throw away
+     the conversation they were in the middle of. -->
+<div class="views">
+  <section class="view" id="view-chat" role="tabpanel" aria-labelledby="tab-chat">
+    <iframe id="frame-chat" title="Chat" src="about:blank"></iframe>
+  </section>
+  <section class="view" id="view-code" role="tabpanel" aria-labelledby="tab-code" hidden>
+    <iframe id="frame-code" title="Code" src="about:blank"></iframe>
+    <div class="frame-fallback" id="code-fallback" hidden>
+      <h3>Your workshop is not running</h3>
+      <p>It may still be starting up. If this does not clear, tell whoever set this up.</p>
+      <button class="btn" id="code-retry">Try again</button>
+    </div>
+  </section>
+</div>
+
+<dialog class="dlg sheet" id="dlg-settings">
+<div class="sheet-head"><h2>Settings</h2><button class="btn ghost" id="settings-close">Done</button></div>
 <main>
-  <section class="lede">
-    <h1>Everything in one place</h1>
-    <p>One login, one bill, one trail — across every surface you use.</p>
-  </section>
-
-  <!-- The four front doors that used to be four separate URLs. -->
-  <section class="cards" id="cards">
-    <a class="card" id="card-chat" href="#" target="_blank" rel="noopener">
-      <span class="glyph">💬</span>
-      <h2>Chat</h2>
-      <p>Ask, research, write. Skills, tools and memory.</p>
-      <span class="go">Open<span class="arr">→</span></span>
-    </a>
-    <a class="card" id="card-workspace" href="#" target="_blank" rel="noopener">
-      <span class="glyph">⌨️</span>
-      <h2>Workshop</h2>
-      <p>A coding agent in a real terminal, with a live preview.</p>
-      <span class="go">Open<span class="arr">→</span></span>
-      <span class="muted-note" id="no-workspace" hidden>No workspace yet</span>
-    </a>
-    <a class="card" id="card-published" href="#" target="_blank" rel="noopener">
-      <span class="glyph">🌍</span>
-      <h2>Shared work</h2>
-      <p>What you have published, as anyone else sees it.</p>
-      <span class="go">Open<span class="arr">→</span></span>
-    </a>
-  </section>
-
   <div class="grid">
 
     <section class="panel" id="panel-spend">
@@ -95,6 +106,7 @@
 
   </div>
 </main>
+</dialog>
 
 <dialog class="dlg" id="dlg-key">
   <h3 id="dlg-key-title">Your new key</h3>

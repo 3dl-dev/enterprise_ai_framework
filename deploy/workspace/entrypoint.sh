@@ -79,14 +79,42 @@ export OPENCODE_CONFIG=/etc/opencode/opencode.json
 # `#` after whitespace starts a comment and silently eats the rest of the continued command,
 # which is how ttyd once came up with no command at all.
 
-# The shell UI and the live preview. Loopback only; oauth2-proxy is the front door for
-# every route in this pod.
+# THE BIND, AND WHY IT IS NO LONGER LOOPBACK
+#
+# This used to be `--interface lo`, with the comment that widening it "removes the entire
+# access control" — true at the time, because the oauth2-proxy sidecar sharing this
+# network namespace was the only guard.
+#
+# The portal now serves the workshop as a tab on one origin, which means the control
+# plane has to reach these ports from another pod, which means loopback is no longer
+# possible. That is a real reduction in defence and is not pretended otherwise. Two
+# independent controls replace the one:
+#
+#   1. A NetworkPolicy that permits ingress on 7681/7682 ONLY from the control-plane pod
+#      (deploy/k8s/60-workspace-common.yaml). Note the CNI caveat recorded there: this
+#      cluster's kube-router allows a packet as soon as the DESTINATION's ingress rules
+#      permit it, without consulting the SOURCE's egress rules — so the `from` list is
+#      what actually closes workspace-to-workspace traffic, and it is tested, not assumed.
+#   2. A credential on ttyd itself and a token on the shell server, so reaching the port
+#      is not the same as using it. Pod-local, and it holds even if the policy does not.
+#
+# If WS_INTERNAL_TOKEN is absent we refuse to start rather than come up unauthenticated:
+# a workspace that silently loses its second lock is exactly the failure nobody notices.
+if [[ -z "${WS_INTERNAL_TOKEN:-}" ]]; then
+    echo "refusing to start: WS_INTERNAL_TOKEN is not set." >&2
+    echo "  It is the credential the control plane presents to this pod. Without it the" >&2
+    echo "  terminal would be reachable by anything the NetworkPolicy failed to stop." >&2
+    exit 1
+fi
+
+# The shell UI and the live preview. Reachable from the control plane only; it checks the
+# same token on every request.
 /usr/local/bin/shell-server.py &
 
 exec /usr/local/bin/ttyd \
     --port 7681 \
     --base-path /terminal \
-    --interface lo \
+    --credential "ws:${WS_INTERNAL_TOKEN}" \
     --writable \
     --ping-interval 30 \
     --client-option "titleFixed=workspace: ${WS_USER}" \

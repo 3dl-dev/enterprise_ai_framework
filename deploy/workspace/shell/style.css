@@ -546,3 +546,13 @@ input, textarea, select {
 }
 @keyframes toastin { from { opacity: 0; transform: translate(-50%, 8px); } }
 .toast.bad { border-left-color: var(--danger); }
+
+
+/* EMBEDDED AS A TAB
+ *
+ * The portal serves this surface inside its own chrome, so the wordmark here would be a
+ * second brand bar stacked under the first one — the exact "two apps bolted together"
+ * look that putting it in a tab is meant to remove. The project chip and the actions
+ * stay: they are about THIS project, not about the product. */
+body.embedded .brand { display: none; }
+body.embedded .bar { padding-left: 14px; }

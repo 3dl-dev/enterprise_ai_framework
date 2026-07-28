@@ -98,13 +98,17 @@ spec:
               value: mongodb://chatdb:27017
             - name: CHAT_MONGO_DB
               value: librechat
-            # Workspaces are per-user NodePorts on the worker. The pod has no Kubernetes
-            # API access by design, so the mapping is configuration rather than
-            # discovery. Update it when a workspace is provisioned.
-            - name: WORKSPACE_HOST
-              value: "192.168.2.44"
-            - name: WORKSPACE_PORTS
-              value: "baron:30440,student:30441,claire:30433"
+            # The credential the portal presents to a workspace pod. The pod refuses to
+            # start without its half of it, so a workspace can never come up reachable
+            # but unauthenticated.
+            #
+            # There is deliberately no per-user host or port map here any more. The proxy
+            # resolves a workspace from the AUTHENTICATED username to a Service name, so
+            # adding a camper needs no configuration in this file — which is what the old
+            # hand-maintained WORKSPACE_PORTS list required, and forgetting to update it
+            # sent somebody to a link that hung.
+            - name: WORKSPACE_INTERNAL_TOKEN
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: WORKSPACE_INTERNAL_TOKEN } }
           ports: [{ containerPort: 8000 }]
           readinessProbe:
             httpGet: { path: /health, port: 8000 }
@@ -135,6 +139,10 @@ spec:
             # origin root — the root of this origin is the chat surface, and a proxy
             # claiming /oauth2/* there would shadow it.
             - --proxy-prefix=/portal/oauth2
+            # The terminal is a websocket. Without this the Code tab loads its chrome,
+            # the socket never upgrades, and it reads as a hung agent rather than a
+            # proxy setting — the same failure the workspace sidecar hit.
+            - --proxy-websockets=true
             - --set-xauthrequest=true
             - --pass-user-headers=true
             - --skip-provider-button=true

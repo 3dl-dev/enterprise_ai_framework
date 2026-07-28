@@ -69,26 +69,16 @@ async function loadMe() {
   $("username").textContent = me.username;
   $("email").textContent = me.email || "";
   $("avatar").textContent = (me.username || "?").slice(0, 1).toUpperCase();
-  $("who").hidden = false;
   document.title = `${me.username} — Enterprise AI`;
 
   const L = me.links || {};
-  wire("card-chat", L.chat);
-  wire("card-published", L.published);
   wire("link-password", L.password || L.account);
   wire("link-account", L.account);
+  wire("mi-account", L.password || L.account);
+  wire("mi-published", L.published);
   if (L.signout) $("signout").href = L.signout;
-
-  // A workspace is provisioned per user and may not exist yet. Saying so plainly beats a
-  // link that goes nowhere.
-  if (L.workspace) {
-    wire("card-workspace", L.workspace);
-  } else {
-    const c = $("card-workspace");
-    c.classList.add("disabled");
-    c.removeAttribute("href");
-    $("no-workspace").hidden = false;
-  }
+  LINKS = L;
+  mountFrames();
   return me;
 }
 
@@ -98,6 +88,80 @@ function wire(id, href) {
   if (href) el.href = href;
   else { el.classList.add("disabled"); el.removeAttribute("href"); }
 }
+
+/* ---------------------------------------------------------------- tabs
+
+   Both surfaces stay mounted once visited. Switching tabs only flips visibility, because
+   reloading chat every time somebody glances at their code would throw away the
+   conversation they were in the middle of — which is precisely the disjointedness this
+   whole change exists to remove. */
+
+let LINKS = {};
+const TAB_KEY = "eai.tab.v1";
+
+function mountFrames() {
+  const last = localStorage.getItem(TAB_KEY) === "code" ? "code" : "chat";
+  showTab(last);
+}
+
+function loadFrame(which) {
+  const frame = which === "code" ? $("frame-code") : $("frame-chat");
+  if (frame.dataset.loaded) return;
+  // The workshop is proxied on THIS origin at /workshop/; chat is the origin root. Both
+  // same-origin, which is what makes them embeddable at all — the old workspace URL was
+  // a plain-HTTP LAN address that a browser refuses to frame inside an HTTPS page.
+  frame.src = which === "code" ? "/workshop/" : (LINKS.chat || "/");
+  frame.dataset.loaded = "1";
+}
+
+function showTab(which) {
+  const code = which === "code";
+  $("view-chat").hidden = code;
+  $("view-code").hidden = !code;
+  $("tab-chat").setAttribute("aria-selected", String(!code));
+  $("tab-code").setAttribute("aria-selected", String(code));
+  loadFrame(which);
+  localStorage.setItem(TAB_KEY, which);
+  document.title = code ? "Code — Enterprise AI" : "Chat — Enterprise AI";
+}
+
+$("tab-chat").addEventListener("click", () => showTab("chat"));
+$("tab-code").addEventListener("click", () => showTab("code"));
+$("code-retry").addEventListener("click", () => {
+  const f = $("frame-code");
+  delete f.dataset.loaded;
+  $("code-fallback").hidden = true;
+  loadFrame("code");
+});
+
+/* ---------------------------------------------------------------- user menu */
+
+function toggleMenu(show) {
+  const open = show ?? $("user-menu").hidden;
+  $("user-menu").hidden = !open;
+  $("avatar-btn").setAttribute("aria-expanded", String(open));
+}
+$("avatar-btn").addEventListener("click", (e) => { e.stopPropagation(); toggleMenu(); });
+document.addEventListener("click", () => toggleMenu(false));
+$("user-menu").addEventListener("click", (e) => e.stopPropagation());
+
+$("mi-settings").addEventListener("click", () => {
+  toggleMenu(false);
+  // Refresh on open rather than on page load: these numbers go stale while somebody is
+  // working, and the settings sheet is the only place they are visible.
+  loadSpend(); loadPublished(); loadKeys();
+  $("dlg-settings").showModal();
+});
+$("settings-close").addEventListener("click", () => $("dlg-settings").close());
+
+document.addEventListener("keydown", (e) => {
+  const typing = ["INPUT", "TEXTAREA", "IFRAME", "SELECT"].includes(document.activeElement?.tagName);
+  if (e.key === "Escape") { toggleMenu(false); return; }
+  if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+  // Digit shortcuts, the way a tabbed app is expected to behave.
+  if (e.key === "1") showTab("chat");
+  if (e.key === "2") showTab("code");
+});
 
 /* ---------------------------------------------------------------- spend */
 
@@ -264,10 +328,9 @@ async function boot() {
     $("failbar").hidden = false;
     return;
   }
-  // Independently, so one slow or broken panel cannot hold up the others.
-  loadSpend();
-  loadPublished();
-  loadKeys();
+  // Settings content is fetched when the sheet is opened, not on load: it is not on the
+  // critical path to somebody's work, and three requests behind a page that is about to
+  // mount two iframes is three requests competing with the thing they came for.
 }
 
 $("retry").addEventListener("click", boot);

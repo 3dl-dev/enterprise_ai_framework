@@ -1,5 +1,10 @@
 /* Workshop behaviour.
  *
+ * URLS ARE RELATIVE, ON PURPOSE. The page is served standalone at / and also proxied by
+ * the portal under /workshop/ so the workshop can be a tab instead of a separate site
+ * on a LAN address. Relative URLs resolve against <base>, which the proxy rewrites; a
+ * root-relative "/api/state" would escape the prefix and 404 in the embedded case.
+ *
  * No framework, no build step: this has to keep working for as long as the camp does
  * without anyone running npm. Native <dialog> does the modals, so focus trapping, Escape
  * and the backdrop come from the platform rather than from code I would have to get right.
@@ -14,6 +19,11 @@
  */
 
 const $ = (id) => document.getElementById(id);
+
+/* Framed by the portal, rather than opened on its own. Used only to drop the duplicate
+ * wordmark; everything else behaves identically in both modes, because a surface that
+ * behaves differently depending on how it was reached is a surface nobody can support. */
+if (window.self !== window.top) document.body.classList.add("embedded");
 const api = {
   async get(p) { const r = await fetch(p, { cache: "no-store" }); return r.json(); },
   async post(p, b) {
@@ -244,7 +254,7 @@ let previewLoading = false;
 function loadPreview() {
   // Cache-bust rather than reload(): a plain reload can come from cache, and a child who
   // sees no change concludes their edit did nothing.
-  const u = new URL("/preview/", location.origin);
+  const u = new URL("preview/", document.baseURI);
   u.searchParams.set("_", Date.now());
   previewLoading = true;
   $("drawer-progress").hidden = false;
@@ -264,7 +274,7 @@ function syncEmpty() {
   $("preview-empty").hidden = !empty;
   // Never read contentDocument to decide this — the preview is sandboxed without
   // allow-same-origin and touching it throws. /api/pulse is the only source of truth.
-  if (empty && !M.previewRetried && $("preview").src.includes("/preview/")) {
+  if (empty && !M.previewRetried && $("preview").src.includes("preview/")) {
     M.previewRetried = true;
     setTimeout(() => { if (M.drawer !== "closed" && hasIndex()) loadPreview(); }, 1500);
   }
@@ -364,7 +374,7 @@ $("btn-fill").addEventListener("click", () => {
 
 // User intent always overrides the machine: this reloads now, whatever the settle gate says.
 $("btn-reload").addEventListener("click", () => { M.dirty = false; loadPreview(); });
-$("btn-popout").addEventListener("click", () => window.open("/preview/", "_blank", "noopener"));
+$("btn-popout").addEventListener("click", () => window.open("preview/", "_blank", "noopener"));
 $("empty-ideas").addEventListener("click", () => openStuck());
 
 /* ------------------------------------------------------------------ settle gate */
@@ -571,7 +581,7 @@ function onPollFailure() {
 async function pollPulse() {
   let scheduled = M.backoff;
   try {
-    const r = await fetch("/api/pulse", { cache: "no-store" });
+    const r = await fetch("api/pulse", { cache: "no-store" });
     if (r.status === 404 && M.havePulse === null) {
       // The endpoint is not there at all. Degrade permanently and silently: Ribbon from
       // /api/state only, no auto-reveal, drawer by button. The UI must not break because
@@ -677,7 +687,7 @@ async function restartAgent() {
     danger: "Restart it",
   })) return;
   // ttyd spawns a fresh shell per websocket, so reloading the frame IS the restart.
-  $("terminal-frame").src = "/terminal/";
+  $("terminal-frame").src = "terminal/";
   $("bar-stuck").hidden = true;
   transient("Fresh start. Type what you want to make.", "grey");
 }
@@ -688,7 +698,7 @@ $("stuck-restart").addEventListener("click", restartAgent);
 /* Switching only writes one file and reloads two frames: ttyd spawns a fresh shell per
  * websocket, so reloading the terminal lands in the new directory by itself. */
 function reloadPanes() {
-  $("terminal-frame").src = "/terminal/";
+  $("terminal-frame").src = "terminal/";
   $("preview").src = "about:blank";
   if (M.havePulse !== true) {
     // No pulse to resolve the switch for us, so decide from /api/state right now.
@@ -713,7 +723,7 @@ function renderMenu() {
     b.addEventListener("click", async () => {
       toggleMenu(false);
       if (p.name === STATE.project) return;
-      const { ok, data } = await api.post("/api/switch", { name: p.name });
+      const { ok, data } = await api.post("api/switch", { name: p.name });
       if (ok) { await load(); reloadPanes(); toast(data.message); } else toast(data.message, false);
     });
     m.appendChild(b);
@@ -739,7 +749,7 @@ $("project-menu").addEventListener("click", (e) => e.stopPropagation());
 async function createProject() {
   const name = await newProjectDialog();
   if (!name) return;
-  const { ok, data } = await api.post("/api/projects", { name });
+  const { ok, data } = await api.post("api/projects", { name });
   if (!ok) { toast(data.message || "Could not make it.", false); return; }
   await load(); reloadPanes(); toast(data.message);
 }
@@ -751,7 +761,7 @@ $("reset-project").addEventListener("click", async () => {
     body: "This empties the project. Every earlier version stays in its history, so nothing is truly lost.",
     danger: "Empty it",
   })) return;
-  const { ok, data } = await api.post("/api/reset", {});
+  const { ok, data } = await api.post("api/reset", {});
   if (ok) { await load(); reloadPanes(); }
   toast(data.message, ok);
 });
@@ -764,7 +774,7 @@ $("delete-project").addEventListener("click", async () => {
     body: "The project and its share link both go, for good. Anyone holding the link will see nothing.",
     danger: "Delete it",
   })) return;
-  const { ok, data } = await api.post("/api/delete", { name });
+  const { ok, data } = await api.post("api/delete", { name });
   if (ok) { await load(); reloadPanes(); }
   toast(data.message, ok);
 });
@@ -777,7 +787,7 @@ $("btn-settings").addEventListener("click", () => $("dlg-settings").showModal())
 
 async function load() {
   let s;
-  try { s = await api.get("/api/state"); }
+  try { s = await api.get("api/state"); }
   catch { $("bar-lost").hidden = false; return; }
   STATE = s;
 
@@ -800,7 +810,7 @@ async function load() {
     span.appendChild(subEl);
     l.append(input, span);
     input.addEventListener("change", async (e) => {
-      const { ok, data } = await api.post("/api/model", { model: e.target.value });
+      const { ok, data } = await api.post("api/model", { model: e.target.value });
       toast(data.message || "Saved.", ok);
       if (ok) await load();
     });
@@ -881,7 +891,7 @@ $("btn-share").addEventListener("click", async () => {
   btn.disabled = true;
   label.textContent = "Sharing…";
   try {
-    const { data } = await api.post("/api/publish");
+    const { data } = await api.post("api/publish");
     if (data.ok && data.url) {
       await load();
       showShare(data.url);
