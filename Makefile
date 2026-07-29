@@ -4,9 +4,21 @@ BUNDLE := bundle
 COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env
 
 ## Scope item 8: the whole bundle starts from one command on a single host, no GPU.
+##
+## render-env.sh before make-certs.sh, not the other way round: make-certs.sh only
+## records IDP_PUBLIC_HOST into a .env that already exists (`elif [[ -f .env ]]`), and on
+## a genuinely fresh worktree with no bundle/.env yet, running it first meant neither
+## branch fired — IDP_PUBLIC_HOST was silently never written, and identity came up with
+## a malformed KC_HOSTNAME (`https:` with nothing after it) and stayed unhealthy.
+## render-env.sh's job is exactly "create .env from .env.example if it does not exist,
+## fill gaps otherwise" and has no dependency on certs existing first, so running it
+## first makes the later grep/sed in make-certs.sh see a real file every time, first run
+## included. Found running `make up` in a brand-new worktree (enterpriseaiframework-cbf):
+## an untested combination, since the primary checkout and every other worktree so far
+## already had a bundle/.env before this ordering could matter.
 up:
-	@$(BUNDLE)/bin/make-certs.sh
 	@$(BUNDLE)/bin/render-env.sh
+	@$(BUNDLE)/bin/make-certs.sh
 	@$(BUNDLE)/bin/render-gateway-config.py
 	@$(COMPOSE) up -d --build postgres valkey fakeprovider identity gateway control-plane
 	@$(BUNDLE)/bin/wait-healthy.sh

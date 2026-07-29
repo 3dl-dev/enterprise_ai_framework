@@ -102,6 +102,26 @@ make test-workspace                               # drives both, as a person wou
 will call. Each run rotates that user's `<username>::ide` virtual key through the control
 plane, so the pod never holds a shared key and the ledger's token hash stays correct.
 
+**The agent's house rules are configuration, not image content** (enterpriseaiframework-cbf).
+`/etc/opencode/PLATFORM.md` is baked into the image and cannot be changed without a rebuild —
+facts about the pod, verified against the NetworkPolicy and the live cluster, not preference.
+`/etc/opencode/tenant/TENANT.md` is an operator's own standing instructions for the terminal
+agent, mounted from a ConfigMap and never baked in. It is **per-deployment, not per-user**: one
+`workspace-tenant-instructions` ConfigMap, shared by every workspace this namespace provisions.
+
+```bash
+deploy/bin/provision-workspace.sh baron                                   # seeds TENANT.md from deploy/workspace/AGENTS.md the first time
+deploy/bin/provision-workspace.sh student --instructions ./our-house-rules.md   # replaces it, for every workspace, no image rebuild
+```
+
+A change takes effect on the next pod, and on an already-running pod without a restart. The
+mount is a directory (`/etc/opencode/tenant/`), not a `subPath` mount of a single file —
+`subPath` mounts do NOT receive ConfigMap updates from the kubelet's sync, only a whole-volume
+mount does, so the mount shape is load-bearing for that claim (see
+`deploy/bin/lib/tenant-instructions.sh` and `deploy/workspace/Dockerfile`). First run with
+nothing passed seeds the ConfigMap from `deploy/workspace/AGENTS.md` unedited, so the coding
+camp's current rules are what a fresh deployment gets by default.
+
 | | |
 |---|---|
 | URL | none of its own — reached at `$PUBLIC_BASE_URL/portal/`, Code tab |

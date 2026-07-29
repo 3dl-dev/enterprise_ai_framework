@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Provision one user's browser-terminal workspace.
 #
-#   deploy/bin/provision-workspace.sh <keycloak-username> [--model NAME]
+#   deploy/bin/provision-workspace.sh <keycloak-username> [--model NAME] [--instructions FILE]
 #
 # Repeatable and idempotent: run it twice and you get the same workspace with a freshly
 # rotated virtual key. This is the mechanism the on-click provisioning API will call; it
@@ -19,9 +19,26 @@
 #      reach from your authenticated name, so a request cannot name somebody else's.
 #   3. The pod cannot reach the Kubernetes API, another workspace, or anything else we
 #      run except the gateway. See the NetworkPolicy in 60-workspace-common.yaml.
+#
+# --instructions FILE (enterpriseaiframework-cbf): the terminal agent's standing
+# instructions for THIS DEPLOYMENT, not this user. Every workspace pod in the namespace
+# mounts one shared ConfigMap (`workspace-tenant-instructions`) as a directory (see
+# deploy/k8s/61-workspace.template.yaml) — matching "one control plane" rather than making
+# agent behaviour a per-user setting; per-user was considered and rejected because it
+# invites every user editing the agent's rules, which is a different product than an
+# operator configuring one. First run with no --instructions seeds that ConfigMap from
+# deploy/workspace/AGENTS.md — the camp's current rules, unedited — so nothing regresses
+# for the tenant that already exists. A later run WITH --instructions overwrites it for
+# every workspace in the namespace, present and future; because the mount is a directory
+# and not a subPath, a running pod picks up the change on the kubelet's own ConfigMap
+# sync, no restart, no image build (subPath mounts do NOT get that sync — see
+# deploy/bin/lib/tenant-instructions.sh and deploy/workspace/Dockerfile). Platform facts
+# that must hold regardless of what any operator writes here live separately, baked into
+# the image at /etc/opencode/PLATFORM.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+source deploy/bin/lib/tenant-instructions.sh
 
 NS=enterprise-ai
 REGISTRY="${RAIL_REGISTRY:-192.168.2.43:30500}"
@@ -31,12 +48,14 @@ IMAGE="${WORKSPACE_IMAGE:-${REGISTRY}/${IMAGE_NAME}:${WORKSPACE_TAG}}"
 REALM="${IDP_REALM:-enterprise-ai}"
 CLIENT_ID=workspace
 
-USER_NAME="${1:?usage: provision-workspace.sh <keycloak-username> [--model NAME]}"
+USER_NAME="${1:?usage: provision-workspace.sh <keycloak-username> [--model NAME] [--instructions FILE]}"
 shift
 MODEL="${WORKSPACE_MODEL:-glm-5.2@deepinfra}"
+INSTRUCTIONS="${WORKSPACE_INSTRUCTIONS:-}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --model)    MODEL="$2"; shift 2 ;;
+        --model)        MODEL="$2"; shift 2 ;;
+        --instructions) INSTRUCTIONS="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -135,6 +154,12 @@ PUBLISH_URL="${PUBLISH_URL:-https://gateway.tailcb6ef9.ts.net:8443}"
 
 # ---------------------------------------------------------------- apply
 kubectl apply -f deploy/k8s/60-workspace-common.yaml >/dev/null
+
+# One ConfigMap for the whole deployment, applied BEFORE the pod template below so a pod
+# created by this run always finds it already there — see
+# deploy/bin/lib/tenant-instructions.sh for the three cases this covers.
+ensure_tenant_instructions "$NS" workspace-tenant-instructions \
+    deploy/workspace/AGENTS.md "$INSTRUCTIONS"
 
 sed -e "s|__USER__|${USER_NAME}|g" \
     -e "s|__IMAGE__|${IMAGE}|g" \

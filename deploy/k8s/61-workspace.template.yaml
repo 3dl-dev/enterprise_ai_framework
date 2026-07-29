@@ -145,6 +145,22 @@ spec:
             # has to become a real upload service instead of a shared mount.
             - { name: published, mountPath: /published }
             - { name: home, mountPath: /home/coder }
+            # The operator's house rules for the terminal agent, layered under the
+            # platform facts baked into the image (deploy/workspace/Dockerfile,
+            # enterpriseaiframework-cbf). Mounted as a DIRECTORY, not with subPath: a
+            # subPath mount does not receive ConfigMap updates from the kubelet's sync —
+            # only a whole-volume mount does — and the point of a ConfigMap here is that
+            # an operator's edit reaches an already-running pod with no restart. One
+            # ConfigMap for the whole deployment (not one per __USER__): every workspace
+            # this namespace ever provisions mounts the same one, matching "one control
+            # plane" rather than making agent behaviour a per-user setting.
+            # `optional: true`: a pod scheduled before deploy/bin/provision-workspace.sh
+            # has ever created this ConfigMap still starts, with an empty tenant
+            # directory, instead of hanging in ContainerCreating — the ConfigMap is
+            # supposed to always exist by the time a pod is created (the script creates it
+            # before applying this template), but the guarantee should not depend on that
+            # ordering never being violated.
+            - { name: tenant-instructions, mountPath: /etc/opencode/tenant, readOnly: true }
           resources:
             # k3s-worker runs live GPU training. A student running `make -j` must not be
             # able to take the node down with them, so the limit is real and the request
@@ -177,3 +193,13 @@ spec:
         # the user's code and nothing else.
         - name: home
           emptyDir: { sizeLimit: 2Gi }
+        # Deployment-wide, not __USER__-scoped: deploy/bin/provision-workspace.sh (via
+        # deploy/bin/lib/tenant-instructions.sh) seeds this ConfigMap once, from
+        # deploy/workspace/AGENTS.md verbatim, and every workspace pod in the namespace
+        # mounts the same one. An operator replaces it with
+        # `provision-workspace.sh <user> --instructions <path>` — no image build, and
+        # because the mount above is a directory (not subPath) a content change reaches
+        # an already-running pod on the kubelet's own ConfigMap sync, no restart. `optional:
+        # true` matches the volumeMount above.
+        - name: tenant-instructions
+          configMap: { name: workspace-tenant-instructions, optional: true }
