@@ -36,6 +36,32 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ENTRYPOINT = REPO_ROOT / "deploy/workspace/entrypoint.sh"
+WORKSPACE_DOCKERFILE = REPO_ROOT / "deploy/workspace/Dockerfile"
+
+# The ttyd release this reimplementation's fidelity was manually verified against (see
+# module docstring). If Dockerfile's pin ever moves off these values, that verification no
+# longer covers the running binary and _parse_client_option must be re-checked against the
+# new release's src/server.c before this pin is updated to match.
+PINNED_TTYD_VERSION = "1.7.7"
+PINNED_TTYD_SHA256 = "8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55"
+
+
+def test_dockerfile_ttyd_pin_matches_the_version_the_parser_was_verified_against():
+    dockerfile_text = WORKSPACE_DOCKERFILE.read_text()
+    version_match = re.search(r"^ARG TTYD_VERSION=(\S+)$", dockerfile_text, re.MULTILINE)
+    sha_match = re.search(r"^ARG TTYD_SHA256=(\S+)$", dockerfile_text, re.MULTILINE)
+    assert version_match, "Dockerfile no longer sets ARG TTYD_VERSION=..."
+    assert sha_match, "Dockerfile no longer sets ARG TTYD_SHA256=..."
+    assert version_match.group(1) == PINNED_TTYD_VERSION, (
+        "Dockerfile's TTYD_VERSION moved off the release _parse_client_option was manually "
+        "verified against (see this module's docstring). Re-verify the reimplementation "
+        "against the new release's src/server.c, then update PINNED_TTYD_VERSION here."
+    )
+    assert sha_match.group(1) == PINNED_TTYD_SHA256, (
+        "Dockerfile's TTYD_SHA256 moved off the binary _parse_client_option was manually "
+        "verified against (see this module's docstring). Re-verify the reimplementation "
+        "against the new release's src/server.c, then update PINNED_TTYD_SHA256 here."
+    )
 
 # The commit this documentation item started from (current main at dispatch time). The
 # control case below proves the doc-only edit made on top of it left ttyd's real exec
