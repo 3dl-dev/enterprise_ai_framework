@@ -188,10 +188,16 @@ _CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
 # cent-level agreement with the provider's own invoice (finding 9) is not on the table
 # here and no version of this trades it.
 #
-# Read against `status`, not against spend or tokens. Deducing "failed" from `spend = 0`
-# would sweep in every cache hit, and from `total_tokens = 0` would sweep in anything else
-# that ever records no tokens. LiteLLM writes 'success' or 'failure' here and leaves it
-# NULL on paths predating the column, so an unknown status is not counted as a failure —
+# Read against `status`, not against spend or tokens. That is not hypothetical: measured on
+# this bundle's ledger, `spend = 0` matches the cache-hit row AND all ten failure rows, so
+# deducing "failed" from the money column would report cache hits as failures and vice
+# versa depending on which way it was written. `total_tokens = 0` is no better — it would
+# sweep in anything else that ever records no tokens.
+#
+# The observed values are exactly 'success' and 'failure'. The COALESCE is defensive rather
+# than measured: nothing here has produced a NULL status, but the sibling column cache_hit
+# does carry the literal string 'None' on older rows, so this family of columns clearly
+# does not guarantee a clean value. Failing to 'not a failure' is the right direction —
 # the bill should under-claim failures rather than invent them.
 _FAILED = "lower(COALESCE(s.status, '')) = 'failure'"
 
