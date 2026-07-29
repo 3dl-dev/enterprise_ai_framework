@@ -897,3 +897,74 @@ Measured on the bundle afterwards, over a ledger where every key had been revoke
 join blanks 4 of 4 rows, the shared expression blanks 1 — and that one is a request LiteLLM
 *refused*, logged with `user_api_key_alias: null` and $0 spend, which is genuinely
 unattributable and correctly labelled.
+
+### 39. A request was served, charged upstream, and never billed — because the gateway shut down politely
+
+`enterpriseaiframework-3f3` had stood open since 2026-07-28: one request, HTTP 200 from a
+workspace pod on its own `baron::ide` key at 02:10:50Z, and no spend row. Two explanations
+were disproved before this one, and both were disproved by measurement rather than argument:
+
+- **Not a cache hit** (the theory this item was parked on for a day). Cache hits write
+  their own ledger row — 1 miss + 1 hit + 1 refusal produced 3 rows on the bundle.
+- **Not the master key** (finding 36's bucket). Master-key requests *do* land in the
+  ledger, as `(unattributed)`. Reading the cluster's own export for the hour in question:
+  69 rows, every one of them carrying `chat-surface::chat`, and **zero** rows with no
+  alias. There was nothing to attribute, orphan, or mislabel. The row was never written.
+
+The mechanism, reproduced on the compose bundle in three steps:
+
+1. `POST /v1/chat/completions` → **HTTP 200**, 19 tokens, real content handed to the caller.
+2. `docker compose stop gateway` — an ordinary SIGTERM; the container was down in 2.8s.
+3. Bring it back and wait past every flush interval. **The row is never written.** A control
+   request in the same run, with no restart, bills normally.
+
+LiteLLM does not write the spend row inline with the response. Its logging callback appends
+it to `prisma_client.spend_log_transactions`, a Python list, and a scheduled job commits the
+batch every `random.randint(PROXY_BATCH_WRITE_AT - 3, + 3)` = **7–13 seconds**. Its
+`proxy_shutdown_event` then disconnects Prisma, closes the cache, and flushes *Langfuse* —
+and never drains that list. Read from the vendor source inside the running container, not
+from documentation.
+
+So this was never a crash-only edge case. **Every ordinary redeploy, rollout or `restart` of
+the gateway silently discards up to thirteen seconds of billing for requests it has already
+served and the provider has already charged for.** The gateway is restarted by every
+deployment; the cluster's own ledger shows a 4m23s hole between 02:07:23 and 02:11:46 on the
+night in question, with the unaccounted request sitting inside it.
+
+Three things generalise:
+
+- **The bill is not wrong here, it is short.** Nothing errors, no row is mislabelled, no
+  total fails to add up. Findings 25, 34 and 38 were all about a row that existed and named
+  the wrong person; this is the first one where the money leaves no trace at all, and it is
+  correspondingly invisible — there is no `(unattributed)` bucket to notice.
+- **"Served" and "recorded" were never the same event, and nothing in the system said so.**
+  A 200 was treated as proof of a ledger row for the entire life of the project.
+- **Two disproved hypotheses cost a day each** because both were plausible and neither was
+  measured. The cache theory and the master-key theory were each written into the item as
+  the likely answer. What resolved it was standing the bundle up and stopping a container.
+
+**Fixed** in `enterpriseaiframework-3f3` by `deploy/gateway/flush_spend_on_shutdown.py`,
+mounted alongside the other gateway callbacks: it wraps `proxy_shutdown_event` so LiteLLM's
+own `update_spend` — the function its scheduler calls — runs *before* the database goes
+away. We do not write the row and we do not reimplement metering; we make the vendor's flush
+happen at the moment it forgot to. A FastAPI `on_event("shutdown")` handler was not an
+option: LiteLLM builds its app with a custom `lifespan`, and Starlette ignores registered
+shutdown handlers when one is supplied, so such a handler would look right and never run.
+
+`tests/test_spend_survives_restart.py` holds it in two halves, because the end-to-end test
+alone can pass for the wrong reason if the scheduler happens to tick before the stop. The
+integration test serves three requests, proves at least one was still buffered, stops the
+gateway, and asserts every row is on the bill **while the gateway is still down** — with the
+right token count, non-zero spend, and the principal and surface from the key alias, because
+a row existing is not a row being right. The ordering test carries no timing at all: it
+replaces both the flush and the vendor shutdown with recorders inside the real gateway
+container and asserts the order is flush-then-shutdown, which is the entire defect. All
+three fail before the fix; the integration one fails with `3 of 3 requests were served with
+HTTP 200 and are not on the bill`.
+
+**Still open, deliberately.** SIGKILL, an OOM kill and node loss still discard the buffer —
+measured, same three steps with `docker kill -s KILL`, same result. Surviving those needs an
+inline write, which means owning the metering path we deliberately do not own. What is
+closed is the frequent, operator-caused case. The live cluster is **not** yet fixed: it runs
+a gateway config that predates this change (and predates finding 36's `require_principal`),
+so it needs a `deploy/bin/deploy.sh` run to pick either of them up.

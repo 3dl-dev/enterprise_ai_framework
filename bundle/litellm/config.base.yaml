@@ -66,7 +66,19 @@ litellm_settings:
   # and $0.11 of real agent traffic had been served against the master key, which has no
   # LiteLLM_VerificationToken row and stamps no alias, so the bill could name nobody and
   # no budget applied. Source and full reasoning: deploy/gateway/require_principal.py
-  callbacks: ["strip_reasoning.handler", "require_principal.handler"]
+  #
+  # flush_spend_on_shutdown commits the pending spend batch before the proxy tears down
+  # its database connection. LiteLLM buffers spend rows in memory for 7-13 seconds and its
+  # own shutdown event disconnects Prisma without draining that buffer, so an ordinary
+  # restart silently loses billing for requests it already served — measured on this
+  # bundle as one 200-response, 19 tokens, no ledger row, ever. Source and full reasoning:
+  # deploy/gateway/flush_spend_on_shutdown.py
+  #
+  # KEEP THIS LIST IN INLINE FLOW STYLE. tests/test_gateway_callbacks.py parses it with a
+  # regex on `callbacks: [ ... ]` to derive the modules every deployment must ship; block
+  # style makes that parse return nothing, which skips the whole drift trap instead of
+  # failing it.
+  callbacks: ["strip_reasoning.handler", "require_principal.handler", "flush_spend_on_shutdown.handler"]
   # Every request gets a spend row. This is the ledger the control plane reads for
   # the one bill (scope item 4) — without it, spend-by-user-and-surface returns nothing.
   success_callback: ["postgres"]

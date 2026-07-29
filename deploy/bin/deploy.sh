@@ -106,6 +106,7 @@ kubectl -n "$NS" create configmap gateway-config \
     --from-file=config.yaml=bundle/litellm/config.generated.yaml \
     --from-file=strip_reasoning.py=deploy/gateway/strip_reasoning.py \
     --from-file=require_principal.py=deploy/gateway/require_principal.py \
+    --from-file=flush_spend_on_shutdown.py=deploy/gateway/flush_spend_on_shutdown.py \
     --dry-run=client -o yaml | kubectl apply -f -
 
 # The chat surface's in-cluster endpoint differs from compose only in hostname.
@@ -115,7 +116,7 @@ kubectl -n "$NS" create configmap chat-config \
     --dry-run=client -o yaml | kubectl apply -f -
 rm -f /tmp/librechat-k8s.yaml
 
-CFG_SUM=$( { cat bundle/litellm/config.generated.yaml bundle/librechat/librechat.yaml deploy/gateway/strip_reasoning.py deploy/gateway/require_principal.py; } | sha256sum | cut -c1-16)
+CFG_SUM=$( { cat bundle/litellm/config.generated.yaml bundle/librechat/librechat.yaml deploy/gateway/strip_reasoning.py deploy/gateway/require_principal.py deploy/gateway/flush_spend_on_shutdown.py; } | sha256sum | cut -c1-16)
 
 echo "==> build and push control-plane image -> ${IMAGE}"
 docker build -q -t "$IMAGE" ./control-plane
