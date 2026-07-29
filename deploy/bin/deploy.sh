@@ -45,6 +45,14 @@ if grep -q 'forge' bundle/litellm/config.generated.yaml 2>/dev/null && [[ -z "${
     exit 1
 fi
 
+# enterpriseaiframework-dc0: the opposite drift. config.generated.yaml is rendered fresh
+# by whoever last ran `make up`, in whatever shell they happened to be in — this deploy
+# script has no way to tell whether that render was fakes-only or Forge-backed. Refuse to
+# push a fakes-only catalogue over a cluster that is currently Forge-backed, rather than
+# silently reducing every real user on it to three fake models.
+source deploy/bin/lib/catalogue-guard.sh
+assert_catalogue_not_downgraded "$NS" gateway-config bundle/litellm/config.generated.yaml || exit 1
+
 echo "==> namespace"
 kubectl apply -f deploy/k8s/00-namespace.yaml
 
