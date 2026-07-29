@@ -95,12 +95,65 @@ data:
         listen 8080;
         server_name _;
 
+        # THE USER LEVEL — /live/<user>/ and anything sitting directly inside it.
+        #
+        # This location exists only because of a migration. publish(1) writes to
+        # /live/<user>/<project>/ and has done since each project got its own path. The
+        # publisher BEFORE that wrote every project to /live/<user>/index.html, and those
+        # files are still on the volume. nginx's default `index index.html` served them
+        # happily, so /live/<user>/ answered 200 text/html with a page the running code
+        # can neither regenerate nor replace — a viewer saw work that looked live and was
+        # months stale, with nothing to tell them so. That is this project's signature
+        # failure: a path that responds 200 and looks healthy while serving something the
+        # current code no longer produces.
+        #
+        # Two rules, and they are separate on purpose:
+        #
+        #  1. `index` is pointed at a name nothing creates, so a directory request here
+        #     ALWAYS renders the autoindex — the list of that user's projects, generated
+        #     fresh — and never gets silently swapped for a stale published page. This is
+        #     why the fix is not a blanket 410 on the directory: a user who has both
+        #     residue and real projects must still get their project list.
+        #
+        #  2. A request that resolves to a regular FILE at this depth is old-layout
+        #     content by construction — publish(1) only ever creates directories here —
+        #     so it is refused. 410, not 404: it really was published at this path and
+        #     the layout moved out from under it. 404 reads as "you typed it wrong".
+        #
+        # Rule 2 also backstops rule 1: if a file with the sentinel index name ever did
+        # appear, the index lookup would internally redirect onto this same location and
+        # rule 2 would refuse it. Neither rule alone is load-bearing for the other.
+        #
+        # `root`, not `alias`, and deliberately INSIDE this location rather than at
+        # server level. It has to be root because $request_filename is what the -f test
+        # reads, and it has to be location-scoped because a server-level root makes the
+        # image's own /usr/share/nginx/html/index.html reachable — this server would
+        # start answering /index.html with nginx's welcome page instead of 404.
+        #
+        # The regex is anchored so it matches exactly two path segments: it catches
+        # /live/<user>/ and /live/<user>/<name>, and never /live/<user>/<project>/....
+        # Note it tests -f rather than matching an extension: a residual file with no
+        # extension must still be refused, and a project directory with dots in its name
+        # must still be served.
+        location ~ "^/live/[^/]+/[^/]*$" {
+            root /usr/share/nginx/html;
+            if (-f $request_filename) { return 410; }
+            index .never-an-index-file;
+            autoindex on;
+            autoindex_exact_size off;
+            autoindex_localtime on;
+        }
+
         # Directory listing at /live/ so a kid can see everything they have published,
         # and a parent given the top-level link can find the right one.
         # alias + autoindex, deliberately WITHOUT try_files: a try_files chain ending in
         # =404 intercepts the request before autoindex can list the directory, so an
         # empty published volume 404s instead of showing an empty index — which reads as
         # the server being broken rather than as nobody having published yet.
+        #
+        # This still serves index.html, because at PROJECT depth — /live/<user>/<project>/
+        # — an index.html is exactly what publish(1) puts there and exactly what a parent
+        # opening the link is meant to get. Only the user level above is restricted.
         location /live/ {
             alias /usr/share/nginx/html/live/;
             index index.html;
@@ -118,8 +171,20 @@ data:
         # so /listing/ has no public route. It is still only a directory listing of files
         # that are already served publicly one path over; there is nothing here that
         # /live/ does not already give away.
+        #
+        # /listing/ is a directory-listing API and nothing else, at every depth. It must
+        # never answer with a published PAGE: the portal calls /listing/<user>/ and does
+        # resp.json() on it, so an index.html served here comes back as HTML, the parse
+        # raises, and the portal's own except-branch reports "nothing published" for a
+        # user who has published plenty. Same defect as above, one layer up, and equally
+        # silent — hence the same two rules. The index sentinel keeps a directory request
+        # rendering the listing; the -f refusal keeps a file request from being served as
+        # content. 404 rather than 410 here because this path is an internal API with no
+        # public route, so there is no viewer to explain a migration to.
         location /listing/ {
             alias /usr/share/nginx/html/live/;
+            if (-f $request_filename) { return 404; }
+            index .never-an-index-file;
             autoindex on;
             autoindex_format json;
             autoindex_localtime on;
