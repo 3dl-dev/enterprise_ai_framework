@@ -16,7 +16,7 @@ import time
 from collections import defaultdict
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI(title="fake-provider")
 
@@ -91,11 +91,38 @@ async def openai_models():
     }
 
 
+# A prompt containing this marker makes the upstream fail with a 500.
+#
+# There are three ways a request can end without the caller getting an answer, and they
+# take three different code paths through the gateway, so "a failed request is not billed"
+# has to be asked of each one separately:
+#
+#   1. refused at the budget          -> raised in user_api_key_auth, before the router
+#   2. refused at the key's model list -> also before the router
+#   3. the upstream itself fails       -> past the router, onto the FAILURE CALLBACK,
+#                                         which is pointed at the same ledger
+#
+# Only the third can plausibly write a spend row, and it was the one no test could reach,
+# because a stand-in provider that always succeeds cannot produce it. Injection is by
+# prompt marker rather than a header: LiteLLM forwards the message body verbatim but does
+# not pass arbitrary client headers through to the upstream.
+FAIL_MARKER = "__fakeprovider_fail_500__"
+
+
 @openai_router.post("/chat/completions")
 async def openai_chat(request: Request):
     body = await request.json()
     model = body.get("model", "fake-gpt-large")
     prompt = extract_prompt(body.get("messages", []))
+    if FAIL_MARKER in prompt:
+        # Recorded before failing, so a test can still tell "the upstream was called and
+        # blew up" apart from "the gateway never called the upstream at all".
+        record_call(prompt)
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": "fake-provider was asked to fail",
+                               "type": "server_error"}},
+        )
     text = reply_text(prompt, model)
     prompt_tokens = count_tokens(prompt)
     completion_tokens = count_tokens(text)

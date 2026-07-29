@@ -181,11 +181,27 @@ cache miss wearing a budget error's clothes.
   not be smuggled into the money column.
 - What was actually wrong is that the bill said none of this. `85 requests, 150,574
   tokens, $0.000000` with no further explanation is indistinguishable from a bill that
-  has lost the money — and it was read as exactly that, twice. `/admin/spend` now reports
-  `cached_requests` per user-and-surface and in the totals, so a $0 line is explained on
-  its face.
+  has lost the money — and it was read as exactly that, twice. `/admin/spend`,
+  `/portal/api/spend` and `/portal/api/admin/overview` now report `cached_requests` per
+  user-and-surface and in the totals, **and the portal renders it as a "Free" column** in
+  both the user's own spend table and the operator's. The first revision of this fix put
+  the number in the JSON and in none of the pages, which left the claim true only for
+  somebody reading the API by hand — not for the operator the ruling was written for.
 
 Locked in by `TestCacheHitsBudgetAndTheBill` in `tests/test_scope_items.py`.
+
+> **A third correction, same shape as the first two.** The revision that added
+> `cached_requests` also added a test asserting flatly that "a refused request is not
+> billed", and checked it against a single budget refusal. The assertion passed; the claim
+> was still wrong, because a request that fails at the *upstream* is past the router, goes
+> onto the failure callback, and does get a row that the bill counts. Once again a result
+> from one path was written down as a rule about all of them. The three classes are
+> measured separately in finding 36, and there is now one test per class.
+>
+> This also means the bill has **two** kinds of $0 row and this ruling only explains one
+> of them. `cached_requests` counts requests that were served for free. A failed request
+> was served to nobody, and whether it belongs in a request count at all is open —
+> `enterpriseaiframework-e69`.
 
 **A trap for anyone writing tests here.** The fake provider's reply — body, completion id,
 token counts — is a pure function of (model, prompt), so a cached reply and a fresh one
@@ -686,7 +702,11 @@ Two things generalise, and the second is the expensive one:
 **Not fixed here.** Filed as `enterpriseaiframework-f8c`, which requires a test asserting
 the two renderings agree — the duplication, not the lookup, is the defect.
 
-### 28. No key on the cluster carries a budget, so no one can be over one
+### 35. No key on the cluster carries a budget, so no one can be over one
+
+> Filed as "finding 28" when it was first written, which was already taken by "A sandbox
+> is an authority boundary". Renumbered to 35; `enterpriseaiframework-d65` is the item.
+
 
 Found while measuring finding 10. Every virtual key the control plane has provisioned on
 the cluster has `max_budget` NULL:
@@ -720,3 +740,73 @@ the cluster is a mutation this row's scope did not cover. Filed as
 `enterpriseaiframework-d65`. Note that milestone `enterpriseaiframework-0a4` asks for "a
 user past their budget is REFUSED **on the cluster**", which cannot be demonstrated at
 all until a cluster key has a budget to be past.
+
+### 36. A request the provider never answered is still counted as a request
+
+Found while answering the veracity gate on `enterpriseaiframework-d58`, which challenged
+the claim that "a refused request is not billed". The challenge was half right, and the
+half it was right about is the more interesting one.
+
+There are three ways a request can end without the caller getting an answer, and they do
+not take the same path through the gateway:
+
+| how it ends | where it is stopped | ledger row? | counted in `requests`? |
+|---|---|---|---|
+| over budget | `user_api_key_auth`, before the router | no | no |
+| model not on the key's list | `user_api_key_auth`, before the router | no | no |
+| the upstream itself fails | past the router, on the failure callback | **yes** | **yes** |
+
+Measured on the bundle, one key per class, unique prompts throughout:
+
+```
+budget:    2 served,  6 refused  -> ledger 2 rows, bill 2 requests
+model:     1 served,  3 denied   -> ledger 1 row,  bill 1 request
+upstream:  1 served,  3 failed   -> ledger 4 rows, bill 4 requests
+```
+
+The three upstream-failure rows carry `status='failure'`, `spend=0`, `total_tokens=0`,
+`cache_hit='False'`. So the bill tells an operator that this person made four requests
+when one was served, and it puts three zero-dollar rows in front of them with nothing to
+say why they are zero.
+
+**This is the same shape as the defect d58 set out to fix, in a second place.** d58's
+ruling was that a cache hit correctly bills $0 and the bill must therefore *say* how many
+requests were free, because an unexplained $0 gets read as lost money — it was filed as
+under-reporting twice. `cached_requests` explains one kind of zero. This is the other
+kind, and it is worse than unexplained: a cache hit is a request that was *served*, for
+free, and belongs in a request count. A failed request was served to nobody.
+
+**Not fixed here, deliberately.** Whether a request that returned an error belongs in the
+number labelled "requests" is a product decision about how money and usage are reported,
+not an implementation detail, and d58 is already at an attention gate for exactly this
+class of question. Filed as `enterpriseaiframework-e69`. The options are visible from
+here — exclude failures from `requests`, or carry `failed_requests` alongside
+`cached_requests` the way this item did for cache hits — and both are cheap; choosing is
+the part that is not.
+
+**What IS locked down here.** `cached_requests` must never absorb these rows. The
+predicate behind it reads the `cache_hit` column, not the spend column, and
+`test_an_upstream_failure_is_billed_as_a_request_at_zero_and_is_not_a_cache_hit` fails if
+that is ever loosened — demonstrated by loosening it to `spend = 0`, which reported three
+failed requests to the operator as free ones.
+
+### 37. `make up` failed the first time and passed on a re-run, in a clean checkout
+
+`make up` ran `make-certs.sh` before `render-env.sh`. `make-certs.sh` is what records
+`IDP_PUBLIC_HOST` into `bundle/.env`, but it only did so `elif [[ -f .env ]]` — and
+`render-env.sh` is what creates `.env`. So on the first run in a checkout with no `.env`
+yet, all three branches were skipped in silence, `KC_HOSTNAME` interpolated to
+`https://:8443`, and Keycloak crash-looped on:
+
+```
+java.net.URISyntaxException: Expected scheme-specific part at index 6: https:
+```
+
+`make up` then sat in `wait-healthy.sh` until it timed out. Running it a second time
+worked, because by then `.env` existed — which is why this survived: nobody meets it
+twice.
+
+Fixed by running `render-env.sh` first, and by making `make-certs.sh` fail loudly when
+`.env` is missing instead of skipping. Verified from a genuinely clean state — `make
+nuke`, `rm bundle/.env bundle/certs/*`, `make up` — which reproduced the crash before the
+change and came up healthy after it.

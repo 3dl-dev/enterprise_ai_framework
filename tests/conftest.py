@@ -6,6 +6,7 @@ the real stack over the network rather than mocking it: an item proven against a
 not proven.
 """
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -77,6 +78,40 @@ def compose(*args: str, check=True) -> subprocess.CompletedProcess:
          "--env-file", str(BUNDLE / ".env"), *args],
         capture_output=True, text=True, check=check,
     )
+
+
+def portal_get(path: str, username: str) -> tuple[int, str]:
+    """GET a portal path from inside the control-plane container, as `username`.
+
+    WHY IT HAS TO BE DONE THIS WAY. The portal takes the caller's identity from the
+    headers its authenticating proxy sets, and portal.py trusts those headers only when
+    the connection comes from loopback — otherwise anybody who could reach the published
+    port could name themselves anybody. The compose bundle ships no oauth2-proxy, so from
+    outside the container there is no way for a test to *be* somebody, and the published
+    port answers every portal route with a 401. Reaching in over `compose exec` is what
+    the sidecar would otherwise do, and it is the reason the whole /portal/api/admin/*
+    surface had never been touched by a test.
+
+    Returns (status, body) and does not raise on 4xx: the 404 a non-operator gets is a
+    thing tests need to assert on, not an accident.
+
+    urllib and not httpx/curl on purpose — the control-plane image has neither.
+    """
+    script = (
+        "import json,sys,urllib.request,urllib.error\n"
+        f"req=urllib.request.Request({json.dumps('http://localhost:8000' + path)},"
+        f" headers={{'x-auth-request-preferred-username': {json.dumps(username)}}})\n"
+        "try:\n"
+        "    r=urllib.request.urlopen(req); out={'status':r.status,'body':r.read().decode()}\n"
+        "except urllib.error.HTTPError as e:\n"
+        "    out={'status':e.code,'body':e.read().decode()}\n"
+        # One line, last line, so nothing the container writes to stdout first can be
+        # mistaken for the payload.
+        "sys.stdout.write('\\n'+json.dumps(out))\n"
+    )
+    out = compose("exec", "-T", "control-plane", "python", "-c", script)
+    envelope = json.loads(out.stdout.strip().splitlines()[-1])
+    return envelope["status"], envelope["body"]
 
 
 def idp_admin_token(env) -> str:

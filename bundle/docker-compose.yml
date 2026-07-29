@@ -153,6 +153,13 @@ services:
       IDP_CLIENT_ID: control-plane
       IDP_CLIENT_SECRET: ${IDP_CLIENT_SECRET:?set IDP_CLIENT_SECRET in .env}
       CONTROL_PLANE_ADMIN_TOKEN: ${CONTROL_PLANE_ADMIN_TOKEN:?set CONTROL_PLANE_ADMIN_TOKEN in .env}
+      # Who may see the read-only operator view of the bill in the portal. The k8s
+      # deployment has always set this; the bundle never did, so `make up` produced a
+      # deployment with NO operator console, and /portal/api/admin/* answered 404 to
+      # everybody — including the account the bundle itself bootstraps as the operator.
+      # That is also why the endpoint went untested: it was unreachable here.
+      # Defaults to the bootstrap user, who is the only account a fresh bundle has.
+      PORTAL_ADMINS: ${PORTAL_ADMINS:-${BOOTSTRAP_USER:-baron}}
     ports:
       - "${CONTROL_PLANE_PORT:-8081}:8000"
     depends_on:

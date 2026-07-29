@@ -192,6 +192,10 @@ async function loadSpend() {
     tr.innerHTML =
       `<td><span class="surface-tag"></span></td>` +
       `<td class="num">${compact(r.requests)}</td>` +
+      // How many of those were answered from cache, and therefore cost nothing. The
+      // number the API has carried since d58; until it was rendered here the operator's
+      // only sight of it was the raw JSON from `make spend`.
+      `<td class="num">${compact(r.cached_requests)}</td>` +
       `<td class="num">${compact(tokens)}</td>` +
       `<td class="num">${money(r.spend)}</td>`;
     // textContent, not innerHTML: the surface name comes from a key alias and is not
@@ -352,6 +356,7 @@ async function loadAdmin() {
     tr.innerHTML =
       "<td></td><td class='surfaces'></td>" +
       `<td class="num">${compact(p.requests)}</td>` +
+      `<td class="num">${compact(p.cached_requests)}</td>` +
       `<td class="num">${compact(tokens)}</td>` +
       `<td class="num">${money(p.spend)}</td>` +
       `<td class="num">${cap}</td>`;

@@ -4,9 +4,16 @@ BUNDLE := bundle
 COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env
 
 ## Scope item 8: the whole bundle starts from one command on a single host, no GPU.
+## render-env BEFORE make-certs, and the order is load-bearing. make-certs records
+## IDP_PUBLIC_HOST into .env, but it only did so when .env already existed — and
+## render-env is what creates .env. So the FIRST `make up` in a clean checkout left
+## IDP_PUBLIC_HOST unset, KC_HOSTNAME resolved to "https://:8443", and identity
+## crash-looped on a URISyntaxException; the second run passed, because by then .env
+## existed. Another "failed once, passed on a re-run" (cf. fae71e0). render-env needs
+## nothing from make-certs, so the dependency only runs one way.
 up:
-	@$(BUNDLE)/bin/make-certs.sh
 	@$(BUNDLE)/bin/render-env.sh
+	@$(BUNDLE)/bin/make-certs.sh
 	@$(BUNDLE)/bin/render-gateway-config.py
 	@$(COMPOSE) up -d --build postgres valkey fakeprovider identity gateway control-plane
 	@$(BUNDLE)/bin/wait-healthy.sh

@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import subprocess
 import time
 import uuid
@@ -15,7 +16,7 @@ import httpx
 import pytest
 
 import oidc_login
-from conftest import BUNDLE, DOGFOOD_USER, compose, set_user_enabled
+from conftest import BUNDLE, DOGFOOD_USER, compose, portal_get, set_user_enabled
 
 
 def _chat_token(client, chat_url: str) -> str:
@@ -31,6 +32,39 @@ def _chat_token(client, chat_url: str) -> str:
 pytestmark = pytest.mark.usefixtures("stack_up")
 
 TIMEOUT = 60.0
+
+# Put this in a prompt and the stand-in provider answers 500. Kept in step with
+# fakeprovider/app.py's FAKE_MARKER; it is the only way to exercise the gateway's failure
+# path, because a provider that always succeeds cannot produce one.
+FAKE_FAIL_MARKER = "__fakeprovider_fail_500__"
+
+
+def _table_headers(html: str, table_id: str) -> list[str]:
+    """The column headings a table declares, in order."""
+    start = html.index(f'id="{table_id}"')
+    thead = html.index("<thead>", start)
+    end = html.index("</thead>", thead)
+    return [
+        re.sub(r"<[^>]+>", "", cell).strip()
+        for cell in re.findall(r"<th\b[^>]*>(.*?)</th>", html[thead:end], re.S)
+    ]
+
+
+def _row_template_cells(js: str, marker: str) -> list[str]:
+    """The cells one `tr.innerHTML = ...` template emits, in order.
+
+    Whole-line // comments are dropped first. They are prose, they sit in the middle of
+    these templates, and a semicolon inside one would otherwise look like the end of the
+    statement and silently truncate the count — which would make this helper report a
+    column mismatch that is not there, or miss one that is.
+    """
+    body = "\n".join(
+        line for line in js.splitlines() if not line.strip().startswith("//")
+    )
+    at = body.index(marker)
+    start = body.rindex("tr.innerHTML", 0, at)
+    end = body.index(";", at)
+    return ["<td" + part for part in body[start:end].split("<td")[1:]]
 
 
 def gateway_aliases(gateway_url: str, master_headers: dict) -> set[str]:
@@ -964,17 +998,9 @@ class TestCacheHitsBudgetAndTheBill:
         # portal, built from one query, still managed to disagree — so a number added to
         # one of them gets checked against the other here rather than assumed.
         #
-        # The portal only honours identity headers from loopback (see portal.py), so this
-        # asks from inside the container, which is where its authenticating sidecar
-        # normally asks from. python, not curl: the image has no curl.
-        script = (
-            "import json,urllib.request;"
-            "r=urllib.request.Request('http://localhost:8000/portal/api/spend',"
-            f"headers={{'x-auth-request-preferred-username': '{username}'}});"
-            "print(urllib.request.urlopen(r).read().decode())"
-        )
-        out = compose("exec", "-T", "control-plane", "python", "-c", script)
-        portal = json.loads(out.stdout.strip().splitlines()[-1])
+        status, body = portal_get("/portal/api/spend", username)
+        assert status == 200, body[:300]
+        portal = json.loads(body)
         chat_row = next(
             (s for s in portal["by_surface"] if s["surface"] == "chat"), None
         )
@@ -987,47 +1013,301 @@ class TestCacheHitsBudgetAndTheBill:
         assert chat_row["spend"] == pytest.approx(row["spend"], rel=1e-6), (portal, row)
         assert portal["total"]["cached_requests"] == 1, portal
 
-    def test_a_refused_request_is_not_billed(
+    def _bill_row(self, control_plane_url, admin_headers, username, settle=25):
+        """This user's line on the operator's bill, after the ledger has had time to flush.
+
+        The gateway batches its writes, so reading immediately measures the batch interval
+        rather than the behaviour.
+        """
+        time.sleep(settle)
+        bill = httpx.get(
+            f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+        ).json()
+        return next(
+            (r for r in bill["by_user_and_surface"] if r["username"] == username), None
+        )
+
+    # THREE WAYS A REQUEST CAN END WITHOUT AN ANSWER, AND THEY DO NOT AGREE
+    #
+    # The three tests below replace one that asserted "a refusal is not billed" as a flat
+    # claim, checked it against a single budget refusal, and was therefore both passing
+    # and wrong: it advertised a general rule while exercising one special case. Measured
+    # on this bundle, the three classes split two-to-one:
+    #
+    #   budget exceeded      refused in user_api_key_auth, before the router   NOT billed
+    #   model not entitled   refused in user_api_key_auth, before the router   NOT billed
+    #   upstream 500         past the router, onto the failure callback        BILLED
+    #
+    # The third writes a real row — status 'failure', spend 0, zero tokens — and the bill
+    # counts it in `requests`. So "a refusal is not billed" is true of what a user gets
+    # refused and false of what breaks downstream, and each test now names which it means.
+    # The third is asserted as it BEHAVES, not as it ought to: see finding 36 and
+    # enterpriseaiframework-e69, where whether a request nobody was served should appear
+    # in the request count is raised as the product decision it is.
+
+    def test_a_budget_refusal_is_not_billed_as_usage(
         self, gateway_url, control_plane_url, master_headers, admin_headers
     ):
-        """The other half of the money question: a refusal must not appear as usage.
-
-        The gateway has a failure callback pointed at the same ledger, so this is a live
-        question rather than an obvious one.
-        """
+        """Past the cap, the refusals themselves cost nothing and count as nothing."""
         username = f"refusedbill-{uuid.uuid4().hex[:8]}"
         key = self._new_key(
-            gateway_url, master_headers, f"{username}::chat", max_budget=0.0000001
+            gateway_url, master_headers, f"{username}::chat", max_budget=0.00025
         )
         served = 0
         refusals = 0
-        deadline = time.monotonic() + 90
-        while time.monotonic() < deadline:
+        # Six refusals, not one. With a single refusal, "billed" and "not billed" differ
+        # by one request, which is indistinguishable from a row that had not flushed yet;
+        # at six the two answers are 6 apart and no timing story explains the gap.
+        deadline = time.monotonic() + 150
+        while time.monotonic() < deadline and refusals < 6:
             # Unique every time: this test is about what a refusal writes, so no request
             # may be answered from the cache and skew the served count.
             r = self._ask(gateway_url, key, f"refused {uuid.uuid4().hex}")
             if r.status_code >= 400:
+                assert "budget" in r.text.lower(), f"refused for some other reason: {r.text}"
                 refusals += 1
-                break
-            served += 1
-            time.sleep(3)
-        assert refusals == 1, "the key was never refused, so there is no refusal to check"
+            else:
+                # Counted, not forbidden. "Never served again after the first refusal" is
+                # a stricter claim than this test needs, and enforcement reads a spend
+                # figure the gateway refreshes on an interval — so a 200 arriving just
+                # after a 400 is a plausible race rather than a defect, and asserting it
+                # away would buy nothing but an intermittent failure. What is asserted
+                # below holds whatever order they arrive in: every served request appears
+                # on the bill and no refused one does.
+                served += 1
+            time.sleep(2)
+        assert refusals == 6, f"only {refusals} refusals; nothing to measure"
         assert served >= 1, "nothing was served, so there is no baseline to compare against"
 
-        # Give the ledger longer than the flush interval to write anything it was going to.
-        time.sleep(20)
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "the served calls are missing from the bill"
+        assert row["requests"] == served, (
+            f"{served} requests were served and {refusals} refused, but the bill counts "
+            f"{row['requests']} — a budget refusal was written to the ledger as usage: {row}"
+        )
+        assert row["cached_requests"] == 0, row
+
+    def test_a_request_the_key_may_not_make_is_not_billed_as_usage(
+        self, gateway_url, control_plane_url, master_headers, admin_headers
+    ):
+        """The other pre-router refusal: a model this key was never entitled to.
+
+        Separate from the budget test on purpose. Both are refused by the same dependency
+        today, but they are different rules and could stop sharing a code path; a test
+        that covers one and speaks for both is how the claim got wrong the first time.
+        """
+        username = f"denied-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(gateway_url, master_headers, f"{username}::chat")
+
+        assert self._ask(gateway_url, key, f"allowed {uuid.uuid4().hex}").status_code == 200
+
+        for _ in range(3):
+            denied = httpx.post(
+                f"{gateway_url}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                # The key was issued for fake-large only.
+                json={"model": "fake-small",
+                      "messages": [{"role": "user", "content": f"nope {uuid.uuid4().hex}"}]},
+                timeout=TIMEOUT,
+            )
+            assert denied.status_code >= 400, denied.text
+            assert "model" in denied.text.lower(), denied.text
+
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "the one allowed call is missing from the bill"
+        assert row["requests"] == 1, (
+            f"one call was served and three were denied at the key's model list, but the "
+            f"bill counts {row['requests']} requests: {row}"
+        )
+
+    def test_an_upstream_failure_is_billed_as_a_request_at_zero_and_is_not_a_cache_hit(
+        self, gateway_url, control_plane_url, master_headers, admin_headers, fakeprovider_url
+    ):
+        """The class that IS written to the ledger — and the guard on cached_requests.
+
+        When the provider itself fails, the request is past the router and the failure
+        callback writes a spend row: status 'failure', spend 0, no tokens. The bill counts
+        it in `requests`. That is asserted here as the behaviour it is, not as the
+        behaviour it should be — whether a request nobody was served belongs in a request
+        count is a product decision, raised as enterpriseaiframework-e69 / finding 36.
+
+        THE PART THAT BELONGS TO THIS ITEM. Those rows are $0 and they are NOT cache hits,
+        so the bill now has two kinds of zero in it and cached_requests must only ever
+        claim the one it means. If the predicate behind cached_requests were ever loosened
+        from the cache_hit column to something like "spend = 0", every upstream failure
+        would be reported to the operator as a request that was free — money that was
+        never spent because nothing was delivered, dressed up as an efficiency. This test
+        fails the moment that happens.
+        """
+        username = f"upfail-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(gateway_url, master_headers, f"{username}::chat")
+
+        assert self._ask(gateway_url, key, f"good {uuid.uuid4().hex}").status_code == 200
+
+        failures = 3
+        for _ in range(failures):
+            prompt = f"{FAKE_FAIL_MARKER} {uuid.uuid4().hex}"
+            broke = self._ask(gateway_url, key, prompt)
+            assert broke.status_code >= 500, (
+                f"the provider was asked to fail and did not: {broke.status_code} "
+                f"{broke.text[:200]}"
+            )
+            # The upstream really was reached — which is what puts this request on the
+            # failure-callback path rather than the pre-router refusal path. Without this
+            # the test would pass just as well if the gateway had rejected it locally,
+            # and it would then be measuring the wrong class entirely.
+            assert self._provider_calls(fakeprovider_url, prompt) >= 1, (
+                "the gateway never called the provider, so this is not an upstream failure"
+            )
+
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "the successful call is missing from the bill"
+        assert row["requests"] == 1 + failures, (
+            f"one call was served and {failures} failed at the provider; the bill counts "
+            f"{row['requests']} requests. If this is now {1}, the behaviour changed and "
+            f"finding 36 has been fixed — update this test rather than deleting it: {row}"
+        )
+        assert row["cached_requests"] == 0, (
+            f"a failed request was reported to the operator as a FREE request. Nothing "
+            f"was delivered and nothing was cached; cached_requests must count cache hits "
+            f"and only cache hits: {row}"
+        )
+        # The money is still right even though the count is not: a failure buys nothing,
+        # so exactly one call's worth of spend is on the line.
+        assert row["spend"] > 0, row
+        assert row["prompt_tokens"] > 0 and row["completion_tokens"] > 0, row
+
+    def test_the_operator_console_reports_cached_requests(
+        self, gateway_url, control_plane_url, master_headers, admin_headers, fakeprovider_url, env
+    ):
+        """/portal/api/admin/overview — the operator's own view of the same free requests.
+
+        This endpoint had never been touched by a test, and could not be: the bundle set
+        no PORTAL_ADMINS, so require_admin_user answered 404 to every name in it,
+        including the account the bundle bootstraps. Only the k8s deployment set it. It is
+        set in the bundle now, defaulted to BOOTSTRAP_USER, which is what makes this test
+        able to exist at all — the endpoint was previously verified by reading portal.py,
+        which is not verification.
+
+        The 404 for a non-operator is asserted in the same test rather than a separate
+        one, because a 200 here means nothing if it would also be 200 for everybody: the
+        assertion that matters is that the console distinguishes the two.
+        """
+        admin = env.get("BOOTSTRAP_USER", "baron")
+        username = f"adminview-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(gateway_url, master_headers, f"{username}::chat")
+        prompt = f"operator sees this {uuid.uuid4().hex}"
+
+        assert self._ask(gateway_url, key, prompt).status_code == 200
+        assert self._ask(gateway_url, key, prompt).status_code == 200
+        assert self._provider_calls(fakeprovider_url, prompt) == 1, \
+            "the second call reached the provider, so there is no free request to report"
+
+        # THE CONTROL. A stranger must not see the operator console, and must not learn
+        # that there is one — 404, not 403.
+        status, body = portal_get("/portal/api/admin/overview", username)
+        assert status == 404, (
+            f"{username} is not in PORTAL_ADMINS but was served the operator console "
+            f"anyway: {status} {body[:300]}"
+        )
+
+        # Now as the operator. Poll: this reads the same batched ledger as the bill.
+        deadline = time.monotonic() + 90
+        person = None
+        while time.monotonic() < deadline:
+            status, body = portal_get("/portal/api/admin/overview", admin)
+            assert status == 200, (
+                f"{admin} is PORTAL_ADMINS but the console refused them: {status} "
+                f"{body[:300]}"
+            )
+            overview = json.loads(body)
+            person = next(
+                (p for p in overview["people"] if p["username"] == username), None
+            )
+            if person and person["requests"] >= 2:
+                break
+            time.sleep(3)
+
+        assert person is not None, (
+            f"the operator console does not show this user at all: "
+            f"{[p['username'] for p in overview['people']]}"
+        )
+        assert person["requests"] == 2, person
+        assert person["cached_requests"] == 1, (
+            f"the operator cannot see which of this person's requests were free: {person}"
+        )
+        # Per surface as well as per person. The two are summed from the same rows, so a
+        # column added to one and not the other is the exact shape of finding f8c.
+        chat = next((s for s in person["surfaces"] if s["surface"] == "chat"), None)
+        assert chat is not None, person
+        assert chat["cached_requests"] == 1, chat
+        assert overview["totals"]["cached_requests"] >= 1, overview["totals"]
+
+        # And it must agree with the operator's other rendering of the same money.
         bill = httpx.get(
             f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
         ).json()
         row = next(
             (r for r in bill["by_user_and_surface"] if r["username"] == username), None
         )
-        assert row is not None, "the served calls are missing from the bill"
-        assert row["requests"] == served, (
-            f"{served} requests were served and {refusals} refused, but the bill counts "
-            f"{row['requests']} — a refusal was written to the ledger as usage: {row}"
+        assert row is not None, "on the console but not on the bill"
+        assert person["cached_requests"] == row["cached_requests"], (
+            f"the console and the bill disagree about how many requests were free: "
+            f"console {person}, bill {row}"
         )
-        assert row["cached_requests"] == 0, row
+
+    def test_the_portal_page_has_a_column_for_the_free_requests(self):
+        """The number has to reach the operator's eyes, not just their JSON.
+
+        cached_requests was added to three JSON endpoints and rendered by none of them, so
+        "the bill reports how many requests were free" was true only of `make spend` and
+        of anyone reading the API by hand. The person the ruling was written for — an
+        operator looking at a $0 line and wondering where the money went — still saw a
+        table with no explanation in it.
+
+        WHAT THIS TEST DOES NOT DO, stated plainly rather than left to be discovered. It
+        does not execute the page. `make test` has no DOM: the only browser harness in
+        this repo is tests-live/test_browser.py, which drives a real Chromium against the
+        CLUSTER, needs kubectl to read its credentials, and needs browser binaries the
+        test venv does not install. It also cannot be pointed at the bundle, because the
+        portal takes its identity from an authenticating proxy the bundle does not run —
+        there is no browser path to this page here at all. So what is checked is the two
+        things that are checkable without a DOM, against the files the control-plane
+        actually SERVES rather than the ones in the working tree:
+
+          1. the script writes cached_requests into a cell, and
+          2. that cell has a heading — the header and the row still declare the same
+             number of columns.
+
+        (2) is the load-bearing half. Adding a cell to the row template and forgetting the
+        <th> silently shifts every column after it, so the operator reads the free count
+        under "Tokens" and the spend under nothing. That is a rendering bug this test
+        catches; whether the browser paints it is not.
+        """
+        admin = "anyone"  # /portal/ and its assets need a user, not an operator.
+        status, page = portal_get("/portal/", admin)
+        assert status == 200, page[:300]
+        status, script = portal_get("/portal/static/app.js", admin)
+        assert status == 200, script[:300]
+
+        for table_id, row_marker, field in (
+            ("spend-table", "surface-tag", "r.cached_requests"),
+            ("admin-table", "class='surfaces'", "p.cached_requests"),
+        ):
+            headers = _table_headers(page, table_id)
+            assert any("free" in h.lower() for h in headers), (
+                f"the {table_id} header has no column for the free requests: {headers}"
+            )
+            cells = _row_template_cells(script, row_marker)
+            assert field in " ".join(cells), (
+                f"the {table_id} row never writes {field}, so the column the header "
+                f"promises is empty: {cells}"
+            )
+            assert len(headers) == len(cells), (
+                f"{table_id} declares {len(headers)} columns but its rows emit "
+                f"{len(cells)} cells, so every column after the mismatch renders under "
+                f"the wrong heading.\nheaders: {headers}\ncells: {cells}"
+            )
 
 
 # ---------------------------------------------------------------------------
