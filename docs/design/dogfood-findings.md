@@ -638,3 +638,55 @@ Two things generalise, and the second is the expensive one:
 
 **Not fixed here.** Filed as `enterpriseaiframework-f8c`, which requires a test asserting
 the two renderings agree — the duplication, not the lookup, is the defect.
+
+### 35. A migration moved where work is published; the server kept serving the old place
+
+`GET /listing/baron/` and `GET /live/baron/` on the cluster, 2026-07-29 — both returned:
+
+```
+HTTP/1.1 200 OK
+Content-Type: text/html
+Content-Length: 5164
+Last-Modified: Tue, 28 Jul 2026 04:39:46 GMT
+```
+
+5164 bytes of a game called "Pink Unicorn". Nothing on the cluster can regenerate it.
+`publish(1)` writes to `/live/<user>/<project>/`; the publisher that wrote
+`/live/<user>/index.html` was replaced when each project got its own path, precisely so a
+second game would stop overwriting the link a parent had already been sent. The migration
+changed the writer and left the reader alone, and nginx's default `index index.html`
+kept serving the residue at 200.
+
+`/live/baron/my-first-project/` — the shape the current code emits — returned 404 at the
+same moment. So the only URL that answered was the one no longer generated.
+
+Two things generalise:
+
+- **A migration has a serving side, and it is the side nobody diffs.** The publisher was
+  reviewed, tested and correct. Nothing was wrong with the code that writes. The defect
+  was entirely in what the old data still meant to a reader that had not been told the
+  layout moved — and the reader here is a config file, which is not where anyone looks
+  for stale-data bugs.
+- **It survived every test because the tests asserted URL shape.**
+  `tests-live/test_portal.py::test_published_list_is_scoped` checks that
+  `/live/<user>/` is a substring of each returned link. That assertion is true of a link
+  serving anything at all, including four-month-old bytes, forever. The same shape as
+  finding 27 and finding 34: the check was on the *form* of the evidence, never on what
+  came back when you followed it.
+
+There was a second, quieter half. `portal.py::my_published` does `resp.json()` on
+`/listing/<user>/`, and that path was returning HTML, so the parse raised into a bare
+`except: pass` whose comment reads "Nothing published yet is the common case". A user
+with residue was reported as having published nothing — the failure dressed as the empty
+state.
+
+**Fixed** in `enterpriseaiframework-7bc`. At the user level, `index` is pointed at a name
+nothing creates so a directory request always renders the freshly-generated project list,
+and any request resolving to a regular *file* at that depth returns 410 Gone — by an `-f`
+test rather than a filename heuristic, so extensionless residue is refused and a project
+directory with dots in its name is not. Project depth is untouched: that is where an
+`index.html` is exactly what `publish(1)` puts and what a parent is meant to open.
+`tests/test_published_layout.py` runs the pinned nginx image against the config parsed out
+of `62-published.yaml` over a tree holding both layouts, and asserts the returned bytes —
+including for a user who has residue *and* a live project, which is the case an
+over-broad fix silently takes offline.
