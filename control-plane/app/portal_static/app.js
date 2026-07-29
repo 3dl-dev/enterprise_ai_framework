@@ -196,6 +196,9 @@ async function loadSpend() {
       // number the API has carried since d58; until it was rendered here the operator's
       // only sight of it was the raw JSON from `make spend`.
       `<td class="num">${compact(r.cached_requests)}</td>` +
+      // And how many reached the provider and came back an error — the other $0 row
+      // (e69). Distinct from Free: a cache hit was delivered, this was not.
+      `<td class="num">${compact(r.failed_requests)}</td>` +
       `<td class="num">${compact(tokens)}</td>` +
       `<td class="num">${money(r.spend)}</td>`;
     // textContent, not innerHTML: the surface name comes from a key alias and is not
@@ -357,6 +360,7 @@ async function loadAdmin() {
       "<td></td><td class='surfaces'></td>" +
       `<td class="num">${compact(p.requests)}</td>` +
       `<td class="num">${compact(p.cached_requests)}</td>` +
+      `<td class="num">${compact(p.failed_requests)}</td>` +
       `<td class="num">${compact(tokens)}</td>` +
       `<td class="num">${money(p.spend)}</td>` +
       `<td class="num">${cap}</td>`;

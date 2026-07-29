@@ -75,8 +75,12 @@
       <table class="tbl" id="spend-table">
         <!-- "Free" is the cache-hit count (enterpriseaiframework-d58). Without it a row
              reading "85 requests, 150,574 tokens, $0.00" is indistinguishable from a bill
-             that has lost the money, and it was read as exactly that, twice. -->
-        <thead><tr><th>Surface</th><th class="num">Requests</th><th class="num" title="Answered from cache — no provider call, so no cost">Free</th><th class="num">Tokens</th><th class="num">Spend</th></tr></thead>
+             that has lost the money, and it was read as exactly that, twice.
+             "Failed" is the other kind of $0 row (enterpriseaiframework-e69): the provider
+             was called and returned nothing, so no tokens and no money. Both are subtotals
+             OF Requests, not deductions from it — Requests counts what the gateway
+             admitted, and these two columns say which of those cost nothing and why. -->
+        <thead><tr><th>Surface</th><th class="num">Requests</th><th class="num" title="Answered from cache — no provider call, so no cost">Free</th><th class="num" title="The provider was called and returned an error — nothing delivered, nothing charged">Failed</th><th class="num">Tokens</th><th class="num">Spend</th></tr></thead>
         <tbody id="spend-rows"></tbody>
       </table>
       <p class="empty" id="spend-empty" hidden>Nothing yet. Spend appears here as you use the surfaces above.</p>
@@ -111,7 +115,7 @@
       </div>
       <div class="total"><span class="amount" id="admin-total">—</span><span class="unit">across everyone</span></div>
       <table class="tbl" id="admin-table">
-        <thead><tr><th>Person</th><th>Surfaces</th><th class="num">Requests</th><th class="num" title="Answered from cache — no provider call, so no cost">Free</th><th class="num">Tokens</th><th class="num">Spend</th><th class="num">Cap</th></tr></thead>
+        <thead><tr><th>Person</th><th>Surfaces</th><th class="num">Requests</th><th class="num" title="Answered from cache — no provider call, so no cost">Free</th><th class="num" title="The provider was called and returned an error — nothing delivered, nothing charged">Failed</th><th class="num">Tokens</th><th class="num">Spend</th><th class="num">Cap</th></tr></thead>
         <tbody id="admin-rows"></tbody>
       </table>
       <p class="warn" id="admin-unpriced" hidden></p>

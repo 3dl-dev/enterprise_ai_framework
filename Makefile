@@ -4,7 +4,6 @@ BUNDLE := bundle
 COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env
 
 ## Scope item 8: the whole bundle starts from one command on a single host, no GPU.
-<<<<<<< HEAD
 ##
 ## render-env.sh before make-certs.sh, not the other way round: make-certs.sh only
 ## records IDP_PUBLIC_HOST into a .env that already exists (`elif [[ -f .env ]]`), and on

@@ -1041,19 +1041,88 @@ under-reporting twice. `cached_requests` explains one kind of zero. This is the 
 kind, and it is worse than unexplained: a cache hit is a request that was *served*, for
 free, and belongs in a request count. A failed request was served to nobody.
 
-**Not fixed here, deliberately.** Whether a request that returned an error belongs in the
-number labelled "requests" is a product decision about how money and usage are reported,
-not an implementation detail, and d58 is already at an attention gate for exactly this
-class of question. Filed as `enterpriseaiframework-e69`. The options are visible from
-here — exclude failures from `requests`, or carry `failed_requests` alongside
-`cached_requests` the way this item did for cache hits — and both are cheap; choosing is
-the part that is not.
+**Not fixed when this was written, deliberately.** Whether a request that returned an
+error belongs in the number labelled "requests" is a product decision about how money and
+usage are reported, not an implementation detail, and d58 was already at an attention gate
+for exactly this class of question. Filed as `enterpriseaiframework-e69`. The options were
+visible from here — exclude failures from `requests`, or carry `failed_requests` alongside
+`cached_requests` the way d58 did for cache hits — and both are cheap; choosing is the
+part that is not.
 
-**What IS locked down here.** `cached_requests` must never absorb these rows. The
+**What was locked down here.** `cached_requests` must never absorb these rows. The
 predicate behind it reads the `cache_hit` column, not the spend column, and
 `test_an_upstream_failure_is_billed_as_a_request_at_zero_and_is_not_a_cache_hit` fails if
 that is ever loosened — demonstrated by loosening it to `spend = 0`, which reported three
 failed requests to the operator as free ones.
+
+#### The ruling (`enterpriseaiframework-e69`) — and it is reversible
+
+**`requests` counts every request the gateway ADMITTED. Each way of costing nothing gets a
+named subtotal beside it — `cached_requests`, `failed_requests`. `requests` does not
+become a count of successes.**
+
+The whole bill in one sentence: *a request the gateway refused at the door was never
+admitted and is not on the bill; a request it admitted is on the bill, and if it cost
+nothing the bill says which kind of nothing it was.*
+
+The founder may prefer the other option. What the numbers look like either way, for one
+served call and three upstream failures on the same key:
+
+| | `requests` | `cached_requests` | `failed_requests` | `spend` |
+|---|---|---|---|---|
+| **chosen** — name the failures | 4 | 0 | 3 | one call's cost |
+| **rejected** — subtract them | 1 | 0 | *(absent)* | one call's cost |
+
+Three reasons it went this way.
+
+1. **The rejected option is lossy and irreversible.** `requests - failed_requests` gives
+   anyone who wants the net count exactly the rejected option's number. Subtracting at the
+   source destroys the failure count for every consumer downstream and nothing can
+   recover it. One option contains the other; it is not symmetric.
+2. **It would give the column two rules.** d58 already decided that a cache hit — the
+   other $0 row — stays in `requests` and is explained by `cached_requests`. Excluding one
+   kind of zero while keeping the other means `requests` answers a different question
+   depending on which zero you have. That is precisely how the attribution join came to be
+   corrected in one rendering and not the others, twice (findings 25 and 34).
+3. **A vanishing request is this codebase's signature defect.** If a provider starts
+   erroring on half its traffic, subtracting failures makes the operator's usage graph
+   show a quiet dip — indistinguishable from people using it less — while every surviving
+   row looks healthy. The count is the *only* trace a failure leaves: it has no spend and
+   no tokens to appear in. Worse, LiteLLM's failure callback writes `spend=0` and
+   `total_tokens=0` regardless of whether the provider will bill for the attempt, so if a
+   provider ever *does* charge for a failed call, the request count is the single
+   remaining signal that would let an operator notice the discrepancy against their
+   invoice.
+
+**Neither option touches money, which is what makes this decidable at all.** A failure
+contributes 0 to `SUM(s.spend)` either way, so the cent-level agreement with the
+provider's own invoice (finding 9) is not on the table here and no version of this trades
+it. That was checked rather than assumed: `TestPricingIntegrity` is unchanged and still
+passes, and `test_a_cache_hit_is_not_reported_as_a_failure` re-asserts d58's exact
+`spend == one call's cost` on the case this change did not touch.
+
+**On whether a refusal should count as usage at all.** The two pre-router classes — over
+budget, and a model not on the key's list — write no row and are counted nowhere, and this
+ruling leaves that alone. It is the right asymmetry: the gateway declining is not the same
+event as the provider failing, and only one of them consumed anything outside this layer.
+Counting refusals would also make the bill grow when a user is *denied* service, which
+inverts what a budget is for. `test_a_refusal_the_gateway_issued_is_still_no_request_at_all`
+pins that side.
+
+Landed in all three renderings of the ledger, because the two before it each had to be
+corrected twice for being fixed in one place only:
+
+- `/admin/spend` per-user lines **and** `totals`, plus `/portal/api/spend` and
+  `/portal/api/admin/overview` — `failed_requests` alongside `cached_requests`.
+- Both portal spend tables render a **Failed** column beside **Free**.
+- `spend.csv`, the archive a departing customer keeps, gains a `status` column. It is
+  per-request so it has no count to explain, but it was handing over $0 rows that a
+  failure and an unpriced success were indistinguishable in — `cache_hit` cannot separate
+  them, since a failure carries `cache_hit='False'` exactly like an unpriced success.
+
+`test_the_request_count_is_not_quietly_reduced` exists to fail if someone later implements
+the rejected option — it names this finding in its failure message so the reversal is made
+on purpose rather than by accident.
 
 ### 41. `make up` failed the first time and passed on a re-run, in a clean checkout
 

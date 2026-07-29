@@ -146,6 +146,56 @@ def ledger_attribution_sql(shared_param: str) -> dict[str, str]:
 _CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
 
 
+# WHY A FAILED REQUEST STAYS IN `requests` AND IS NAMED SEPARATELY (enterpriseaiframework-e69)
+#
+# There are two ways a request reaches the ledger having cost nothing, and until this row
+# the bill could only explain one of them.
+#
+#   cache hit        served, free, real tokens        cache_hit='True'  spend 0
+#   upstream failure served to NOBODY, no tokens      status='failure'  spend 0
+#
+# A third and fourth way exist and never reach the ledger at all: over budget, and a model
+# not on the key's list. Both are refused in LiteLLM's `user_api_key_auth`, a route
+# dependency that runs before the router, so no row is ever written and the bill neither
+# counts nor charges them. Measured, one fresh key per class, in finding 40.
+#
+# THE RULING (enterpriseaiframework-e69, and the founder may reverse it — see finding 40).
+# `requests` counts every request the gateway ADMITTED, and each way of costing nothing
+# gets its own named subtotal beside it. It does NOT become a count of requests that
+# succeeded.
+#
+# The losing option was to subtract failures out of `requests`, which is cheaper and reads
+# better — "4 requests, $0.01" becomes "1 request, $0.01" and every number on the line then
+# refers to the same event. It was rejected for three reasons.
+#
+#   1. It is lossy and irreversible. failed_requests lets anyone who wants the net count
+#      compute `requests - failed_requests`; subtracting at the source destroys the
+#      failure count for every consumer downstream, and nothing can recover it.
+#   2. It would give the column two rules. d58 already decided that a cache hit — the
+#      other $0 row — stays in `requests` and is explained by `cached_requests`. Excluding
+#      one kind of zero while keeping the other means `requests` answers a different
+#      question depending on which zero you have, which is how the next correction gets
+#      applied to only half the cases. It already happened twice to the attribution join
+#      (see ledger_attribution_sql above).
+#   3. A vanishing request is this codebase's signature defect. If a provider starts
+#      erroring on half its traffic, subtracting failures makes the operator's graph show
+#      a quiet drop in usage — indistinguishable from people using it less — while the
+#      surviving rows all look healthy. The count is the ONLY trace a failure leaves: it
+#      has no spend and no tokens to show up in.
+#
+# NEITHER OPTION TOUCHES MONEY, which is what makes this decidable at all. Both leave
+# SUM(s.spend) byte-identical, because a failure contributes 0 to it either way, so the
+# cent-level agreement with the provider's own invoice (finding 9) is not on the table
+# here and no version of this trades it.
+#
+# Read against `status`, not against spend or tokens. Deducing "failed" from `spend = 0`
+# would sweep in every cache hit, and from `total_tokens = 0` would sweep in anything else
+# that ever records no tokens. LiteLLM writes 'success' or 'failure' here and leaves it
+# NULL on paths predating the column, so an unknown status is not counted as a failure —
+# the bill should under-claim failures rather than invent them.
+_FAILED = "lower(COALESCE(s.status, '')) = 'failure'"
+
+
 async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
     """The single query the scope item names. One row per (user, surface)."""
     where, params = "", []
@@ -161,6 +211,7 @@ async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
         COALESCE({attr["surface"]}, '(unknown)') AS surface,
         COUNT(*)                                  AS requests,
         COUNT(*) FILTER (WHERE {_CACHE_HIT})::bigint AS cached_requests,
+        COUNT(*) FILTER (WHERE {_FAILED})::bigint AS failed_requests,
         COALESCE(SUM(s.spend), 0)::float8         AS spend,
         COALESCE(SUM(s.prompt_tokens), 0)::bigint AS prompt_tokens,
         COALESCE(SUM(s.completion_tokens), 0)::bigint AS completion_tokens
@@ -183,6 +234,7 @@ async def totals(since: str | None = None) -> dict:
     sql = f"""
     SELECT COUNT(*) AS requests,
            COUNT(*) FILTER (WHERE {_CACHE_HIT})::bigint AS cached_requests,
+           COUNT(*) FILTER (WHERE {_FAILED})::bigint AS failed_requests,
            COALESCE(SUM(s.spend), 0)::float8 AS spend,
            COUNT(DISTINCT {_ALIAS}) AS active_keys
     {_LEDGER_JOIN}

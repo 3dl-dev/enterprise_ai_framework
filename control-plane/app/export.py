@@ -38,10 +38,20 @@ KEY_COLUMNS = ("username", "surface", "key_alias", "status", "max_budget", "crea
 # Without it the archive a departing customer keeps is a column of hex for the surface
 # most people use, and it would disagree with the bill they were shown while they were a
 # customer — which is finding 34 all over again, in the one rendering that outlives us.
+#
+# `status` is here for the same reason `cache_hit` is, and was added when the aggregate
+# bill learned to say the same thing (enterpriseaiframework-e69). This CSV is per-request,
+# so it has no `requests` count to explain — but it does hand the customer $0 rows, and
+# without `status` a row that the provider failed is indistinguishable from one that was
+# served. `cache_hit` alone cannot tell them apart: an upstream failure carries
+# cache_hit='False' and $0, exactly like a request that has not been priced. This is the
+# third rendering of the ledger, and the two before it each had to be corrected twice
+# because a fix landed in one and was forgotten in the others (see
+# metering.ledger_attribution_sql).
 SPEND_COLUMNS = (
     "request_id", "start_time", "end_time", "model", "key_alias", "surface",
-    "end_user", "principal", "spend", "prompt_tokens", "completion_tokens",
-    "total_tokens", "cache_hit",
+    "end_user", "principal", "status", "spend", "prompt_tokens",
+    "completion_tokens", "total_tokens", "cache_hit",
 )
 
 
@@ -123,6 +133,7 @@ async def spend_csv() -> AsyncIterator[str]:
                COALESCE({attr["surface"]}, '') AS surface,
                COALESCE(s.end_user, '')        AS end_user,
                {attr["principal"]}             AS principal,
+               COALESCE(s.status, '')          AS status,
                s.spend, s.prompt_tokens, s.completion_tokens, s.total_tokens,
                COALESCE(s.cache_hit, '')       AS cache_hit
         {attr["join"]}

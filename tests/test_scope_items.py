@@ -1278,9 +1278,12 @@ class TestCacheHitsBudgetAndTheBill:
     # The third writes a real row — status 'failure', spend 0, zero tokens — and the bill
     # counts it in `requests`. So "a refusal is not billed" is true of what a user gets
     # refused and false of what breaks downstream, and each test now names which it means.
-    # The third is asserted as it BEHAVES, not as it ought to: see finding 36 and
-    # enterpriseaiframework-e69, where whether a request nobody was served should appear
-    # in the request count is raised as the product decision it is.
+    #
+    # The third was left asserted as it BEHAVED, pending the product decision raised as
+    # enterpriseaiframework-e69 / finding 40. That decision is now made: it stays in
+    # `requests` and is named by `failed_requests`. The tests for it are in
+    # TestFailedRequestsAreNamedNotErased below, and the ruling with its rejected
+    # alternative is in metering._FAILED.
 
     def test_a_budget_refusal_is_not_billed_as_usage(
         self, gateway_url, control_plane_url, master_headers, admin_headers
@@ -1401,8 +1404,13 @@ class TestCacheHitsBudgetAndTheBill:
         assert row is not None, "the successful call is missing from the bill"
         assert row["requests"] == 1 + failures, (
             f"one call was served and {failures} failed at the provider; the bill counts "
-            f"{row['requests']} requests. If this is now {1}, the behaviour changed and "
-            f"finding 36 has been fixed — update this test rather than deleting it: {row}"
+            f"{row['requests']} requests. e69 ruled that `requests` counts what the "
+            f"gateway ADMITTED and names the failures separately, so this must stay "
+            f"{1 + failures} and failed_requests must be {failures}: {row}"
+        )
+        assert row["failed_requests"] == failures, (
+            f"the failures are in `requests` but nothing says so — which is the whole "
+            f"defect finding 40 recorded: {row}"
         )
         assert row["cached_requests"] == 0, (
             f"a failed request was reported to the operator as a FREE request. Nothing "
@@ -1527,24 +1535,321 @@ class TestCacheHitsBudgetAndTheBill:
         status, script = portal_get("/portal/static/app.js", admin)
         assert status == 200, script[:300]
 
-        for table_id, row_marker, field in (
-            ("spend-table", "surface-tag", "r.cached_requests"),
-            ("admin-table", "class='surfaces'", "p.cached_requests"),
+        for table_id, row_marker, prefix in (
+            ("spend-table", "surface-tag", "r."),
+            ("admin-table", "class='surfaces'", "p."),
         ):
             headers = _table_headers(page, table_id)
-            assert any("free" in h.lower() for h in headers), (
-                f"the {table_id} header has no column for the free requests: {headers}"
-            )
             cells = _row_template_cells(script, row_marker)
-            assert field in " ".join(cells), (
-                f"the {table_id} row never writes {field}, so the column the header "
-                f"promises is empty: {cells}"
-            )
+            # Both kinds of $0 row need a heading and a cell. "Free" is d58's cache-hit
+            # count; "Failed" is e69's upstream-failure count. They are checked in one
+            # loop because the failure mode is identical for both and was real for the
+            # first: a number added to the JSON and never rendered.
+            for heading, field in (("free", "cached_requests"),
+                                   ("failed", "failed_requests")):
+                assert any(heading == h.lower() for h in headers), (
+                    f"the {table_id} header has no '{heading}' column, so the "
+                    f"{field} count never reaches the operator's eyes: {headers}"
+                )
+                assert prefix + field in " ".join(cells), (
+                    f"the {table_id} row never writes {prefix + field}, so the column "
+                    f"the header promises is empty: {cells}"
+                )
             assert len(headers) == len(cells), (
                 f"{table_id} declares {len(headers)} columns but its rows emit "
                 f"{len(cells)} cells, so every column after the mismatch renders under "
                 f"the wrong heading.\nheaders: {headers}\ncells: {cells}"
             )
+
+
+class TestFailedRequestsAreNamedNotErased:
+    """enterpriseaiframework-e69 / finding 40 — the second kind of $0 row.
+
+    THE RULING THIS CLASS LOCKS IN, and the founder may reverse it. `requests` counts
+    every request the gateway ADMITTED, and each way of costing nothing gets a named
+    subtotal beside it: `cached_requests` for served-from-cache, `failed_requests` for
+    the-provider-returned-nothing. `requests` does NOT become a count of successes.
+
+    The rejected alternative was to subtract failures out of `requests`. The full
+    reasoning is in metering._FAILED; the part that needs a test is that the alternative
+    is LOSSY — once failures are subtracted at the source, no consumer can recover the
+    count, and a provider erroring on half its traffic shows up as a quiet dip in usage
+    rather than as an error rate. So `test_the_request_count_is_not_quietly_reduced`
+    asserts the losing option was not taken, deliberately. If a later change implements
+    it, that test fails and sends whoever did it back to finding 40 to reverse the ruling
+    on purpose rather than by accident.
+
+    WHY THE GUARD TESTS LOOK PARANOID. d58 shipped `cached_requests` and the adversary's
+    first move was to loosen its predicate to `spend = 0`, which reported three failed
+    requests to the operator as FREE ones. `failed_requests` is one column over and has
+    the same hazard in reverse. Both predicates are therefore pinned from both sides: a
+    cache hit must not be counted as a failure, and a failure must not be counted as free.
+    """
+
+    # Reused rather than re-declared. Copies of this harness are how the two renderings of
+    # the attribution join drifted apart twice (see metering.ledger_attribution_sql), and
+    # the fake provider's call counter in particular is the only ground truth in the file
+    # for "was this cached" — a second, subtly different copy of it is worth nothing.
+    _new_key = TestCacheHitsBudgetAndTheBill.__dict__["_new_key"]
+    _ask = TestCacheHitsBudgetAndTheBill.__dict__["_ask"]
+    _provider_calls = TestCacheHitsBudgetAndTheBill.__dict__["_provider_calls"]
+    _bill_row = TestCacheHitsBudgetAndTheBill.__dict__["_bill_row"]
+    INPUT_COST = TestCacheHitsBudgetAndTheBill.INPUT_COST
+    OUTPUT_COST = TestCacheHitsBudgetAndTheBill.OUTPUT_COST
+
+    def test_the_request_count_is_not_quietly_reduced(
+        self, gateway_url, control_plane_url, master_headers, admin_headers, fakeprovider_url
+    ):
+        """The rejected option, asserted against so it cannot be taken by accident.
+
+        One served call and three upstream failures. `requests` must read 4, not 1. This
+        is the assertion that distinguishes the ruling from its alternative, and it is the
+        only test in the suite that would notice if someone "cleaned up" the bill by
+        filtering failures out of the count.
+        """
+        username = f"notreduced-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(gateway_url, master_headers, f"{username}::chat")
+
+        good = self._ask(gateway_url, key, f"served {uuid.uuid4().hex}")
+        assert good.status_code == 200, good.text
+
+        for _ in range(3):
+            prompt = f"{FAKE_FAIL_MARKER} {uuid.uuid4().hex}"
+            broke = self._ask(gateway_url, key, prompt)
+            assert broke.status_code >= 500, f"{broke.status_code} {broke.text[:200]}"
+            # Without this the request could have been refused locally, which is a
+            # different class entirely and writes no row at all.
+            assert self._provider_calls(fakeprovider_url, prompt) >= 1, (
+                "the gateway never called the provider, so this is not an upstream failure"
+            )
+
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "the served call is missing from the bill"
+        assert row["requests"] == 4, (
+            f"e69 ruled that `requests` counts admitted requests, failures included, and "
+            f"names them in failed_requests. This reads {row['requests']}. If that was "
+            f"deliberate, finding 40's ruling has been reversed — say so there and in "
+            f"metering._FAILED, and fix this test on purpose: {row}"
+        )
+        assert row["failed_requests"] == 3, row
+        # The net count the losing option would have shown is still available, which is
+        # the argument that decided it: this subtraction is possible, the reverse is not.
+        assert row["requests"] - row["failed_requests"] == 1, row
+
+    def test_a_failure_is_not_reported_as_a_free_request(
+        self, gateway_url, control_plane_url, master_headers, admin_headers, fakeprovider_url
+    ):
+        """The two $0 columns must not leak into each other. Failure side.
+
+        A key whose only traffic is failures: cached_requests must be 0. If either
+        predicate were ever written against the spend column instead of its own, these
+        rows would be reported to the operator as requests that were FREE — money not
+        spent because nothing was delivered, dressed up as a cache efficiency.
+        """
+        username = f"failnotfree-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(gateway_url, master_headers, f"{username}::chat")
+
+        for _ in range(3):
+            prompt = f"{FAKE_FAIL_MARKER} {uuid.uuid4().hex}"
+            broke = self._ask(gateway_url, key, prompt)
+            assert broke.status_code >= 500, f"{broke.status_code} {broke.text[:200]}"
+            assert self._provider_calls(fakeprovider_url, prompt) >= 1
+
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "three failures wrote no ledger row at all"
+        assert row["requests"] == 3, row
+        assert row["failed_requests"] == 3, row
+        assert row["cached_requests"] == 0, (
+            f"a failed request was reported to the operator as a FREE request: {row}"
+        )
+        # Nothing was delivered, so nothing was bought and nothing was counted. This is
+        # what keeps the failure rows out of the reconciliation against a provider
+        # invoice (finding 9) — they contribute 0 to spend under this ruling and under
+        # the rejected one alike.
+        assert row["spend"] == 0, (
+            f"a request the provider refused to answer was charged for: {row}"
+        )
+        assert row["prompt_tokens"] == 0 and row["completion_tokens"] == 0, row
+
+    def test_a_cache_hit_is_not_reported_as_a_failure(
+        self, gateway_url, control_plane_url, master_headers, admin_headers, fakeprovider_url
+    ):
+        """The same guard from the other side — the case this change did NOT touch.
+
+        A key whose only traffic is a miss and a hit. failed_requests must be 0. The
+        `status` column reads 'success' on both rows, and this fails if the new predicate
+        were ever widened to something like `spend = 0`, which is exactly the mistake that
+        was made against cached_requests one column over.
+        """
+        username = f"freenotfail-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(gateway_url, master_headers, f"{username}::chat")
+        prompt = f"cached not failed {uuid.uuid4().hex}"
+
+        first = self._ask(gateway_url, key, prompt)
+        assert first.status_code == 200, first.text
+        usage = first.json()["usage"]
+        second = self._ask(gateway_url, key, prompt)
+        assert second.status_code == 200, second.text
+        assert self._provider_calls(fakeprovider_url, prompt) == 1, (
+            "the second call reached the provider, so there is no cache hit here and this "
+            "test is not measuring what it claims"
+        )
+
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "the cache traffic never reached the bill"
+        assert row["requests"] == 2, row
+        assert row["cached_requests"] == 1, row
+        assert row["failed_requests"] == 0, (
+            f"a request that was served — one of them from cache — was reported to the "
+            f"operator as having FAILED: {row}"
+        )
+        # d58's money assertion, restated here rather than assumed: adding a column to
+        # this query must not disturb the cost of the case that already worked.
+        expected = (usage["prompt_tokens"] * self.INPUT_COST
+                    + usage["completion_tokens"] * self.OUTPUT_COST)
+        assert row["spend"] == pytest.approx(expected, rel=1e-6), (
+            f"expected exactly one upstream call's cost ({expected}), got {row['spend']}"
+        )
+
+    def test_a_refusal_the_gateway_issued_is_still_no_request_at_all(
+        self, gateway_url, control_plane_url, master_headers, admin_headers
+    ):
+        """The line the ruling draws, asserted on the side it did not move.
+
+        A request the gateway refuses at the door — here, a model the key was never
+        entitled to — is not admitted, writes no ledger row, and appears in neither
+        `requests` nor `failed_requests`. That asymmetry with an upstream failure is
+        deliberate and is the reason `requests` can be described in one sentence:
+        it counts what the gateway admitted. A refusal was never admitted; a failure was
+        admitted and then came back empty.
+
+        This is the unchanged path. It is asserted because "failures are now named" would
+        be an easy change to make by widening the count to include pre-router refusals
+        too, which would break the one-sentence rule and start charging usage for
+        requests the layer itself declined.
+        """
+        username = f"refusednotfailed-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(gateway_url, master_headers, f"{username}::chat")
+
+        assert self._ask(gateway_url, key, f"allowed {uuid.uuid4().hex}").status_code == 200
+
+        for _ in range(3):
+            denied = httpx.post(
+                f"{gateway_url}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                # The key was issued for fake-large only.
+                json={"model": "fake-small",
+                      "messages": [{"role": "user", "content": f"nope {uuid.uuid4().hex}"}]},
+                timeout=TIMEOUT,
+            )
+            assert denied.status_code >= 400, denied.text
+
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "the one allowed call is missing from the bill"
+        assert row["requests"] == 1, (
+            f"three requests were refused before the router and must not be on the bill "
+            f"at all; the bill counts {row['requests']}: {row}"
+        )
+        assert row["failed_requests"] == 0, (
+            f"a refusal the gateway issued itself was reported as an upstream failure. "
+            f"The provider was never called: {row}"
+        )
+        assert row["cached_requests"] == 0, row
+
+    def test_the_totals_and_the_portal_agree_about_the_failures(
+        self, gateway_url, control_plane_url, master_headers, admin_headers, fakeprovider_url
+    ):
+        """Every rendering of the ledger carries the number, and they agree.
+
+        Finding f8c is that `make spend` and the portal, built from one query, still
+        managed to disagree. So a column added to one is checked against the others here
+        rather than assumed — which is also how d58's `cached_requests` turned out to be
+        present in three JSON endpoints and rendered by none.
+        """
+        username = f"failtotals-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(gateway_url, master_headers, f"{username}::chat")
+
+        assert self._ask(gateway_url, key, f"ok {uuid.uuid4().hex}").status_code == 200
+        prompt = f"{FAKE_FAIL_MARKER} {uuid.uuid4().hex}"
+        assert self._ask(gateway_url, key, prompt).status_code >= 500
+        assert self._provider_calls(fakeprovider_url, prompt) >= 1
+
+        time.sleep(25)
+        bill = httpx.get(
+            f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+        ).json()
+        row = next(
+            (r for r in bill["by_user_and_surface"] if r["username"] == username), None
+        )
+        assert row is not None, "the traffic never reached the bill"
+        assert row["failed_requests"] == 1, row
+
+        assert "failed_requests" in bill["totals"], (
+            f"the per-user lines name the failures but the total does not, so the two "
+            f"halves of the same page disagree: {bill['totals']}"
+        )
+        assert bill["totals"]["failed_requests"] >= 1, bill["totals"]
+
+        # The user's own view of their own usage.
+        status, body = portal_get("/portal/api/spend", username)
+        assert status == 200, body[:300]
+        portal = json.loads(body)
+        assert portal["total"]["failed_requests"] == row["failed_requests"], (
+            f"the bill says {row['failed_requests']} failed and the portal says "
+            f"{portal['total']['failed_requests']}"
+        )
+        assert portal["total"]["requests"] == row["requests"], (
+            "the two renderings disagree about the request count itself"
+        )
+
+    def test_the_exit_archive_says_which_rows_the_provider_failed(self, tmp_path):
+        """The third rendering of the ledger — the CSV a departing customer keeps.
+
+        Per-request, so there is no `requests` count to explain. The defect is the same
+        one anyway: without `status` a $0 row that the provider failed is
+        indistinguishable from a served row that was never priced, and `cache_hit` cannot
+        separate them because a failure carries cache_hit='False' exactly like an unpriced
+        success. This archive outlives the deployment; it is the one rendering nobody can
+        come back and correct.
+
+        THIS TEST DEPENDS ON EARLIER TESTS IN THIS CLASS having put failure rows in the
+        ledger, so it asserts the column and the failure rows separately: the column must
+        exist unconditionally, and the failure rows are checked only if the export
+        contains any. That keeps it honest when run in isolation rather than silently
+        passing on an empty file.
+        """
+        # `exit.sh export` is the non-destructive mode — it does not revoke, so this can
+        # run here rather than inside TestItem9ExitPath, which genuinely breaks the bundle
+        # and has to run last.
+        out = tmp_path / "export"
+        out.mkdir()
+        result = subprocess.run(
+            [str(BUNDLE / "bin" / "exit.sh"), "export"],
+            capture_output=True, text=True, cwd=str(BUNDLE),
+            env={**os.environ, "EXPORT_DIR": str(out)},
+        )
+        assert result.returncode == 0, f"export failed:\n{result.stdout}\n{result.stderr}"
+        latest = (out / "latest").resolve()
+        with (latest / "spend.csv").open(newline="") as fh:
+            rows = list(csv.DictReader(fh))
+
+        assert rows, "the export carried no spend rows, so nothing here is being checked"
+        assert "status" in rows[0], (
+            f"the archive hands the customer $0 rows with no way to tell a failure from "
+            f"an unpriced success: {sorted(rows[0])}"
+        )
+
+        failed = [r_ for r_ in rows if (r_["status"] or "").lower() == "failure"]
+        assert failed, (
+            "no row in the export is marked 'failure'. Either the failure rows are "
+            "missing from the archive or the column is not being populated — both are "
+            "defects, and a passing test here would hide either."
+        )
+        for f in failed:
+            assert float(f["spend"]) == 0, f
+            # The point of the column: these rows were NOT cache hits, so cache_hit alone
+            # could never have explained their zero.
+            assert (f["cache_hit"] or "").lower() != "true", f
 
 
 # ---------------------------------------------------------------------------

@@ -170,10 +170,12 @@ async def my_spend(since: str | None = None, user: str = Depends(require_user)):
     """
     rows = await metering.spend_by_user_and_surface(since)
     mine: dict[str, dict] = {}
-    # cached_requests rides along with the rest (finding 10): a person looking at their
-    # own $0 is owed the same explanation the operator gets, and carrying it in one
-    # rendering but not the other is how the two views start disagreeing.
-    total = {"requests": 0, "cached_requests": 0, "spend": 0.0,
+    # cached_requests and failed_requests ride along with the rest (findings 10 and 40):
+    # a person looking at their own $0 is owed the same explanation the operator gets, and
+    # carrying it in one rendering but not the other is how the two views start
+    # disagreeing. Both are subtotals OF `requests`, never subtracted from it — see the
+    # ruling in metering._FAILED.
+    total = {"requests": 0, "cached_requests": 0, "failed_requests": 0, "spend": 0.0,
              "prompt_tokens": 0, "completion_tokens": 0}
     for r in rows:
         who = chat_identity.resolve(r.get("username") or "")
@@ -181,9 +183,11 @@ async def my_spend(since: str | None = None, user: str = Depends(require_user)):
             continue
         surface = r.get("surface") or "(unknown)"
         acc = mine.setdefault(surface, {"surface": surface, "requests": 0,
-                                        "cached_requests": 0, "spend": 0.0,
+                                        "cached_requests": 0, "failed_requests": 0,
+                                        "spend": 0.0,
                                         "prompt_tokens": 0, "completion_tokens": 0})
-        for k in ("requests", "cached_requests", "spend", "prompt_tokens", "completion_tokens"):
+        for k in ("requests", "cached_requests", "failed_requests", "spend",
+                  "prompt_tokens", "completion_tokens"):
             acc[k] += r.get(k) or 0
             total[k] += r.get(k) or 0
     return {
@@ -284,17 +288,21 @@ async def admin_overview(since: str | None = None,
         if who == "chat-surface":
             who = "(chat surface, no user)"
         acc = people.setdefault(who, {
-            "username": who, "requests": 0, "cached_requests": 0, "spend": 0.0,
+            "username": who, "requests": 0, "cached_requests": 0,
+            "failed_requests": 0, "spend": 0.0,
             "prompt_tokens": 0, "completion_tokens": 0, "surfaces": {},
         })
         surface = r.get("surface") or "(unknown)"
         s = acc["surfaces"].setdefault(
-            surface, {"requests": 0, "cached_requests": 0, "spend": 0.0}
+            surface,
+            {"requests": 0, "cached_requests": 0, "failed_requests": 0, "spend": 0.0},
         )
-        for k in ("requests", "cached_requests", "spend", "prompt_tokens", "completion_tokens"):
+        for k in ("requests", "cached_requests", "failed_requests", "spend",
+                  "prompt_tokens", "completion_tokens"):
             acc[k] += r.get(k) or 0
         s["requests"] += r.get("requests") or 0
         s["cached_requests"] += r.get("cached_requests") or 0
+        s["failed_requests"] += r.get("failed_requests") or 0
         s["spend"] += r.get("spend") or 0.0
 
     keys = await gateway.list_keys()
@@ -315,6 +323,7 @@ async def admin_overview(since: str | None = None,
     # "who spent" are different questions, and an operator needs the first one too.
     for owner in budgets:
         people.setdefault(owner, {"username": owner, "requests": 0, "cached_requests": 0,
+                                  "failed_requests": 0,
                                   "spend": 0.0, "prompt_tokens": 0,
                                   "completion_tokens": 0, "surfaces": {}})
 
