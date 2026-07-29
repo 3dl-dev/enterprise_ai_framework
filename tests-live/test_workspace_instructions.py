@@ -466,44 +466,78 @@ def _pod_for(user: str) -> str:
                      "-o", "jsonpath={.items[0].metadata.name}").stdout
 
 
+def _restore_prod_default():
+    """Force PROD_CM back to the documented default (AGENTS.md verbatim), unconditionally.
+
+    Uses the `instructions given` branch of ensure_tenant_instructions, which always
+    overwrites regardless of the ConfigMap's current state (missing, seeded, or hand-
+    edited) — so this is safe to call whether the CM was deleted, never recreated, or
+    left in some partial state by whatever failed. This is the one call every exit path
+    of the control-case test below must reach.
+    """
+    restore = _call_ensure(NS, PROD_CM, str(AGENTS_MD), str(AGENTS_MD))
+    assert restore.returncode == 0, (
+        f"FAILED TO RESTORE {PROD_CM} to the documented default after this test deleted "
+        f"it — the live deployment's house rules are now gone. stderr={restore.stderr}"
+    )
+
+
 def test_fresh_deployment_pod_gets_the_camp_rules_verbatim_with_no_operator_action(cbf_users):
     """The control case. Delete the shared ConfigMap to simulate a genuinely fresh
     deployment (nobody has ever run --instructions), then provision a user with NO flags —
     the path every existing camp deployment takes today — and check the resulting pod, not
     just the ConfigMap.
+
+    PROD_CM is the real, shared, deployment-wide ConfigMap every workspace pod mounts —
+    there is no throwaway substitute available here because provision-workspace.sh always
+    names it literally (it is not parameterised). Deleting it is therefore wrapped in
+    try/finally: if `_provision` fails, or any assert below fails, the finally block still
+    runs and force-restores the documented default before the test exits either way. A
+    wave-3 review found the unguarded version of this test could leave the live tenant's
+    house rules deleted on any failure path — this is that fix.
     """
     user, _ = cbf_users
-    _delete_cm(PROD_CM)
-    assert not _cm_exists(PROD_CM)
+    try:
+        _delete_cm(PROD_CM)
+        assert not _cm_exists(PROD_CM)
 
-    result = _provision(user)
-    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
-    assert "seeded default" in result.stdout
+        result = _provision(user)
+        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+        assert "seeded default" in result.stdout
 
-    pod = _pod_for(user)
-    assert pod, f"no pod for {user}"
+        pod = _pod_for(user)
+        assert pod, f"no pod for {user}"
 
-    tenant_md = _exec_cat(pod, "/etc/opencode/tenant/TENANT.md")
-    assert tenant_md == AGENTS_MD.read_text(), (
-        "the pod's mounted TENANT.md must equal the camp's AGENTS.md byte-for-byte — "
-        "this is done-condition 3"
-    )
+        tenant_md = _exec_cat(pod, "/etc/opencode/tenant/TENANT.md")
+        assert tenant_md == AGENTS_MD.read_text(), (
+            "the pod's mounted TENANT.md must equal the camp's AGENTS.md byte-for-byte — "
+            "this is done-condition 3"
+        )
 
-    platform_md = _exec_cat(pod, "/etc/opencode/PLATFORM.md")
-    assert platform_md == PLATFORM_MD.read_text()
+        platform_md = _exec_cat(pod, "/etc/opencode/PLATFORM.md")
+        assert platform_md == PLATFORM_MD.read_text()
 
-    cfg = _kubectl("exec", pod, "-c", "ttyd", "--", "opencode", "debug", "config", check=False)
-    assert cfg.returncode == 0, cfg.stderr
-    resolved = json.loads(cfg.stdout)
-    assert resolved["instructions"] == [
-        "/etc/opencode/PLATFORM.md", "/etc/opencode/tenant/TENANT.md"
-    ]
+        cfg = _kubectl("exec", pod, "-c", "ttyd", "--", "opencode", "debug", "config", check=False)
+        assert cfg.returncode == 0, cfg.stderr
+        resolved = json.loads(cfg.stdout)
+        assert resolved["instructions"] == [
+            "/etc/opencode/PLATFORM.md", "/etc/opencode/tenant/TENANT.md"
+        ]
+    finally:
+        _restore_prod_default()
 
 
 def test_a_second_user_with_different_instructions_proves_per_deployment_not_per_user(cbf_users):
     """Done-condition 4: a second, different instruction set on a second user, and it must
     be visible on the FIRST user's already-running pod too — because the scope decision
     (per-deployment, not per-user) means there is exactly one ConfigMap.
+
+    This test overwrites PROD_CM (the real, shared, deployment-wide ConfigMap — there is no
+    throwaway substitute, provision-workspace.sh always names it literally) with a
+    throwaway test string partway through. Same hazard class as the fresh-deployment test
+    above: if any assert between the overwrite and the original bottom-of-test restore
+    failed, PROD_CM was left holding test content instead of the camp's real house rules,
+    on any failure path. Wrapped in try/finally for the same reason.
     """
     user1, user2 = cbf_users
     pod1_before = _pod_for(user1)
@@ -516,39 +550,41 @@ def test_a_second_user_with_different_instructions_proves_per_deployment_not_per
     tmp = Path("/tmp") / f"cbf-custom-{uuid.uuid4().hex[:8]}.md"
     tmp.write_text(custom)
     try:
-        result = _provision(user2, "--instructions", str(tmp))
-        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
-        assert "updated" in result.stdout
+        try:
+            result = _provision(user2, "--instructions", str(tmp))
+            assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+            assert "updated" in result.stdout
+        finally:
+            tmp.unlink(missing_ok=True)
+
+        pod2 = _pod_for(user2)
+        assert _exec_cat(pod2, "/etc/opencode/tenant/TENANT.md") == custom
+
+        # The already-running FIRST user's pod must pick this up too — same pod, no
+        # restart — because it is one ConfigMap for the whole deployment.
+        import time as _t
+
+        deadline = _t.time() + 90
+        seen = ""
+        while _t.time() < deadline:
+            seen = _exec_cat(pod1_before, "/etc/opencode/tenant/TENANT.md")
+            if seen == custom:
+                break
+            _t.sleep(5)
+        assert seen == custom, (
+            f"user1's already-running pod never saw the deployment-wide update; last "
+            f"read: {seen!r}"
+        )
+
+        restarts_after = _kubectl(
+            "get", "pod", pod1_before, "-o",
+            "jsonpath={.status.containerStatuses[0].restartCount}",
+        ).stdout
+        assert restarts_after == restarts_before, (
+            "the update must reach the running pod without a restart"
+        )
     finally:
-        tmp.unlink(missing_ok=True)
-
-    pod2 = _pod_for(user2)
-    assert _exec_cat(pod2, "/etc/opencode/tenant/TENANT.md") == custom
-
-    # The already-running FIRST user's pod must pick this up too — same pod, no restart —
-    # because it is one ConfigMap for the whole deployment.
-    import time as _t
-
-    deadline = _t.time() + 90
-    seen = ""
-    while _t.time() < deadline:
-        seen = _exec_cat(pod1_before, "/etc/opencode/tenant/TENANT.md")
-        if seen == custom:
-            break
-        _t.sleep(5)
-    assert seen == custom, (
-        f"user1's already-running pod never saw the deployment-wide update; last read: {seen!r}"
-    )
-
-    restarts_after = _kubectl(
-        "get", "pod", pod1_before, "-o",
-        "jsonpath={.status.containerStatuses[0].restartCount}",
-    ).stdout
-    assert restarts_after == restarts_before, (
-        "the update must reach the running pod without a restart"
-    )
-
-    # Restore the shared default so the namespace is left in the documented default state
-    # for anyone reading it next, rather than a throwaway test string.
-    restore = _provision(user1, "--instructions", str(AGENTS_MD))
-    assert restore.returncode == 0, restore.stderr
+        # Restore the shared default so the namespace is left in the documented default
+        # state for anyone reading it next, rather than a throwaway test string — on
+        # every exit path, not just the one where every assert above passed.
+        _restore_prod_default()
