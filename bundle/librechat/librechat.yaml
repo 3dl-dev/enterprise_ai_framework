@@ -74,20 +74,29 @@ modelSpecs:
         # after the thinking rather than producing a smaller answer.
         maxContextTokens: 200000
         maxOutputTokens: 32768
-        promptPrefix: |
-          When you produce a self-contained HTML/CSS/JS page, a React component, a
-          Mermaid diagram or an SVG, emit it as an artifact.
-
-          The opening fence is EXACTLY three colons, then the word artifact:
-          :::artifact{identifier="kebab-case-id" type="text/html" title="A Short Title"}
-          ```html
-          <!DOCTYPE html> ...
-          ```
-          :::
-
-          Three colons to open and three to close. Two colons will not render and the
-          user will see raw code instead of a running program. Put the entire program in
-          one artifact so it runs on its own with no other files.
+        # NO promptPrefix (enterpriseaiframework-8b5). One used to live here: ~10 lines,
+        # every one of them about emitting runnable HTML, ending in a worked
+        # <!DOCTYPE html> example, with nothing about prose. That is standing context on
+        # every turn of every conversation, so an ambiguous message ("make it a lot
+        # sorter", a typo for "shorter") read as a request to build a program, and GLM
+        # built one. FOUND IN USE: see docs/design/dogfood-findings.md and the item.
+        #
+        # It was also redundant on both things it tried to do:
+        #   - WHEN to use an artifact: `artifacts: "default"` below already makes
+        #     LibreChat inject its own artifact system prompt
+        #     (api/app/clients/prompts/artifacts.js, generateArtifactsPrompt), which
+        #     already states the HTML/React/Mermaid/SVG types, the format, and — unlike
+        #     the prompt removed here — explicit guidance on when NOT to use one
+        #     ("prefer in-line content", "err on the side of not creating an artifact").
+        #   - HOW to open the fence: the removed prompt's only other job was drilling
+        #     GLM into using three colons instead of the two it actually emits.
+        #     deploy/gateway/strip_reasoning.py's `_OPEN_FENCE` regex already rewrites
+        #     `:{1,4}artifact{` to `:::artifact{` deterministically, on both the
+        #     streaming and non-streaming paths, for every surface and every model
+        #     (24fe929) — whose own commit message records that prompting the fence
+        #     was tried first, twice, and did not hold. That gateway rewrite is what
+        #     actually owns fence correctness; a model-side prompt asking nicely for
+        #     three colons was never going to be reliable and doesn't need to try.
     - name: glm-4-7
       label: "GLM 4.7 (cheapest)"
       description: "Open weights. $0.40/$1.75 per Mtok — the cheapest priced model in the catalogue."
@@ -97,20 +106,7 @@ modelSpecs:
         artifacts: "default"
         maxContextTokens: 128000
         maxOutputTokens: 32768
-        promptPrefix: |
-          When you produce a self-contained HTML/CSS/JS page, a React component, a
-          Mermaid diagram or an SVG, emit it as an artifact.
-
-          The opening fence is EXACTLY three colons, then the word artifact:
-          :::artifact{identifier="kebab-case-id" type="text/html" title="A Short Title"}
-          ```html
-          <!DOCTYPE html> ...
-          ```
-          :::
-
-          Three colons to open and three to close. Two colons will not render and the
-          user will see raw code instead of a running program. Put the entire program in
-          one artifact so it runs on its own with no other files.
+        # NO promptPrefix — same reasoning as glm-5-2 above (enterpriseaiframework-8b5).
 
 registration:
   # Only identities from the realm. Belt and braces alongside ALLOW_REGISTRATION=false.
