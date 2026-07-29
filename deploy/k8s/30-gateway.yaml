@@ -66,6 +66,7 @@ spec:
             # it the proxy raises ImportError at startup and crash-loops.
             - { name: config, mountPath: /app/strip_reasoning.py, subPath: strip_reasoning.py, readOnly: true }
             - { name: config, mountPath: /app/require_principal.py, subPath: require_principal.py, readOnly: true }
+            - { name: config, mountPath: /app/flush_spend_on_shutdown.py, subPath: flush_spend_on_shutdown.py, readOnly: true }
           readinessProbe:
             httpGet: { path: /health/liveliness, port: 4000 }
             initialDelaySeconds: 20
