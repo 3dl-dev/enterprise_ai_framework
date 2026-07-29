@@ -4,7 +4,10 @@
 # with no provider account and no spend. Point the gateway at real upstreams by editing
 # litellm/config.yaml and setting the provider keys in .env — nothing else changes.
 
-name: enterprise-ai
+# A worktree checkout gets its own project name and its own port block, rendered into
+# .env by bin/render-env.sh (enterpriseaiframework-0e3) — otherwise every worktree's
+# `docker compose up/down` would operate on the SAME containers as the primary checkout.
+name: ${COMPOSE_PROJECT_NAME:-enterprise-ai}
 
 x-postgres-env: &pg-env
   POSTGRES_USER: ${POSTGRES_USER:-eai}

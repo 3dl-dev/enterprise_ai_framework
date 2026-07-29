@@ -38,10 +38,10 @@
       "serviceAccountsEnabled": false,
       "secret": "REPLACED_AT_BUNDLE_UP",
       "redirectUris": [
-        "http://localhost:3080/oauth/openid/callback",
-        "http://127.0.0.1:3080/oauth/openid/callback"
+        "http://localhost:REPLACED_CHAT_PORT_AT_BUNDLE_UP/oauth/openid/callback",
+        "http://127.0.0.1:REPLACED_CHAT_PORT_AT_BUNDLE_UP/oauth/openid/callback"
       ],
-      "webOrigins": ["http://localhost:3080"],
+      "webOrigins": ["http://localhost:REPLACED_CHAT_PORT_AT_BUNDLE_UP"],
       "defaultClientScopes": ["openid", "profile", "email", "roles"]
     },
     {
