@@ -9,8 +9,9 @@
      one attribute; nothing else in the page knows or cares which mode it is in. -->
 <base href="/">
 <title>Workshop</title>
-<!-- data: URI, not a file request. The pod has no egress; a remote favicon is a broken
-     favicon and a console error a nine-year-old cannot read. -->
+<!-- data: URI, not a file request. Not because the pod is offline — it is not — but because
+     the workshop's own chrome must not depend on a third party being up: a remote favicon
+     is a request that can fail, and a console error a nine-year-old cannot read. -->
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🦄</text></svg>">
 <link rel="stylesheet" href="static/style.css">
 </head>
@@ -157,7 +158,7 @@
     <details data-stuck="3">
       <summary>It says it needs the internet</summary>
       <div class="d-body">
-        <p>This room has no internet, so anything the page loads from the web comes up blank.</p>
+        <p>Your page is asking the web for a piece of itself. That piece can go missing, and then the page comes up blank. Keep everything inside the file instead.</p>
         <button class="btn small" type="button" data-copy="Do not load anything from the internet. Put all the code, styles and pictures inside the index.html itself.">Copy the sentence</button>
       </div>
     </details>

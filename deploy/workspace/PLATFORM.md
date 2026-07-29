@@ -32,7 +32,17 @@ exists to fix, just moved one layer down — so the two rules are dropped here r
 carried forward. They still exist, unedited, in the tenant's own instructions (the seed is
 `deploy/workspace/AGENTS.md`, byte-for-byte) — a tenant's own text is free to be wrong
 about its own deployment, the same way any of an operator's other preferences might be;
-what must not happen is the platform image asserting it as a verified fact. See
-enterpriseaiframework-644 for the open question of whether the camp's own text should be
-corrected — that is a tenant-content decision, not a platform one, and out of this item's
-scope.
+what must not happen is the platform image asserting it as a verified fact.
+
+**enterpriseaiframework-644 has since resolved the tenant-content half.** The camp's seed
+(`deploy/workspace/AGENTS.md`) keeps both rules — inline everything, do not run installers
+— but no longer justifies them with a network claim, because the network claim is false.
+The same item corrected the four other places in `deploy/workspace/` that repeated it, and
+`tests/test_workspace_network_claims.py` now derives the expectation from the NetworkPolicy
+rather than hard-coding it, so the claim cannot be reintroduced on one side without the
+other side moving too. This file's decision to drop the two rules is unchanged.
+
+Note for anyone updating a RUNNING deployment: `ensure_tenant_instructions` only seeds
+`workspace-tenant-instructions` when it is absent, so a cluster provisioned before this
+change still serves the old text until an operator runs
+`deploy/bin/provision-workspace.sh <user> --instructions deploy/workspace/AGENTS.md`.

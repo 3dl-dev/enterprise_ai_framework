@@ -770,3 +770,71 @@ nobody anything and name nobody. What must hold is that nothing in the bucket ev
 non-empty and attributed. Measured with the hook disabled, a single master-key request put
 `$0.000198` and 22 tokens into that bucket, so the assertion is a real detector rather than
 a restatement of the 403 above it.
+### 37. The workspace told its own agent it had no internet, and it was wrong
+
+Five places in `deploy/workspace/` asserted, as fact, that the workspace pod has no
+network: `AGENTS.md` rule 1 ("There is no internet here… Anything loaded from the web
+arrives as nothing"), rule 5 ("There is no egress. Both hang and then fail"), the Stuck?
+panel a child reads ("This room has no internet"), the Ribbon phrase ("That page needs the
+internet, and this room has none"), and the `OFFLINE_REF` comment that justifies the whole
+remote-reference counter.
+
+Measured from inside a running workspace pod on 2026-07-29, not read off the YAML —
+kube-router resolves a packet on the *destination's* ingress rules without consulting the
+source's egress, so an egress rule alone proves nothing in either direction:
+
+```
+$ kubectl -n enterprise-ai exec ws-student-… -c ttyd -- \
+    curl -sS -o /dev/null -m 10 -w 'http_code=%{http_code} remote=%{remote_ip}:%{remote_port}\n' \
+    https://registry.npmjs.org/
+http_code=200 remote=104.16.4.34:443
+
+$ … https://pypi.org/simple/
+http_code=200 remote=151.101.128.223:443
+```
+
+The live `workspace-isolation` NetworkPolicy's egress section is structurally identical to
+what is checked in at `60-workspace-common.yaml`, so this is not deploy drift. The
+`0.0.0.0/0`-minus-private rule carries no port restriction, is captioned "The internet, for
+pip / npm / git clone", and has been there since the commit that created the surface. The
+policy is deliberate. **The text is what was wrong.**
+
+Two things generalise:
+
+- **A false capability claim is worse than a missing one.** An agent told it has no network
+  does not try, and then explains a blank page to a nine-year-old with a mechanism that
+  does not exist. The claim is unfalsifiable from inside the conversation: nobody ever
+  runs the command that would disprove it, because the rules say not to.
+- **The claim was false for a second reason nobody had noticed, and that one survives any
+  policy change.** The preview is `<iframe src="preview/">` — *the child's browser* fetches
+  the page and every subresource named in it, not the pod. `shell-server.py` sends no
+  `Content-Security-Policy` and the iframe's sandbox does not restrict subresource loading,
+  so a CDN `<script src>` in a preview loads over the child's own connection. Even a
+  fully-closed pod would not have made "anything loaded from the web arrives as nothing"
+  true. Measured against the real server in
+  `test_the_preview_does_not_block_remote_subresources`.
+
+**Fixed** in `enterpriseaiframework-644`. Both house rules are kept — inline everything, do
+not run installers — because they are good camp rules; only their false justification is
+replaced, with the true one (a remote reference is the piece of a page that works at the
+desk and is missing at the demo) and an explicit "this is a camp rule, not a limit of the
+machine". The remote-reference counter is kept and re-documented as a house-rule check
+rather than a capability check; its field name in `/api/pulse` stays `offline_refs`,
+because that response shape is frozen.
+
+`tests/test_workspace_network_claims.py` **derives** the obligation from the NetworkPolicy
+instead of hard-coding it, in both directions: while the policy allows general internet
+egress the text must not deny it, and if the policy is ever narrowed the agent's rules must
+say so — otherwise an agent that does not know it is offline burns a user's turn on an
+install that hangs. Both branches are fault-injected (the retired text is replayed verbatim
+through the checker and must be caught; a synthetic restrictive spec must flip the
+complaint), so neither the check nor the branch it does not currently take can rot green.
+
+Still open, and attention-gated: the policy's *breadth*. Unrestricted egress to any host on
+any port, from a pod that runs agent-written code next to a spendable virtual key, is a
+deliberate setting that had never actually been chosen. Closing it entirely is the wrong
+answer — the product is not the camp, and an enterprise's developers need `pip`, `npm` and
+`git clone` — but narrowing the rule to TCP 80/443 costs only public `git+ssh` and buys the
+loss of arbitrary-port outbound. Note that no CIDR-based egress policy can prevent key
+exfiltration while package installs are permitted; the registry is a fine exfil channel.
+That is a founder decision, not an agent one.
