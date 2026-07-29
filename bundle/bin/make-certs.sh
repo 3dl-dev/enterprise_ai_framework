@@ -37,9 +37,18 @@ if [[ -z "$IDP_PUBLIC_IP" ]]; then
 fi
 
 # Record it so compose and the tests use the same address the certificate covers.
-if grep -qE '^IDP_PUBLIC_HOST=' .env 2>/dev/null; then
+# A missing .env used to fall through all three branches in silence, leaving
+# IDP_PUBLIC_HOST unset for compose. Nothing downstream noticed until Keycloak died on
+# "https://:8443", ten containers later. It is render-env.sh's job to create .env and
+# `make up` now runs it first, so reaching here without one is a broken invocation and
+# says so rather than producing a bundle that cannot start.
+if [[ ! -f .env ]]; then
+    echo "error: bundle/.env does not exist — run bundle/bin/render-env.sh first" >&2
+    exit 1
+fi
+if grep -qE '^IDP_PUBLIC_HOST=' .env; then
     sed "s|^IDP_PUBLIC_HOST=.*|IDP_PUBLIC_HOST=${IDP_PUBLIC_IP}|" .env > .env.tmp && mv .env.tmp .env
-elif [[ -f .env ]]; then
+else
     printf 'IDP_PUBLIC_HOST=%s\n' "$IDP_PUBLIC_IP" >> .env
 fi
 

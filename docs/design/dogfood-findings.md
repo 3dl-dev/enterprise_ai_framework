@@ -123,36 +123,99 @@ For the same request (39 input, 27 output on `claude-haiku-4-5`) both compute
 live request against Forge's own usage record rather than trusting either side.
 
 
-## Open — behaviour to know about, not yet decided
+### 10. A cache hit does not bypass budget enforcement, and $0 is the right price
 
-### 10. A cache hit bypasses budget enforcement
+The gateway's own response cache (LiteLLM's exact-match cache in Valkey — *not* the
+provider-side prompt caching, which is a separate mechanism, priced through `model_info`,
+and measured separately at 0.00546710 cold vs 0.00273814 cached). Two claims were made
+about it and both are false. This entry records what is measured, and the ruling that
+closes it.
 
-With the exact-match cache on, an identical request is served from cache. Measured
-behaviour, from a two-key probe (same prompt, different virtual keys):
+**A cache hit writes a spend row.** Attributed to the requesting key, tokens counted,
+cost zero. From a two-key probe (same prompt, different virtual keys):
 
 | key | `cache_hit` | spend | tokens |
 |---|---|---|---|
 | A — populated the cache | — | $0.000189 | 19 |
 | B — hit the cache | `True` | $0 | 19 |
 
-So cache hits **do** write a spend row, **correctly attributed to the requesting key**,
-with tokens counted and cost zero. Cost accounting is right: no upstream call was made.
+**An over-budget key is refused, cached answer or not.** The budget is checked in
+LiteLLM's `user_api_key_auth`, which runs as a route dependency — strictly before the
+request reaches the router, and therefore before any cache lookup. Measured on the bundle
+at `litellm:main-v1.77.3-stable`, the same image the cluster runs, by putting a key past
+its cap in front of a prompt already proven to be in the cache:
 
-> **Correction.** An earlier revision of this document claimed cache hits produce no
-> spend row at all. That was wrong — it was inferred from a test that failed to find a
-> row, rather than from the ledger. The table above is measured. The practical difference
-> matters: usage counts are *not* under-reported, so the bill is trustworthy.
+```
+1. prompt P                  -> 200,  provider called once
+2. prompt P again            -> 200,  provider NOT called    (P is cached)
+3. unrelated prompt          -> 200,  spend now 0.000384 > cap 0.00025
+4. prompt P again            -> 400 budget_exceeded
+5. cap raised, prompt P      -> 200,  provider STILL not called
+```
 
-What remains true and unresolved:
+Step 5 is the part that makes step 4 mean anything: the entry was in the cache the whole
+time, so the 400 was the budget refusing a request the cache could have answered, not a
+cache miss wearing a budget error's clothes.
 
-- An over-budget key is **still served** from cache, because the budget is not consulted
-  on a hit. No money is spent, so this is defensible — but "the budget stopped them" is
-  not quite true, and an operator who disables someone expects silence.
-- Any test touching metering or enforcement must use unique content. Fixed prompts made
-  three separate tests pass once and then fail forever after, which reads as flakiness
-  rather than as a cache hit.
+> **Two corrections, and they have the same shape.** An earlier revision claimed cache
+> hits write no spend row; that was inferred from a test that failed to find one. The
+> replacement claimed the budget is not consulted on a hit; that was inferred from a
+> probe that only ever showed a cache hit costing $0 and never once put an over-budget
+> key in front of a cached prompt. Both read a *fact about cost* as a *fact about
+> enforcement*. Neither was measured before it was written down.
 
-**Not yet decided:** whether budget refusal should precede the cache lookup.
+**Ruling: a cache hit bills $0, and the bill says how many requests were free.**
+
+- $0 is not a concession, it is the correct number. Nothing was bought. Pricing a cache
+  hit at list would put a figure in the ledger that no provider invoice will ever
+  confirm, and cent-level agreement with the provider (finding 9) is the strongest
+  evidence this layer has that its bill is true. Trading that for a nicer-looking usage
+  column is the exact trade this project exists not to make.
+- Charging back internally at list price is a *policy* question and a legitimate one, but
+  it is not a *cost*. The ledger keeps costs. Every cache-hit row carries its real token
+  counts, so any operator who wants list-price chargeback can compute it from the ledger
+  without the cost column having to lie.
+- Budgets therefore cap **money, not usage**. A user answered entirely from cache never
+  advances toward their cap, because they never cost anything. If a deployment wants to
+  cap *usage*, that is rate limiting (RPM/TPM), a control that already exists and should
+  not be smuggled into the money column.
+- What was actually wrong is that the bill said none of this. `85 requests, 150,574
+  tokens, $0.000000` with no further explanation is indistinguishable from a bill that
+  has lost the money — and it was read as exactly that, twice. `/admin/spend`,
+  `/portal/api/spend` and `/portal/api/admin/overview` now report `cached_requests` per
+  user-and-surface and in the totals, **and the portal renders it as a "Free" column** in
+  both the user's own spend table and the operator's. The first revision of this fix put
+  the number in the JSON and in none of the pages, which left the claim true only for
+  somebody reading the API by hand — not for the operator the ruling was written for.
+
+Locked in by `TestCacheHitsBudgetAndTheBill` in `tests/test_scope_items.py`.
+
+> **A third correction, same shape as the first two.** The revision that added
+> `cached_requests` also added a test asserting flatly that "a refused request is not
+> billed", and checked it against a single budget refusal. The assertion passed; the claim
+> was still wrong, because a request that fails at the *upstream* is past the router, goes
+> onto the failure callback, and does get a row that the bill counts. Once again a result
+> from one path was written down as a rule about all of them. The three classes are
+> measured separately in finding 36, and there is now one test per class.
+>
+> This also means the bill has **two** kinds of $0 row and this ruling only explains one
+> of them. `cached_requests` counts requests that were served for free. A failed request
+> was served to nobody, and whether it belongs in a request count at all is open —
+> `enterpriseaiframework-e69`.
+
+**A trap for anyone writing tests here.** The fake provider's reply — body, completion id,
+token counts — is a pure function of (model, prompt), so a cached reply and a fresh one
+are byte-identical. "The response id matched, so it was a cache hit" proves nothing and
+passes whether the cache works or not. `GET /debug/calls?prompt=...` on the fake provider
+returns how many times it was actually asked to generate; that is the only ground truth
+available, and it is what those tests assert against.
+
+Relatedly: any test touching metering or enforcement must use unique content. Fixed
+prompts made three separate tests pass once and then fail forever after, which reads as
+flakiness rather than as a cache hit.
+
+
+## Open — behaviour to know about, not yet decided
 
 ### 11. Control-plane admin auth is a shared bearer token
 
@@ -897,3 +960,118 @@ Measured on the bundle afterwards, over a ledger where every key had been revoke
 join blanks 4 of 4 rows, the shared expression blanks 1 — and that one is a request LiteLLM
 *refused*, logged with `user_api_key_alias: null` and $0 spend, which is genuinely
 unattributable and correctly labelled.
+### 39. No key on the cluster carries a budget, so no one can be over one
+
+> Filed as "finding 28" when it was first written, which was already taken by "A sandbox
+> is an authority boundary", then renumbered to 35 on d58's branch, and to 39 when that
+> branch merged into a main which had meanwhile taken 35–38.
+> `enterpriseaiframework-d65` is the item, and is the stable reference.
+
+
+Found while measuring finding 10. Every virtual key the control plane has provisioned on
+the cluster has `max_budget` NULL:
+
+```
+baron::ide         | spend 0.6019512900 | max_budget (null)
+chat-surface::chat | spend 0.2280494825 | max_budget (null)
+student::ide       | spend 0.0168477300 | max_budget 1000000
+baron::chat, student::chat, claire::*, *::terminal  | spend 0 | max_budget (null)
+```
+
+`/admin/sync` takes `default_budget` as an optional query parameter and defaults it to
+`None`, and nothing in the deploy path passes one. LiteLLM's key budget check is guarded
+by `if valid_token.max_budget is not None`, so with no cap set it does not run.
+
+This matters because it is the *real* reason a user on the cluster is never refused, and
+because it is easy to mistake for the cache defect finding 10 alleged: both look like
+"they went on being served". They are not the same, and only this one is true. Measured
+directly — a key with a cap is refused past it, a key without one is served indefinitely:
+
+```
+budget consulted   (cap 0.00025):  10s past the cap -> 400 budget_exceeded
+budget NOT consulted (cap unset):  30s past the same spend -> 10 x 200
+```
+
+The `1000000` on `student::ide` is a cap in name only; it exists because something once
+passed a number, not because anyone chose it.
+
+**Not fixed here** — setting budgets is an operator policy decision, and applying one to
+the cluster is a mutation this row's scope did not cover. Filed as
+`enterpriseaiframework-d65`. Note that milestone `enterpriseaiframework-0a4` asks for "a
+user past their budget is REFUSED **on the cluster**", which cannot be demonstrated at
+all until a cluster key has a budget to be past.
+
+### 40. A request the provider never answered is still counted as a request
+
+> Written as "finding 36" on d58's branch and cited under that number in
+> `enterpriseaiframework-e69`. Renumbered to 40 when d58 merged into a main that had
+> meanwhile taken 35–38. The item is `enterpriseaiframework-e69`; the ruling this finding
+> asked for is recorded below under **The ruling**.
+
+Found while answering the veracity gate on `enterpriseaiframework-d58`, which challenged
+the claim that "a refused request is not billed". The challenge was half right, and the
+half it was right about is the more interesting one.
+
+There are three ways a request can end without the caller getting an answer, and they do
+not take the same path through the gateway:
+
+| how it ends | where it is stopped | ledger row? | counted in `requests`? |
+|---|---|---|---|
+| over budget | `user_api_key_auth`, before the router | no | no |
+| model not on the key's list | `user_api_key_auth`, before the router | no | no |
+| the upstream itself fails | past the router, on the failure callback | **yes** | **yes** |
+
+Measured on the bundle, one key per class, unique prompts throughout:
+
+```
+budget:    2 served,  6 refused  -> ledger 2 rows, bill 2 requests
+model:     1 served,  3 denied   -> ledger 1 row,  bill 1 request
+upstream:  1 served,  3 failed   -> ledger 4 rows, bill 4 requests
+```
+
+The three upstream-failure rows carry `status='failure'`, `spend=0`, `total_tokens=0`,
+`cache_hit='False'`. So the bill tells an operator that this person made four requests
+when one was served, and it puts three zero-dollar rows in front of them with nothing to
+say why they are zero.
+
+**This is the same shape as the defect d58 set out to fix, in a second place.** d58's
+ruling was that a cache hit correctly bills $0 and the bill must therefore *say* how many
+requests were free, because an unexplained $0 gets read as lost money — it was filed as
+under-reporting twice. `cached_requests` explains one kind of zero. This is the other
+kind, and it is worse than unexplained: a cache hit is a request that was *served*, for
+free, and belongs in a request count. A failed request was served to nobody.
+
+**Not fixed here, deliberately.** Whether a request that returned an error belongs in the
+number labelled "requests" is a product decision about how money and usage are reported,
+not an implementation detail, and d58 is already at an attention gate for exactly this
+class of question. Filed as `enterpriseaiframework-e69`. The options are visible from
+here — exclude failures from `requests`, or carry `failed_requests` alongside
+`cached_requests` the way this item did for cache hits — and both are cheap; choosing is
+the part that is not.
+
+**What IS locked down here.** `cached_requests` must never absorb these rows. The
+predicate behind it reads the `cache_hit` column, not the spend column, and
+`test_an_upstream_failure_is_billed_as_a_request_at_zero_and_is_not_a_cache_hit` fails if
+that is ever loosened — demonstrated by loosening it to `spend = 0`, which reported three
+failed requests to the operator as free ones.
+
+### 41. `make up` failed the first time and passed on a re-run, in a clean checkout
+
+`make up` ran `make-certs.sh` before `render-env.sh`. `make-certs.sh` is what records
+`IDP_PUBLIC_HOST` into `bundle/.env`, but it only did so `elif [[ -f .env ]]` — and
+`render-env.sh` is what creates `.env`. So on the first run in a checkout with no `.env`
+yet, all three branches were skipped in silence, `KC_HOSTNAME` interpolated to
+`https://:8443`, and Keycloak crash-looped on:
+
+```
+java.net.URISyntaxException: Expected scheme-specific part at index 6: https:
+```
+
+`make up` then sat in `wait-healthy.sh` until it timed out. Running it a second time
+worked, because by then `.env` existed — which is why this survived: nobody meets it
+twice.
+
+Fixed by running `render-env.sh` first, and by making `make-certs.sh` fail loudly when
+`.env` is missing instead of skipping. Verified from a genuinely clean state — `make
+nuke`, `rm bundle/.env bundle/certs/*`, `make up` — which reproduced the crash before the
+change and came up healthy after it.

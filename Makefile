@@ -4,6 +4,7 @@ BUNDLE := bundle
 COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env
 
 ## Scope item 8: the whole bundle starts from one command on a single host, no GPU.
+<<<<<<< HEAD
 ##
 ## render-env.sh before make-certs.sh, not the other way round: make-certs.sh only
 ## records IDP_PUBLIC_HOST into a .env that already exists (`elif [[ -f .env ]]`), and on
@@ -15,7 +16,10 @@ COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.
 ## first makes the later grep/sed in make-certs.sh see a real file every time, first run
 ## included. Found running `make up` in a brand-new worktree (enterpriseaiframework-cbf):
 ## an untested combination, since the primary checkout and every other worktree so far
-## already had a bundle/.env before this ordering could matter.
+## already had a bundle/.env before this ordering could matter. Found independently a
+## second time on enterpriseaiframework-d58, which named the same symptom from the other
+## end: KC_HOSTNAME resolved to "https://:8443" and identity crash-looped on a
+## URISyntaxException, passing on the re-run because by then .env existed.
 up:
 	@$(BUNDLE)/bin/render-env.sh
 	@$(BUNDLE)/bin/make-certs.sh

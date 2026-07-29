@@ -126,6 +126,26 @@ def ledger_attribution_sql(shared_param: str) -> dict[str, str]:
     }
 
 
+# WHY THE BILL COUNTS CACHE HITS SEPARATELY (enterpriseaiframework-d58)
+#
+# The gateway serves a repeated request out of Valkey without calling the provider, and
+# writes a spend row for it: right key, real token counts, spend $0. Every part of that is
+# correct — no upstream call was made, so no money was spent, and a non-zero number there
+# would be one no invoice will ever confirm.
+#
+# But a bill that reports "85 requests, 150,574 tokens, $0.00" and says nothing else is
+# indistinguishable from a bill that has lost the money, and it was read as exactly that —
+# those are the real cluster figures, filed twice as the bill under-reporting. The $0 is
+# not the problem; the $0 being unexplained is. So the count travels with it, and an
+# operator can see that the free rows were free because they had already been answered.
+#
+# LiteLLM writes this column as the strings 'True'/'False', and leaves it NULL on paths
+# that predate it — hence the case-insensitive compare against 'true' rather than a
+# boolean cast, which would error on the NULLs. Same predicate as unpriced_models below,
+# deliberately: the two must agree about what a cache hit is.
+_CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
+
+
 async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
     """The single query the scope item names. One row per (user, surface)."""
     where, params = "", []
@@ -140,6 +160,7 @@ async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
         {attr["principal"]} AS username,
         COALESCE({attr["surface"]}, '(unknown)') AS surface,
         COUNT(*)                                  AS requests,
+        COUNT(*) FILTER (WHERE {_CACHE_HIT})::bigint AS cached_requests,
         COALESCE(SUM(s.spend), 0)::float8         AS spend,
         COALESCE(SUM(s.prompt_tokens), 0)::bigint AS prompt_tokens,
         COALESCE(SUM(s.completion_tokens), 0)::bigint AS completion_tokens
@@ -161,6 +182,7 @@ async def totals(since: str | None = None) -> dict:
         params.append(since)
     sql = f"""
     SELECT COUNT(*) AS requests,
+           COUNT(*) FILTER (WHERE {_CACHE_HIT})::bigint AS cached_requests,
            COALESCE(SUM(s.spend), 0)::float8 AS spend,
            COUNT(DISTINCT {_ALIAS}) AS active_keys
     {_LEDGER_JOIN}
@@ -186,7 +208,7 @@ async def unpriced_models(since: str | None = None) -> list[dict]:
     # correct rather than a missing price. Counting them here made the detector fire on
     # healthy traffic, and a detector that cries wolf is one people stop reading — which
     # is exactly how a genuinely unpriced model would then slip through.
-    where = "WHERE s.total_tokens > 0 AND lower(COALESCE(s.cache_hit, '')) <> 'true'"
+    where = f"WHERE s.total_tokens > 0 AND NOT ({_CACHE_HIT})"
     params: list = []
     if since:
         where += ' AND s."startTime" >= $1::text::timestamptz'

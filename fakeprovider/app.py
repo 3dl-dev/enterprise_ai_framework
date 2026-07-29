@@ -13,15 +13,43 @@ import hashlib
 import json
 import os
 import time
+from collections import defaultdict
 
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI(title="fake-provider")
 
 # Deterministic pseudo-token accounting. The gateway meters what the upstream reports,
 # so these numbers flow all the way through to the ledger and the tests assert on them.
 CHARS_PER_TOKEN = 4
+
+
+# HOW A TEST KNOWS A REQUEST WAS SERVED FROM THE GATEWAY'S CACHE
+#
+# It cannot use the response. Every field this provider returns — the body text, the
+# completion id, the token counts — is a pure function of (model, prompt), precisely so
+# tests can assert on them. A cached reply and a freshly generated one are therefore
+# byte-identical, and "the id matched, so it was a cache hit" proves nothing at all. A
+# probe written that way passes whether the cache works or not.
+#
+# The one observable that separates the two is whether this process was called. So it
+# counts, per prompt, and reports the counts. A test that asserts "over-budget requests
+# are refused even when the answer is cached" has to establish the answer really was
+# cached, or it is asserting nothing; this is the ground truth it establishes it with.
+#
+# Test-fixture scope only. This service stands in for a provider account and never runs
+# in a real deployment — see docs/design/dogfood-scope.md item 8. It is unauthenticated
+# for the same reason the rest of it is.
+CALLS_BY_PROMPT: defaultdict[str, int] = defaultdict(int)
+
+
+def prompt_digest(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode()).hexdigest()[:16]
+
+
+def record_call(prompt: str) -> None:
+    CALLS_BY_PROMPT[prompt_digest(prompt)] += 1
 
 
 def count_tokens(text: str) -> int:
@@ -63,16 +91,44 @@ async def openai_models():
     }
 
 
+# A prompt containing this marker makes the upstream fail with a 500.
+#
+# There are three ways a request can end without the caller getting an answer, and they
+# take three different code paths through the gateway, so "a failed request is not billed"
+# has to be asked of each one separately:
+#
+#   1. refused at the budget          -> raised in user_api_key_auth, before the router
+#   2. refused at the key's model list -> also before the router
+#   3. the upstream itself fails       -> past the router, onto the FAILURE CALLBACK,
+#                                         which is pointed at the same ledger
+#
+# Only the third can plausibly write a spend row, and it was the one no test could reach,
+# because a stand-in provider that always succeeds cannot produce it. Injection is by
+# prompt marker rather than a header: LiteLLM forwards the message body verbatim but does
+# not pass arbitrary client headers through to the upstream.
+FAIL_MARKER = "__fakeprovider_fail_500__"
+
+
 @openai_router.post("/chat/completions")
 async def openai_chat(request: Request):
     body = await request.json()
     model = body.get("model", "fake-gpt-large")
     prompt = extract_prompt(body.get("messages", []))
+    if FAIL_MARKER in prompt:
+        # Recorded before failing, so a test can still tell "the upstream was called and
+        # blew up" apart from "the gateway never called the upstream at all".
+        record_call(prompt)
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": "fake-provider was asked to fail",
+                               "type": "server_error"}},
+        )
     text = reply_text(prompt, model)
     prompt_tokens = count_tokens(prompt)
     completion_tokens = count_tokens(text)
     created = int(time.time())
-    cid = "fakecmpl-" + hashlib.sha256(prompt.encode()).hexdigest()[:16]
+    cid = "fakecmpl-" + prompt_digest(prompt)
+    record_call(prompt)
 
     if not body.get("stream"):
         return {
@@ -144,7 +200,8 @@ async def anthropic_messages(request: Request):
     text = reply_text(prompt, model)
     input_tokens = count_tokens(prompt)
     output_tokens = count_tokens(text)
-    mid = "fakemsg-" + hashlib.sha256(prompt.encode()).hexdigest()[:16]
+    mid = "fakemsg-" + prompt_digest(prompt)
+    record_call(prompt)
 
     if not body.get("stream"):
         return {
@@ -210,6 +267,19 @@ async def anthropic_messages(request: Request):
 
 app.include_router(openai_router, prefix="/v1")
 app.include_router(anthropic_router, prefix="/v1")
+
+
+@app.get("/debug/calls")
+async def debug_calls(prompt: str | None = None):
+    """How many times this provider was actually asked to generate.
+
+    `prompt` is the exact prompt text a test sent; the count comes back for that prompt
+    alone. Without it, every prompt this process has seen. See CALLS_BY_PROMPT above for
+    why a test cannot get this from the response body.
+    """
+    if prompt is not None:
+        return {"prompt_digest": prompt_digest(prompt), "calls": CALLS_BY_PROMPT[prompt_digest(prompt)]}
+    return {"total": sum(CALLS_BY_PROMPT.values()), "by_prompt": dict(CALLS_BY_PROMPT)}
 
 
 @app.get("/health")
