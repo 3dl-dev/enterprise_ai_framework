@@ -117,6 +117,10 @@ services:
       FORGE_API_KEY: ${FORGE_API_KEY:-}
     volumes:
       - ./litellm/config.generated.yaml:/app/config.yaml:ro
+      # The callback module config.yaml names. litellm imports it by bare module name from
+      # the working directory, so it has to sit next to config.yaml — without it the proxy
+      # raises ImportError at startup and crash-loops. Same file the cluster mounts.
+      - ../deploy/gateway/strip_reasoning.py:/app/strip_reasoning.py:ro
     ports:
       - "${GATEWAY_PORT:-4000}:4000"
     depends_on:

@@ -108,12 +108,42 @@ class TestItem1OneLogin:
             timeout=TIMEOUT,
         ).json()
 
-        assert set(endpoints) == {"Enterprise AI"}, (
-            f"surface offers routes around the gateway: {sorted(endpoints)}"
+        # An allow-list, not a deny-list: a LibreChat upgrade that introduces a new
+        # endpoint must fail this test and be ruled on, rather than appear silently.
+        #
+        # `agents` is permitted because it is not the thing this test guards against. It
+        # carries no provider of its own — it runs on top of a configured endpoint, which
+        # here is the custom one pointing at the gateway. It is enabled deliberately
+        # (ENDPOINTS: custom,agents in docker-compose.yml and on the cluster): naming only
+        # "custom" also removes MCP servers, memory, tools, file search and web search,
+        # which is a capability loss, not a security gain. The bypass this test exists to
+        # catch is LibreChat's DIRECT provider endpoints, asserted explicitly below.
+        allowed = {"Enterprise AI", "agents"}
+        assert set(endpoints) <= allowed, (
+            f"surface offers routes around the gateway: {sorted(set(endpoints) - allowed)}"
         )
-        assert endpoints["Enterprise AI"].get("userProvide") is False, (
-            "users can supply their own provider key, bypassing the virtual key"
+        assert "Enterprise AI" in endpoints, "the gateway endpoint is not offered at all"
+
+        # The actual bypass: LibreChat's built-in direct-provider endpoints. Named rather
+        # than inferred, so this keeps testing the claim even if the allow-list is widened
+        # again later for another non-provider framework endpoint.
+        direct_providers = {
+            "openAI", "azureOpenAI", "anthropic", "google", "bedrock",
+            "gptPlugins", "assistants", "azureAssistants", "custom",
+        }
+        offered_direct = direct_providers & set(endpoints)
+        assert not offered_direct, (
+            f"surface offers a direct provider path around the gateway: {sorted(offered_direct)} "
+            "— unmetered, unbudgeted and outside the audit trail"
         )
+
+        # Applied to EVERY endpoint, not just the gateway one. A framework endpoint that
+        # lets a user paste their own provider key is the same bypass by another door.
+        for name, cfg in endpoints.items():
+            assert cfg.get("userProvide") is False, (
+                f"endpoint {name!r} lets users supply their own provider key, "
+                "bypassing the virtual key"
+            )
 
     def test_chat_catalog_is_pushed_from_the_gateway(
         self, chat_session, chat_url, gateway_url, master_headers

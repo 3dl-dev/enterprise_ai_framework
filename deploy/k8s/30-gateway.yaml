@@ -61,6 +61,10 @@ spec:
           ports: [{ containerPort: 4000 }]
           volumeMounts:
             - { name: config, mountPath: /app/config.yaml, subPath: config.yaml, readOnly: true }
+            # The callback module the config names. litellm imports it by bare module name
+            # from the working directory, so it has to land next to config.yaml — without
+            # it the proxy raises ImportError at startup and crash-loops.
+            - { name: config, mountPath: /app/strip_reasoning.py, subPath: strip_reasoning.py, readOnly: true }
           readinessProbe:
             httpGet: { path: /health/liveliness, port: 4000 }
             initialDelaySeconds: 20

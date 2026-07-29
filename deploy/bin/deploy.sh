@@ -100,8 +100,11 @@ fi
 echo "==> config"
 # The generated gateway catalogue: same artifact the compose bundle runs, so the cluster
 # offers exactly the models that were priced and verified locally.
+# strip_reasoning.py rides in the same configmap because config.yaml names it as a
+# callback: litellm imports it at startup and the proxy will not boot without it.
 kubectl -n "$NS" create configmap gateway-config \
     --from-file=config.yaml=bundle/litellm/config.generated.yaml \
+    --from-file=strip_reasoning.py=deploy/gateway/strip_reasoning.py \
     --dry-run=client -o yaml | kubectl apply -f -
 
 # The chat surface's in-cluster endpoint differs from compose only in hostname.
@@ -111,7 +114,7 @@ kubectl -n "$NS" create configmap chat-config \
     --dry-run=client -o yaml | kubectl apply -f -
 rm -f /tmp/librechat-k8s.yaml
 
-CFG_SUM=$( { cat bundle/litellm/config.generated.yaml bundle/librechat/librechat.yaml; } | sha256sum | cut -c1-16)
+CFG_SUM=$( { cat bundle/litellm/config.generated.yaml bundle/librechat/librechat.yaml deploy/gateway/strip_reasoning.py; } | sha256sum | cut -c1-16)
 
 echo "==> build and push control-plane image -> ${IMAGE}"
 docker build -q -t "$IMAGE" ./control-plane
