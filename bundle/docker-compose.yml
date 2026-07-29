@@ -124,6 +124,7 @@ services:
       # the working directory, so it has to sit next to config.yaml — without it the proxy
       # raises ImportError at startup and crash-loops. Same file the cluster mounts.
       - ../deploy/gateway/strip_reasoning.py:/app/strip_reasoning.py:ro
+      - ../deploy/gateway/require_principal.py:/app/require_principal.py:ro
     ports:
       - "${GATEWAY_PORT:-4000}:4000"
     depends_on:
