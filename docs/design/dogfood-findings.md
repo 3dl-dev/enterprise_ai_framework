@@ -838,3 +838,62 @@ answer — the product is not the camp, and an enterprise's developers need `pip
 loss of arbitrary-port outbound. Note that no CIDR-based egress policy can prevent key
 exfiltration while package installs are permitted; the registry is a fine exfil channel.
 That is a founder decision, not an agent one.
+
+### 38. The archive the customer leaves with was the worst-attributed rendering of the ledger, and only because of the order the exit runs in
+
+`GET /admin/export/spend` on the cluster, 2026-07-29: of 477 exported rows, **265 carried
+an empty `key_alias` and an empty `end_user`** — no principal at all. The bill over the
+same ledger, at the same moment, put only 42 requests in `(unattributed)`. So roughly half
+the export was anonymous while the bill named it correctly.
+
+The cause was already written down. `control-plane/app/export.py::spend_csv` attributed
+every row through
+
+```sql
+LEFT JOIN "LiteLLM_VerificationToken" v ON v.token = s.api_key
+... COALESCE(v.key_alias, '') AS key_alias
+```
+
+which is exactly the join finding 25 established is wrong, because three supported
+operations DELETE from that table. Finding 25 fixed `metering.spend_by_user_and_surface`
+and left `export.py` on the old query. This is the third rendering of the finding 34 shape
+— bill, portal, export — and the last one to be found.
+
+What makes it worse than the column count suggests is the **order the exit path runs in**.
+`bundle/bin/exit.sh full` revokes every virtual key and then exports. Revocation empties
+`LiteLLM_VerificationToken`. So the export was at its least attributed at precisely the
+moment it became the only record that outlives the deployment: the customer walks away
+with a per-request ledger that cannot say who spent the money, and nothing left running to
+ask.
+
+Two things generalise:
+
+- **A defect's severity depends on the sequence it is reached in, not on the code.** The
+  same query is nearly correct when run casually and nearly useless when run as step three
+  of leaving. Nothing in `export.py` said which one it was for. The blast radius lived in a
+  shell script fifty lines long, in another directory.
+- **It survived every test because the exit-path suite asserted `spend.csv` exists.** A
+  presence check, again — finding 27 and finding 35 in a third costume. The file was
+  always there; nobody had ever looked inside it after the revocation the same script had
+  just performed.
+
+**Fixed** in `enterpriseaiframework-37a`. There is now exactly ONE attribution expression,
+`metering.ledger_attribution_sql`, and both the bill and the export build their SQL from
+it; the bill's generated SQL is byte-for-byte what it was, so this is a share, not a
+rewrite. The CSV gains a `principal` column — who the row is billed to, by the same rule
+the bill uses, with a chat ObjectId translated to a username — while `end_user` stays
+verbatim, because the export is evidence and a rewritten column cannot be reconciled
+against a provider invoice.
+
+`tests/test_scope_items.py::TestItem9ExitPath::test_the_export_still_names_the_spender_after_the_exit_revokes_every_key`
+exports, revokes through the real `/admin/exit/revoke-all`, and exports again. It asserts
+the named row survives, that the two exports agree byte-for-byte on every column the change
+did not touch, and — the population-wide form of the cluster measurement — that revocation
+strips the alias from **no** row that had one a moment earlier. Shown to have teeth by
+reintroducing only the old join behind the new columns: the test then fails with
+`exported with key_alias '' after the exit revoked exitattr-c3b6cbb6::ide`.
+
+Measured on the bundle afterwards, over a ledger where every key had been revoked: the old
+join blanks 4 of 4 rows, the shared expression blanks 1 — and that one is a request LiteLLM
+*refused*, logged with `user_api_key_alias: null` and $0 spend, which is genuinely
+unattributable and correctly labelled.

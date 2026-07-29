@@ -20,15 +20,28 @@ import io
 import json
 from typing import AsyncIterator
 
-from . import db, metering
+from . import chat_identity, db, metering
 
 # Secrets never leave in an export, and the token hash is not useful to the operator
 # afterwards, so the key inventory carries identity and lifecycle only.
 KEY_COLUMNS = ("username", "surface", "key_alias", "status", "max_budget", "created_at", "revoked_at")
 
+# RAW AND RESOLVED, BOTH, DELIBERATELY.
+#
+# `end_user` is exactly what the caller put in the request body — for the chat surface,
+# LibreChat's internal ObjectId. It stays verbatim because this file is evidence: it is
+# what an operator reconciles against a provider invoice after this platform is deleted,
+# and a column that has been "helpfully" rewritten cannot be reconciled against anything.
+#
+# `principal` is who that row is billed to, by the same rule and the same SQL the one bill
+# uses (metering.ledger_attribution_sql), with a chat ObjectId translated to a username.
+# Without it the archive a departing customer keeps is a column of hex for the surface
+# most people use, and it would disagree with the bill they were shown while they were a
+# customer — which is finding 34 all over again, in the one rendering that outlives us.
 SPEND_COLUMNS = (
     "request_id", "start_time", "end_time", "model", "key_alias", "surface",
-    "end_user", "spend", "prompt_tokens", "completion_tokens", "total_tokens", "cache_hit",
+    "end_user", "principal", "spend", "prompt_tokens", "completion_tokens",
+    "total_tokens", "cache_hit",
 )
 
 
@@ -69,30 +82,58 @@ async def audit_jsonl() -> AsyncIterator[str]:
                 ) + "\n"
 
 
+def spend_row(record) -> list:
+    """One ledger row as CSV values. Pure apart from the already-primed identity cache.
+
+    Split out from the query so the naming half can be tested without a database — the
+    half that decides what a human reads is the half that was wrong twice.
+    """
+    r = dict(record)
+    # `refresh_on_miss=False`: the map is loaded once for the whole export by spend_csv.
+    # Left to itself resolve() re-reads the chat database on every miss, and an export of
+    # a tenant whose chat accounts are gone is nothing but misses.
+    r["principal"] = chat_identity.resolve(r.get("principal") or "", refresh_on_miss=False)
+    return [r[c] for c in SPEND_COLUMNS]
+
+
 async def spend_csv() -> AsyncIterator[str]:
-    """Every metered request, joined to the key alias that produced it."""
+    """Every metered request, attributed by the same rule as the one bill.
+
+    THE ORDER THE EXIT PATH RUNS IN IS WHY THIS MATTERS. `exit.sh full` revokes every
+    virtual key, and revocation DELETES from LiteLLM_VerificationToken. A rendering that
+    attributes through that table is therefore at its emptiest exactly when it is the only
+    record left — measured on the cluster as 265 of 477 exported rows with no principal at
+    all, over a ledger the bill attributed all but 42 of. So attribution comes from the
+    alias LiteLLM stamps onto the spend row itself, which nothing later deletes, with the
+    key-table join kept only as a fallback for rows written before that metadata existed.
+    """
     yield _csv_line(SPEND_COLUMNS)
+
+    # Load the chat id -> username map once for the whole file rather than per row.
+    chat_identity.refresh()
+
+    params = [metering.SHARED_SURFACE_ALIASES]
+    attr = metering.ledger_attribution_sql(f"${len(params)}")
+    sql = f"""
+        SELECT s.request_id,
+               s."startTime"::text AS start_time,
+               s."endTime"::text   AS end_time,
+               s.model,
+               COALESCE({attr["alias"]}, '')   AS key_alias,
+               COALESCE({attr["surface"]}, '') AS surface,
+               COALESCE(s.end_user, '')        AS end_user,
+               {attr["principal"]}             AS principal,
+               s.spend, s.prompt_tokens, s.completion_tokens, s.total_tokens,
+               COALESCE(s.cache_hit, '')       AS cache_hit
+        {attr["join"]}
+        ORDER BY s."startTime" ASC
+    """
     pool = await metering.pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            cursor = conn.cursor(
-                """
-                SELECT s.request_id,
-                       s."startTime"::text AS start_time,
-                       s."endTime"::text   AS end_time,
-                       s.model,
-                       COALESCE(v.key_alias, '')                        AS key_alias,
-                       COALESCE(NULLIF(split_part(v.key_alias, '::', 2), ''), '') AS surface,
-                       COALESCE(s.end_user, '')                         AS end_user,
-                       s.spend, s.prompt_tokens, s.completion_tokens, s.total_tokens,
-                       COALESCE(s.cache_hit, '')                        AS cache_hit
-                FROM "LiteLLM_SpendLogs" s
-                LEFT JOIN "LiteLLM_VerificationToken" v ON v.token = s.api_key
-                ORDER BY s."startTime" ASC
-                """
-            )
+            cursor = conn.cursor(sql, *params)
             async for r in cursor:
-                yield _csv_line([r[c] for c in SPEND_COLUMNS])
+                yield _csv_line(spend_row(r))
 
 
 async def keys_csv() -> AsyncIterator[str]:
@@ -142,7 +183,10 @@ async def manifest() -> dict:
         "total_spend": total_spend,
         "formats": {
             "audit.jsonl": "one JSON object per line, oldest first, hash-chained",
-            "spend.csv": "one row per metered request",
+            "spend.csv": (
+                "one row per metered request; `end_user` is the raw request field as sent, "
+                "`principal` is who it is billed to, by the same rule as the bill"
+            ),
             "keys.csv": "virtual key inventory; contains no secrets",
         },
         "verify": "bundle/bin/verify-export.py <export-dir>",

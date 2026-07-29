@@ -82,6 +82,49 @@ _TRUSTED_END_USER = f"""CASE
     ELSE NULL
 END"""
 
+# What the bill calls a row it cannot put a name to. Money that was definitely spent stays
+# on the bill under this label; dropping it would hide it and guessing would be worse.
+UNATTRIBUTED = "(unattributed)"
+
+
+def ledger_attribution_sql(shared_param: str) -> dict[str, str]:
+    """The one attribution rule, as SQL fragments, for every rendering of the ledger.
+
+    THERE IS EXACTLY ONE OF THESE ON PURPOSE. The ledger is rendered three ways — the
+    aggregate bill below, the portal built on it, and the per-request CSV the exit path
+    hands a departing customer — and each rendering that carries its own copy of the join
+    is a place the next correction gets forgotten. It was forgotten twice already:
+    finding 25 fixed the deleted-key join in the bill and left `export.py` on the old one,
+    and finding 34 fixed the naming in the portal and left `/admin/spend` behind. The
+    export was the worst of the three, because the exit path revokes every key *before*
+    exporting, so the CSV attributed from a table it had just emptied.
+
+    `shared_param` is the positional placeholder ($1, $2, …) that the caller has bound to
+    SHARED_SURFACE_ALIASES in the query being built. It is a parameter rather than an
+    interpolated list so the shared-surface list can never be injected through.
+
+    Returns the fragments a renderer needs, all of which assume the returned `join`:
+
+      join      the FROM/LEFT JOIN clause, aliasing the ledger `s` and the key table `v`
+      alias     the key alias for the row, metadata first (NULL if genuinely unknown)
+      surface   the surface encoded in that alias      (NULL if genuinely unknown)
+      principal whose spend this is — never NULL, falls back to UNATTRIBUTED
+    """
+    trusted = _TRUSTED_END_USER.replace("$SHARED", shared_param)
+    return {
+        "join": _LEDGER_JOIN,
+        "alias": _ALIAS,
+        "surface": f"NULLIF(split_part({_ALIAS}, '::', 2), '')",
+        # Attribution precedence: the end user a SHARED surface forwarded, then the user
+        # encoded in the key alias. See SHARED_SURFACE_ALIASES — a per-user key naming
+        # somebody else is ignored, because otherwise the caller picks who gets billed.
+        "principal": (
+            f"COALESCE(\n            {trusted},\n"
+            f"            NULLIF(split_part({_ALIAS}, '::', 1), ''),\n"
+            f"            '{UNATTRIBUTED}'\n        )"
+        ),
+    }
+
 
 async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
     """The single query the scope item names. One row per (user, surface)."""
@@ -90,24 +133,17 @@ async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
         where = 'WHERE s."startTime" >= $1::text::timestamptz'
         params.append(since)
 
-    # Attribution precedence: the end user a SHARED surface forwarded, then the user
-    # encoded in the key alias. See SHARED_SURFACE_ALIASES — a per-user key naming
-    # somebody else is ignored, because otherwise the caller picks who gets billed.
     params.append(SHARED_SURFACE_ALIASES)
-    trusted = _TRUSTED_END_USER.replace("$SHARED", f"${len(params)}")
+    attr = ledger_attribution_sql(f"${len(params)}")
     sql = f"""
     SELECT
-        COALESCE(
-            {trusted},
-            NULLIF(split_part({_ALIAS}, '::', 1), ''),
-            '(unattributed)'
-        ) AS username,
-        COALESCE(NULLIF(split_part({_ALIAS}, '::', 2), ''), '(unknown)') AS surface,
+        {attr["principal"]} AS username,
+        COALESCE({attr["surface"]}, '(unknown)') AS surface,
         COUNT(*)                                  AS requests,
         COALESCE(SUM(s.spend), 0)::float8         AS spend,
         COALESCE(SUM(s.prompt_tokens), 0)::bigint AS prompt_tokens,
         COALESCE(SUM(s.completion_tokens), 0)::bigint AS completion_tokens
-    {_LEDGER_JOIN}
+    {attr["join"]}
     {where}
     GROUP BY 1, 2
     ORDER BY spend DESC, username, surface
