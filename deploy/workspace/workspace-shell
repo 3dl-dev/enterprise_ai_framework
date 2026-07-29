@@ -28,6 +28,59 @@ export PS1='\[\e[1;36m\]${WS_USER:-coder}\[\e[0m\]:\w\$ '
 : "${OPENCODE_CONFIG:=/etc/opencode/opencode.json}"
 export OPENCODE_CONFIG
 
+# ONE AGENT PER PROJECT, NO MATTER HOW MANY CONNECTIONS
+#
+# ttyd spawns a fresh shell per websocket. Every page load, tab switch and reconnect
+# lands here and, before this guard existed, ran the case statement below unconditionally
+# — so two tabs open on the same project, or a client that reconnects while the old
+# socket is still draining, started a SECOND agent process on top of the first. The pod
+# is capped at 1 CPU on purpose (k3s-worker runs live GPU training; see
+# deploy/k8s/61-workspace.template.yaml) and nothing bounded how many agents could pile
+# up inside it. dogfood-findings.md finding 33 saw exactly this: a context leak stacked a
+# dozen agents in one pod until it answered 429. That instance was diagnosed as a
+# test-side defect, but the pod-side amplifier — this function's absence — was real
+# either way.
+#
+# Answered by checking the process table, not a pidfile: a pidfile can name a PID that
+# exited and was reused by something unrelated, and the pod's /proc is cheap to read.
+# cwd is compared, not just process name, because a user can switch the active project
+# in one tab while an agent from a DIFFERENT project is still finishing up in another —
+# that is two agents in the pod, correctly, one per project.
+agent_pid_for_project() {
+    local dir="$1" pid cwd cmdline argv0 argv1
+    for pid in /proc/[0-9]*; do
+        pid="${pid#/proc/}"
+        [ "$pid" = "$$" ] && continue
+        cwd="$(readlink -e "/proc/$pid/cwd" 2>/dev/null)" || continue
+        [ "$cwd" = "$dir" ] || continue
+        cmdline="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null)" || continue
+        argv0="$(basename "$(printf '%s\n' "$cmdline" | sed -n '1p')" 2>/dev/null)"
+        case "$argv0" in
+            opencode|aider)
+                printf '%s\n' "$pid"
+                return 0
+                ;;
+            python*)
+                # aider is a pip console script: the kernel runs it through its shebang,
+                # so argv[0] is the interpreter and the real name is argv[1]. opencode
+                # ships as a standalone binary today (argv[0] IS "opencode", caught
+                # above) but this branch is not special-cased to aider only — it mirrors
+                # shell-server.py's own agent scan (_agent_jiffies / AGENT_NAMES), which
+                # checks both names here symmetrically, so a future opencode
+                # distribution shape (or a test double) is not a silent blind spot.
+                argv1="$(basename "$(printf '%s\n' "$cmdline" | sed -n '2p')" 2>/dev/null)"
+                case "$argv1" in
+                    opencode|aider)
+                        printf '%s\n' "$pid"
+                        return 0
+                        ;;
+                esac
+                ;;
+        esac
+    done
+    return 1
+}
+
 if [ -z "${WS_NO_AUTOSTART:-}" ]; then
     # Confirmation behaviour is set in the image (AIDER_YES_ALWAYS), not here, so that a
     # user who types `aider` by hand after this exits gets identical behaviour rather than
@@ -35,54 +88,74 @@ if [ -z "${WS_NO_AUTOSTART:-}" ]; then
     # WS_AGENT selects what the terminal opens into. opencode by default: it is
     # autonomous and explores the repo itself, where aider requires you to nominate
     # files first. aider stays installed and is one word away.
-    # RESUMING
-    #
-    # ttyd spawns a fresh shell per websocket, so every page load, tab switch and reload
-    # started a brand new agent and silently dropped the conversation the user was in the
-    # middle of. `opencode --continue` picks the last session back up.
-    #
-    # It is conditional, because --continue with nothing to continue does not fail
-    # quietly: it paints "Unexpected server error" in a red box, which would be the first
-    # thing a child ever saw. The marker is written by us rather than inferred from
-    # `opencode session list`, because that list is global — a fresh project would see
-    # another project's sessions and resume the wrong conversation.
-    MARK="${PROJECTS_ROOT}/.meta/${ACTIVE}.session"
-    NEWFLAG="${PROJECTS_ROOT}/.meta/${ACTIVE}.new-session"
-    mkdir -p "${PROJECTS_ROOT}/.meta" 2>/dev/null || true
+    # Resolved once: readlink -e inside the function compares against a live process's
+    # /proc/<pid>/cwd, which the kernel always reports fully resolved, so an unresolved
+    # WS_PROJECT_DIR (a symlink component in PROJECTS_ROOT, say) would never match and the
+    # guard would silently do nothing.
+    PROJECT_DIR_REAL="$(readlink -e "$WS_PROJECT_DIR" 2>/dev/null || printf '%s' "$WS_PROJECT_DIR")"
+    EXISTING_PID="$(agent_pid_for_project "$PROJECT_DIR_REAL" || true)"
+    if [ -n "$EXISTING_PID" ]; then
+        # Do NOT touch the session marker below: no session was started on this
+        # connection, so there is nothing to mark and nothing to clear the new-session
+        # flag for. The other connection's exit is what should record that.
+        echo
+        echo "an agent for this project is already running in another connection"
+        echo "(pid ${EXISTING_PID}). This pod runs at most one agent per project at a"
+        echo "time — reload or switch to that tab instead of opening a second one here;"
+        echo "a second agent would not be a second conversation, it would double the"
+        echo "CPU load in a 1-CPU pod."
+        echo
+    else
+        # RESUMING
+        #
+        # ttyd spawns a fresh shell per websocket, so every page load, tab switch and
+        # reload started a brand new agent and silently dropped the conversation the
+        # user was in the middle of. `opencode --continue` picks the last session back
+        # up.
+        #
+        # It is conditional, because --continue with nothing to continue does not fail
+        # quietly: it paints "Unexpected server error" in a red box, which would be the
+        # first thing a child ever saw. The marker is written by us rather than inferred
+        # from `opencode session list`, because that list is global — a fresh project
+        # would see another project's sessions and resume the wrong conversation.
+        MARK="${PROJECTS_ROOT}/.meta/${ACTIVE}.session"
+        NEWFLAG="${PROJECTS_ROOT}/.meta/${ACTIVE}.new-session"
+        mkdir -p "${PROJECTS_ROOT}/.meta" 2>/dev/null || true
 
-    RESUME=""
-    if [ -f "$MARK" ] && [ ! -f "$NEWFLAG" ]; then
-        RESUME="--continue"
-    fi
-    rm -f "$NEWFLAG"
-    # Before launching, not after: a reload kills this shell without running anything
-    # below, and a session that cannot be resumed after a reload is the bug being fixed.
-    touch "$MARK" 2>/dev/null || true
+        RESUME=""
+        if [ -f "$MARK" ] && [ ! -f "$NEWFLAG" ]; then
+            RESUME="--continue"
+        fi
+        rm -f "$NEWFLAG"
+        # Before launching, not after: a reload kills this shell without running anything
+        # below, and a session that cannot be resumed after a reload is the bug being fixed.
+        touch "$MARK" 2>/dev/null || true
 
-    # THE MODEL IS PASSED EXPLICITLY, NOT LEFT TO THE CONFIG
-    #
-    # A resumed session carries the model it was started with, so writing a new one into
-    # opencode.json changed nothing that a user could see: they picked GLM 4.7 in
-    # Settings, the file said 4.7, and the terminal came back still saying 5.2. Measured,
-    # not assumed. --model overrides the session, which makes the setting mean what it
-    # says while keeping the conversation.
-    MODELARG=""
-    CFG_MODEL="$(python3 -c "
+        # THE MODEL IS PASSED EXPLICITLY, NOT LEFT TO THE CONFIG
+        #
+        # A resumed session carries the model it was started with, so writing a new one into
+        # opencode.json changed nothing that a user could see: they picked GLM 4.7 in
+        # Settings, the file said 4.7, and the terminal came back still saying 5.2. Measured,
+        # not assumed. --model overrides the session, which makes the setting mean what it
+        # says while keeping the conversation.
+        MODELARG=""
+        CFG_MODEL="$(python3 -c "
 import json,sys
 try:    print(json.load(open('opencode.json')).get('model',''))
 except Exception: print('')" 2>/dev/null)"
-    [ -n "$CFG_MODEL" ] && MODELARG="--model $CFG_MODEL"
+        [ -n "$CFG_MODEL" ] && MODELARG="--model $CFG_MODEL"
 
-    case "${WS_AGENT:-opencode}" in
-        aider)    aider || true ;;
-        none)     : ;;
-        *)        opencode $RESUME $MODELARG || true ;;
-    esac
-    echo
-    echo "agent exited — you are in a shell."
-    echo "  opencode   autonomous agent (default)"
-    echo "  aider      pair-programmer, needs files added to the chat"
-    echo
+        case "${WS_AGENT:-opencode}" in
+            aider)    aider || true ;;
+            none)     : ;;
+            *)        opencode $RESUME $MODELARG || true ;;
+        esac
+        echo
+        echo "agent exited — you are in a shell."
+        echo "  opencode   autonomous agent (default)"
+        echo "  aider      pair-programmer, needs files added to the chat"
+        echo
+    fi
 fi
 
 exec /bin/bash --norc -i
