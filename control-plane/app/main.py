@@ -16,7 +16,17 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from . import db, export, gateway, identity, issuance, metering, portal, workshop
+from . import (
+    chat_identity,
+    db,
+    export,
+    gateway,
+    identity,
+    issuance,
+    metering,
+    portal,
+    workshop,
+)
 
 bearer = HTTPBearer(auto_error=True)
 
@@ -302,27 +312,46 @@ async def set_budget(req: BudgetRequest):
 async def spend(since: str | None = None):
     """Scope item 4. Total spend by user and by surface, all three surfaces, one call.
 
-    Carries the unpriced-model warning inline. A bill that is quietly missing a model is
-    worse than one that is obviously broken, so the caveat travels with the number rather
-    than living on a page nobody opens.
+    This is the bill an operator without a browser has, and it is the query the scope item
+    names — so it must name the same people the portal names. It does not translate chat
+    identifiers itself: `metering.spend_by_user_and_surface` does that for every reader
+    (see chat_identity.attribute). Doing it here as well is what the previous defect
+    looked like, one call site at a time.
+
+    Carries its caveats inline. A bill that is quietly missing a model, or quietly showing
+    an ObjectId where a name belongs, is worse than one that is obviously broken — so the
+    caveat travels with the number rather than living on a page nobody opens.
     """
+    rows = await metering.spend_by_user_and_surface(since)
     unpriced = await metering.unpriced_models(since)
+    warnings = []
+    if unpriced:
+        warnings.append({
+            "kind": "unpriced_model",
+            "detail": "served traffic but priced at $0 — budgets will not trip "
+                      "and this bill under-reports",
+            "models": unpriced,
+        })
+    # A chat principal we could not translate is money we can account for but cannot put a
+    # name to. It stays on the bill under a label that says so — dropping it would hide
+    # real spend and guessing would be worse — but the operator is told, because the usual
+    # cause is the chat database being unreachable from here, which is fixable.
+    unresolved = [r for r in rows if chat_identity.is_unresolved(r["username"])]
+    if unresolved:
+        warnings.append({
+            "kind": "unresolved_chat_principal",
+            "detail": "chat spend that could not be matched to a person — the chat "
+                      "database is unreachable or the account no longer exists; the "
+                      "money is still on this bill, only the name is missing",
+            "principals": [r["username"] for r in unresolved],
+            "requests": sum(r["requests"] for r in unresolved),
+            "spend": sum(r["spend"] for r in unresolved),
+        })
     return {
         "since": since,
         "totals": await metering.totals(since),
-        "by_user_and_surface": await metering.spend_by_user_and_surface(since),
-        "warnings": (
-            [
-                {
-                    "kind": "unpriced_model",
-                    "detail": "served traffic but priced at $0 — budgets will not trip "
-                              "and this bill under-reports",
-                    "models": unpriced,
-                }
-            ]
-            if unpriced
-            else []
-        ),
+        "by_user_and_surface": rows,
+        "warnings": warnings,
     }
 
 

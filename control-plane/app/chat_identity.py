@@ -96,13 +96,13 @@ def refresh() -> int:
     return len(_cache)
 
 
-def resolve(value: str) -> str:
+def resolve(value: str, *, refresh_on_miss: bool = True) -> str:
     """Translate one end_user value to a username, or hand it back untouched."""
     if not looks_like_chat_id(value):
         return value
     if not _loaded:
         refresh()
-    if value not in _cache:
+    if value not in _cache and refresh_on_miss:
         # A brand new chat account will miss the cache exactly once.
         refresh()
     return _cache.get(value, value)
@@ -113,3 +113,110 @@ def ids_for(username: str) -> list[str]:
     if not _loaded:
         refresh()
     return [cid for cid, name in _cache.items() if name == username]
+
+
+# ---------------------------------------------------------------------------
+# Naming a principal on the bill
+#
+# This lives here, and every rendering of the bill goes through it, because the defect it
+# fixes was not a broken lookup — the lookup above was correct all along. It was that the
+# translation had been applied at two call sites in the portal and nowhere else, so
+# `/admin/spend` (which IS the query scope item 4 names) showed a column of hex while the
+# web console showed names, over the same money (finding 34). Two renderings of one bill
+# that disagree about the principal is the failure; a second copy of the lookup would
+# have been a third thing to forget.
+#
+# So the rule is: nothing outside this module decides what a spend row's principal is
+# called. `metering.spend_by_user_and_surface` applies `attribute()` to every row it
+# returns, which means the CLI bill, the portal, the operator console and anything added
+# later all inherit the same names by construction rather than by remembering.
+# ---------------------------------------------------------------------------
+
+# The SQL already emits this when a row has no alias and no trusted end user.
+UNATTRIBUTED = "(unattributed)"
+
+# The alias the shared chat key is minted under. It is a surface, not a person: rows land
+# under it when the chat surface called the gateway without forwarding who it was for
+# (titling a conversation, for instance). Listing it beside real names invites somebody to
+# read it as one.
+SHARED_SURFACE_PRINCIPAL = "chat-surface"
+SHARED_SURFACE_LABEL = "(chat surface, no user)"
+
+# A chat id we could not translate. It keeps the identifier — dropping the row would hide
+# money that was definitely spent, and picking a name would be a guess — but it must not
+# be mistaken for a person's name, which is exactly what a bare ObjectId in a username
+# column looks like.
+UNRESOLVED_PREFIX = "(unresolved chat user "
+
+
+def is_unresolved(label: str) -> bool:
+    """True for a principal this module could not translate. Drives the bill's warning."""
+    return bool(label) and label.startswith(UNRESOLVED_PREFIX)
+
+
+def principal_label(raw: str, *, refresh_on_miss: bool = True) -> str:
+    """What one spend row's principal is called, everywhere.
+
+    Idempotent: feeding a label back through returns it unchanged, so a caller that
+    applies it twice cannot corrupt a name.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return UNATTRIBUTED
+    if value == SHARED_SURFACE_PRINCIPAL:
+        return SHARED_SURFACE_LABEL
+    if not looks_like_chat_id(value):
+        # Already a username, or one of the labels above. Not ours to touch.
+        return value
+    name = resolve(value, refresh_on_miss=refresh_on_miss)
+    if name != value:
+        return name
+    return f"{UNRESOLVED_PREFIX}{value})"
+
+
+def _prime(values) -> None:
+    """Load the map at most twice for a whole bill, rather than once per unknown row.
+
+    `resolve` re-reads Mongo on a cache miss so that somebody who signed in to chat a
+    second ago still gets a name. Left to itself that is one round trip per unresolvable
+    id, and a bill with a column of them would wait on the chat database repeatedly.
+    """
+    ids = {v for v in values if looks_like_chat_id(v)}
+    if not ids:
+        return
+    if not _loaded:
+        refresh()
+    if any(i not in _cache for i in ids):
+        refresh()
+
+
+_COUNTERS = ("requests", "spend", "prompt_tokens", "completion_tokens")
+
+
+def attribute(rows: list[dict]) -> list[dict]:
+    """Name the principal on every spend row, then re-merge rows that now agree.
+
+    Translation can make two rows the same row: one person can hold more than one chat
+    id, and a resolvable id and a plain username can both name `baron`. The query's
+    contract is one row per (principal, surface), so merging here keeps that promise
+    rather than emitting the same person twice and leaving each reader to add them up —
+    which is how two renderings start disagreeing again.
+    """
+    _prime([(r.get("username") or "") for r in rows])
+    merged: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        row = dict(r)
+        row["username"] = principal_label(row.get("username") or "", refresh_on_miss=False)
+        row["surface"] = row.get("surface") or "(unknown)"
+        key = (row["username"], row["surface"])
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = row
+            continue
+        for col in _COUNTERS:
+            if col in row or col in existing:
+                existing[col] = (existing.get(col) or 0) + (row.get(col) or 0)
+    return sorted(
+        merged.values(),
+        key=lambda r: (-(r.get("spend") or 0), r["username"], r["surface"]),
+    )

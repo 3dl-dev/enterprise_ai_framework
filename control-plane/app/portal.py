@@ -164,15 +164,16 @@ async def my_spend(since: str | None = None, user: str = Depends(require_user)):
     """This user's own spend, by surface.
 
     Built on the same query that produces the operator's bill, so the two can never
-    disagree — and filtered here rather than in SQL so that the chat surface's identifiers
-    get translated first. A chat row is keyed by LibreChat's internal id, and filtering
-    before translation would silently drop every chat row from the user's own total.
+    disagree — and filtered here rather than in SQL because the query names the principal
+    (`chat_identity.attribute`) after the database has answered. A chat row is keyed by
+    LibreChat's internal id, and filtering in SQL, before that translation, would
+    silently drop every chat row from the user's own total.
     """
     rows = await metering.spend_by_user_and_surface(since)
     mine: dict[str, dict] = {}
     total = {"requests": 0, "spend": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
     for r in rows:
-        who = chat_identity.resolve(r.get("username") or "")
+        who = r.get("username") or ""
         if who != user:
             continue
         surface = r.get("surface") or "(unknown)"
@@ -265,19 +266,15 @@ async def admin_overview(since: str | None = None,
     """Everyone's usage, in one call.
 
     The same query that produces a user's own bill, unfiltered — so the operator view and
-    the personal view can never disagree about what somebody spent. Chat identifiers are
-    resolved to usernames here for the same reason they are in /portal/api/spend: the raw
-    value is LibreChat's internal id, and a column of hex is not a bill anybody can read.
+    the personal view can never disagree about what somebody spent. Principals are named
+    by the query itself (`chat_identity.attribute`); this page deliberately does not name
+    them a second time, because a second copy of that step is precisely what let this view
+    show names while `/admin/spend` showed hex (finding 34).
     """
     rows = await metering.spend_by_user_and_surface(since)
     people: dict[str, dict] = {}
     for r in rows:
-        who = chat_identity.resolve(r.get("username") or "") or "(unattributed)"
-        # The shared chat key's own alias is not a person. Rows land here when the chat
-        # surface made a call without forwarding who it was for — titling, for instance.
-        # Listing "chat-surface" beside real names invites somebody to read it as one.
-        if who == "chat-surface":
-            who = "(chat surface, no user)"
+        who = r.get("username") or chat_identity.UNATTRIBUTED
         acc = people.setdefault(who, {
             "username": who, "requests": 0, "spend": 0.0,
             "prompt_tokens": 0, "completion_tokens": 0, "surfaces": {},

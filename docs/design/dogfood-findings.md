@@ -174,18 +174,25 @@ anything other than localhost. Not done.
 The test suite emulates the browser's localhost exception explicitly rather than
 weakening the surface's cookie flags to suit a stricter HTTP client.
 
-### 13. Chat spend attributes to the surface, not to the person
+### 13. Chat spend attributes to the surface, not to the person — SUPERSEDED
 
-The chat surface is a shared client holding one virtual key, so its traffic lands under
-`chat-surface / chat` rather than under the signed-in user. The coding agents, which hold
-per-user keys, attribute correctly.
+**This entry is no longer true and is kept because its reasoning still is.** It read: the
+chat surface is a shared client holding one virtual key, so its traffic lands under
+`chat-surface / chat` rather than under the signed-in user; forwarding the user via
+`addParams: {user: "{{LIBRECHAT_USER_ID}}"}` was tried and removed, because that
+substitution is only demonstrably supported for headers and an unsubstituted placeholder
+would write the literal string `{{LIBRECHAT_USER_ID}}` into the ledger as a username — a
+corrupted bill being worse than a coarse one.
 
-Forwarding the user via `addParams: {user: "{{LIBRECHAT_USER_ID}}"}` was tried and
-removed: that substitution is only demonstrably supported for headers, and an
-unsubstituted placeholder writes the literal string `{{LIBRECHAT_USER_ID}}` into the
-ledger as a username — a corrupted bill is worse than a coarse one. The ledger query
-already prefers `end_user` where present, so this becomes correct the moment the surface
-is confirmed to forward it.
+The cluster ledger disproves the first half. Chat spend rows carry a per-user `end_user`
+value (LibreChat's own user id) and are attributed per person, which is what finding 34
+then found the bill rendering as hex. `chat-surface / chat` remains a real row, but it is
+now only the calls the surface makes on nobody's behalf — conversation titling and the
+like — and it is labelled `(chat surface, no user)` so it cannot be read as a person.
+
+The second half stands and is why nothing in `librechat.yaml` forwards the user through
+`addParams`: an unsubstituted placeholder in the username column is worse than no chat
+attribution at all.
 
 ### 14. Forge prices only 12 of its 68 models, and the unpriced ones are the interesting ones
 
@@ -636,5 +643,33 @@ Two things generalise, and the second is the expensive one:
   chat identities are not LibreChat ObjectIds, so the code path that needs translating is
   never exercised. The fixture was more uniform than production.
 
-**Not fixed here.** Filed as `enterpriseaiframework-f8c`, which requires a test asserting
-the two renderings agree — the duplication, not the lookup, is the defect.
+**Fixed** (`enterpriseaiframework-f8c`) by moving the naming of a principal into the query
+itself. `metering.spend_by_user_and_surface` now passes every row through
+`chat_identity.attribute`, so the CLI bill, the user's portal page, the operator console
+and anything added later inherit the same names by construction rather than by each
+remembering to ask. The two call sites in `portal.py` were deleted rather than copied to
+`main.py`: a third copy is a third thing to forget.
+
+Two things the fix had to get right beyond the lookup:
+
+- **A principal that genuinely cannot be resolved is labelled, not dropped and not
+  guessed.** It reads `(unresolved chat user 6a67…)` — the identifier survives for
+  tracing, the money stays on the bill, and `/admin/spend` raises an
+  `unresolved_chat_principal` warning alongside the unpriced-model one. Dropping the row
+  would have been finding 25's shape; printing the bare ObjectId is this finding.
+- **Translation can merge rows.** One person with two chat accounts produced two rows
+  naming the same person, so `attribute` re-merges on (principal, surface) to keep the
+  query's one-row-per-pair contract. Otherwise one reader sums them and another shows the
+  first — finding 34 again, one level down.
+
+**Why it could not be tested before, and can be now:** the bundle never set
+`CHAT_MONGO_URL`, which the cluster has always set — so no chat row in any test carried an
+ObjectId and the translating path was unreachable. `bundle/docker-compose.yml` now sets it
+(and `PORTAL_ADMINS`, without which the console rendering did not exist here either).
+
+**Regression tests:** `TestChatPrincipalOnTheOneBill` (4 integration tests — a real
+ObjectId written into LibreChat's Mongo, spent through the shared chat key, then asserted
+across `/admin/spend`, `/portal/api/spend` and `/portal/api/admin/overview`) and
+`tests/test_chat_principal_naming.py` (17 unit tests covering the unreachable-database
+case and every principal that must NOT be relabelled). All 21 fail against the code as it
+was; the integration four fail by showing hex where a name belongs.

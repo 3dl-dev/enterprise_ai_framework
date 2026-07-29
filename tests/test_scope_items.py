@@ -457,6 +457,298 @@ class TestItem4OneBill:
         assert row["requests"] >= 1
 
 
+class TestChatPrincipalOnTheOneBill:
+    """Finding 34: the one bill named the same money two different ways.
+
+    `/admin/spend` — the query scope item 4 actually names, and the only bill an operator
+    without a browser has — printed the chat surface as a column of LibreChat ObjectIds:
+
+        6a67b18069dba4d1126fef44 / chat   135 req   $0.2247
+
+    while the portal, over the same query and the same rows, printed `baron`. The lookup
+    was never broken. It was applied in portal.py at two call sites and nowhere else.
+
+    It survived every test because the compose bundle had no CHAT_MONGO_URL, so no chat
+    row here ever carried an ObjectId and the code path that has to translate one was
+    never reached. The fixture was more uniform than production, which is the actual
+    reason this shipped. The bundle now sets it, exactly as the cluster always has, and
+    these tests stage a real ObjectId in a real ledger row.
+
+    A presence check would pass on the broken code — `username` was always present, and
+    always a string. Every assertion below is about WHICH string.
+    """
+
+    def _chat_key(self, env) -> str:
+        key = env.get("CHAT_VIRTUAL_KEY", "").strip()
+        assert key, (
+            "CHAT_VIRTUAL_KEY missing from bundle/.env — provision-chat-key.sh runs as "
+            "part of `make up`; without the shared surface key there is no way to write "
+            "a chat-surface spend row and this test proves nothing"
+        )
+        return key
+
+    def _new_chat_user(self, username: str) -> str:
+        """Create a LibreChat account and return its ObjectId, the way one really looks.
+
+        Written straight into LibreChat's Mongo rather than by signing a browser in,
+        because what is under test is the translation from an ObjectId to a name — the
+        id has to be a genuine 24-character ObjectId in the collection chat_identity
+        reads, and how the row got there is not part of the claim.
+        """
+        oid = uuid.uuid4().hex[:24]
+        js = (
+            'db.getSiblingDB("librechat").users.insertOne({'
+            f'_id: ObjectId("{oid}"), username: "{username}", '
+            f'email: "{username}@bundle.test"'
+            "})"
+        )
+        r = compose("exec", "-T", "chatdb", "mongosh", "--quiet", "--eval", js,
+                    check=False)
+        assert r.returncode == 0, f"mongosh insert failed: {r.stdout}\n{r.stderr}"
+        return oid
+
+    def _spend_as_chat_user(self, gateway_url: str, key: str, oid: str):
+        """One request through the shared chat key, forwarded on behalf of `oid`.
+
+        This is exactly what the chat surface does: one key for the whole deployment,
+        the signed-in person carried in the request body's `user` field, which the
+        gateway records as `end_user`. Unique content — a cache hit writes no spend row.
+        """
+        return httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={
+                "model": "fake-large",
+                "messages": [{"role": "user", "content": f"chat bill {uuid.uuid4().hex}"}],
+                "user": oid,
+            },
+            timeout=TIMEOUT,
+        )
+
+    def _bill(self, control_plane_url, admin_headers) -> dict:
+        r = httpx.get(f"{control_plane_url}/admin/spend", headers=admin_headers,
+                      timeout=TIMEOUT)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def _await_row(self, control_plane_url, admin_headers, predicate, what: str) -> dict:
+        """The gateway flushes spend rows on a batch interval; poll, do not sleep-and-hope."""
+        deadline = time.monotonic() + 90
+        bill = {}
+        while time.monotonic() < deadline:
+            bill = self._bill(control_plane_url, admin_headers)
+            row = next((r for r in bill["by_user_and_surface"] if predicate(r)), None)
+            if row:
+                return row
+            time.sleep(2)
+        raise AssertionError(
+            f"{what} never appeared on the bill. Last bill: "
+            f"{json.dumps(bill.get('by_user_and_surface', []), indent=2)}"
+        )
+
+    def test_chat_spend_is_billed_to_the_person_not_to_a_hex_string(
+        self, env, gateway_url, control_plane_url, admin_headers, master_headers
+    ):
+        """A request made by a KNOWN chat user shows THAT user's name on /admin/spend.
+
+        Not "a username field exists" — the field existed throughout the defect. The
+        assertion is that the field holds the name of the person who made the request,
+        and that the ObjectId they were identified by is nowhere on the bill.
+        """
+        username = f"chatuser-{uuid.uuid4().hex[:8]}"
+        oid = self._new_chat_user(username)
+
+        # A per-user IDE key spending in the same window, so the row this change must NOT
+        # touch is on the same bill as the row it must fix — and is there because this
+        # test put it there, not because some earlier test happened to run first.
+        ide_user = f"idetest-{uuid.uuid4().hex[:8]}"
+        created = httpx.post(
+            f"{gateway_url}/key/generate", headers=master_headers,
+            json={"key_alias": f"{ide_user}::ide", "metadata": {"surface": "ide"}},
+            timeout=TIMEOUT,
+        )
+        assert created.status_code == 200, created.text
+        ide_spend = httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {created.json()['key']}"},
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": f"ide bill {uuid.uuid4().hex}"}]},
+            timeout=TIMEOUT,
+        )
+        assert ide_spend.status_code == 200, ide_spend.text
+
+        resp = self._spend_as_chat_user(gateway_url, self._chat_key(env), oid)
+        assert resp.status_code == 200, resp.text
+
+        row = self._await_row(
+            control_plane_url, admin_headers,
+            lambda r: r["username"] == username and r["surface"] == "chat",
+            f"chat spend for {username}",
+        )
+        assert row["requests"] >= 1
+        assert row["spend"] > 0
+
+        bill = self._bill(control_plane_url, admin_headers)
+        principals = [r["username"] for r in bill["by_user_and_surface"]]
+        assert oid not in principals, (
+            f"the raw LibreChat ObjectId {oid} is still a principal on the bill: "
+            f"{principals} — this is finding 34 exactly"
+        )
+        assert not any(oid in p for p in principals), (
+            f"the ObjectId leaked into a principal label: {principals}"
+        )
+
+        # THE CASE THIS CHANGE DID NOT TOUCH, asserted on the same bill: a per-user key
+        # already carries the person in its alias and must still read as a plain name.
+        # `baron / ide 223 req` was the row that was RIGHT before this fix.
+        self._await_row(
+            control_plane_url, admin_headers,
+            lambda r: r["username"] == ide_user and r["surface"] == "ide",
+            f"ide spend for {ide_user}",
+        )
+        bill = self._bill(control_plane_url, admin_headers)
+        ide_rows = [r for r in bill["by_user_and_surface"] if r["surface"] == "ide"]
+        assert ide_rows, "no ide spend on the bill to cross-check the unchanged path"
+        for r in ide_rows:
+            assert not r["username"].startswith("("), (
+                f"a per-user ide principal was relabelled: {r['username']}"
+            )
+            assert "::" not in r["username"]
+
+    def test_the_cli_bill_and_the_portal_agree_about_who_spent_what(
+        self, env, gateway_url, control_plane_url, admin_headers
+    ):
+        """The two renderings, over the same money, from the same query.
+
+        Finding 34 was not "the CLI is wrong" — it was that two readers of one ledger
+        disagreed, and each looked right on its own. So this compares them rather than
+        checking either in isolation: the operator's `make spend` row for a person and
+        that person's own portal page must carry the same principal, the same request
+        count and the same spend.
+        """
+        username = f"chatuser-{uuid.uuid4().hex[:8]}"
+        oid = self._new_chat_user(username)
+        assert self._spend_as_chat_user(
+            gateway_url, self._chat_key(env), oid
+        ).status_code == 200
+
+        admin_row = self._await_row(
+            control_plane_url, admin_headers,
+            lambda r: r["username"] == username and r["surface"] == "chat",
+            f"chat spend for {username}",
+        )
+
+        # The portal authenticates from its sidecar proxy, which shares the pod's network
+        # namespace — so it only trusts identity headers arriving from loopback. Reached
+        # here from inside the container for that reason, not to bypass anything: this is
+        # the same request the proxy makes, from the same address it makes it from.
+        code = (
+            "import json,urllib.request;"
+            "req=urllib.request.Request("
+            "'http://localhost:8000/portal/api/spend',"
+            "headers={'X-Auth-Request-Preferred-Username': %r});"
+            "print(urllib.request.urlopen(req, timeout=30).read().decode())" % username
+        )
+        proc = compose("exec", "-T", "control-plane", "python", "-c", code, check=False)
+        assert proc.returncode == 0, f"portal call failed: {proc.stdout}\n{proc.stderr}"
+        portal = json.loads(proc.stdout.strip().splitlines()[-1])
+
+        assert portal["username"] == username
+        portal_chat = next(
+            (s for s in portal["by_surface"] if s["surface"] == "chat"), None
+        )
+        assert portal_chat is not None, (
+            f"the portal shows this person no chat spend at all while the operator bill "
+            f"shows {admin_row['requests']} request(s): {portal}"
+        )
+        assert portal_chat["requests"] == admin_row["requests"], (
+            f"console and CLI disagree on request count for {username}: "
+            f"portal={portal_chat['requests']} admin={admin_row['requests']}"
+        )
+        assert portal_chat["spend"] == pytest.approx(admin_row["spend"]), (
+            f"console and CLI disagree on spend for {username}: "
+            f"portal={portal_chat['spend']} admin={admin_row['spend']}"
+        )
+
+    def test_the_operator_console_names_the_same_people_as_the_cli_bill(
+        self, env, gateway_url, control_plane_url, admin_headers
+    ):
+        """The third rendering. `/portal/api/admin/overview` is the page finding 34 says
+        showed names while the CLI showed hex; the two must now agree principal for
+        principal, over the whole bill and not just one row."""
+        username = f"chatuser-{uuid.uuid4().hex[:8]}"
+        oid = self._new_chat_user(username)
+        assert self._spend_as_chat_user(
+            gateway_url, self._chat_key(env), oid
+        ).status_code == 200
+        self._await_row(
+            control_plane_url, admin_headers,
+            lambda r: r["username"] == username and r["surface"] == "chat",
+            f"chat spend for {username}",
+        )
+
+        operator = env.get("BOOTSTRAP_USER", DOGFOOD_USER)
+        code = (
+            "import json,urllib.request;"
+            "req=urllib.request.Request("
+            "'http://localhost:8000/portal/api/admin/overview',"
+            "headers={'X-Auth-Request-Preferred-Username': %r});"
+            "print(urllib.request.urlopen(req, timeout=30).read().decode())" % operator
+        )
+        proc = compose("exec", "-T", "control-plane", "python", "-c", code, check=False)
+        assert proc.returncode == 0, (
+            f"operator console call failed (PORTAL_ADMINS must name {operator}): "
+            f"{proc.stdout}\n{proc.stderr}"
+        )
+        console = json.loads(proc.stdout.strip().splitlines()[-1])
+
+        console_people = {p["username"] for p in console["people"] if p["requests"]}
+        bill = self._bill(control_plane_url, admin_headers)
+        cli_people = {r["username"] for r in bill["by_user_and_surface"]}
+        assert username in console_people
+        assert cli_people <= console_people, (
+            f"the CLI bill names principals the console does not: "
+            f"{sorted(cli_people - console_people)}"
+        )
+
+    def test_an_unresolvable_chat_principal_is_labelled_never_dropped(
+        self, env, gateway_url, control_plane_url, admin_headers
+    ):
+        """Spend forwarded for a chat account that does not exist.
+
+        Three wrong answers this rules out, all of which would have looked fine: dropping
+        the row (money leaves the bill silently — finding 25's shape), guessing a name
+        (attribution becomes fiction), and printing the bare ObjectId (finding 34). The
+        money stays, the label says plainly that we could not name it, and the bill warns.
+        """
+        ghost = uuid.uuid4().hex[:24]
+        assert self._spend_as_chat_user(
+            gateway_url, self._chat_key(env), ghost
+        ).status_code == 200
+
+        row = self._await_row(
+            control_plane_url, admin_headers,
+            lambda r: ghost in r["username"],
+            f"unresolvable chat principal {ghost}",
+        )
+        assert row["username"] != ghost, (
+            "a bare ObjectId is not a label — it reads as a person's name, which is the "
+            "defect this item exists to fix"
+        )
+        assert row["username"].startswith("(unresolved chat user "), row["username"]
+        assert row["requests"] >= 1 and row["spend"] > 0, "the money must stay on the bill"
+
+        bill = self._bill(control_plane_url, admin_headers)
+        warning = next(
+            (w for w in bill["warnings"] if w["kind"] == "unresolved_chat_principal"),
+            None,
+        )
+        assert warning is not None, (
+            f"the bill carries unnamed spend and says nothing about it: {bill['warnings']}"
+        )
+        assert row["username"] in warning["principals"]
+
+
 class TestPricingIntegrity:
     """Regression guard for a silent-money defect found while building this row.
 
