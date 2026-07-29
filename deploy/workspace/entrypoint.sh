@@ -78,6 +78,22 @@ export OPENCODE_CONFIG=/etc/opencode/opencode.json
 # The `#` characters in the theme are why every value below is single-quoted: an unquoted
 # `#` after whitespace starts a comment and silently eats the rest of the continued command,
 # which is how ttyd once came up with no command at all.
+#
+# A second, unrelated trap lives in the same flags: ttyd's OWN option parser truncates a
+# --client-option VALUE at a second '=', silently. This is server-side C, not the browser —
+# src/server.c (ttyd 1.7.7, the version pinned in Dockerfile's TTYD_VERSION), case 't', calls
+# `strsep(&option, "=")` TWICE: once to split the key off the front of "key=value...", and
+# again on whatever strsep left behind to split the value off THAT. Whatever comes after the
+# second '=' is simply gone — not appended to the value, not an error, no output at all.
+# Example: --client-option "titleFixed=user=admin" parses as key "titleFixed", value "user";
+# "admin" vanishes. Verified against the actual pinned binary (sha256 matches Dockerfile's
+# TTYD_SHA256), not just the source: started it with that flag and read the SET_PREFERENCES
+# frame it sends the client over its websocket protocol — it came back
+# `{"titleFixed": "user", "fontSize": 14}`. See tests/test_ttyd_client_options.py, which
+# reimplements the same two-strsep logic and pins it to that observed value.
+# None of the values below contain a second '=' as written, so none are truncated today.
+# titleFixed is the one to watch — it interpolates ${WS_USER} at runtime, and a WS_USER value
+# that itself contained '=' would trip this exactly the same way.
 
 # THE BIND, AND WHY IT IS NO LONGER LOOPBACK
 #
