@@ -98,12 +98,35 @@ GIT_COMMON_DIR="$(_abs_git_path --git-common-dir)"
 
 hex_hash() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
 
-if [[ -n "$GIT_DIR" && "$GIT_DIR" != "$GIT_COMMON_DIR" ]]; then
-    WORKTREE_PATH="$(git rev-parse --show-toplevel)"
+# The bare name `enterprise-ai` belongs to the PRIMARY checkout and to nothing else. A
+# checkout only earns it by positively proving it is the primary: inside a git repository,
+# with --git-dir and --git-common-dir agreeing. Everything else — a linked worktree, and
+# equally a plain copy, an extracted tarball, or an agent's scratchpad checkout with no
+# .git at all — gets a derived name.
+#
+# The first version keyed on "is this a LINKED WORKTREE" and let everything else fall
+# through to the primary name. A non-git checkout has no --git-dir, so GIT_DIR came back
+# empty, the condition was false, and it took `enterprise-ai` — then `docker compose up`
+# there RECREATED the primary's containers with the copy's own bind-mount paths. When that
+# directory was later cleaned up, the mounts pointed at nothing and identity crash-looped
+# on a missing /certs/identity.crt. Observed, not hypothesised (enterpriseaiframework-35a).
+#
+# So the test is now "prove you are the primary", not "prove you are a worktree". Absence
+# of evidence resolves to isolation, which is the safe direction: a needlessly isolated
+# bundle costs some ports, while a needlessly shared one destroys somebody's running stack.
+IS_PRIMARY=0
+if [[ -n "$GIT_DIR" && "$GIT_DIR" == "$GIT_COMMON_DIR" ]]; then
+    IS_PRIMARY=1
+fi
+
+if [[ "$IS_PRIMARY" -eq 0 ]]; then
+    # `git rev-parse --show-toplevel` is unavailable outside a repository, so fall back to
+    # the checkout's own absolute path — which is what the offset is derived from anyway.
+    WORKTREE_PATH="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
     HASH="$(hex_hash "$WORKTREE_PATH")"
     OFFSET=$(( (HASH % 200 + 1) * 100 ))
     SHORT_HASH="$(hex_hash "${WORKTREE_PATH}:name")"
-    echo "linked worktree detected (${WORKTREE_PATH}); isolating compose project (offset +${OFFSET})"
+    echo "not the primary checkout (${WORKTREE_PATH}); isolating compose project (offset +${OFFSET})"
     set_var COMPOSE_PROJECT_NAME "enterprise-ai-${SHORT_HASH:0:8}"
     set_var GATEWAY_PORT         "$(( 4000 + OFFSET ))"
     set_var CONTROL_PLANE_PORT   "$(( 8081 + OFFSET ))"

@@ -249,3 +249,51 @@ def test_self_heal_leaves_a_deliberate_custom_project_name_alone(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert _read_env(repo / "bundle" / ".env")["COMPOSE_PROJECT_NAME"] == "acme-internal-ai"
+
+
+def test_a_non_git_copy_does_not_claim_the_primary_compose_project(tmp_path):
+    """The bare name `enterprise-ai` belongs to the primary checkout and nothing else.
+
+    Detection used to ask "is this a linked worktree?" and let everything else fall through
+    to the primary name. A plain copy — an extracted tarball, an agent's scratchpad checkout
+    — has no .git at all, so `git rev-parse --git-dir` returns nothing, the condition was
+    false, and it took `enterprise-ai`. `docker compose up` there then RECREATED the
+    primary's containers with the copy's own bind-mount paths; when that directory was
+    cleaned up the mounts pointed at nothing and identity crash-looped on a missing
+    /certs/identity.crt. Observed on this machine, not hypothesised.
+
+    Absence of evidence must resolve to isolation: a needlessly isolated bundle costs a few
+    ports, a needlessly shared one destroys somebody's running stack.
+    """
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not available")
+
+    # Deliberately NOT a git repo: no `git init` anywhere above this directory.
+    copy = tmp_path / "scratch-copy"
+    (copy / "bundle" / "bin").mkdir(parents=True)
+    (copy / "bundle" / "keycloak").mkdir(parents=True)
+    shutil.copy2(RENDER, copy / "bundle" / "bin" / "render-env.sh")
+    shutil.copy2(BUNDLE / ".env.example", copy / "bundle" / ".env.example")
+    shutil.copy2(
+        BUNDLE / "keycloak" / "realm-export.template.json",
+        copy / "bundle" / "keycloak" / "realm-export.template.json",
+    )
+
+    env = {**os.environ}
+    for k in [*DEFAULT_PORTS, "COMPOSE_PROJECT_NAME"]:
+        env.pop(k, None)
+    proc = subprocess.run(
+        ["bundle/bin/render-env.sh"], cwd=copy, capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    result = _read_env(copy / "bundle" / ".env")
+    assert result["COMPOSE_PROJECT_NAME"] != "enterprise-ai", (
+        "a non-git copy claimed the primary checkout's compose project — `docker compose "
+        "up` there would recreate the primary's containers with this directory's paths"
+    )
+    assert result["COMPOSE_PROJECT_NAME"].startswith("enterprise-ai-")
+    for var, default in DEFAULT_PORTS.items():
+        assert int(result[var]) != default, (
+            f"{var} kept the primary's default {default}; the copy would collide on it"
+        )
