@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 
@@ -466,23 +467,82 @@ def _pod_for(user: str) -> str:
                      "-o", "jsonpath={.items[0].metadata.name}").stdout
 
 
-def _restore_prod_default():
-    """Force PROD_CM back to the documented default (AGENTS.md verbatim), unconditionally.
+def _snapshot_cm(name: str) -> dict:
+    """Capture enough state to restore `name` EXACTLY: whether it existed, and if so, its
+    TENANT.md content verbatim.
 
-    Uses the `instructions given` branch of ensure_tenant_instructions, which always
-    overwrites regardless of the ConfigMap's current state (missing, seeded, or hand-
-    edited) — so this is safe to call whether the CM was deleted, never recreated, or
-    left in some partial state by whatever failed. This is the one call every exit path
-    of the control-case test below must reach.
+    Wave-5 finding: a restore that always writes the camp default (deploy/workspace/
+    AGENTS.md) is wrong whenever an operator has put their own house rules in this
+    ConfigMap — which is the entire reason this item exists. The default is only correct
+    when the ConfigMap genuinely did not exist before the test touched it.
     """
-    restore = _call_ensure(NS, PROD_CM, str(AGENTS_MD), str(AGENTS_MD))
-    assert restore.returncode == 0, (
-        f"FAILED TO RESTORE {PROD_CM} to the documented default after this test deleted "
-        f"it — the live deployment's house rules are now gone. stderr={restore.stderr}"
+    if _cm_exists(name):
+        return {"existed": True, "content": _cm_tenant_md(name)}
+    return {"existed": False, "content": None}
+
+
+def _restore_cm_snapshot(name: str, snapshot: dict, default_seed: Path) -> None:
+    """Force `name` back to exactly what `snapshot` describes, then VERIFY BY READING THE
+    CONFIGMAP'S CONTENT BACK — not by trusting a subprocess return code.
+
+    Wave-5 finding (1), "the guard is vacuous": the previous version asserted
+    `restore.returncode == 0` on the CompletedProcess from `_call_ensure`. `_call_ensure`
+    runs `ensure_tenant_instructions` via `bash -c` with no `set -euo pipefail`, and that
+    function's LAST statement is `echo` — so the subshell's exit status is echo's, not
+    kubectl's. That assertion passed whether or not the ConfigMap was actually written.
+    Reading `.data.TENANT\\.md` back and comparing it against what we intended to leave
+    behind cannot be fooled by an unrelated command's exit code the way a `bash -c` return
+    code can — see test_restore_guard_actually_checks_configmap_content_not_a_return_code
+    below, which proves it by forcing exactly that failure shape.
+
+    Wave-5 finding (2), "restores the wrong thing": if `name` HELD something before the
+    test ran, THAT EXACT CONTENT is restored — never the camp default. The default is used
+    only when `name` genuinely did not exist beforehand (a deployment that has never been
+    configured), which is the one case restoring the default is correct.
+    """
+    if snapshot["existed"]:
+        expected = snapshot["content"]
+        tmp = Path(f"/tmp/cbf-restore-{uuid.uuid4().hex[:8]}.md")
+        tmp.write_text(expected)
+        try:
+            _call_ensure(NS, name, str(default_seed), str(tmp))
+        finally:
+            tmp.unlink(missing_ok=True)
+    else:
+        _delete_cm(name)  # in case a test (re-)seeded it after the snapshot was taken
+        expected = default_seed.read_text()
+        _call_ensure(NS, name, str(default_seed))
+
+    actual = _cm_tenant_md(name)
+    assert actual == expected, (
+        f"FAILED TO RESTORE {name} to its pre-test state — the live deployment's house "
+        f"rules do not match what was there before this test ran. "
+        f"expected={expected!r} actual={actual!r}"
     )
 
 
-def test_fresh_deployment_pod_gets_the_camp_rules_verbatim_with_no_operator_action(cbf_users):
+@pytest.fixture()
+def prod_cm_snapshot():
+    """Snapshot PROD_CM before a test touches it, and force it back to EXACTLY that
+    snapshot afterward — pytest runs fixture teardown (the code after `yield`)
+    unconditionally once setup has completed, whether the test passes, fails an
+    assertion, or raises, the same guarantee a `try/finally` around the test body gives.
+    Centralising it here means the restore logic (and its fault-injection proof) lives in
+    one place instead of being re-implemented inside every test that mutates PROD_CM.
+
+    See test_restore_guard_recovers_the_exact_pre_test_content_after_a_forced_mid_test_failure
+    and test_restore_guard_actually_checks_configmap_content_not_a_return_code below for
+    fault-injection proof this actually restores the right content and actually verifies
+    it worked, rather than trusting a return code that cannot fail.
+    """
+    snapshot = _snapshot_cm(PROD_CM)
+    yield snapshot
+    _restore_cm_snapshot(PROD_CM, snapshot, AGENTS_MD)
+
+
+def test_fresh_deployment_pod_gets_the_camp_rules_verbatim_with_no_operator_action(
+    cbf_users, prod_cm_snapshot
+):
     """The control case. Delete the shared ConfigMap to simulate a genuinely fresh
     deployment (nobody has ever run --instructions), then provision a user with NO flags —
     the path every existing camp deployment takes today — and check the resulting pod, not
@@ -490,44 +550,47 @@ def test_fresh_deployment_pod_gets_the_camp_rules_verbatim_with_no_operator_acti
 
     PROD_CM is the real, shared, deployment-wide ConfigMap every workspace pod mounts —
     there is no throwaway substitute available here because provision-workspace.sh always
-    names it literally (it is not parameterised). Deleting it is therefore wrapped in
-    try/finally: if `_provision` fails, or any assert below fails, the finally block still
-    runs and force-restores the documented default before the test exits either way. A
-    wave-3 review found the unguarded version of this test could leave the live tenant's
-    house rules deleted on any failure path — this is that fix.
+    names it literally (it is not parameterised). The `prod_cm_snapshot` fixture snapshots
+    PROD_CM's actual pre-test state (an operator's own content if there is one, not the
+    camp default) before this test runs, and restores exactly that in its teardown, which
+    pytest guarantees runs whether `_provision` fails, an assert below fails, or everything
+    passes. A wave-3 review found the unguarded version of this test could leave the live
+    tenant's house rules deleted on any failure path; a wave-5 review found the
+    first-round fix restored the wrong content on the success path (the camp default
+    instead of whatever was actually there) and did so behind a return-code assertion that
+    could not fail either way — both are fixed in `_restore_cm_snapshot` above.
     """
     user, _ = cbf_users
-    try:
-        _delete_cm(PROD_CM)
-        assert not _cm_exists(PROD_CM)
+    _delete_cm(PROD_CM)
+    assert not _cm_exists(PROD_CM)
 
-        result = _provision(user)
-        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
-        assert "seeded default" in result.stdout
+    result = _provision(user)
+    assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+    assert "seeded default" in result.stdout
 
-        pod = _pod_for(user)
-        assert pod, f"no pod for {user}"
+    pod = _pod_for(user)
+    assert pod, f"no pod for {user}"
 
-        tenant_md = _exec_cat(pod, "/etc/opencode/tenant/TENANT.md")
-        assert tenant_md == AGENTS_MD.read_text(), (
-            "the pod's mounted TENANT.md must equal the camp's AGENTS.md byte-for-byte — "
-            "this is done-condition 3"
-        )
+    tenant_md = _exec_cat(pod, "/etc/opencode/tenant/TENANT.md")
+    assert tenant_md == AGENTS_MD.read_text(), (
+        "the pod's mounted TENANT.md must equal the camp's AGENTS.md byte-for-byte — "
+        "this is done-condition 3"
+    )
 
-        platform_md = _exec_cat(pod, "/etc/opencode/PLATFORM.md")
-        assert platform_md == PLATFORM_MD.read_text()
+    platform_md = _exec_cat(pod, "/etc/opencode/PLATFORM.md")
+    assert platform_md == PLATFORM_MD.read_text()
 
-        cfg = _kubectl("exec", pod, "-c", "ttyd", "--", "opencode", "debug", "config", check=False)
-        assert cfg.returncode == 0, cfg.stderr
-        resolved = json.loads(cfg.stdout)
-        assert resolved["instructions"] == [
-            "/etc/opencode/PLATFORM.md", "/etc/opencode/tenant/TENANT.md"
-        ]
-    finally:
-        _restore_prod_default()
+    cfg = _kubectl("exec", pod, "-c", "ttyd", "--", "opencode", "debug", "config", check=False)
+    assert cfg.returncode == 0, cfg.stderr
+    resolved = json.loads(cfg.stdout)
+    assert resolved["instructions"] == [
+        "/etc/opencode/PLATFORM.md", "/etc/opencode/tenant/TENANT.md"
+    ]
 
 
-def test_a_second_user_with_different_instructions_proves_per_deployment_not_per_user(cbf_users):
+def test_a_second_user_with_different_instructions_proves_per_deployment_not_per_user(
+    cbf_users, prod_cm_snapshot
+):
     """Done-condition 4: a second, different instruction set on a second user, and it must
     be visible on the FIRST user's already-running pod too — because the scope decision
     (per-deployment, not per-user) means there is exactly one ConfigMap.
@@ -535,9 +598,12 @@ def test_a_second_user_with_different_instructions_proves_per_deployment_not_per
     This test overwrites PROD_CM (the real, shared, deployment-wide ConfigMap — there is no
     throwaway substitute, provision-workspace.sh always names it literally) with a
     throwaway test string partway through. Same hazard class as the fresh-deployment test
-    above: if any assert between the overwrite and the original bottom-of-test restore
-    failed, PROD_CM was left holding test content instead of the camp's real house rules,
-    on any failure path. Wrapped in try/finally for the same reason.
+    above: if any assert between the overwrite and the end of the test failed, PROD_CM
+    would be left holding test content instead of the deployment's real house rules on
+    that failure path. The `prod_cm_snapshot` fixture snapshots PROD_CM's real pre-test
+    content and restores exactly that in its teardown — guaranteed by pytest to run
+    whether this test passes or fails — rather than the camp default, which would be wrong
+    on any deployment where an operator has already set their own instructions.
     """
     user1, user2 = cbf_users
     pod1_before = _pod_for(user1)
@@ -550,41 +616,153 @@ def test_a_second_user_with_different_instructions_proves_per_deployment_not_per
     tmp = Path("/tmp") / f"cbf-custom-{uuid.uuid4().hex[:8]}.md"
     tmp.write_text(custom)
     try:
-        try:
-            result = _provision(user2, "--instructions", str(tmp))
-            assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
-            assert "updated" in result.stdout
-        finally:
-            tmp.unlink(missing_ok=True)
+        result = _provision(user2, "--instructions", str(tmp))
+        assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
+        assert "updated" in result.stdout
+    finally:
+        tmp.unlink(missing_ok=True)
 
-        pod2 = _pod_for(user2)
-        assert _exec_cat(pod2, "/etc/opencode/tenant/TENANT.md") == custom
+    pod2 = _pod_for(user2)
+    assert _exec_cat(pod2, "/etc/opencode/tenant/TENANT.md") == custom
 
-        # The already-running FIRST user's pod must pick this up too — same pod, no
-        # restart — because it is one ConfigMap for the whole deployment.
-        import time as _t
+    # The already-running FIRST user's pod must pick this up too — same pod, no
+    # restart — because it is one ConfigMap for the whole deployment.
+    import time as _t
 
-        deadline = _t.time() + 90
-        seen = ""
-        while _t.time() < deadline:
-            seen = _exec_cat(pod1_before, "/etc/opencode/tenant/TENANT.md")
-            if seen == custom:
-                break
-            _t.sleep(5)
-        assert seen == custom, (
-            f"user1's already-running pod never saw the deployment-wide update; last "
-            f"read: {seen!r}"
+    deadline = _t.time() + 90
+    seen = ""
+    while _t.time() < deadline:
+        seen = _exec_cat(pod1_before, "/etc/opencode/tenant/TENANT.md")
+        if seen == custom:
+            break
+        _t.sleep(5)
+    assert seen == custom, (
+        f"user1's already-running pod never saw the deployment-wide update; last "
+        f"read: {seen!r}"
+    )
+
+    restarts_after = _kubectl(
+        "get", "pod", pod1_before, "-o",
+        "jsonpath={.status.containerStatuses[0].restartCount}",
+    ).stdout
+    assert restarts_after == restarts_before, (
+        "the update must reach the running pod without a restart"
+    )
+
+
+# ============================================================== fault-injection proof for the restore guard
+# Wave 5 found the guard behind prod_cm_snapshot's predecessor (_restore_prod_default)
+# vacuous in two distinct ways:
+#
+#   (1) `assert restore.returncode == 0` could not fail. `_call_ensure` runs
+#       `ensure_tenant_instructions` via `bash -c` with no `set -euo pipefail`, and that
+#       function's LAST statement is `echo` — the subshell's exit status is echo's, not
+#       kubectl's. The assertion passed whether or not the ConfigMap was actually written.
+#
+#   (2) even on the genuine success path it restored the CAMP DEFAULT rather than
+#       whatever was actually there before the test ran — which silently destroys a real
+#       operator's configuration, on every run, on any deployment where one exists. This
+#       item exists specifically so an operator CAN put their own house rules in this
+#       ConfigMap; a suite that resets it to the camp default is the exact bug the item
+#       is meant to fix, reintroduced by the guard meant to protect against it.
+#
+# Both are fixed in `_snapshot_cm` / `_restore_cm_snapshot` above. These two tests force
+# each failure mode for real — using scratch ConfigMaps, never PROD_CM — and prove the
+# fixed code behaves correctly where the old code would have passed silently.
+
+def test_restore_guard_recovers_the_exact_pre_test_content_after_a_forced_mid_test_failure():
+    """Fault-injection proof for finding (2) plus the try/finally-equivalent guarantee
+    `prod_cm_snapshot` gives every test that uses it: seed a scratch ConfigMap with
+    OPERATOR content (deliberately NOT the camp default), snapshot it the way the fixture
+    does, mutate it the way a real control-case test's body does, then force an assertion
+    failure midway through — the same shape as a real assert failing inside
+    test_fresh_deployment_pod_gets_the_camp_rules_verbatim_with_no_operator_action or
+    test_a_second_user_with_different_instructions_proves_per_deployment_not_per_user —
+    and prove the ConfigMap comes back holding its ORIGINAL operator content: not the camp
+    default, and not the mid-test mutation.
+    """
+    cm = f"cbf-fault-inject-{uuid.uuid4().hex[:10]}"
+    operator_content = "# this deployment's real house rules\n\nnot the camp default.\n"
+    tmp = Path("/tmp") / f"cbf-operator-{uuid.uuid4().hex[:8]}.md"
+    tmp.write_text(operator_content)
+    try:
+        _call_ensure(NS, cm, str(AGENTS_MD), str(tmp))
+        assert _cm_tenant_md(cm) == operator_content, "setup: seeding operator content failed"
+        assert operator_content != AGENTS_MD.read_text(), (
+            "test invariant: operator content must differ from the camp default, or this "
+            "test cannot tell 'restored correctly' apart from 'restored the default'"
         )
 
-        restarts_after = _kubectl(
-            "get", "pod", pod1_before, "-o",
-            "jsonpath={.status.containerStatuses[0].restartCount}",
-        ).stdout
-        assert restarts_after == restarts_before, (
-            "the update must reach the running pod without a restart"
+        snapshot = _snapshot_cm(cm)
+        assert snapshot == {"existed": True, "content": operator_content}
+
+        def _mid_test_body():
+            # Mutate the CM the way a real control-case test's body does, then hit the
+            # kind of assertion failure a real regression would cause.
+            _call_ensure(NS, cm, str(AGENTS_MD), str(AGENTS_MD))
+            assert _cm_tenant_md(cm) == AGENTS_MD.read_text()
+            raise AssertionError("INJECTED: simulating a real assertion failing mid-test")
+
+        try:
+            _mid_test_body()
+            pytest.fail("the injected failure did not fire; this test proves nothing")
+        except AssertionError as e:
+            assert "INJECTED" in str(e), f"unexpected assertion failure: {e}"
+        finally:
+            # This is the exact call prod_cm_snapshot's fixture teardown makes.
+            _restore_cm_snapshot(cm, snapshot, AGENTS_MD)
+
+        assert _cm_tenant_md(cm) == operator_content, (
+            "the restore guard did not recover the pre-test content after a forced "
+            "mid-test failure — it must, whether the test's own assertions failed or not"
         )
     finally:
-        # Restore the shared default so the namespace is left in the documented default
-        # state for anyone reading it next, rather than a throwaway test string — on
-        # every exit path, not just the one where every assert above passed.
-        _restore_prod_default()
+        tmp.unlink(missing_ok=True)
+        _delete_cm(cm)
+
+
+def test_restore_guard_actually_checks_configmap_content_not_a_return_code(monkeypatch):
+    """Fault-injection proof for finding (1): the OLD guard was
+    `assert restore.returncode == 0` on the CompletedProcess `_call_ensure` returns. This
+    monkeypatches `_call_ensure` to return exactly the failure shape that made the old
+    guard vacuous — a "succeeded" CompletedProcess (returncode 0, the success message on
+    stdout) that changes nothing — and proves `_restore_cm_snapshot`, which reads the
+    ConfigMap's content back instead of trusting the return code, raises where the old
+    code would have passed silently.
+    """
+    cm = f"cbf-fault-inject-{uuid.uuid4().hex[:10]}"
+    original = "# original content the fake restore call must not touch\n"
+    stale = "# stale content the fake restore call leaves behind\n"
+    try:
+        subprocess.run(
+            ["kubectl", "-n", NS, "create", "configmap", cm, f"--from-literal=TENANT.md={stale}"],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        assert _cm_tenant_md(cm) == stale
+
+        snapshot = {"existed": True, "content": original}
+
+        def fake_call_ensure(*_args, **_kwargs):
+            """Simulates the exact wave-5 failure shape: a `bash -c "...; echo ..."`
+            subshell reporting success because echo succeeded, while the kubectl commands
+            before it did nothing (e.g. a swallowed apiserver error) — the ConfigMap is
+            left at `stale`, not restored to `original`.
+            """
+            return subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout="    instructions ... (deployment-wide, updated)\n", stderr="",
+            )
+
+        monkeypatch.setattr(sys.modules[__name__], "_call_ensure", fake_call_ensure)
+
+        with pytest.raises(AssertionError, match="FAILED TO RESTORE"):
+            _restore_cm_snapshot(cm, snapshot, AGENTS_MD)
+
+        # The fake never touched the real ConfigMap — still `stale`, proving the
+        # assertion above fired on a genuine content mismatch, not a coincidence.
+        assert _cm_tenant_md(cm) == stale, (
+            "sanity check: the fake _call_ensure must not have actually changed the "
+            "ConfigMap, or this test is not isolating the guard's own logic"
+        )
+    finally:
+        _delete_cm(cm)
