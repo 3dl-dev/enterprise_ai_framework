@@ -18,12 +18,12 @@ cluster manifests. A presence check on one deployment is not a correctness check
 configuration.
 """
 
-import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
+import artifact_freshness
 from conftest import BUNDLE, compose
 
 REPO = Path(__file__).resolve().parent.parent
@@ -36,24 +36,30 @@ DEPLOY_SH = REPO / "deploy" / "bin" / "deploy.sh"
 def _callback_modules() -> list[str]:
     """Module names in `litellm_settings.callbacks`, e.g. 'strip_reasoning.handler' -> 'strip_reasoning'.
 
-    Parsed with a regex rather than a YAML loader to avoid adding a dependency to the
-    test venv for one list. The generated config is machine-written, so the form is stable.
+    This used to be a regex on `callbacks: [ ... ]`, on the grounds that a YAML loader
+    would add a dependency to the test venv for one list. Two things retired that: pyyaml
+    is in the venv already (added with enterpriseaiframework-cbf), and the regex only read
+    inline flow style. Rewriting the same list in block style — identical YAML — made the
+    parse return nothing, and because "nothing" was treated as "no callbacks declared",
+    this whole file collapsed from 12 passing to `1 failed, 4 skipped`: the drift trap was
+    SKIPPED by a formatting change rather than failed by it. Measured, then fixed.
+
+    artifact_freshness.parse_callbacks loads YAML first, keeps the regex only as a
+    fallback for a file YAML cannot read, and RAISES rather than returning [] when neither
+    works.
     """
     if not GENERATED_CONFIG.exists():
         pytest.exit(f"{GENERATED_CONFIG} missing — run `make up` first", returncode=2)
-    text = GENERATED_CONFIG.read_text()
-    match = re.search(r"^\s*callbacks:\s*\[(?P<body>[^\]]*)\]", text, re.MULTILINE)
-    if not match:
-        return []
-    entries = re.findall(r"['\"]([^'\"]+)['\"]", match.group("body"))
-    # "module.attr" -> "module". A bare "module" is also legal.
-    return sorted({e.split(".")[0] for e in entries if e.strip()})
+    return artifact_freshness.parse_callbacks(
+        GENERATED_CONFIG.read_text(), origin=str(GENERATED_CONFIG)
+    )
 
 
 CALLBACK_MODULES = _callback_modules()
 
-# If the config stops naming callbacks these tests have nothing to assert, and silently
-# passing would hide the fact that the guard went away with it.
+# Reached only when the config genuinely declares `callbacks: []` — an unreadable list
+# raises above instead of arriving here empty. test_config_names_at_least_one_callback
+# still fails loudly in that case, so nothing passes by having no work to do.
 requires_callbacks = pytest.mark.skipif(
     not CALLBACK_MODULES,
     reason="gateway config names no callbacks",
