@@ -266,8 +266,13 @@ def test_has_index_flips_with_the_file(shell):
 
 
 def test_offline_refs_counts_only_loadable_references(shell):
-    """The highest-value line in the server. The pod has no egress; a CDN <script src>
-    renders a blank page with no explanation, and this is what turns that into a sentence."""
+    """The highest-value line in the server: it turns "your page reaches off itself for a
+    piece of itself" into a sentence a child can act on.
+
+    The docstring here used to say "the pod has no egress; a CDN <script src> renders a
+    blank page". That was false twice over — see the OFFLINE_REF comment in shell-server.py
+    and enterpriseaiframework-644. The counter is a house-rule check, not a capability
+    check; what it counts is unchanged."""
     (shell.root / "alpha" / "index.html").write_text(
         '<script src="https://cdn.example.com/x.js"></script>\n'
         '<link rel="stylesheet" href="//fonts.example.com/f.css">\n'
@@ -404,6 +409,48 @@ def test_preview_serves_the_project(shell):
     r = shell.get("/preview/")
     assert r.status_code == 200
     assert b"<h1>mine</h1>" in r.content
+
+
+def test_the_preview_does_not_block_remote_subresources(shell):
+    """enterpriseaiframework-644, the second mechanism.
+
+    The retired claim was that a remote <script src> in a child's page "arrives as
+    nothing". Even if the pod's NetworkPolicy denied egress — it does not — that would not
+    make the claim true, because THIS POD DOES NOT FETCH THE PAGE. The preview is
+    `<iframe src="preview/">` (deploy/workspace/shell/app.js), so the child's browser
+    fetches index.html from this route and then fetches every subresource named inside it
+    over the child's own connection.
+
+    Two things would have to be true for the shell to actually block that, and this test
+    measures both against the real server rather than reading the source:
+
+      1. a Content-Security-Policy on the preview response restricting script-src, and
+      2. the remote reference not surviving into the served body.
+
+    Neither holds. If a future change adds a CSP here, this test fails and the workshop's
+    copy gets to make the offline claim honestly — at which point say so deliberately,
+    rather than deleting the assertion to get green.
+    """
+    (shell.root / "alpha" / "index.html").write_text(
+        '<script src="https://cdn.example.com/x.js"></script><h1>mine</h1>'
+    )
+    r = shell.get("/preview/")
+    assert r.status_code == 200
+
+    assert "content-security-policy" not in {k.lower() for k in r.headers}, (
+        f"the preview now sends a CSP ({dict(r.headers)}) — check whether it actually "
+        "blocks remote subresources, and if it does, the 'no internet' copy retired by "
+        "enterpriseaiframework-644 may be worth reinstating as a true statement"
+    )
+    assert b'src="https://cdn.example.com/x.js"' in r.content, (
+        "the server rewrote or stripped the remote reference; if it now does that, the "
+        "claim that remote references do not load has become true and the workspace text "
+        "should say so again"
+    )
+
+    # The counter still SEES it — the house-rule check is what survives the correction.
+    p = shell.wait_for(lambda p: p["has_index"], "index.html to register")
+    assert p["offline_refs"] == 1
 
 
 def test_preview_without_an_index_explains_itself(shell):

@@ -7,7 +7,9 @@
  *
  * No framework and no build step. This has to keep working for as long as the camp does
  * without anyone running npm, so everything here is plain CSS with custom properties.
- * Nothing is fetched: no CDN, no web font, no remote image. The pod has no egress.
+ * Nothing is fetched: no CDN, no web font, no remote image. Not a network limit — the pod
+ * reaches the internet and the browser certainly does — but the workshop's own chrome must
+ * not be able to break because somebody else's host is down.
  */
 
 :root {

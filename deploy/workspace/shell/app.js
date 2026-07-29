@@ -9,8 +9,10 @@
  * without anyone running npm. Native <dialog> does the modals, so focus trapping, Escape
  * and the backdrop come from the platform rather than from code I would have to get right.
  *
- * Nothing here is fetched from the network except this pod's own root-relative routes.
- * The pod has no egress; an absolute URL is a hang, not a request.
+ * Nothing here is fetched from the network except this pod's own routes, and every one of
+ * those is written relative to <base> rather than absolute. Not for a network reason — this
+ * file runs in the browser, which can reach anything the child's network can — but because
+ * an absolute URL hard-codes one of the two ways the workshop is served and breaks the other.
  *
  * The shape of the thing: the terminal is full width at rest. One 1 Hz poll of /api/pulse
  * feeds one snapshot, and one render pass derives the Ribbon phrase, the drawer, the share
@@ -560,7 +562,7 @@ function derivePhrase(now) {
       : [`Writing ${changed.length} files…`, "amber"];
   }
   if (s.offline_refs > 0 && s.has_index)
-    return ["That page needs the internet, and this room has none. Press Stuck?", "warn"];
+    return ["That page loads a piece of itself from the web. Press Stuck?", "warn"];
   if (M.drawer === "closed" && s.rev > M.seenRev && M.everBuilt)
     return ["There's a new version — press Look.", "green"];
   if (s.has_index && now - M.lastRevAt < 10000) return ["Made it — take a look.", "green"];

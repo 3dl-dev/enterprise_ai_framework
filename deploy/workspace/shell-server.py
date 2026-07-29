@@ -191,9 +191,25 @@ CHANGED_WINDOW_MS = 4000
 # claim a write that never happened.
 NEVER_MS = 10 ** 9
 
-# A reference the pod cannot load. There is no egress except the AI gateway, so a model
-# that emits a CDN <script src> produces a blank page with no explanation — the single
-# most likely camp-day failure. Counting these turns it into a sentence a child can act on.
+# A reference the page fetches from somewhere other than itself.
+#
+# The name is historical and the comment that used to be here was wrong twice
+# (enterpriseaiframework-644). It claimed "there is no egress except the AI gateway, so a
+# model that emits a CDN <script src> produces a blank page." Both halves are false:
+#
+#   1. The workspace NetworkPolicy (deploy/k8s/60-workspace-common.yaml) has always allowed
+#      egress to 0.0.0.0/0 minus the private ranges, on any port. Measured, not read:
+#      `curl https://registry.npmjs.org/` from inside a running ws- pod returns 200.
+#   2. It would not matter if it did not. The preview is an <iframe src="preview/"> — the
+#      CHILD'S BROWSER fetches the page and every subresource in it, not this pod. This
+#      server sends no Content-Security-Policy and the iframe's sandbox does not restrict
+#      subresource loading, so a CDN <script src> in the preview loads from the child's own
+#      connection. See test_the_preview_does_not_block_remote_subresources.
+#
+# The counter is still worth having, for the reason the house rules give: a remote
+# reference is the one thing in a child's page that can work at the desk and be blank at
+# the demo. It is a house-rule check, not a capability check. Renaming the field would
+# change /api/pulse's frozen shape, so the name stays and this comment carries the truth.
 OFFLINE_REF = re.compile(
     r"""<(?:script|link|img|source|iframe|audio|video)\b[^>]*?\b"""
     r"""(?:src|href)\s*=\s*["']?(?:https?:)?//""",
