@@ -79,8 +79,22 @@ set_var() {
     echo "  set ${var}=${value}"
 }
 
-GIT_DIR="$(git rev-parse --git-dir 2>/dev/null || true)"
-GIT_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+# Both are resolved to absolute physical paths before comparing. git reports these
+# INCONSISTENTLY when the working directory is a subdirectory of the checkout, which this
+# script always is (it cd's to bundle/ above): --git-dir comes back absolute
+# (/path/to/repo/.git) while --git-common-dir comes back relative (../.git). Comparing the
+# raw strings therefore reports "different" for the PRIMARY checkout, which sent it down
+# the worktree branch and renamed the main bundle's compose project out from under a
+# running stack. Caught by the integration gate, not by the worktree tests — the worktree
+# case is unequal either way, so only the primary checkout could expose it.
+_abs_git_path() {
+    local p
+    p="$(git rev-parse "$1" 2>/dev/null)" || return 0
+    [[ -z "$p" ]] && return 0
+    ( cd "$p" 2>/dev/null && pwd -P ) || printf '%s' "$p"
+}
+GIT_DIR="$(_abs_git_path --git-dir)"
+GIT_COMMON_DIR="$(_abs_git_path --git-common-dir)"
 
 hex_hash() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
 
@@ -98,7 +112,25 @@ if [[ -n "$GIT_DIR" && "$GIT_DIR" != "$GIT_COMMON_DIR" ]]; then
     set_var FAKEPROVIDER_PORT    "$(( 8090 + OFFSET ))"
     set_var CHAT_PORT            "$(( 3080 + OFFSET ))"
 else
-    ensure COMPOSE_PROJECT_NAME "enterprise-ai"
+    # Self-heal a .env written while the detection above was broken. That bug rendered the
+    # PRIMARY checkout as a worktree, so this file can already carry a derived project name
+    # and a full offset port block. ensure() would not repair it — the values are non-empty,
+    # so it leaves them alone, and the primary bundle would keep coming up under the wrong
+    # identity on the wrong ports for as long as the file survived. Only the derived shape
+    # (enterprise-ai-<digits>, written by set_var above) is reset, so a deliberately
+    # customised project name or port is left alone.
+    if grep -qE '^COMPOSE_PROJECT_NAME=enterprise-ai-[0-9]+$' .env; then
+        echo "primary checkout carries a worktree-derived project name; resetting to defaults"
+        set_var COMPOSE_PROJECT_NAME "enterprise-ai"
+        set_var GATEWAY_PORT       "4000"
+        set_var CONTROL_PLANE_PORT "8081"
+        set_var IDP_PORT           "8082"
+        set_var IDP_HTTPS_PORT     "8443"
+        set_var FAKEPROVIDER_PORT  "8090"
+        set_var CHAT_PORT          "3080"
+    else
+        ensure COMPOSE_PROJECT_NAME "enterprise-ai"
+    fi
 fi
 
 echo "checking secrets"
