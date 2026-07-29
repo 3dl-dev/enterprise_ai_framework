@@ -123,36 +123,83 @@ For the same request (39 input, 27 output on `claude-haiku-4-5`) both compute
 live request against Forge's own usage record rather than trusting either side.
 
 
-## Open — behaviour to know about, not yet decided
+### 10. A cache hit does not bypass budget enforcement, and $0 is the right price
 
-### 10. A cache hit bypasses budget enforcement
+The gateway's own response cache (LiteLLM's exact-match cache in Valkey — *not* the
+provider-side prompt caching, which is a separate mechanism, priced through `model_info`,
+and measured separately at 0.00546710 cold vs 0.00273814 cached). Two claims were made
+about it and both are false. This entry records what is measured, and the ruling that
+closes it.
 
-With the exact-match cache on, an identical request is served from cache. Measured
-behaviour, from a two-key probe (same prompt, different virtual keys):
+**A cache hit writes a spend row.** Attributed to the requesting key, tokens counted,
+cost zero. From a two-key probe (same prompt, different virtual keys):
 
 | key | `cache_hit` | spend | tokens |
 |---|---|---|---|
 | A — populated the cache | — | $0.000189 | 19 |
 | B — hit the cache | `True` | $0 | 19 |
 
-So cache hits **do** write a spend row, **correctly attributed to the requesting key**,
-with tokens counted and cost zero. Cost accounting is right: no upstream call was made.
+**An over-budget key is refused, cached answer or not.** The budget is checked in
+LiteLLM's `user_api_key_auth`, which runs as a route dependency — strictly before the
+request reaches the router, and therefore before any cache lookup. Measured on the bundle
+at `litellm:main-v1.77.3-stable`, the same image the cluster runs, by putting a key past
+its cap in front of a prompt already proven to be in the cache:
 
-> **Correction.** An earlier revision of this document claimed cache hits produce no
-> spend row at all. That was wrong — it was inferred from a test that failed to find a
-> row, rather than from the ledger. The table above is measured. The practical difference
-> matters: usage counts are *not* under-reported, so the bill is trustworthy.
+```
+1. prompt P                  -> 200,  provider called once
+2. prompt P again            -> 200,  provider NOT called    (P is cached)
+3. unrelated prompt          -> 200,  spend now 0.000384 > cap 0.00025
+4. prompt P again            -> 400 budget_exceeded
+5. cap raised, prompt P      -> 200,  provider STILL not called
+```
 
-What remains true and unresolved:
+Step 5 is the part that makes step 4 mean anything: the entry was in the cache the whole
+time, so the 400 was the budget refusing a request the cache could have answered, not a
+cache miss wearing a budget error's clothes.
 
-- An over-budget key is **still served** from cache, because the budget is not consulted
-  on a hit. No money is spent, so this is defensible — but "the budget stopped them" is
-  not quite true, and an operator who disables someone expects silence.
-- Any test touching metering or enforcement must use unique content. Fixed prompts made
-  three separate tests pass once and then fail forever after, which reads as flakiness
-  rather than as a cache hit.
+> **Two corrections, and they have the same shape.** An earlier revision claimed cache
+> hits write no spend row; that was inferred from a test that failed to find one. The
+> replacement claimed the budget is not consulted on a hit; that was inferred from a
+> probe that only ever showed a cache hit costing $0 and never once put an over-budget
+> key in front of a cached prompt. Both read a *fact about cost* as a *fact about
+> enforcement*. Neither was measured before it was written down.
 
-**Not yet decided:** whether budget refusal should precede the cache lookup.
+**Ruling: a cache hit bills $0, and the bill says how many requests were free.**
+
+- $0 is not a concession, it is the correct number. Nothing was bought. Pricing a cache
+  hit at list would put a figure in the ledger that no provider invoice will ever
+  confirm, and cent-level agreement with the provider (finding 9) is the strongest
+  evidence this layer has that its bill is true. Trading that for a nicer-looking usage
+  column is the exact trade this project exists not to make.
+- Charging back internally at list price is a *policy* question and a legitimate one, but
+  it is not a *cost*. The ledger keeps costs. Every cache-hit row carries its real token
+  counts, so any operator who wants list-price chargeback can compute it from the ledger
+  without the cost column having to lie.
+- Budgets therefore cap **money, not usage**. A user answered entirely from cache never
+  advances toward their cap, because they never cost anything. If a deployment wants to
+  cap *usage*, that is rate limiting (RPM/TPM), a control that already exists and should
+  not be smuggled into the money column.
+- What was actually wrong is that the bill said none of this. `85 requests, 150,574
+  tokens, $0.000000` with no further explanation is indistinguishable from a bill that
+  has lost the money — and it was read as exactly that, twice. `/admin/spend` now reports
+  `cached_requests` per user-and-surface and in the totals, so a $0 line is explained on
+  its face.
+
+Locked in by `TestCacheHitsBudgetAndTheBill` in `tests/test_scope_items.py`.
+
+**A trap for anyone writing tests here.** The fake provider's reply — body, completion id,
+token counts — is a pure function of (model, prompt), so a cached reply and a fresh one
+are byte-identical. "The response id matched, so it was a cache hit" proves nothing and
+passes whether the cache works or not. `GET /debug/calls?prompt=...` on the fake provider
+returns how many times it was actually asked to generate; that is the only ground truth
+available, and it is what those tests assert against.
+
+Relatedly: any test touching metering or enforcement must use unique content. Fixed
+prompts made three separate tests pass once and then fail forever after, which reads as
+flakiness rather than as a cache hit.
+
+
+## Open — behaviour to know about, not yet decided
 
 ### 11. Control-plane admin auth is a shared bearer token
 
@@ -638,3 +685,38 @@ Two things generalise, and the second is the expensive one:
 
 **Not fixed here.** Filed as `enterpriseaiframework-f8c`, which requires a test asserting
 the two renderings agree — the duplication, not the lookup, is the defect.
+
+### 28. No key on the cluster carries a budget, so no one can be over one
+
+Found while measuring finding 10. Every virtual key the control plane has provisioned on
+the cluster has `max_budget` NULL:
+
+```
+baron::ide         | spend 0.6019512900 | max_budget (null)
+chat-surface::chat | spend 0.2280494825 | max_budget (null)
+student::ide       | spend 0.0168477300 | max_budget 1000000
+baron::chat, student::chat, claire::*, *::terminal  | spend 0 | max_budget (null)
+```
+
+`/admin/sync` takes `default_budget` as an optional query parameter and defaults it to
+`None`, and nothing in the deploy path passes one. LiteLLM's key budget check is guarded
+by `if valid_token.max_budget is not None`, so with no cap set it does not run.
+
+This matters because it is the *real* reason a user on the cluster is never refused, and
+because it is easy to mistake for the cache defect finding 10 alleged: both look like
+"they went on being served". They are not the same, and only this one is true. Measured
+directly — a key with a cap is refused past it, a key without one is served indefinitely:
+
+```
+budget consulted   (cap 0.00025):  10s past the cap -> 400 budget_exceeded
+budget NOT consulted (cap unset):  30s past the same spend -> 10 x 200
+```
+
+The `1000000` on `student::ide` is a cap in name only; it exists because something once
+passed a number, not because anyone chose it.
+
+**Not fixed here** — setting budgets is an operator policy decision, and applying one to
+the cluster is a mutation this row's scope did not cover. Filed as
+`enterpriseaiframework-d65`. Note that milestone `enterpriseaiframework-0a4` asks for "a
+user past their budget is REFUSED **on the cluster**", which cannot be demonstrated at
+all until a cluster key has a budget to be past.

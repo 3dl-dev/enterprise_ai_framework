@@ -425,8 +425,10 @@ class TestItem4OneBill:
         assert created.status_code == 200, created.text
         key = created.json()["key"]
 
-        # Unique content: a cache hit is served without writing a spend row, so a fixed
-        # prompt makes this test pass once and then fail forever after.
+        # Unique content, so this asserts on a row this call produced rather than on one
+        # left by an earlier run. A cache hit does write its own spend row (measured —
+        # see finding 10), but it writes $0 against the same alias, which would make the
+        # spend assertions below depend on suite ordering.
         resp = httpx.post(
             f"{gateway_url}/v1/chat/completions",
             headers={"Authorization": f"Bearer {key}"},
@@ -714,8 +716,11 @@ class TestItem7BudgetStop:
         headers = {"Authorization": f"Bearer {key}"}
 
         def spend_request():
-            # Every probe must be a cache miss. A cache hit is served without consulting
-            # the budget, so reusing one payload would test the cache, not enforcement.
+            # Every probe must be a cache miss, because this test is about spend
+            # accumulating until it crosses the cap, and a cached reply adds nothing to
+            # spend — the loop below would run to its deadline and fail for the wrong
+            # reason. It is NOT because the cache escapes enforcement: it does not, and
+            # TestCacheHitsBudgetAndTheBill measures that directly.
             return httpx.post(
                 f"{gateway_url}/v1/chat/completions",
                 headers=headers,
@@ -740,6 +745,289 @@ class TestItem7BudgetStop:
             time.sleep(3)
 
         assert refused, "key exceeded its budget and was still served"
+
+
+class TestCacheHitsBudgetAndTheBill:
+    """The gateway's own response cache, against refusal and against the bill.
+
+    enterpriseaiframework-d58 / finding 10. Two claims were open about it:
+
+      1. that an over-budget key is still served when the answer is sitting in the
+         cache, because the budget is not consulted on a hit;
+      2. that the $0 those rows carry means the bill under-reports.
+
+    Both are false, and the tests below are how that is known rather than believed. The
+    first was inferred from a probe that only ever showed a cache hit costing $0 — which
+    it does — and never once put an over-budget key in front of a cached prompt. It is
+    checked in `user_api_key_auth`, strictly before any cache lookup, so refusal wins.
+    The second is answered by the same fact that makes $0 correct: no provider was
+    called, so no money was spent.
+
+    THE TRAP THESE TESTS HAVE TO AVOID. The fake provider's reply — text, completion id,
+    token counts — is a pure function of (model, prompt). A cached reply and a fresh one
+    are byte-identical, so "the id matched" is not evidence of a cache hit, and a test
+    resting on it passes whether the cache works or not. Every assertion here about
+    something being cached is therefore made against the provider's own call counter.
+
+    And the refusal test needs the converse control: a 400 proves nothing if the entry
+    had quietly gone. So after the refusal it restores the budget, asks again, and
+    requires both a 200 and an unchanged provider call count — the answer was there the
+    whole time, and the budget is what stood between the caller and it.
+    """
+
+    # fake-large's configured price, from bundle/litellm/config.base.yaml. Hardcoded on
+    # purpose: reading it from the same config the gateway read would make the check
+    # circular, and this asserts the money, not the plumbing.
+    INPUT_COST = 0.000003
+    OUTPUT_COST = 0.000015
+
+    @staticmethod
+    def _new_key(gateway_url, master_headers, alias, max_budget=None):
+        body = {"key_alias": alias, "models": ["fake-large"]}
+        if max_budget is not None:
+            body["max_budget"] = max_budget
+        r = httpx.post(
+            f"{gateway_url}/key/generate", headers=master_headers, json=body, timeout=TIMEOUT
+        )
+        assert r.status_code == 200, r.text
+        return r.json()["key"]
+
+    @staticmethod
+    def _ask(gateway_url, key, prompt):
+        return httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "fake-large", "messages": [{"role": "user", "content": prompt}]},
+            timeout=TIMEOUT,
+        )
+
+    @staticmethod
+    def _provider_calls(fakeprovider_url, prompt):
+        r = httpx.get(
+            f"{fakeprovider_url}/debug/calls", params={"prompt": prompt}, timeout=TIMEOUT
+        )
+        assert r.status_code == 200, r.text
+        return r.json()["calls"]
+
+    def test_a_repeated_request_is_answered_without_calling_the_provider(
+        self, gateway_url, master_headers, fakeprovider_url
+    ):
+        """The premise every other test in this class rests on."""
+        key = self._new_key(gateway_url, master_headers, f"cache-{uuid.uuid4().hex[:8]}::chat")
+        prompt = f"cache me {uuid.uuid4().hex}"
+
+        assert self._provider_calls(fakeprovider_url, prompt) == 0, "prompt was not fresh"
+
+        first = self._ask(gateway_url, key, prompt)
+        assert first.status_code == 200, first.text
+        assert self._provider_calls(fakeprovider_url, prompt) == 1
+
+        second = self._ask(gateway_url, key, prompt)
+        assert second.status_code == 200, second.text
+        assert self._provider_calls(fakeprovider_url, prompt) == 1, (
+            "the gateway called the provider again for a prompt it had already answered "
+            "— the response cache is not doing anything, and every cache assertion in "
+            "this class is vacuous"
+        )
+        assert second.json()["choices"][0]["message"]["content"] == \
+            first.json()["choices"][0]["message"]["content"]
+
+    def test_an_over_budget_key_is_refused_even_when_the_answer_is_cached(
+        self, gateway_url, master_headers, fakeprovider_url
+    ):
+        """The claim the product is sold on: past the budget, the layer says no.
+
+        Not "says no unless it happens to have the answer lying around".
+        """
+        alias = f"cachebudget-{uuid.uuid4().hex[:8]}::chat"
+        # One fake-large exchange costs ~$0.000192, so the second one crosses this.
+        budget = 0.00025
+        key = self._new_key(gateway_url, master_headers, alias, max_budget=budget)
+        prompt = f"cached and over budget {uuid.uuid4().hex}"
+
+        assert self._ask(gateway_url, key, prompt).status_code == 200
+        assert self._ask(gateway_url, key, prompt).status_code == 200
+        assert self._provider_calls(fakeprovider_url, prompt) == 1, \
+            "the answer is not in the cache, so this test would prove nothing"
+
+        # Spend past the cap on a different prompt, so the cached one is untouched.
+        assert self._ask(gateway_url, key, f"push over {uuid.uuid4().hex}").status_code == 200
+
+        # Enforcement reads spend the gateway flushes on a batch interval, so allow it
+        # to lag. Each attempt re-asks the cached prompt: if the cache did outrank the
+        # budget, every one of these would come back 200 until the deadline.
+        deadline = time.monotonic() + 90
+        refusal = None
+        while time.monotonic() < deadline:
+            r = self._ask(gateway_url, key, prompt)
+            if r.status_code >= 400:
+                refusal = r
+                break
+            time.sleep(3)
+
+        assert refusal is not None, (
+            "an over-budget key was served the cached answer — budget enforcement is "
+            "happening after the cache lookup instead of before it"
+        )
+        assert refusal.status_code == 400, refusal.text
+        assert "budget" in refusal.text.lower(), refusal.text
+
+        # THE CONTROL. Without this, the 400 above is equally consistent with the cache
+        # entry having expired or been evicted, and the test would be asserting nothing.
+        # Lift the budget and ask again: a 200 whose answer still did not cost a provider
+        # call proves the entry was there throughout, and that the budget is what refused.
+        raised = httpx.post(
+            f"{gateway_url}/key/update",
+            headers=master_headers,
+            json={"key": key, "max_budget": 100.0},
+            timeout=TIMEOUT,
+        )
+        assert raised.status_code == 200, raised.text
+
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            after = self._ask(gateway_url, key, prompt)
+            if after.status_code == 200:
+                break
+            time.sleep(3)
+        assert after.status_code == 200, (
+            f"budget raised but the key is still refused: {after.text}"
+        )
+        assert self._provider_calls(fakeprovider_url, prompt) == 1, (
+            "the provider was called again, so the cache entry had gone — the refusal "
+            "above cannot be attributed to the budget"
+        )
+
+    def test_a_cache_hit_bills_zero_and_the_bill_says_so(
+        self, gateway_url, control_plane_url, master_headers, admin_headers, fakeprovider_url
+    ):
+        """The billing ruling, locked in.
+
+        A cache hit costs the company nothing, so it bills $0 — putting a list price
+        there would put a number in the ledger that no invoice will ever confirm. But it
+        is not silent: the row is written, attributed to the key that asked, with the
+        real token counts, and the bill reports how many of a person's requests were
+        answered that way. A line reading "2 requests, $0.000192" with no further
+        explanation is what got these rows read as lost money in the first place.
+        """
+        username = f"cachebill-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(gateway_url, master_headers, f"{username}::chat")
+        prompt = f"bill the cache {uuid.uuid4().hex}"
+
+        first = self._ask(gateway_url, key, prompt)
+        assert first.status_code == 200, first.text
+        usage = first.json()["usage"]
+        expected_spend = (
+            usage["prompt_tokens"] * self.INPUT_COST
+            + usage["completion_tokens"] * self.OUTPUT_COST
+        )
+
+        second = self._ask(gateway_url, key, prompt)
+        assert second.status_code == 200, second.text
+        assert self._provider_calls(fakeprovider_url, prompt) == 1, \
+            "second call reached the provider; there is no cache hit to bill"
+
+        deadline = time.monotonic() + 90
+        row = None
+        while time.monotonic() < deadline:
+            bill = httpx.get(
+                f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+            ).json()
+            row = next(
+                (r for r in bill["by_user_and_surface"] if r["username"] == username), None
+            )
+            if row and row["requests"] >= 2:
+                break
+            time.sleep(3)
+
+        assert row is not None, "the cache-hit traffic never reached the bill at all"
+        assert row["requests"] == 2, f"expected the miss and the hit, got {row}"
+        assert row["cached_requests"] == 1, (
+            f"the bill cannot say which of these requests were free: {row}"
+        )
+        # The money: one upstream call was made and one was avoided, so the line carries
+        # exactly one call's cost. This is the assertion that would catch a cache hit
+        # being priced at list, and the one that keeps the bill reconcilable against a
+        # provider invoice that never saw the second request.
+        assert row["spend"] == pytest.approx(expected_spend, rel=1e-6), (
+            f"expected exactly one call's cost ({expected_spend}), got {row['spend']}"
+        )
+        # Usage is not lost: both requests' tokens are counted, so an operator who wants
+        # to charge back at list price can, from this row, without the cost column lying.
+        assert row["prompt_tokens"] == 2 * usage["prompt_tokens"]
+        assert row["completion_tokens"] == 2 * usage["completion_tokens"]
+
+        assert "cached_requests" in bill["totals"], bill["totals"]
+        assert bill["totals"]["cached_requests"] >= 1
+
+        # The other rendering of the same money. Finding f8c is that `make spend` and the
+        # portal, built from one query, still managed to disagree — so a number added to
+        # one of them gets checked against the other here rather than assumed.
+        #
+        # The portal only honours identity headers from loopback (see portal.py), so this
+        # asks from inside the container, which is where its authenticating sidecar
+        # normally asks from. python, not curl: the image has no curl.
+        script = (
+            "import json,urllib.request;"
+            "r=urllib.request.Request('http://localhost:8000/portal/api/spend',"
+            f"headers={{'x-auth-request-preferred-username': '{username}'}});"
+            "print(urllib.request.urlopen(r).read().decode())"
+        )
+        out = compose("exec", "-T", "control-plane", "python", "-c", script)
+        portal = json.loads(out.stdout.strip().splitlines()[-1])
+        chat_row = next(
+            (s for s in portal["by_surface"] if s["surface"] == "chat"), None
+        )
+        assert chat_row is not None, f"the portal shows this user nothing: {portal}"
+        assert chat_row["requests"] == row["requests"], (portal, row)
+        assert chat_row["cached_requests"] == row["cached_requests"], (
+            f"the operator's bill and the user's own page disagree about how many of "
+            f"their requests were free: portal {chat_row}, /admin/spend {row}"
+        )
+        assert chat_row["spend"] == pytest.approx(row["spend"], rel=1e-6), (portal, row)
+        assert portal["total"]["cached_requests"] == 1, portal
+
+    def test_a_refused_request_is_not_billed(
+        self, gateway_url, control_plane_url, master_headers, admin_headers
+    ):
+        """The other half of the money question: a refusal must not appear as usage.
+
+        The gateway has a failure callback pointed at the same ledger, so this is a live
+        question rather than an obvious one.
+        """
+        username = f"refusedbill-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(
+            gateway_url, master_headers, f"{username}::chat", max_budget=0.0000001
+        )
+        served = 0
+        refusals = 0
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            # Unique every time: this test is about what a refusal writes, so no request
+            # may be answered from the cache and skew the served count.
+            r = self._ask(gateway_url, key, f"refused {uuid.uuid4().hex}")
+            if r.status_code >= 400:
+                refusals += 1
+                break
+            served += 1
+            time.sleep(3)
+        assert refusals == 1, "the key was never refused, so there is no refusal to check"
+        assert served >= 1, "nothing was served, so there is no baseline to compare against"
+
+        # Give the ledger longer than the flush interval to write anything it was going to.
+        time.sleep(20)
+        bill = httpx.get(
+            f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+        ).json()
+        row = next(
+            (r for r in bill["by_user_and_surface"] if r["username"] == username), None
+        )
+        assert row is not None, "the served calls are missing from the bill"
+        assert row["requests"] == served, (
+            f"{served} requests were served and {refusals} refused, but the bill counts "
+            f"{row['requests']} — a refusal was written to the ledger as usage: {row}"
+        )
+        assert row["cached_requests"] == 0, row
 
 
 # ---------------------------------------------------------------------------

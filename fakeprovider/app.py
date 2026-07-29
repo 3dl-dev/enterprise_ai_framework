@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import time
+from collections import defaultdict
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import StreamingResponse
@@ -22,6 +23,33 @@ app = FastAPI(title="fake-provider")
 # Deterministic pseudo-token accounting. The gateway meters what the upstream reports,
 # so these numbers flow all the way through to the ledger and the tests assert on them.
 CHARS_PER_TOKEN = 4
+
+
+# HOW A TEST KNOWS A REQUEST WAS SERVED FROM THE GATEWAY'S CACHE
+#
+# It cannot use the response. Every field this provider returns — the body text, the
+# completion id, the token counts — is a pure function of (model, prompt), precisely so
+# tests can assert on them. A cached reply and a freshly generated one are therefore
+# byte-identical, and "the id matched, so it was a cache hit" proves nothing at all. A
+# probe written that way passes whether the cache works or not.
+#
+# The one observable that separates the two is whether this process was called. So it
+# counts, per prompt, and reports the counts. A test that asserts "over-budget requests
+# are refused even when the answer is cached" has to establish the answer really was
+# cached, or it is asserting nothing; this is the ground truth it establishes it with.
+#
+# Test-fixture scope only. This service stands in for a provider account and never runs
+# in a real deployment — see docs/design/dogfood-scope.md item 8. It is unauthenticated
+# for the same reason the rest of it is.
+CALLS_BY_PROMPT: defaultdict[str, int] = defaultdict(int)
+
+
+def prompt_digest(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode()).hexdigest()[:16]
+
+
+def record_call(prompt: str) -> None:
+    CALLS_BY_PROMPT[prompt_digest(prompt)] += 1
 
 
 def count_tokens(text: str) -> int:
@@ -72,7 +100,8 @@ async def openai_chat(request: Request):
     prompt_tokens = count_tokens(prompt)
     completion_tokens = count_tokens(text)
     created = int(time.time())
-    cid = "fakecmpl-" + hashlib.sha256(prompt.encode()).hexdigest()[:16]
+    cid = "fakecmpl-" + prompt_digest(prompt)
+    record_call(prompt)
 
     if not body.get("stream"):
         return {
@@ -144,7 +173,8 @@ async def anthropic_messages(request: Request):
     text = reply_text(prompt, model)
     input_tokens = count_tokens(prompt)
     output_tokens = count_tokens(text)
-    mid = "fakemsg-" + hashlib.sha256(prompt.encode()).hexdigest()[:16]
+    mid = "fakemsg-" + prompt_digest(prompt)
+    record_call(prompt)
 
     if not body.get("stream"):
         return {
@@ -210,6 +240,19 @@ async def anthropic_messages(request: Request):
 
 app.include_router(openai_router, prefix="/v1")
 app.include_router(anthropic_router, prefix="/v1")
+
+
+@app.get("/debug/calls")
+async def debug_calls(prompt: str | None = None):
+    """How many times this provider was actually asked to generate.
+
+    `prompt` is the exact prompt text a test sent; the count comes back for that prompt
+    alone. Without it, every prompt this process has seen. See CALLS_BY_PROMPT above for
+    why a test cannot get this from the response body.
+    """
+    if prompt is not None:
+        return {"prompt_digest": prompt_digest(prompt), "calls": CALLS_BY_PROMPT[prompt_digest(prompt)]}
+    return {"total": sum(CALLS_BY_PROMPT.values()), "by_prompt": dict(CALLS_BY_PROMPT)}
 
 
 @app.get("/health")

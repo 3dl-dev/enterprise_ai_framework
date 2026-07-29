@@ -50,6 +50,17 @@ def idp_url(env) -> str:
 
 
 @pytest.fixture(scope="session")
+def fakeprovider_url(env) -> str:
+    """The stand-in upstream, reached directly rather than through the gateway.
+
+    Needed by the cache tests: whether the provider was called is the only thing that
+    distinguishes a cached reply from a fresh one, because every byte of the reply is a
+    pure function of the request. See fakeprovider/app.py.
+    """
+    return f"http://localhost:{env.get('FAKEPROVIDER_PORT', '8090')}"
+
+
+@pytest.fixture(scope="session")
 def admin_headers(env) -> dict:
     return {"Authorization": f"Bearer {env['CONTROL_PLANE_ADMIN_TOKEN']}"}
 
