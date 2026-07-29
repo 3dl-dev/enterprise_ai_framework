@@ -62,11 +62,15 @@ def _identity_map(monkeypatch):
 
 
 def _row(**over):
+    # Mirrors the columns the query in export.spend_csv selects. `status` joined it for
+    # enterpriseaiframework-e69: without it a $0 row the provider failed is
+    # indistinguishable from a served row that was never priced, and `cache_hit` cannot
+    # tell them apart because a failure carries 'False' exactly like an unpriced success.
     base = {
         "request_id": "req-1", "start_time": "2026-07-29T00:00:00+00:00",
         "end_time": "2026-07-29T00:00:01+00:00", "model": "fake-large",
         "key_alias": "baron::ide", "surface": "ide", "end_user": "",
-        "principal": "baron", "spend": 0.001, "prompt_tokens": 1,
+        "principal": "baron", "status": "success", "spend": 0.001, "prompt_tokens": 1,
         "completion_tokens": 2, "total_tokens": 3, "cache_hit": "",
     }
     base.update(over)
@@ -222,3 +226,41 @@ def test_the_csv_header_carries_both_columns_in_a_stable_order():
     assert export.SPEND_COLUMNS.index("end_user") + 1 == export.SPEND_COLUMNS.index("principal")
     for required in ("request_id", "key_alias", "surface", "spend", "total_tokens"):
         assert required in export.SPEND_COLUMNS, required
+
+
+# ---------------------------------------------------------------------------
+# Which $0 rows the archive can explain (enterpriseaiframework-e69 / finding 40)
+# ---------------------------------------------------------------------------
+
+def test_a_failed_row_is_distinguishable_from_a_free_one_in_the_archive():
+    """The two kinds of $0 row must not read identically to a departing customer.
+
+    The aggregate bill separates them with `failed_requests` and `cached_requests`. This
+    file is per-request, so it has no counts — it separates them with `status`, and
+    `cache_hit` alone provably cannot: an upstream failure carries cache_hit 'False',
+    which is exactly what an unpriced success carries too.
+    """
+    failed = _as_dict(export.spend_row(_row(
+        status="failure", spend=0, prompt_tokens=0, completion_tokens=0,
+        total_tokens=0, cache_hit="False",
+    )))
+    cached = _as_dict(export.spend_row(_row(
+        status="success", spend=0, cache_hit="True",
+    )))
+    unpriced = _as_dict(export.spend_row(_row(status="success", spend=0, cache_hit="False")))
+
+    assert failed["status"] == "failure"
+    assert cached["status"] == "success"
+
+    # The load-bearing claim: status separates the failure from the unpriced success, and
+    # cache_hit does not. If a future edit drops `status` from SPEND_COLUMNS, the second
+    # assertion still holds and the first stops being checkable — hence both.
+    assert failed["status"] != unpriced["status"], (
+        "a failed request and an unpriced success are indistinguishable in the archive"
+    )
+    assert failed["cache_hit"] == unpriced["cache_hit"], (
+        "this test's premise is stale: cache_hit now separates these two, so the argument "
+        "for carrying `status` needs rechecking rather than this assertion relaxing"
+    )
+    # And the money is untouched by any of it — the reason this was decidable at all.
+    assert failed["spend"] == 0 and cached["spend"] == 0

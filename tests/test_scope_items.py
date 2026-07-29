@@ -1488,6 +1488,18 @@ class TestCacheHitsBudgetAndTheBill:
         assert chat["cached_requests"] == 1, chat
         assert overview["totals"]["cached_requests"] >= 1, overview["totals"]
 
+        # e69's column, on the endpoint d58's veracity gate faulted for being verified by
+        # READING portal.py rather than by reaching it. This person's two requests both
+        # succeeded, so the operator console must say zero failed — at the person level,
+        # the surface level and in the totals, all three of which e69 had to touch
+        # separately. A KeyError here means the console was left behind again.
+        assert person["failed_requests"] == 0, (
+            f"two successful requests, one of them from cache, reported to the operator "
+            f"as having failed: {person}"
+        )
+        assert chat["failed_requests"] == 0, chat
+        assert "failed_requests" in overview["totals"], overview["totals"]
+
         # And it must agree with the operator's other rendering of the same money.
         bill = httpx.get(
             f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
