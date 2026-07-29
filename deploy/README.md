@@ -23,6 +23,7 @@ is a complete uninstall.
 | What | How | Why |
 |---|---|---|
 | **Portal** | NodePort 30460 | `/portal/*` on the same origin. The signed-in front door: links to every surface, your spend, your keys, your published work, and the account console. oauth2-proxy sidecar on the control-plane pod authenticates first |
+| Workshop | *(no port)* | `/workshop/*` on the same origin, proxied by the portal to the signed-in user's own pod. It has no URL of its own — see below |
 | Chat | NodePort 30380 | Gateway VM Caddy `:8081`, behind Tailscale Funnel on `:8443` |
 | Identity | NodePort 30382 | Same origin as chat — Caddy routes `/realms/*` and `/resources/*` here. They **must** share an origin or the OIDC issuer check fails |
 | Gateway | NodePort 30400 | LAN/tailnet only — not published to the internet |
@@ -42,20 +43,56 @@ is a complete uninstall.
   rebuilt wholesale, which destroys the ledger and audit chain with it. A tank-backed ZFS
   dataset is requested in the mainframe note; until it exists, treat cluster data as
   disposable.
+- **The bill does not charge for a cache hit** (rd `d58`). A response served from the
+  gateway's own Valkey cache writes a spend row of `$0` and does not consult the budget:
+  85 requests and 150,574 tokens are recorded at zero. Both headline claims are affected —
+  the bill under-reports, and a user past their cap keeps being served.
+- **The workshop's pods share one internal token** (rd `1b9`). Reaching another workspace
+  additionally requires defeating the NetworkPolicy, which is tested, but per-pod
+  credentials would be stronger.
 - **The generated catalogue still carries the three fake-provider models**, which point at
   a service that is not deployed here. They 500 if selected. Harmless but untidy — the
   cluster should render a Forge-only catalogue.
 
-## The IDE surface — browser-terminal aider
+## One surface, two tabs
 
-A per-user pod running **real terminal aider** under `ttyd`, behind oauth2-proxy against
-Keycloak. Not `aider --browser` (its Streamlit GUI drops most slash commands) and not an
-MCP wrapper (one-shot `--message` throws away the context accumulation and the
-apply/lint/test/repair loop, which is the product).
+There is one address: **`$PUBLIC_BASE_URL/portal/`**. Chat and Code are tabs on it,
+remembering whichever was used last, with spend, keys, published work and the account
+console behind the avatar. An operator named in `PORTAL_ADMINS` also sees everyone's usage
+there — read-only, because seeing the bill should not require the admin token that can
+revoke every key.
+
+The workshop used to be a per-user NodePort on the house LAN. That made it a separate
+website, unreachable from any other network, where it did not fail cleanly but hung until
+the browser gave up. It is now proxied by the control plane, which already knows who you
+are and routes you to your own pod — so adding a camper needs no routing configuration
+anywhere. The per-pod oauth2-proxy is gone; what replaced it is a NetworkPolicy admitting
+7681/7682 only from the control-plane pod, plus a token the pod checks on every request.
+Both are tested in `tests-live/test_workspace_isolation.py` rather than asserted, because
+this CNI resolves a packet on the destination's ingress rules without consulting the
+source's egress.
+
+```bash
+deploy/bin/setup-portal.sh        # registers the portal's Keycloak client, idempotent
+make test-browser                 # drives both UIs in a real Chromium
+make test-e2e                     # the whole journey: login, agent, run, publish, bill
+```
+
+## The IDE surface — a browser terminal running opencode
+
+A per-user pod running a **real terminal agent** under `ttyd`. Not `aider --browser` (its
+Streamlit GUI drops most slash commands) and not an MCP wrapper (one-shot `--message`
+throws away the context accumulation and the apply/lint/test/repair loop, which is the
+product). opencode is the default because it explores the repo itself rather than asking
+which files to add; aider stays installed and is one word away.
+
+The terminal **resumes its last session**, so a reload, a tab switch or a project switch
+no longer drops the conversation. Sessions live on the PVC — they were on an emptyDir and
+erased by every restart until that was found.
 
 ```bash
 deploy/bin/kaniko-build.sh deploy/workspace 192.168.2.43:30500/enterprise-ai-workspace:$(git rev-parse --short HEAD)
-deploy/bin/ensure-second-user.sh student          # a second realm user, for the isolation check
+deploy/bin/ensure-second-user.sh student          # a realm user; each gets its own secret
 deploy/bin/provision-workspace.sh baron
 deploy/bin/provision-workspace.sh student
 make test-workspace                               # drives both, as a person would
@@ -67,8 +104,8 @@ plane, so the pod never holds a shared key and the ledger's token hash stays cor
 
 | | |
 |---|---|
-| URL | `http://<k3s-worker>:<nodeport>` — allocated per user, stable across reprovisions |
-| Auth | oauth2-proxy → Keycloak, then an allow-list containing exactly that user's email |
+| URL | none of its own — reached at `$PUBLIC_BASE_URL/portal/`, Code tab |
+| Auth | the portal authenticates, then proxies you to your own pod; the pod is ClusterIP, admitted only from the control plane, and checks a token on every request |
 | Key | `<username>::ide`, minted by `POST /admin/keys/issue` at provision time |
 | Model | `glm-5.2@deepinfra` by default; `--model` overrides from the gateway catalogue |
 | Budget | 0.5 CPU / 1Gi requested, 1 CPU / 2Gi limit, 4Gi ephemeral |

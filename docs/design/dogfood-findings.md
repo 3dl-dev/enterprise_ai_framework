@@ -499,3 +499,96 @@ marker turns the suite red the moment 522 is fixed and the marker is left behind
 **The lesson that generalises:** a presence check is not an attribution check. "There is a
 row for this user" and "this user's spend is on this row" are different claims, and the
 first one passes for years while the second is false.
+
+### 28. A sandbox is an authority boundary, not a CPU budget
+
+The preview iframe is sandboxed without `allow-same-origin`, which stops a generated page
+scripting, navigating or reading the Workshop around it. It does not stop that page taking
+the main thread and never giving it back.
+
+A voxel game the agent wrote — ~20,000 cells redrawn per frame — froze the entire tab,
+terminal included, and Chrome offered repeatedly to kill the page. Reproduced twice
+against the real file, once directly and once inside the sandboxed frame.
+
+No in-page control can rescue this, because the thread a "Stop" handler would run on is
+the thread being starved. A watchdog has the same problem. The only thing that works is
+not starting the page without being asked: the drawer still reveals the moment something
+exists, but it reveals an offer — *Run it here* or *Open in its own tab* — rather than a
+running app. `/api/pulse` reports whether the page keeps running after load
+(`requestAnimationFrame`, `setInterval`, `while(true)`, a `<canvas>`) so an animating one
+is steered to its own tab, where the same bug costs one tab instead of the workshop.
+
+### 29. ttyd sizes its terminal once, and only a WINDOW resize makes it re-measure
+
+Reported as "the input box is off screen after reconnecting", reproduced exactly: 50 rows
+in a pane that fits 38, viewport unchanged.
+
+ttyd fits its terminal from whatever the frame measured when its client started. On a
+reconnect — a project switch, New chat, a reload of that frame — it starts before the
+surrounding layout settles, measures a taller box than it ends up with, and keeps a size
+it no longer has. Nothing signals it afterwards, because only the ELEMENT changed size,
+never the window. The frame is nudged to re-measure after every connect.
+
+The same shape bites a hidden tab: a frame laid out while its tab is hidden measures zero.
+
+### 30. opencode pins the model to the session, so a "model" setting alone does nothing
+
+Once the terminal resumed its last session, changing the model in Settings wrote the
+config, reconnected, and came back on the old model. Even the explicit flag loses:
+`opencode --continue --model glm-4.7` paints "GLM 4.7" and then "GLM 5.2" as the session
+loads over it.
+
+There is no version of this that keeps both, so switching models now ends the session and
+the UI says so first. Related: opencode keeps sessions in an sqlite db under
+`XDG_DATA_HOME`, which defaulted to `$HOME` — an emptyDir — so "resume" was erased by
+every pod restart until it was pointed at the PVC.
+
+### 31. An unpriced model was never metering at $0 — the rule that assumed so hid 140 models
+
+The catalogue generator excluded any model Forge had not explicitly priced, on the stated
+grounds that it "meters at $0, so budgets never trip and the bill under-reports". That was
+asserted confidently, in the generator's own docstring, and was wrong.
+
+Forge charges request-time cost and draws budgets down for models with no PriceRecord —
+demonstrated by running a real counter down with `kimi-k2-thinking`, which has none. Only
+the rollups reported $0, and that was a Forge bug, since fixed. The catalogue now reads
+`/v1/pricing/effective`, which prices every model and reports whether the number came from
+a human (`default`) or the provider's own rate card (`catalog`). 148 models exposed, up
+from 8.
+
+What survives is narrower: a model quoted at exactly $0 is still excluded, because no
+budget can bind on zero. That is a cap that cannot be expressed, not a price that is
+missing.
+
+### 32. Cache pricing belongs in `model_info`; in `litellm_params` it bills cached tokens at zero
+
+deepinfra's prompt caching works and arrives intact — `deepseek-v3.2@deepinfra` reported
+20,992 of 21,020 prompt tokens cached on a repeat call, through Forge and the gateway.
+The gap was ours: the generated catalogue carried no cache pricing, so the ledger billed
+cached tokens at the full input rate and the bill overstated by the whole discount,
+worst exactly when caching worked best.
+
+Putting `cache_read_input_token_cost` in `litellm_params` made it worse in the opposite
+direction — cached tokens billed at ZERO — and only measuring caught it. In `model_info`
+an identical 21,020-token call bills `0.00546710` cold and `0.00273814` cached, matching
+`28*in + 20992*cache_read + 5*out` exactly.
+
+Not every model caches: `glm-5.2@deepinfra`, the default coding model, reports no cached
+tokens and Forge does not list `prompt_caching` among its supported params.
+
+### 33. Green unit tests said the product worked on a day when opening a tab froze the browser
+
+Every suite before this one was HTTP-level: status codes, bodies, JSON shapes. That proves
+a file is served and says nothing about whether its JavaScript runs — and both surfaces
+are almost entirely JavaScript.
+
+`make test-browser` drives a real Chromium and fails on any console error; `make test-e2e`
+does the whole journey with a real account and real money: one login, type at the agent,
+watch a file appear, run it, publish it, then fetch that link with NO session at all.
+Between them they caught a permanently-open settings dialog, a terminal that resized
+itself, a preview that froze the tab, and a model picker that did nothing.
+
+Three failures along the way were the TESTS, not the product: a context leak that piled up
+a dozen agents in a 1-CPU pod until it answered 429, layout assertions that passed alone
+and failed in a suite because the drawer opens by itself once a project has content, and
+an assertion on the "Ask anything" placeholder that a resumed session correctly replaces.

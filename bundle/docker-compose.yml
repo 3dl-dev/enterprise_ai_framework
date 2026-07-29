@@ -205,8 +205,15 @@ services:
       # One control plane. Without this the surface also offers openAI, anthropic,
       # google, azure and bedrock endpoints that talk to providers directly — a path
       # around the gateway with no metering, no budget and no audit trail. Restricting
-      # to custom endpoints leaves exactly one way out of the building.
-      ENDPOINTS: custom
+      # this list leaves exactly one way out of the building.
+      #
+      # custom,agents — NOT just "custom". The list is literal, and naming only "custom"
+      # also drops the AGENTS endpoint, which is where MCP servers, memory, tools, file
+      # search and web search live. That was found on the cluster: closing the provider
+      # bypass silently took the entire agents framework with it. The bundle kept the
+      # narrower value for weeks afterwards, so anything exercised here was testing a
+      # different surface from the one deployed.
+      ENDPOINTS: custom,agents
 
       CREDS_KEY: ${CHAT_CREDS_KEY:?set CHAT_CREDS_KEY in .env}
       CREDS_IV: ${CHAT_CREDS_IV:?set CHAT_CREDS_IV in .env}
