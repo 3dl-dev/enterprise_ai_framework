@@ -1814,7 +1814,10 @@ class TestFailedRequestsAreNamedNotErased:
             "the two renderings disagree about the request count itself"
         )
 
-    def test_the_exit_archive_says_which_rows_the_provider_failed(self, tmp_path):
+    def test_the_exit_archive_says_which_rows_the_provider_failed(
+        self, gateway_url, control_plane_url, master_headers, admin_headers,
+        fakeprovider_url, tmp_path,
+    ):
         """The third rendering of the ledger — the CSV a departing customer keeps.
 
         Per-request, so there is no `requests` count to explain. The defect is the same
@@ -1824,12 +1827,43 @@ class TestFailedRequestsAreNamedNotErased:
         success. This archive outlives the deployment; it is the one rendering nobody can
         come back and correct.
 
-        THIS TEST DEPENDS ON EARLIER TESTS IN THIS CLASS having put failure rows in the
-        ledger, so it asserts the column and the failure rows separately: the column must
-        exist unconditionally, and the failure rows are checked only if the export
-        contains any. That keeps it honest when run in isolation rather than silently
-        passing on an empty file.
+        IT MAKES ITS OWN FAILURE ROW rather than borrowing one from the tests above it.
+        An earlier draft asserted `failed` was non-empty while relying on its siblings to
+        have populated the ledger, which passes in a whole-suite run and fails under `-k`
+        for reasons that have nothing to do with the behaviour. Both halves of the
+        assertion are unconditional here — the column must exist, AND a row marked
+        'failure' must be in the archive — because a version that skipped the second half
+        when the file happened to hold no failures would pass on the exact defect it
+        exists to catch.
         """
+        prompt = f"{FAKE_FAIL_MARKER} archive {uuid.uuid4().hex}"
+        broke = self._ask(gateway_url, self._new_key(
+            gateway_url, master_headers, f"archivefail-{uuid.uuid4().hex[:8]}::chat"
+        ), prompt)
+        assert broke.status_code >= 500, f"{broke.status_code} {broke.text[:200]}"
+        assert self._provider_calls(fakeprovider_url, prompt) >= 1, (
+            "the gateway never called the provider, so no failure row will be written"
+        )
+
+        # Poll rather than sleep a flat interval: in a whole-suite run the siblings above
+        # have already flushed failures and this returns at once, while in isolation it
+        # waits for the one this test just made. Asserting on the total (not on a delta)
+        # is what makes both cases the same assertion.
+        deadline = time.monotonic() + 90
+        failed_total = 0
+        while time.monotonic() < deadline:
+            totals = httpx.get(
+                f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+            ).json()["totals"]
+            failed_total = totals.get("failed_requests") or 0
+            if failed_total >= 1:
+                break
+            time.sleep(3)
+        assert failed_total >= 1, (
+            "the failure never reached the ledger, so the export below could not carry it "
+            "and this test would be asserting nothing"
+        )
+
         # `exit.sh export` is the non-destructive mode — it does not revoke, so this can
         # run here rather than inside TestItem9ExitPath, which genuinely breaks the bundle
         # and has to run last.
