@@ -194,6 +194,24 @@ The second half stands and is why nothing in `librechat.yaml` forwards the user 
 `addParams`: an unsubstituted placeholder in the username column is worse than no chat
 attribution at all.
 
+**And nothing needs to, which was never measured until now.** LibreChat sets the outgoing
+request's `user` field to its own Mongo `_id` by itself, with no `addParams` and no
+configuration on our side. Measured in the compose bundle 2026-07-29 by signing in through
+the real identity provider, sending one message through the surface's own message API, and
+reading the raw column the gateway recorded:
+
+```
+end_user                 | user_api_key_alias | model
+6a6a20ca6e4b89f8dd617f90 | chat-surface::chat | fake-gpt-large
+```
+
+`6a6a20ca6e4b89f8dd617f90` is exactly what the surface's own `/api/user` returns as that
+account's `_id`. It is not the email and not the OIDC `sub`. Everything `chat_identity`
+does rests on that being true, and it was previously believed from the shape of cluster
+data rather than demonstrated end to end; it is now asserted by
+`TestChatPrincipalOnTheOneBill::test_the_chat_surface_identifies_a_spender_by_its_own_mongo_id`,
+which fails loudly if a LibreChat upgrade ever changes it.
+
 ### 14. Forge prices only 12 of its 68 models, and the unpriced ones are the interesting ones
 
 Wiring Forge as the real upstream ran straight back into finding 1, this time with real
@@ -667,9 +685,35 @@ Two things the fix had to get right beyond the lookup:
 ObjectId and the translating path was unreachable. `bundle/docker-compose.yml` now sets it
 (and `PORTAL_ADMINS`, without which the console rendering did not exist here either).
 
-**Regression tests:** `TestChatPrincipalOnTheOneBill` (4 integration tests — a real
-ObjectId written into LibreChat's Mongo, spent through the shared chat key, then asserted
-across `/admin/spend`, `/portal/api/spend` and `/portal/api/admin/overview`) and
+**Regression tests:** `TestChatPrincipalOnTheOneBill` (6 integration tests) and
 `tests/test_chat_principal_naming.py` (17 unit tests covering the unreachable-database
-case and every principal that must NOT be relabelled). All 21 fail against the code as it
-was; the integration four fail by showing hex where a name belongs.
+case and every principal that must NOT be relabelled). Against the pre-fix control plane,
+5 of the 6 integration tests and all 17 unit tests fail; the integration ones fail by
+showing hex where a name belongs.
+
+Three of the six are there because the first attempt at this fix was tested in ways that
+looked adequate and were not:
+
+- **The premise is proven, not staged.**
+  `test_the_chat_surface_identifies_a_spender_by_its_own_mongo_id` drives a genuine
+  message through the chat surface's own API as a signed-in user and reads the raw
+  `end_user` the gateway recorded. Nothing in the test chooses that value. The earlier
+  version wrote the Mongo user AND forwarded the id itself, which proved the translation
+  while assuming the thing being translated ever occurs — see finding 13 above.
+- **The control case on the deleted path.**
+  `test_the_portal_still_names_a_user_who_has_no_chat_identity` exercises
+  `/portal/api/spend` for a user with only IDE spend and no chat identity at all. That
+  endpoint is where `chat_identity.resolve()` was deleted, and every other test of it uses
+  a chat user, so the case the change did *not* set out to alter had nothing watching it.
+  It passes against the pre-fix code by design — it is a control — and it fails against a
+  relabelling that is too broad (verified by removing the `looks_like_chat_id` guard from
+  `principal_label`: the ide user's own spend then vanishes from both renderings).
+- **The tests do not disfigure the bill they inspect.** The unresolvable-principal test
+  necessarily writes a row that can never be named. Left behind, it would put a permanent
+  `(unresolved chat user …)` line and a permanent warning on every later `make spend` for
+  that bundle — a test that corrupts its own subject. Its ledger rows are now deleted in a
+  `finally` (so a failed assertion still cleans up) and their absence is asserted
+  afterwards, which makes the reversibility a checked claim. No test in the class creates
+  a synthetic LibreChat account any more: the person they bill is the bundle's real
+  bootstrap user, signed in through the real identity provider, so the rows they leave are
+  rows the bill should carry.
