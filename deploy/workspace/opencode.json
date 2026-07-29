@@ -28,5 +28,5 @@
   },
   "model": "enterprise-ai/glm-5.2@deepinfra",
   "theme": "system",
-  "instructions": ["/etc/opencode/AGENTS.md"]
+  "instructions": ["/etc/opencode/PLATFORM.md", "/etc/opencode/tenant/TENANT.md"]
 }

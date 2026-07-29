@@ -88,11 +88,37 @@ COPY model-settings.yml model-metadata.json /etc/aider/
 #     all" without the variable; that was inferred from a laptop repro that did not use
 #     this path, and it is wrong. The variable earns its place by covering the routes
 #     that skip both scripts — `kubectl exec` being the one that matters.
-#   - AGENTS.md is the agent's standing instructions, pulled in by the "instructions" key.
-#     It lives here rather than in the project directory on purpose: a file in the project
-#     root gets read as work the child asked for, gets published, and gets committed.
+#   - "instructions" names TWO files, loaded in order (enterpriseaiframework-cbf). Neither
+#     lives in the project directory: a file in the project root gets read as work the
+#     tenant's user asked for, gets published, and gets committed.
+#
+#       /etc/opencode/PLATFORM.md         baked into this image, COPYed below. Facts about
+#                                          the pod, verified against the NetworkPolicy and
+#                                          the live cluster, not preference — see that
+#                                          file. Never tenant content, never a ConfigMap.
+#       /etc/opencode/tenant/TENANT.md    NOT baked into this image. An operator's house
+#                                          rules for THEIR deployment: a ConfigMap volume
+#                                          (deploy/k8s/61-workspace.template.yaml, mounted
+#                                          as a directory, not subPath, so a kubectl-side
+#                                          content change reaches an already-running pod on
+#                                          the kubelet's own sync — subPath mounts do NOT
+#                                          get that sync, which is why this is a directory
+#                                          and the file lives one level down). Seeded from
+#                                          deploy/workspace/AGENTS.md by
+#                                          deploy/bin/provision-workspace.sh the first time
+#                                          a deployment provisions anyone, so the camp's
+#                                          current rules are the default. `optional: true`
+#                                          on that volume: a pod started before the
+#                                          ConfigMap exists still starts, with an empty
+#                                          tenant directory, rather than hanging in
+#                                          ContainerCreating — verified against this exact
+#                                          opencode build: `opencode debug config` with the
+#                                          second instructions path pointed at a file that
+#                                          does not exist still exits 0 and returns the
+#                                          full resolved config, so a missing tenant file
+#                                          is a missing tenant file, not a config error.
 COPY opencode.json /etc/opencode/opencode.json
-COPY AGENTS.md /etc/opencode/AGENTS.md
+COPY PLATFORM.md /etc/opencode/PLATFORM.md
 COPY entrypoint.sh workspace-shell publish shell-server.py /usr/local/bin/
 COPY shell/ /usr/local/bin/shell/
 RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/workspace-shell /usr/local/bin/publish /usr/local/bin/shell-server.py
