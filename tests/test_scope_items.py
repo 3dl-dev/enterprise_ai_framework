@@ -199,10 +199,10 @@ class TestItem1OneLogin:
 # ---------------------------------------------------------------------------
 
 class TestItem3OneGatewayBothFormats:
-    def test_openai_compatible_inbound(self, gateway_url, master_headers):
+    def test_openai_compatible_inbound(self, gateway_url, named_key_headers):
         r = httpx.post(
             f"{gateway_url}/v1/chat/completions",
-            headers=master_headers,
+            headers=named_key_headers,
             json={"model": "fake-large", "messages": [{"role": "user", "content": "ping"}]},
             timeout=TIMEOUT,
         )
@@ -211,11 +211,11 @@ class TestItem3OneGatewayBothFormats:
         assert body["choices"][0]["message"]["content"].startswith("[fake-provider")
         assert body["usage"]["total_tokens"] > 0
 
-    def test_anthropic_native_inbound(self, gateway_url, master_headers):
+    def test_anthropic_native_inbound(self, gateway_url, named_key_headers):
         """The terminal coding agent speaks this dialect, not the OpenAI one."""
         r = httpx.post(
             f"{gateway_url}/v1/messages",
-            headers={**master_headers, "anthropic-version": "2023-06-01"},
+            headers={**named_key_headers, "anthropic-version": "2023-06-01"},
             json={
                 "model": "claude-opus-5",
                 "max_tokens": 64,
@@ -229,7 +229,7 @@ class TestItem3OneGatewayBothFormats:
         assert body["content"][0]["text"].startswith("[fake-provider")
         assert body["usage"]["input_tokens"] > 0
 
-    def test_streaming_is_incremental_not_buffered(self, gateway_url, master_headers):
+    def test_streaming_is_incremental_not_buffered(self, gateway_url, named_key_headers):
         """Chunks must arrive over time. A response assembled and then flushed at once
         satisfies a naive 'is it SSE' check while feeling broken to a user."""
         # Unique content forces a cache miss. A cached response replays collapsed, so a
@@ -240,7 +240,7 @@ class TestItem3OneGatewayBothFormats:
         with httpx.stream(
             "POST",
             f"{gateway_url}/v1/chat/completions",
-            headers=master_headers,
+            headers=named_key_headers,
             json={
                 "model": "fake-large",
                 "messages": [
@@ -457,6 +457,241 @@ class TestItem4OneBill:
         assert row["requests"] >= 1
 
 
+class TestAttributableSpendOnly:
+    """Nothing may consume tokens or money without a principal the bill can name.
+
+    THE DEFECT THIS EXISTS FOR, measured on the live cluster 2026-07-29 rather than
+    reasoned about: `/admin/spend` reported 42 requests and $0.1133 under
+    `(unattributed)`, 25 of them — 98% of the unattributed money — in a two-hour window
+    26 hours after deployment. Reading the raw ledger, every one of those rows carried
+    `api_key = sha256(GATEWAY_MASTER_KEY)` with `metadata.user_api_key_alias = null`.
+    The gateway's administrative root credential was also a valid inference credential:
+    it could buy tokens, it had no key row to join to, and — because budgets bind to
+    virtual keys — it had no budget either. The bill was honest that it could not name
+    the money. The defect was that it could not.
+
+    Distinct from finding 25 (a principal that exists whose row was orphaned by
+    revocation) and finding 34 (a principal that exists, named differently by different
+    renderings). Here there was no principal at all.
+
+    WHY THE ASSERTIONS ARE SHAPED THE WAY THEY ARE. `(unattributed)` is a legitimate
+    label, and after this fix the bucket still collects refused attempts — LiteLLM writes
+    a `status = 'failure'` row with zero spend and zero tokens for a request its pre-call
+    hook rejected, and that row has no alias by construction. So "the bucket is empty" is
+    the wrong assertion and would be red on a healthy system. What must hold is that
+    nothing in that bucket ever CONSUMED anything: no money, no tokens. A request that
+    was refused before reaching an upstream costs nobody anything and names nobody,
+    which is correct. A request that was served and counted tokens must name someone.
+
+    The window is also asserted to be non-empty and attributed, so this cannot pass by
+    testing nothing — the failure mode of every emptiness check.
+    """
+
+    @staticmethod
+    def _window_start() -> str:
+        # Explicit UTC offset: the ledger stores timestamptz and a naive string is read
+        # in the server's zone, which silently selects the wrong window.
+        return time.strftime("%Y-%m-%dT%H:%M:%S+00", time.gmtime(time.time() - 5))
+
+    @staticmethod
+    def _bill(control_plane_url, admin_headers, since) -> list[dict]:
+        r = httpx.get(
+            f"{control_plane_url}/admin/spend", headers=admin_headers,
+            params={"since": since}, timeout=TIMEOUT,
+        )
+        assert r.status_code == 200, r.text
+        return r.json()["by_user_and_surface"]
+
+    def test_the_master_key_cannot_buy_inference(self, gateway_url, master_headers):
+        """The administrative credential administers. It does not spend.
+
+        Both inbound dialects, because the terminal surface speaks the Anthropic one and
+        a rule enforced on only one of them is a rule with a documented bypass.
+        """
+        openai_style = httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers=master_headers,
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": f"master {uuid.uuid4().hex}"}]},
+            timeout=TIMEOUT,
+        )
+        assert openai_style.status_code == 403, (
+            f"the gateway master key bought inference: {openai_style.status_code} "
+            f"{openai_style.text[:300]}"
+        )
+        assert "no_attributable_principal" in openai_style.text
+
+        anthropic_style = httpx.post(
+            f"{gateway_url}/v1/messages",
+            headers={**master_headers, "anthropic-version": "2023-06-01"},
+            json={"model": "claude-opus-5", "max_tokens": 32,
+                  "messages": [{"role": "user", "content": f"master {uuid.uuid4().hex}"}]},
+            timeout=TIMEOUT,
+        )
+        assert anthropic_style.status_code == 403, (
+            "the master key bought inference through the Anthropic-native route: "
+            f"{anthropic_style.status_code} {anthropic_style.text[:300]}"
+        )
+
+    def test_a_key_minted_without_an_alias_cannot_buy_inference(
+        self, gateway_url, master_headers
+    ):
+        """The rule is about attribution, not about which credential it is.
+
+        The gateway will happily mint a key with no alias — `key_alias` is optional on
+        `/key/generate`. Such a key produces spend rows the bill cannot name for exactly
+        the same reason the master key did, so it is refused by the same rule. Asserting
+        only the master-key case would leave the hole open one `curl` away.
+        """
+        created = httpx.post(
+            f"{gateway_url}/key/generate", headers=master_headers, json={}, timeout=TIMEOUT,
+        )
+        assert created.status_code == 200, created.text
+        anon = created.json()["key"]
+        try:
+            r = httpx.post(
+                f"{gateway_url}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {anon}"},
+                json={"model": "fake-large",
+                      "messages": [{"role": "user", "content": f"anon {uuid.uuid4().hex}"}]},
+                timeout=TIMEOUT,
+            )
+            assert r.status_code == 403, (
+                f"an alias-less virtual key bought inference: {r.status_code} {r.text[:300]}"
+            )
+        finally:
+            httpx.post(f"{gateway_url}/key/delete", headers=master_headers,
+                       json={"keys": [anon]}, timeout=TIMEOUT)
+
+    def test_the_master_key_still_administers(self, gateway_url, master_headers):
+        """The path this change did NOT touch, asserted rather than assumed.
+
+        Refusing master-key inference by blocking the master key outright would break
+        every mint, every revoke and the catalogue the chat surface reads — a fix worse
+        than the defect, and one that would still look green if only the refusal were
+        tested.
+        """
+        alias = f"adminprobe-{uuid.uuid4().hex[:8]}::ide"
+        created = httpx.post(
+            f"{gateway_url}/key/generate", headers=master_headers,
+            json={"key_alias": alias}, timeout=TIMEOUT,
+        )
+        assert created.status_code == 200, created.text
+
+        listed = httpx.get(
+            f"{gateway_url}/key/list", headers=master_headers,
+            params={"return_full_object": "true", "size": 100}, timeout=TIMEOUT,
+        )
+        assert listed.status_code == 200, listed.text
+
+        catalogue = httpx.get(f"{gateway_url}/v1/models", headers=master_headers,
+                              timeout=TIMEOUT)
+        assert catalogue.status_code == 200, catalogue.text
+        assert catalogue.json()["data"], "the catalogue went empty"
+
+        deleted = httpx.post(f"{gateway_url}/key/delete", headers=master_headers,
+                             json={"key_aliases": [alias]}, timeout=TIMEOUT)
+        assert deleted.status_code == 200, deleted.text
+
+    def test_no_tokens_and_no_money_land_on_the_bill_without_a_principal(
+        self, gateway_url, control_plane_url, admin_headers, master_headers,
+        named_key_headers,
+    ):
+        """The end-to-end invariant, over a window this test knows the whole contents of.
+
+        Drives both kinds of traffic — one named request that must be billed, one
+        anonymous request that must be refused — then reads the bill for that window and
+        checks that every token and every cent in it belongs to somebody.
+        """
+        since = self._window_start()
+
+        # Anonymous attempt: refused, and therefore costs nothing.
+        refused = httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers=master_headers,
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": f"anon spend {uuid.uuid4().hex}"}]},
+            timeout=TIMEOUT,
+        )
+        assert refused.status_code == 403, refused.text
+
+        # Named traffic in the same window. Unique content forces a cache miss: a cache
+        # hit is replayed without writing a spend row, so a fixed prompt would make this
+        # window empty on every run after the first and the invariant vacuous.
+        served = httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers=named_key_headers,
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": f"named spend {uuid.uuid4().hex}"}]},
+            timeout=TIMEOUT,
+        )
+        assert served.status_code == 200, served.text
+
+        # The gateway flushes spend rows on a batch interval; poll rather than sleep.
+        deadline = time.monotonic() + 60
+        rows: list[dict] = []
+        while time.monotonic() < deadline:
+            rows = self._bill(control_plane_url, admin_headers, since)
+            if any(r["prompt_tokens"] + r["completion_tokens"] > 0 for r in rows):
+                break
+            time.sleep(2)
+
+        named = [r for r in rows if r["username"] != "(unattributed)"]
+        billed_tokens = sum(r["prompt_tokens"] + r["completion_tokens"] for r in named)
+        assert billed_tokens > 0, (
+            "no attributed traffic reached the ledger in the window, so the check below "
+            f"would pass without proving anything; rows were {rows}"
+        )
+
+        anonymous = [r for r in rows if r["username"] == "(unattributed)"]
+        for row in anonymous:
+            assert row["spend"] == 0, (
+                f"${row['spend']} was billed to nobody: {row}. A request must not be "
+                "able to reach the gateway, be served, and land on the one bill with no "
+                "principal at all."
+            )
+            assert row["prompt_tokens"] + row["completion_tokens"] == 0, (
+                f"{row['prompt_tokens'] + row['completion_tokens']} tokens were consumed "
+                f"by nobody: {row}. Tokens counted against no principal means the "
+                "request was served, and a served request must name its caller."
+            )
+
+    def test_the_bill_still_names_the_surface_that_spent(
+        self, control_plane_url, admin_headers, gateway_url, named_key_headers
+    ):
+        """The path this change did NOT touch: ordinary attribution still works.
+
+        A refusal rule is easy to get right by refusing too much. This asserts the case
+        that must keep passing — a real caller's spend arriving under their own name and
+        their own surface — in the same window as the refusal above.
+        """
+        since = self._window_start()
+        r = httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers=named_key_headers,
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": f"still works {uuid.uuid4().hex}"}]},
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 200, r.text
+
+        deadline = time.monotonic() + 60
+        row = None
+        while time.monotonic() < deadline:
+            row = next(
+                (b for b in self._bill(control_plane_url, admin_headers, since)
+                 if b["username"].startswith("suitecaller-")),
+                None,
+            )
+            if row:
+                break
+            time.sleep(2)
+
+        assert row is not None, "a named caller's spend never appeared in the bill"
+        assert row["surface"] == "terminal", row
+        assert row["prompt_tokens"] + row["completion_tokens"] > 0, row
+
+
 class TestPricingIntegrity:
     """Regression guard for a silent-money defect found while building this row.
 
@@ -466,7 +701,7 @@ class TestPricingIntegrity:
     """
 
     def test_configured_models_record_nonzero_spend(
-        self, gateway_url, control_plane_url, admin_headers, master_headers
+        self, gateway_url, control_plane_url, admin_headers, named_key_headers
     ):
         # Explicit UTC offset — the ledger stores timestamptz, and a naive string would
         # be read in the server's zone and silently select the wrong window.
@@ -474,7 +709,7 @@ class TestPricingIntegrity:
         for model in ("fake-large", "fake-small", "claude-opus-5"):
             r = httpx.post(
                 f"{gateway_url}/v1/chat/completions",
-                headers=master_headers,
+                headers=named_key_headers,
                 json={"model": model, "messages": [{"role": "user", "content": "price me"}]},
                 timeout=TIMEOUT,
             )
@@ -751,11 +986,12 @@ class TestItem8RunsWithoutProviderAccount:
         assert not env.get("ANTHROPIC_API_KEY"), "test asserts the no-account path"
         assert not env.get("OPENAI_API_KEY"), "test asserts the no-account path"
 
-    def test_traffic_still_flows(self, gateway_url, master_headers):
+    def test_traffic_still_flows(self, gateway_url, named_key_headers):
         r = httpx.post(
             f"{gateway_url}/v1/chat/completions",
-            headers=master_headers,
-            json={"model": "fake-large", "messages": [{"role": "user", "content": "no account"}]},
+            headers=named_key_headers,
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": f"no account {uuid.uuid4().hex}"}]},
             timeout=TIMEOUT,
         )
         assert r.status_code == 200, r.text

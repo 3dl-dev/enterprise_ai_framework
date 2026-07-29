@@ -690,3 +690,83 @@ directory with dots in its name is not. Project depth is untouched: that is wher
 of `62-published.yaml` over a tree holding both layouts, and asserts the returned bytes —
 including for a user who has residue *and* a live project, which is the case an
 over-broad fix silently takes offline.
+
+### 36. The gateway's root credential was also a valid inference credential, so money could be spent by nobody
+
+**Found by:** bisecting `GET /admin/spend?since=` against the live cluster, then reading
+the raw ledger. Not by reasoning; the reasoning available at the time said this was
+history.
+
+`(unattributed)` held 42 requests and $0.113342, and finding 25 explained that bucket as
+rows written before the alias metadata existed — harmless residue. Bisecting the window
+said otherwise:
+
+```
+since -48h   unattributed = 42 req  $0.113342     (all of it)
+since -24h   unattributed = 25 req  $0.110581     (98% of the money)
+since -18h   unattributed = 25 req
+since -16h   unattributed =  0 req
+```
+
+25 requests — 98% of the unattributed money — fell in a two-hour window on 2026-07-28
+between 21:31Z and 23:31Z, on a cluster deployed some 44 hours before the measurement.
+Not setup traffic. `/admin/export/spend` over the same window showed `glm-5.2@deepinfra`
+at 16k–55k tokens a request, `deepseek-v3.2@deepinfra`, `glm-4.7-flash@deepinfra`, and a
+burst of one-shot model probes. Somebody was working, and nobody was named against it.
+
+**The mechanism.** Every one of those rows carries the same `api_key`:
+
+```
+api_key                       = c8c29e12b4e50a3139fc805172e0a5e2091f4cb62f9cc16cb3aea8b7eef4a560
+metadata.user_api_key_alias   = null
+metadata.user_api_key_user_id = "default_user_id"
+```
+
+That hash is `sha256(GATEWAY_MASTER_KEY)`. The gateway's *administrative root credential*
+was also a valid credential on `/v1/chat/completions` and `/v1/messages`. It has no
+`LiteLLM_VerificationToken` row to join to and stamps no alias on the spend row, so the
+bill had nothing to name — through any rendering, ever.
+
+Two consequences, the second worse than the first:
+
+- **Attribution.** Real money lands on the one bill belonging to nobody.
+- **Budgets.** Budgets bind to virtual keys. A credential with no key row has no budget
+  and can never exhaust one, so the single admission point admits it without limit. The
+  budget-stop outcome was never false, but it was never *reachable* on this path.
+
+This is a third distinct defect in the same column, and the distinction matters because
+the first two were fixed and did not cover it. Finding 25: a principal that exists, whose
+rows were orphaned when revocation deleted the key. Finding 34: a principal that exists,
+named differently by the console and the CLI. Finding 36: no principal at all.
+
+**Fixed by** `deploy/gateway/require_principal.py`, a LiteLLM `async_pre_call_hook` that
+refuses any inference request whose credential carries no key alias — the master key, and
+equally any virtual key minted without one, since `key_alias` is optional on
+`/key/generate` and an alias-less key produces exactly the same unnamable rows. Refusal
+rather than a better label: attributing this spend to a synthetic `(root)` principal would
+have made the number attributable-*looking* while naming none of the processes holding the
+key, and would have restored neither budget enforcement nor revocation. The hook fires
+only on the inference call types, so the master key keeps its actual job — minting,
+revoking, and serving `/v1/models` — and merely stops being able to buy tokens.
+
+Our own hermetic suite was one of the callers. Four tests drove `/v1/chat/completions`
+with `master_headers` because it was the credential at hand, which is precisely how a
+scripted path ends up holding root. They now mint a `username::surface` key like a real
+caller (`named_key_headers`), per test rather than per session, because the exit-path test
+revokes every key in the deployment.
+
+**Regression test:** `TestAttributableSpendOnly`, five tests. Two of them assert the paths
+this change did *not* touch — the master key still mints, lists, deletes and reads the
+catalogue; a named caller's spend still arrives under their own name and surface — because
+a refusal rule is easy to get right by refusing too much, and that fix would still look
+green if only the refusal were tested.
+
+**A trap in the assertion, worth stating.** "The `(unattributed)` bucket is empty" is the
+wrong check and would be red on a healthy system. LiteLLM writes a `status = 'failure'`
+row for a request its pre-call hook rejected, with zero spend, zero tokens and — by
+construction — no alias. So refusals keep landing in that bucket, correctly: they cost
+nobody anything and name nobody. What must hold is that nothing in the bucket ever
+*consumed* anything, and that is what the test asserts, over a window it also proves is
+non-empty and attributed. Measured with the hook disabled, a single master-key request put
+`$0.000198` and 22 tokens into that bucket, so the assertion is a real detector rather than
+a restatement of the 403 above it.

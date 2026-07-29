@@ -56,7 +56,41 @@ def admin_headers(env) -> dict:
 
 @pytest.fixture(scope="session")
 def master_headers(env) -> dict:
+    """The gateway's administrative credential. Mints and revokes keys; cannot buy tokens.
+
+    Inference with this key is refused by deploy/gateway/require_principal.py, so any test
+    that needs to make a request uses `named_key_headers` instead. That is not a test
+    inconvenience — it is the property under test. See TestAttributableSpendOnly.
+    """
     return {"Authorization": f"Bearer {env['GATEWAY_MASTER_KEY']}"}
+
+
+@pytest.fixture
+def named_key_headers(gateway_url, master_headers):
+    """A virtual key with a real `username::surface` alias — what a caller actually holds.
+
+    Minted per test rather than per session on purpose: the exit-path test revokes every
+    key in the deployment, so a shared key turns every test that runs after it red, and
+    which tests those are depends on collection order. tests-live/conftest.py hit exactly
+    that and recorded it; this avoids inheriting the same intermittent failure.
+    """
+    import uuid
+
+    import httpx
+
+    alias = f"suitecaller-{uuid.uuid4().hex[:8]}::terminal"
+    created = httpx.post(
+        f"{gateway_url}/key/generate",
+        headers=master_headers,
+        json={"key_alias": alias, "metadata": {"surface": "terminal", "issuer": "test-suite"}},
+        timeout=60,
+    )
+    assert created.status_code == 200, created.text
+    yield {"Authorization": f"Bearer {created.json()['key']}"}
+    httpx.post(
+        f"{gateway_url}/key/delete", headers=master_headers,
+        json={"key_aliases": [alias]}, timeout=60,
+    )
 
 
 def compose(*args: str, check=True) -> subprocess.CompletedProcess:

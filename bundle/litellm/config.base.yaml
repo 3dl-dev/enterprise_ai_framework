@@ -60,7 +60,13 @@ litellm_settings:
   # thought in a separate reasoning_content field, the provider ignores every documented
   # flag to disable it, and aider renders it unconditionally — so it has to be removed
   # here, once, for every surface. Source and full reasoning: deploy/gateway/strip_reasoning.py
-  callbacks: ["strip_reasoning.handler"]
+  #
+  # require_principal refuses any inference request whose credential carries no key
+  # alias — the master key most of all. Found by reading the live ledger: 42 requests
+  # and $0.11 of real agent traffic had been served against the master key, which has no
+  # LiteLLM_VerificationToken row and stamps no alias, so the bill could name nobody and
+  # no budget applied. Source and full reasoning: deploy/gateway/require_principal.py
+  callbacks: ["strip_reasoning.handler", "require_principal.handler"]
   # Every request gets a spend row. This is the ledger the control plane reads for
   # the one bill (scope item 4) — without it, spend-by-user-and-surface returns nothing.
   success_callback: ["postgres"]
