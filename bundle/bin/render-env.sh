@@ -131,11 +131,16 @@ set -a; . ./.env; set +a
 # as environment variables the way the other services take theirs.
 if [[ ! -f keycloak/realm-export.json ]]; then
     echo "rendering keycloak/realm-export.json"
+    # CHAT_PORT is baked into the chat client's redirectUris/webOrigins (enterpriseaiframework-0e3):
+    # Keycloak validates redirect_uri by exact host+port match, so a worktree bundle whose
+    # CHAT_PORT differs from the template's fixed default got a 400 on every login test —
+    # found by actually running two concurrent bundles, not by inspection.
     sed -e "0,/REPLACED_AT_BUNDLE_UP/s||${IDP_CLIENT_SECRET}|" \
         -e "s|REPLACED_AT_BUNDLE_UP|${CHAT_CLIENT_SECRET}|" \
+        -e "s|REPLACED_CHAT_PORT_AT_BUNDLE_UP|${CHAT_PORT:-3080}|g" \
         keycloak/realm-export.template.json > keycloak/realm-export.json
 
-    if grep -q REPLACED_AT_BUNDLE_UP keycloak/realm-export.json; then
+    if grep -qE 'REPLACED_AT_BUNDLE_UP|REPLACED_CHAT_PORT_AT_BUNDLE_UP' keycloak/realm-export.json; then
         echo "error: realm template still has unreplaced placeholders" >&2
         exit 1
     fi
