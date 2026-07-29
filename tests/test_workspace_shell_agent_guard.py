@@ -13,14 +13,27 @@ each add another agent process inside a pod capped at 1 CPU
 is not a tuning knob). dogfood-findings.md finding 33 saw exactly this shape: a context
 leak piled a dozen agents into one pod until it answered 429.
 
-The fake agent is a python-shebang script rather than a bash one on purpose: opencode
-ships as a standalone binary in the real image (argv[0] IS "opencode"), but the guard's
-fallback branch — the one that also matches a python-interpreter's argv[1] — is the same
-branch shell-server.py's own AGENT_NAMES scan already uses for both names symmetrically.
-Exercising that branch here proves it actually works, not just that it parses.
+Two flavors of double, exercising the guard's TWO detection branches separately:
+
+  * FAKE_OPENCODE (the `rig` fixture below) is a python-shebang script. The kernel execs
+    a script's shebang interpreter, so /proc/<pid>/cmdline[0] is "python3" and cmdline[1]
+    is the script — this exercises agent_pid_for_project()'s `python*) ... argv[1]`
+    fallback branch, the same one shell-server.py's own AGENT_NAMES scan uses for both
+    agent names symmetrically.
+
+  * A symlink to /bin/cat (the `rig_real_binary` fixture, further down) is a real ELF
+    binary with no shebang — invoked through a PATH lookup as "opencode", the kernel
+    execs it directly under argv[0]="opencode", nothing in front. This exercises the
+    PRIMARY `case "$argv0" in opencode|aider)` branch, which is what the real opencode
+    binary shipped in the image actually hits (it is a standalone executable, not a
+    script — confirmed by reading deploy/workspace/Dockerfile's COPY line).
+
+A wave-3 veracity review of an earlier version of this file found that only the fallback
+branch was ever exercised; the second fixture and its tests close that gap.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -222,3 +235,233 @@ def test_reconnect_after_the_agent_exits_resumes_rather_than_refusing(rig):
 
     assert started2 != started1
     assert "--continue" in rig.argv_for(started2).split()
+
+
+# ---------------------------------------------------------------------------------------
+# PRIMARY DETECTION PATH — argv[0] IS "opencode", no interpreter in front of it.
+#
+# A wave-3 veracity review of this file's first version found a real coverage gap: the
+# FAKE_OPENCODE double above is a python-shebang script. When the kernel execs a script,
+# it execs the INTERPRETER named in the shebang line, so /proc/<pid>/cmdline[0] is
+# "/usr/bin/python3" and cmdline[1] is the script path — every test above this line
+# therefore only ever exercises agent_pid_for_project()'s `python*) ... argv[1]` fallback
+# branch. The PRIMARY branch — `case "$argv0" in opencode|aider)`, which is what fires
+# against the real opencode binary shipped in the image (a standalone executable, not a
+# script; confirmed by reading deploy/workspace/Dockerfile's COPY line, not asserted) —
+# was never once hit by any test.
+#
+# Fixed here without adding a compiler dependency to the test suite: /bin/cat is a real
+# ELF binary with no shebang (verified: `file /bin/cat` on the machine that ran this
+# fix). A symlink named "opencode" pointing at it, invoked through a PATH lookup, makes
+# the kernel exec cat's ELF image directly under argv[0]="opencode" — no interpreter
+# step, exactly the shape of the real binary. `cat` with zero arguments blocks reading
+# its own stdin, which stands in for "a real long-lived agent still attached to its
+# connection" as long as the test keeps that stdin pipe open. The project directories
+# below are always fresh (no .session marker, no opencode.json), so workspace-shell
+# invokes the double as a bare `opencode` with no arguments — cat never sees a flag it
+# would reject.
+# ---------------------------------------------------------------------------------------
+
+
+def _live_pids_matching_argv0(target_dir: str, name: str) -> set[str]:
+    """Independent ground truth, not a call into the guard under test: scan /proc
+    ourselves for a process whose cwd is target_dir and whose argv[0] basename is
+    exactly `name` with nothing in front of it (the primary-branch shape). If this
+    ever found matches via an interpreter's argv[1] instead, it would not be testing
+    what this section claims to test — so, deliberately, it only ever looks at argv[0].
+    """
+    pids = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            cwd = os.path.realpath(f"/proc/{entry}/cwd")
+            if cwd != target_dir:
+                continue
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                cmdline = fh.read()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        argv0 = cmdline.split(b"\x00", 1)[0]
+        if os.path.basename(argv0.decode(errors="replace")) == name:
+            pids.add(entry)
+    return pids
+
+
+@pytest.fixture
+def rig_real_binary(tmp_path):
+    """Same shape as `rig`, but the opencode double is a real ELF binary (a symlink to
+    /bin/cat) instead of a script, so the guard's primary argv[0]-is-"opencode" branch
+    is what actually fires — not the python-interpreter fallback the other fixture
+    exercises."""
+    cat_path = shutil.which("cat") or "/bin/cat"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    os.symlink(cat_path, bin_dir / "opencode")
+
+    def set_active(name: str) -> str:
+        project_dir = projects_root / name
+        project_dir.mkdir(exist_ok=True)
+        (projects_root / ".active").write_text(name + "\n")
+        return os.path.realpath(str(project_dir))
+
+    def connect_blocking() -> subprocess.Popen:
+        """Starts a connection whose agent double blocks (reading its own stdin, kept
+        open) until `release` closes that pipe — standing in for an agent still
+        attached to a live connection."""
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        env["WS_PROJECTS_ROOT"] = str(projects_root)
+        env["WS_USER"] = "tester"
+        env.pop("WS_NO_AUTOSTART", None)
+        env.pop("WS_AGENT", None)
+        return subprocess.Popen(
+            ["/bin/bash", str(WORKSPACE_SHELL)],
+            env=env, cwd=str(tmp_path),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+
+    def connect_refused() -> subprocess.Popen:
+        """A connection that is expected to be refused by the guard before it ever
+        tries to launch an agent — safe to use a closed/throwaway stdin for these."""
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        env["WS_PROJECTS_ROOT"] = str(projects_root)
+        env["WS_USER"] = "tester"
+        env.pop("WS_NO_AUTOSTART", None)
+        env.pop("WS_AGENT", None)
+        return subprocess.Popen(
+            ["/bin/bash", str(WORKSPACE_SHELL)],
+            env=env, cwd=str(tmp_path),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+
+    def wait_live(project_dir: str, count: int, timeout: float = TIMEOUT) -> set[str]:
+        deadline = time.time() + timeout
+        pids: set[str] = set()
+        while time.time() < deadline:
+            pids = _live_pids_matching_argv0(project_dir, "opencode")
+            if len(pids) >= count:
+                return pids
+            time.sleep(0.02)
+        raise AssertionError(
+            f"expected {count} live opencode(argv0) process(es) under {project_dir} "
+            f"within {timeout}s, found {sorted(pids)}"
+        )
+
+    def release(proc: subprocess.Popen) -> None:
+        # Closing our end of the stdin pipe delivers EOF to cat (and to whatever the
+        # script execs afterwards), which is what makes the double — and then the
+        # wrapping shell — actually exit instead of hanging the test.
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        proc.wait(timeout=TIMEOUT)
+
+    class Rig:
+        pass
+
+    r = Rig()
+    r.set_active = set_active
+    r.connect_blocking = connect_blocking
+    r.connect_refused = connect_refused
+    r.wait_live = wait_live
+    r.live_pids = _live_pids_matching_argv0
+    r.release = release
+    return r
+
+
+def test_primary_branch_refuses_a_second_real_binary_connection(rig_real_binary):
+    """The gap wave-3 named: with a REAL binary double (argv[0] literally "opencode",
+    no interpreter), a second connection to the same project must still be refused, and
+    the live process count for that project directory must stay at 1."""
+    r = rig_real_binary
+    project_dir = r.set_active("shared-real")
+    proc1 = r.connect_blocking()
+    try:
+        live = r.wait_live(project_dir, 1)
+        assert len(live) == 1
+        pid1 = next(iter(live))
+
+        for _ in range(3):
+            proc2 = r.connect_refused()
+            out, _ = proc2.communicate(timeout=TIMEOUT)
+            assert proc2.returncode == 0
+            assert "already running" in out
+            assert pid1 in out
+            # Ground truth via our OWN /proc scan, independent of the guard's message:
+            # still exactly one live process for this project.
+            assert r.live_pids(project_dir, "opencode") == {pid1}
+    finally:
+        r.release(proc1)
+
+
+def test_primary_branch_pre_fix_script_lets_the_duplicate_through(tmp_path):
+    """DEMONSTRATED, not asserted: run the identical scenario above against the
+    PRE-FIX script (the parent commit, before this guard existed) and show the process
+    count for one project actually grows past 1 — the amplification finding-33 shape,
+    reproduced through the real-binary double this time, not just the python one."""
+    pre_fix_script = tmp_path / "workspace-shell-pre-fix"
+    content = subprocess.run(
+        ["git", "show", "8c4ffd2:deploy/workspace/workspace-shell"],
+        cwd=REPO_ROOT, capture_output=True, text=True, timeout=TIMEOUT, check=True,
+    ).stdout
+    assert "agent_pid_for_project" not in content, (
+        "picked a commit that already has the guard — this test would prove nothing"
+    )
+    pre_fix_script.write_text(content)
+    pre_fix_script.chmod(0o755)
+
+    cat_path = shutil.which("cat") or "/bin/cat"
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    os.symlink(cat_path, bin_dir / "opencode")
+
+    project_dir = projects_root / "shared-real"
+    project_dir.mkdir()
+    (projects_root / ".active").write_text("shared-real\n")
+    project_dir_real = os.path.realpath(str(project_dir))
+
+    def connect(stdin) -> subprocess.Popen:
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+        env["WS_PROJECTS_ROOT"] = str(projects_root)
+        env["WS_USER"] = "tester"
+        env.pop("WS_NO_AUTOSTART", None)
+        env.pop("WS_AGENT", None)
+        return subprocess.Popen(
+            ["/bin/bash", str(pre_fix_script)],
+            env=env, cwd=str(tmp_path),
+            stdin=stdin,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+
+    proc1 = connect(subprocess.PIPE)
+    proc2 = connect(subprocess.PIPE)
+    try:
+        deadline = time.time() + TIMEOUT
+        pids: set[str] = set()
+        while time.time() < deadline:
+            pids = _live_pids_matching_argv0(project_dir_real, "opencode")
+            if len(pids) >= 2:
+                break
+            time.sleep(0.02)
+        # Pre-fix: nothing stopped the second connection from starting its own agent.
+        assert len(pids) == 2, (
+            f"expected the unfixed script to let a second agent start (finding-33's "
+            f"shape); found {sorted(pids)} live for {project_dir_real}"
+        )
+    finally:
+        for p in (proc1, proc2):
+            try:
+                p.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            p.wait(timeout=TIMEOUT)
