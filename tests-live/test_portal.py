@@ -8,6 +8,7 @@ every surface, so a test that skipped the login would be testing the wrong thing
 import base64
 import re
 import subprocess
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -130,12 +131,82 @@ def test_keys_are_only_this_users(client, base_url, creds):
 
 
 def test_published_list_is_scoped(client, base_url, creds):
+    """enterpriseaiframework-51f: the earlier version of this test asserted the SHAPE of
+    the returned URL (does it contain `/live/<user>/`?) and never fetched it. That passes
+    against a listing entry pointing at content the current code no longer produces —
+    the presence check and the correctness check are different claims, and only the first
+    was being made. Fetch what is actually served at each link.
+    """
     r = client.get(f"{base_url}/portal/api/published")
     assert r.status_code == 200
     d = r.json()
     assert d["username"] == creds[0]
+    assert d["projects"], (
+        "the test account has nothing published — this test cannot prove scoping over "
+        "an empty list; publish something for the live-test account first"
+    )
     for p in d["projects"]:
         assert f"/live/{creds[0]}/" in p["url"], f"link escapes this user: {p['url']}"
+        served = client.get(p["url"], follow_redirects=False)
+        assert served.status_code == 200, (
+            f"the portal listed {p['url']} but it does not serve: {served.status_code}"
+        )
+        assert len(served.content) > 0, f"{p['url']} listed but served an empty body"
+        # A per-project leaf must be the published page itself, not the directory index
+        # one level up. That confusion is exactly how a leftover artefact from before the
+        # per-project move stays reachable while looking like it belongs to this listing.
+        path = urlsplit(p["url"]).path
+        assert f"Index of {path}" not in served.text, (
+            f"{p['url']} served a directory index, not the published project"
+        )
+
+
+def test_no_published_user_has_a_leftover_pre_migration_artifact(client, base_url):
+    """The negative case from enterpriseaiframework-7bc, high severity: a bare
+    /live/<user>/ path (no project segment) must be a directory index or an explicit
+    404/410 — never a page left over from before publish moved to per-project paths.
+
+    /live/ needs no login at all — that is the point of it, a parent has no Keycloak
+    account — so this walks EVERY published user's directory rather than only the
+    signed-in test account's own scoped links. test_published_list_is_scoped above only
+    ever looks at what /portal/api/published RETURNS for the current user, and that
+    listing is itself built by parsing /listing/<user>/ as JSON (see portal.py
+    my_published): when nginx serves a leftover index.html there instead of the JSON
+    autoindex, resp.json() raises, the handler's bare `except Exception: pass` swallows
+    it, and the user's own published panel silently reports zero projects — so a check
+    confined to that response never reaches the broken directory at all. The stale page
+    is still public at /live/<user>/ regardless of what the JSON listing says, which is
+    why this test drives the public path directly instead of going through the listing.
+
+    OBSERVED LIVE against this cluster while writing this test: /live/baron/ returns 200
+    text/html titled "Pink Unicorn" — a flat-layout leftover — while /live/student/
+    correctly returns nginx's autoindex ("Index of /live/student/"). This test is
+    expected to FAIL until enterpriseaiframework-7bc is fixed; that failure is the proof
+    it would have caught the finding, not a regression introduced here.
+    """
+    root = client.get(f"{base_url}/live/", follow_redirects=False)
+    assert root.status_code == 200, f"/live/ itself did not load: {root.status_code}"
+    names = sorted({
+        name for name in re.findall(r'<a href="([^"]+)/">', root.text) if name != ".."
+    })
+    assert names, "no published users found under /live/ — nothing for this test to check"
+
+    stale = []
+    for name in names:
+        r = client.get(f"{base_url}/live/{name}/", follow_redirects=False)
+        if r.status_code in (404, 410):
+            continue
+        if r.status_code == 200 and f"Index of /live/{name}/" in r.text:
+            continue
+        title = re.search(r"<title>([^<]*)</title>", r.text)
+        stale.append(
+            f"/live/{name}/ -> {r.status_code}"
+            + (f" titled {title.group(1)!r}" if title else "")
+        )
+    assert not stale, (
+        "leftover pre-migration artefact(s) reachable, serving content instead of a "
+        "directory index or 404: " + "; ".join(stale)
+    )
 
 
 def test_the_admin_api_is_not_reachable_by_a_signed_in_browser(client, base_url):
