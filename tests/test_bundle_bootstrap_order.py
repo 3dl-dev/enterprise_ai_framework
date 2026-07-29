@@ -15,11 +15,19 @@ IDP_PUBLIC_HOST was never written. identity then started with a malformed KC_HOS
 The fix is the order, not the scripts: render-env.sh before make-certs.sh. This runs both
 REAL scripts, unmodified, in a scratch directory shaped like `bundle/` (so their own
 `cd "$(dirname "$0")/.."` lands them in the right place) — first in the OLD order, to prove
-the bug actually reproduces and is not merely inferred from reading the scripts, then in
-the FIXED order, to prove the fix actually closes it. A test that only exercised the fixed
-order would not have caught this regression if the bug returns from a future edit; a test
-that only re-derives the failure from reading the scripts would not survive Testing
-Supremacy's "demonstrate, don't assert."
+the ordering dependency actually bites and is not merely inferred from reading the scripts,
+then in the FIXED order, to prove the fix actually closes it. A test that only exercised
+the fixed order would not have caught this regression if the bug returns from a future
+edit; a test that only re-derives the failure from reading the scripts would not survive
+Testing Supremacy's "demonstrate, don't assert."
+
+SECOND FIX, MERGED IN LATER, and it changed what the wrong order does.
+`enterpriseaiframework-d58` found the same bug independently and fixed it from the other
+end: make-certs.sh now exits 1 with a message naming render-env.sh instead of silently
+falling through when .env is absent. The wrong order therefore no longer produces a
+malformed bundle — it refuses to proceed. `test_the_broken_order_now_fails_loudly_instead_of_silently`
+was updated to assert the refusal rather than the silence; see its docstring for why that
+is a strengthening rather than a weakening.
 """
 
 from __future__ import annotations
@@ -76,27 +84,55 @@ def _idp_public_host(env_path: Path) -> str | None:
     return None
 
 
-def test_the_broken_order_actually_reproduces_the_bug(tmp_path):
-    """make-certs.sh before render-env.sh, on a worktree with no .env yet: the original
-    failure, reproduced against the real scripts rather than inferred from reading them.
+def test_the_broken_order_now_fails_loudly_instead_of_silently(tmp_path):
+    """make-certs.sh before render-env.sh, on a worktree with no .env yet.
+
+    UPDATED, AND THE UPDATE IS THE POINT — do not "fix" this back. This test used to
+    assert that the broken order exits 0 and silently writes nothing, because that is
+    exactly what it did when the bug was found (enterpriseaiframework-cbf): all three
+    branches fell through in silence and nothing noticed until Keycloak died on
+    "https://:8443" ten containers later.
+
+    enterpriseaiframework-d58 then fixed the same bug from the other end, independently:
+    make-certs.sh now refuses to run at all without a .env instead of skipping. Both
+    changes are right and they compose — the Makefile ordering fix means the refusal is
+    never reached in a correct invocation, and the refusal means that if the ordering
+    regresses it stops the build with a message naming the fix, rather than producing a
+    bundle that cannot start.
+
+    So the assertion moved from "silently does nothing" to "loudly refuses", which is a
+    strictly stronger guarantee about the same ordering dependency. What has NOT changed
+    is what this test exists to prove: the dependency is real, and it is demonstrated by
+    running the real scripts in the wrong order rather than inferred from reading them.
     """
     scratch = _scratch_bundle(tmp_path)
     assert not (scratch / ".env").exists()
 
     certs = _run(scratch / "bin" / "make-certs.sh", scratch)
-    assert certs.returncode == 0, certs.stderr
-    # make-certs.sh does not create .env itself — confirms the `elif [[ -f .env ]]` branch
-    # really did nothing, not that it silently failed some other way.
+    assert certs.returncode != 0, (
+        "make-certs.sh ran without a .env and did not complain. That is the silent "
+        "fall-through this bug was made of: IDP_PUBLIC_HOST goes unwritten, compose "
+        "resolves KC_HOSTNAME to 'https://:8443', and identity crash-loops ten "
+        f"containers later.\nstdout: {certs.stdout}\nstderr: {certs.stderr}"
+    )
+    assert "render-env.sh" in certs.stderr, (
+        "the refusal must name the script that fixes it — an error that does not say "
+        f"what to run next is how this cost an afternoon the first time: {certs.stderr}"
+    )
+    # It refused; it did not half-write something. .env is still absent, so render-env.sh
+    # is still free to create it from scratch.
     assert not (scratch / ".env").exists()
 
+    # And the ordering dependency is genuinely one-way: render-env.sh needs nothing from
+    # make-certs.sh, so the correct order recovers with no trace of the failed attempt.
     env = _run(scratch / "bin" / "render-env.sh", scratch)
     assert env.returncode == 0, env.stderr
     assert (scratch / ".env").exists()
-
-    assert _idp_public_host(scratch / ".env") is None, (
-        "expected the original bug to reproduce (IDP_PUBLIC_HOST never written) — if this "
-        "fails, either the scripts changed in a way that already fixes the ordering "
-        "dependency, or this test's reproduction is no longer valid and needs re-checking"
+    certs = _run(scratch / "bin" / "make-certs.sh", scratch)
+    assert certs.returncode == 0, certs.stderr
+    assert _idp_public_host(scratch / ".env"), (
+        "after the correct order, IDP_PUBLIC_HOST must be set — the recovery from the "
+        "wrong order must be complete, not partial"
     )
 
 
