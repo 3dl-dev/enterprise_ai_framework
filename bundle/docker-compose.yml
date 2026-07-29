@@ -125,6 +125,7 @@ services:
       # raises ImportError at startup and crash-loops. Same file the cluster mounts.
       - ../deploy/gateway/strip_reasoning.py:/app/strip_reasoning.py:ro
       - ../deploy/gateway/require_principal.py:/app/require_principal.py:ro
+      - ../deploy/gateway/flush_spend_on_shutdown.py:/app/flush_spend_on_shutdown.py:ro
     ports:
       - "${GATEWAY_PORT:-4000}:4000"
     depends_on:

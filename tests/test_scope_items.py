@@ -1280,7 +1280,7 @@ class TestCacheHitsBudgetAndTheBill:
     # refused and false of what breaks downstream, and each test now names which it means.
     #
     # The third was left asserted as it BEHAVED, pending the product decision raised as
-    # enterpriseaiframework-e69 / finding 40. That decision is now made: it stays in
+    # enterpriseaiframework-e69 / finding 41. That decision is now made: it stays in
     # `requests` and is named by `failed_requests`. The tests for it are in
     # TestFailedRequestsAreNamedNotErased below, and the ruling with its rejected
     # alternative is in metering._FAILED.
@@ -1410,7 +1410,7 @@ class TestCacheHitsBudgetAndTheBill:
         )
         assert row["failed_requests"] == failures, (
             f"the failures are in `requests` but nothing says so — which is the whole "
-            f"defect finding 40 recorded: {row}"
+            f"defect finding 41 recorded: {row}"
         )
         assert row["cached_requests"] == 0, (
             f"a failed request was reported to the operator as a FREE request. Nothing "
@@ -1575,7 +1575,7 @@ class TestCacheHitsBudgetAndTheBill:
 
 
 class TestFailedRequestsAreNamedNotErased:
-    """enterpriseaiframework-e69 / finding 40 — the second kind of $0 row.
+    """enterpriseaiframework-e69 / finding 41 — the second kind of $0 row.
 
     THE RULING THIS CLASS LOCKS IN, and the founder may reverse it. `requests` counts
     every request the gateway ADMITTED, and each way of costing nothing gets a named
@@ -1588,7 +1588,7 @@ class TestFailedRequestsAreNamedNotErased:
     count, and a provider erroring on half its traffic shows up as a quiet dip in usage
     rather than as an error rate. So `test_the_request_count_is_not_quietly_reduced`
     asserts the losing option was not taken, deliberately. If a later change implements
-    it, that test fails and sends whoever did it back to finding 40 to reverse the ruling
+    it, that test fails and sends whoever did it back to finding 41 to reverse the ruling
     on purpose rather than by accident.
 
     WHY THE GUARD TESTS LOOK PARANOID. d58 shipped `cached_requests` and the adversary's
@@ -1640,7 +1640,7 @@ class TestFailedRequestsAreNamedNotErased:
         assert row["requests"] == 4, (
             f"e69 ruled that `requests` counts admitted requests, failures included, and "
             f"names them in failed_requests. This reads {row['requests']}. If that was "
-            f"deliberate, finding 40's ruling has been reversed — say so there and in "
+            f"deliberate, finding 41's ruling has been reversed — say so there and in "
             f"metering._FAILED, and fix this test on purpose: {row}"
         )
         assert row["failed_requests"] == 3, row

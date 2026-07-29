@@ -229,7 +229,7 @@ def test_the_csv_header_carries_both_columns_in_a_stable_order():
 
 
 # ---------------------------------------------------------------------------
-# Which $0 rows the archive can explain (enterpriseaiframework-e69 / finding 40)
+# Which $0 rows the archive can explain (enterpriseaiframework-e69 / finding 41)
 # ---------------------------------------------------------------------------
 
 def test_a_failed_row_is_distinguishable_from_a_free_one_in_the_archive():

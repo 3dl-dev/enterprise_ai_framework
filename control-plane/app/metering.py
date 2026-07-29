@@ -157,9 +157,9 @@ _CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
 # A third and fourth way exist and never reach the ledger at all: over budget, and a model
 # not on the key's list. Both are refused in LiteLLM's `user_api_key_auth`, a route
 # dependency that runs before the router, so no row is ever written and the bill neither
-# counts nor charges them. Measured, one fresh key per class, in finding 40.
+# counts nor charges them. Measured, one fresh key per class, in finding 41.
 #
-# THE RULING (enterpriseaiframework-e69, and the founder may reverse it — see finding 40).
+# THE RULING (enterpriseaiframework-e69, and the founder may reverse it — see finding 41).
 # `requests` counts every request the gateway ADMITTED, and each way of costing nothing
 # gets its own named subtotal beside it. It does NOT become a count of requests that
 # succeeded.
