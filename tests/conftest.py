@@ -12,7 +12,52 @@ from pathlib import Path
 
 import pytest
 
+import artifact_freshness
+
 BUNDLE = Path(__file__).resolve().parent.parent / "bundle"
+
+GATEWAY_CONFIG_BASE = BUNDLE / "litellm" / "config.base.yaml"
+GATEWAY_CONFIG_GENERATED = BUNDLE / "litellm" / "config.generated.yaml"
+
+
+def _refuse_to_run_against_a_stale_render() -> None:
+    """Precondition, checked before any test collects. See tests/artifact_freshness.py.
+
+    config.generated.yaml is gitignored and is rendered from config.base.yaml only by
+    `make up`, so `make test` on a fresh merge tests a gateway that never loaded the new
+    configuration. Twice in two merges (d98, 3f3) that surfaced as four unrelated failures
+    about spend attribution and a callback, and cost a red gate on a correct merge both
+    times. Running the suite at all against a stale render is worse than not running it:
+    it produces a confident wrong answer about the merge.
+
+    Deliberately `pytest.exit` and not a test. A test would land as one more line in a
+    list of failures caused by the very same staleness, which is the diagnosis cost this
+    is meant to remove — the point is that nothing else runs and the only thing on screen
+    says `make up`. The logic itself is covered by tests/test_artifact_freshness.py, which
+    exercises it against fixtures rather than against the live bundle.
+    """
+    if not GATEWAY_CONFIG_GENERATED.exists():
+        pytest.exit(
+            f"{GATEWAY_CONFIG_GENERATED} missing — run "
+            "`env -u FORGE_API_KEY -u FORGE_ADMIN_KEY make up` first",
+            returncode=2,
+        )
+    try:
+        reasons = artifact_freshness.stale_render_reasons(
+            GATEWAY_CONFIG_BASE, GATEWAY_CONFIG_GENERATED
+        )
+    except artifact_freshness.CallbacksUnparseable as exc:
+        pytest.exit(f"\n{exc}\n", returncode=2)
+    if reasons:
+        pytest.exit(
+            artifact_freshness.stale_render_message(
+                GATEWAY_CONFIG_BASE, GATEWAY_CONFIG_GENERATED, reasons
+            ),
+            returncode=2,
+        )
+
+
+_refuse_to_run_against_a_stale_render()
 
 
 def _load_env() -> dict:
