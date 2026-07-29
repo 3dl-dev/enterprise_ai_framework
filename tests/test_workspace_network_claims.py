@@ -117,21 +117,51 @@ def _assertion_surface(rel: str, raw: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def _egress_allows_general_internet(spec: dict) -> bool:
-    """True if some egress rule reaches 0.0.0.0/0 on any port.
+PACKAGE_PORTS = {80, 443}
 
-    A rule carrying `ports` is a named destination (DNS, the gateway, the TLS edge), not
-    "the internet" — so a future narrowing of the internet rule to TCP 80/443 reads as
-    False here, which is correct: at that point the agent genuinely cannot open an
-    arbitrary port and the text's obligations change.
-    """
+
+def _public_egress_rules(spec: dict) -> list[dict]:
+    """Egress rules whose destination is the public internet (a 0.0.0.0/0 ipBlock)."""
+    out = []
     for rule in spec.get("egress", []):
-        if "ports" in rule:
-            continue
         for to in rule.get("to", []):
             if to.get("ipBlock", {}).get("cidr") == "0.0.0.0/0":
-                return True
+                out.append(rule)
+                break
+    return out
+
+
+def _reaches_public_internet(spec: dict) -> bool:
+    """Can the pod reach a public host on a port a package manager uses?
+
+    This — not "on every port" — is the question the workspace's TEXT makes a claim
+    about. "There is no internet here" and "npm install hangs" are refuted by reachability
+    on 443 alone; whether port 4444 is also open is a different question with different
+    consequences, answered by `_reaches_arbitrary_public_port` below.
+
+    Keeping these two apart matters for a concrete reason: the -644 escalation proposes
+    narrowing the internet rule to TCP 80/443. If that lands, `pip` and `npm` still work,
+    so the text must NOT start claiming the pod is offline. A predicate that collapsed the
+    two questions would have demanded exactly that false statement — this file's own
+    version of the defect it exists to catch.
+    """
+    for rule in _public_egress_rules(spec):
+        ports = rule.get("ports")
+        if ports is None:
+            return True
+        if any(p.get("port") in PACKAGE_PORTS for p in ports):
+            return True
     return False
+
+
+def _reaches_arbitrary_public_port(spec: dict) -> bool:
+    """Can the pod open a connection to any public host on ANY port?
+
+    Separate from reachability because it is a separate grant: this pod runs
+    agent-written code next to a spendable virtual key. It is asserted on its own below so
+    that changing it is a deliberate, reviewed act rather than a quiet one.
+    """
+    return any("ports" not in rule for rule in _public_egress_rules(spec))
 
 
 def _claim_violations(spec: dict, surfaces: dict[str, str]) -> list[str]:
@@ -140,21 +170,22 @@ def _claim_violations(spec: dict, surfaces: dict[str, str]) -> list[str]:
     `surfaces` maps a label to already-normalised text.
     """
     problems: list[str] = []
-    if _egress_allows_general_internet(spec):
+    if _reaches_public_internet(spec):
         for label, text in surfaces.items():
             for claim in NETWORK_ABSENCE_CLAIMS:
                 if claim in text:
                     problems.append(
                         f"{label} asserts {claim!r}, but the workspace NetworkPolicy "
-                        f"allows egress to 0.0.0.0/0 on any port — the text is what is "
-                        f"wrong here, not the policy (enterpriseaiframework-644)"
+                        f"lets the pod reach public hosts on a package-manager port — "
+                        f"the text is what is wrong here, not the policy "
+                        f"(enterpriseaiframework-644)"
                     )
     else:
         rules = surfaces.get("AGENTS.md", "")
         if not any(claim in rules for claim in NETWORK_ABSENCE_CLAIMS):
             problems.append(
-                "the NetworkPolicy no longer allows general internet egress, but the "
-                "agent's own rules (AGENTS.md) never say so — an agent that does not "
+                "the NetworkPolicy no longer lets the pod reach the public internet, but "
+                "the agent's own rules (AGENTS.md) never say so — an agent that does not "
                 "know it is offline will spend a user's turn on an install that hangs"
             )
     return problems
@@ -180,16 +211,39 @@ def surfaces() -> dict[str, str]:
     return out
 
 
-def test_the_checked_in_policy_still_allows_general_internet_egress(netpol_spec):
-    """Ground truth anchor. If this ever fails the policy was tightened, and the
-    obligation this file enforces flips — which the next test handles automatically. It
-    is here so that a flip shows up as a named, explained failure rather than as a
-    confusing one in a text assertion.
+def test_the_checked_in_policy_lets_the_pod_reach_the_public_internet(netpol_spec):
+    """Ground truth anchor for the text obligation. If this ever fails, the pod really has
+    been cut off from package registries and the workspace text now has to SAY so — which
+    the next test enforces automatically. It is separate so that a flip shows up as a
+    named, explained failure rather than as a confusing one inside a text assertion.
+
+    Deliberately survives the TCP 80/443 narrowing proposed on -644: pip and npm still
+    work through that, so the text must not change.
     """
-    assert _egress_allows_general_internet(netpol_spec), (
-        "deploy/k8s/60-workspace-common.yaml no longer allows 0.0.0.0/0 egress. That may "
-        "be intended (see the -644 escalation proposing TCP 80/443). If so, the workspace "
-        "text now has to TELL the agent it is restricted; the next test enforces that."
+    assert _reaches_public_internet(netpol_spec), (
+        "deploy/k8s/60-workspace-common.yaml no longer lets the workspace pod reach public "
+        "hosts on 80/443. If that is intended, the agent's rules must be updated to say "
+        "the installers no longer work; the next test enforces it."
+    )
+
+
+def test_the_policy_currently_permits_arbitrary_public_ports(netpol_spec):
+    """The authority grant, pinned on its own so that removing it is deliberate.
+
+    The internet rule carries no port restriction, so a workspace pod — which runs
+    agent-written code beside a spendable virtual key — can open a connection to any
+    public host on any port. That is confirmed intentional (it predates every other
+    decision in this file) but had never been *chosen*. -644 escalated a proposed
+    narrowing to TCP 80/443 for founder review.
+
+    IF THAT ESCALATION LANDS, THIS TEST IS THE ONE THAT GOES RED, and the correct
+    response is to invert it here — not to touch the workspace text, which stays true
+    either way because the test above stays green.
+    """
+    assert _reaches_arbitrary_public_port(netpol_spec), (
+        "the workspace internet egress rule is now port-scoped. If that is the -644 "
+        "narrowing landing, invert this assertion and record it in finding 36; the text "
+        "obligations are unaffected."
     )
 
 
@@ -203,13 +257,14 @@ def test_no_workspace_surface_contradicts_the_policy(netpol_spec, surfaces):
     assert not problems, "\n".join(problems)
 
 
-def test_the_egress_reader_does_not_mistake_a_port_scoped_rule_for_the_internet():
-    """The case NOT changed by this item, asserted rather than assumed.
+def test_the_two_egress_readers_answer_two_different_questions():
+    """The cases NOT changed by this item, asserted rather than assumed.
 
-    Everything above rests on `_egress_allows_general_internet` being able to tell "the
-    internet" from the three narrow destinations the policy also permits. A reader that
-    returned True for any `to:` entry would make the whole file vacuous — it would report
-    "open" for a policy that only allowed DNS.
+    Everything above rests on the readers telling "the internet" apart from the three
+    narrow destinations the policy also permits, AND on reachability being a different
+    question from port breadth. A reader that returned True for any `to:` entry would make
+    the whole file vacuous; a single reader answering both questions would demand a false
+    "you are offline" the moment the -644 narrowing landed.
     """
     dns_gateway_and_tls_edge_only = {
         "egress": [
@@ -221,11 +276,13 @@ def test_the_egress_reader_does_not_mistake_a_port_scoped_rule_for_the_internet(
              "ports": [{"protocol": "TCP", "port": 8443}]},
         ]
     }
-    assert not _egress_allows_general_internet(dns_gateway_and_tls_edge_only)
+    assert not _reaches_public_internet(dns_gateway_and_tls_edge_only)
+    assert not _reaches_arbitrary_public_port(dns_gateway_and_tls_edge_only)
 
-    # And the exact narrowing proposed in the -644 escalation: same 0.0.0.0/0 block, but
-    # port-scoped. Must read as NOT-general, or the escalation would land and this file
-    # would keep enforcing the wrong obligation.
+    # The exact narrowing proposed in the -644 escalation. `pip` and `npm` still work
+    # through it, so reachability must stay TRUE — otherwise the escalation lands and this
+    # file starts insisting the workspace text tell the agent it is offline, which would
+    # be a fresh instance of the very defect the file exists to prevent.
     narrowed_to_web_ports = {
         "egress": [
             {"to": [{"ipBlock": {"cidr": "0.0.0.0/0",
@@ -233,7 +290,27 @@ def test_the_egress_reader_does_not_mistake_a_port_scoped_rule_for_the_internet(
              "ports": [{"protocol": "TCP", "port": 80}, {"protocol": "TCP", "port": 443}]},
         ]
     }
-    assert not _egress_allows_general_internet(narrowed_to_web_ports)
+    assert _reaches_public_internet(narrowed_to_web_ports)
+    assert not _reaches_arbitrary_public_port(narrowed_to_web_ports)
+
+    # And the narrowing landing must NOT make the current, corrected text non-compliant.
+    # This is the whole point of splitting the predicates, so it is executed here rather
+    # than argued in a comment.
+    assert _claim_violations(
+        narrowed_to_web_ports,
+        {"AGENTS.md": _assertion_surface("AGENTS.md", (WORKSPACE / "AGENTS.md").read_text())},
+    ) == []
+
+    # A public rule on a port no package manager uses is not reachability in the sense the
+    # text claims — an agent there genuinely cannot install anything.
+    smtp_only = {
+        "egress": [
+            {"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}],
+             "ports": [{"protocol": "TCP", "port": 25}]},
+        ]
+    }
+    assert not _reaches_public_internet(smtp_only)
+    assert not _reaches_arbitrary_public_port(smtp_only)
 
 
 # The two rules exactly as they stood at the commit -644 was filed against
