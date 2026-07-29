@@ -55,7 +55,13 @@ spec:
             - "gateway.tailcb6ef9.ts.net"
       containers:
         - name: librechat
-          image: ghcr.io/danny-avila/librechat:v0.8.0
+          # Must equal the tag in bundle/docker-compose.yml — asserted by
+          # tests/test_chat_surface_version.py. The bundle and the cluster read the SAME
+          # bundle/librechat/librechat.yaml (deploy/bin/deploy.sh renders it into the
+          # chat-config ConfigMap), and v0.8.0 responds to a config it cannot validate by
+          # dropping the whole custom config and coming up healthy-but-empty. Skew between
+          # these two lines is therefore not cosmetic.
+          image: ghcr.io/danny-avila/librechat:v0.8.7
           env:
             - { name: HOST, value: "0.0.0.0" }
             - { name: PORT, value: "3080" }

@@ -690,3 +690,81 @@ directory with dots in its name is not. Project depth is untouched: that is wher
 of `62-published.yaml` over a tree holding both layouts, and asserts the returned bytes —
 including for a user who has residue *and* a live project, which is the case an
 over-broad fix silently takes offline.
+
+### 36. Two upgrade defects that a healthy container reports as healthy
+
+Upgrading the chat surface from LibreChat v0.8.0 to v0.8.7 (`enterpriseaiframework-f50`)
+against the unchanged `bundle/librechat/librechat.yaml`. The container came up, passed its
+`/health` check, served the sign-in page, answered `/api/config` with our model specs, and
+was wrong in two ways that nothing user-facing reported:
+
+```
+warn:  [memory] Agent config detected without explicit `enabled: true`.
+       Automatic memory extraction is now opt-in.
+       Add `memory.agent.enabled: true` to keep automatic memory updates.
+error: [MCPServersRegistry] Failed to inspect server "echo":
+       Domain "http://mcp-echo:8080" is not allowed
+info:  [MCP] Initialized with 1 configured server and 0 tools.
+```
+
+**Memory.** From v0.8.6, `packages/data-schemas/src/app/memory.ts#isMemoryAgentEnabled`
+returns false unless `memory.agent.enabled === true`. v0.8.0 extracted unconditionally.
+The identical config file therefore means "extract" on one version and "never extract" on
+the other. The memories panel still renders, `/api/memories` still answers, stored
+memories still read back — the only thing that stops is anything new being learned. There
+is no user-visible error at any point.
+
+**MCP.** v0.8.6+ blocks MCP servers whose host resolves into private IP space
+(`packages/api/src/auth/domain.ts#isMCPDomainAllowed` → `isSSRFTarget` /
+`resolveHostnameSSRF`) unless exempted. Every MCP server we will ever run is on a private
+network by construction — `mcp-echo:8080` is a compose service name and a k8s Service
+name. One line at boot, then nothing: the tool simply is not in the list the model is
+offered, so the model "chooses not to call it", which is indistinguishable from a model
+being unhelpful. The fix is `mcpSettings.allowedAddresses: ["mcp-echo:8080"]` — host:port
+exemptions, not `mcpSettings.allowedDomains`, because `MCPServerInspector.inspect` sets
+`useSSRFProtection = !allowedDomains?.length` and an `allowedDomains` list therefore turns
+SSRF protection off wholesale for MCP.
+
+Neither is in the changelog. Both were found by reading the container's own boot log.
+
+**The upgrade also has a coupling that is worse than either defect.** The bundle and the
+cluster read the SAME `bundle/librechat/librechat.yaml` — `deploy/bin/deploy.sh` renders
+that exact file into the cluster's `chat-config` ConfigMap. `mcpSettings` does not exist in
+v0.8.0's `configSchema`, which is parsed with `.strict()` at the top level, and v0.8.0's
+`loadCustomConfig` responds to a rejected config by logging and `return null`. A v0.8.7
+config deployed against a v0.8.0 image therefore leaves the surface with **no custom
+configuration at all** — no gateway endpoint, no modelSpecs, no memory, no MCP — while
+`/health` keeps answering 200 and the sign-in page keeps rendering. v0.8.7 replaced that
+with `process.exit(1)`, which is a real improvement, but only for the version that has it.
+The image pin and the config file must land together.
+
+**A third change, which is not a defect but breaks every client we have.**
+`POST /api/agents/chat/<endpoint>` no longer streams. v0.8.0 answered `text/event-stream`
+and the POST body *was* the stream; v0.8.7 answers `application/json` with
+`{"streamId", "conversationId", "status": "started"}` and the answer arrives on a separate
+`GET /api/agents/chat/stream/<streamId>`. A v0.8.0 client parses the JSON handle as SSE,
+finds zero frames, and reports "stream ended with no terminal event" — blaming the model,
+the gateway, or the credentials, none of which are involved. The stream endpoint is also
+not a place to read an answer after the fact: against a fast upstream the job completes
+and is reaped first, and the GET returns 404 for a turn that succeeded.
+
+`tests/chat_turn.py` handles both shapes by not reading the answer off a stream at all —
+it reads the persisted assistant message from `GET /api/messages/<conversationId>`, which
+works on both versions and is the stronger claim anyway. `tests-live/test_mcp_echo.py` and
+`tests-live/test_memory.py` still use the v0.8.0 shape and will break the moment the
+cluster is upgraded; both carry a warning at the helper that says so.
+
+**Assertions rather than eyeballs** live in `tests/test_chat_surface_version.py`: the tool
+list the surface fetched from our own MCP server, the memory-extraction agent observed
+running on a real turn, the model specs the browser is served, the agents endpoint's
+capability list (`skills`, `subagents`, `execute_code`, `artifacts`), the config schema
+version read out of the running image, and the titling call named with the model
+`librechat.yaml` configures.
+
+One incidental correction while there: `interface.artifacts: true` in
+`bundle/librechat/librechat.yaml` has never done anything. The key is absent from
+`interfaceSchema` in **both** v0.8.0 and v0.8.7, so zod strips it, and
+`packages/data-schemas/src/app/interface.ts` never reads it — confirmed by its absence
+from the served `/api/config`. What actually turns artifacts on is `preset.artifacts` on
+each model spec. The key is left in place with a corrected comment and a test that fails
+if a future release starts honouring it.

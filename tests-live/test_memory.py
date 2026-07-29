@@ -149,6 +149,22 @@ def chat_client_b(creds_b) -> httpx.Client:
 def _send_message(client: httpx.Client, text: str, conversation_id: str | None = None) -> dict:
     """POST a real chat message on the default custom endpoint and return the
     terminal ('final': true) SSE event as a dict. Mirrors tests-live/test_mcp_echo.py.
+
+    THIS ONLY WORKS AGAINST LibreChat v0.8.0, WHICH IS WHAT THE CLUSTER STILL RUNS.
+    enterpriseaiframework-f50 moved the compose bundle and deploy/k8s/50-chat.yaml to
+    v0.8.7, where POST /api/agents/chat/<endpoint> no longer streams: it returns
+    `application/json` {"streamId", "conversationId", "status": "started"} and the answer
+    arrives on a separate GET /api/agents/chat/stream/<streamId>. Parsed as SSE that body
+    yields zero frames, so this helper fails with "stream ended with no terminal event" —
+    naming the wrong thing entirely. Measured against a v0.8.7 container, not inferred.
+
+    tests/chat_turn.py already handles both protocols (it reads the answer from the
+    persisted message via /api/messages/<conversationId>, which works on both). This file
+    was NOT converted to it: the assertions below read a memory attachment off the
+    terminal SSE event, and what the equivalent looks like on v0.8.7 cannot be established
+    without running a tool-calling model against a v0.8.7 surface — which needs the
+    cluster upgraded. Converting it blind would swap a known breakage for an unknown one.
+    Tracked as its own item; do it in the same maintenance window as the cluster upgrade.
     """
     body = {
         "text": text,
