@@ -104,7 +104,11 @@ Unset `ANTHROPIC_BASE_URL` (or point it at the provider directly) and set
 
 ## What you keep
 
-- `spend.csv`  — every metered request
+- `spend.csv`  — every metered request. `end_user` is the raw value the caller sent;
+  `principal` is who that request is billed to, by the same rule the bill used. Both are
+  present on purpose: the raw column is what reconciles against a provider invoice, the
+  resolved one is what a person can read. Attribution comes from the ledger row itself, so
+  it survives the key revocation this exit performs.
 - `audit.jsonl` — the full audit trail, hash-chained and independently verifiable
 - `keys.csv`   — which virtual keys existed, for which user and surface
 

@@ -3,7 +3,9 @@
 If any of these cannot pass against the running bundle, the row is void — not re-scoped.
 """
 
+import csv
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -1195,3 +1197,156 @@ class TestItem9ExitPath:
             f"surface cannot reach the provider directly after exit: {direct.text[:300]}"
         )
         assert direct.json()["choices"][0]["message"]["content"].startswith("[fake-provider")
+
+    # -----------------------------------------------------------------------
+    # The archive must still name people after the exit has emptied the key table
+    # -----------------------------------------------------------------------
+
+    def _spend_rows(self, control_plane_url, admin_headers) -> list[dict]:
+        r = httpx.get(f"{control_plane_url}/admin/export/spend",
+                      headers=admin_headers, timeout=TIMEOUT)
+        assert r.status_code == 200, r.text
+        return list(csv.DictReader(io.StringIO(r.text)))
+
+    def test_the_export_still_names_the_spender_after_the_exit_revokes_every_key(
+        self, tmp_path, gateway_url, control_plane_url, admin_headers, master_headers
+    ):
+        """spend.csv is the one rendering of the ledger that outlives the deployment, and
+        it was the least attributed of the three — because of the ORDER the exit runs in.
+
+        `exit.sh full` revokes every virtual key, and revocation DELETEs from
+        LiteLLM_VerificationToken. An export that attributes through that table therefore
+        empties out at precisely the moment it becomes the customer's only record.
+        Measured on the cluster before this test existed: 265 of 477 exported rows with no
+        principal at all, over a ledger whose bill attributed all but 42 requests.
+
+        Finding 25 established the join is wrong and fixed the bill. The export kept its
+        own copy of it and stayed broken through two more findings, which is why the fix
+        under test is a SHARED expression rather than a third correct query.
+
+        The existing export tests assert spend.csv EXISTS. A presence check is not an
+        attribution check — that is what let this survive. So this exports, revokes
+        through the real exit endpoint, exports again, and asserts the archive still names
+        the person who spent the money.
+        """
+        alias = f"exitattr-{uuid.uuid4().hex[:8]}::ide"
+        username = alias.split("::")[0]
+        created = httpx.post(
+            f"{gateway_url}/key/generate", headers=master_headers,
+            json={"key_alias": alias}, timeout=TIMEOUT,
+        )
+        assert created.status_code == 200, created.text
+        key = created.json()["key"]
+
+        spent = httpx.post(
+            f"{gateway_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}"},
+            json={"model": "fake-large",
+                  "messages": [{"role": "user", "content": f"exit-attr {uuid.uuid4().hex}"}]},
+            timeout=TIMEOUT,
+        )
+        assert spent.status_code == 200, spent.text
+
+        # The gateway writes the spend row asynchronously.
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            rows = self._spend_rows(control_plane_url, admin_headers)
+            if any(r["key_alias"] == alias for r in rows):
+                break
+            time.sleep(2)
+        else:
+            pytest.fail(f"{alias} never reached the exported ledger; nothing to test")
+
+        before_dir = tmp_path / "before"
+        before_dir.mkdir()
+        before = {r["request_id"]: r
+                  for r in csv.DictReader(
+                      (self._export(before_dir) / "spend.csv").open(newline=""))}
+        mine_before = {rid for rid, r in before.items() if r["key_alias"] == alias}
+        assert mine_before, (
+            f"the pre-revocation export does not carry {alias}; the rest of this test "
+            "would prove nothing"
+        )
+        for rid in mine_before:
+            assert before[rid]["principal"] == username, before[rid]
+
+        # The real thing, not a key/delete shortcut: this is the endpoint exit.sh calls,
+        # and it deletes the whole table the old query attributed from.
+        revoked = httpx.post(f"{control_plane_url}/admin/exit/revoke-all",
+                             headers=admin_headers, timeout=TIMEOUT)
+        assert revoked.status_code == 200, revoked.text
+        assert alias not in gateway_aliases(gateway_url, master_headers), (
+            f"{alias} survived revoke-all, so this proves nothing about attribution "
+            "surviving a deleted key"
+        )
+
+        after_dir = tmp_path / "after"
+        after_dir.mkdir()
+        after = {r["request_id"]: r
+                 for r in csv.DictReader(
+                     (self._export(after_dir) / "spend.csv").open(newline=""))}
+
+        # 1. The row this test created still names its spender.
+        missing = mine_before - set(after)
+        assert not missing, (
+            f"{len(missing)} of this test's requests vanished from the export after "
+            "revocation; the archive lost rows, not just names"
+        )
+        for rid in sorted(mine_before):
+            row = after[rid]
+            assert row["key_alias"] == alias, (
+                f"request {rid} exported with key_alias {row['key_alias']!r} after the "
+                f"exit revoked {alias}. The exit path revokes BEFORE it exports, so this "
+                "is the state every real archive is written in — the customer would leave "
+                "with a ledger that cannot say who spent the money"
+            )
+            assert row["principal"] == username, (
+                f"request {rid} is billed to {row['principal']!r} rather than {username!r}"
+            )
+            assert row["surface"] == "ide", (
+                f"request {rid} lost its surface ({row['surface']!r}); the surface is "
+                "carried by the same alias and dies with the same join"
+            )
+
+        # 2. THE ROWS THIS TEST DID NOT CREATE. The measured defect was population-wide —
+        #    half the ledger, most of it written by other surfaces long before. Revocation
+        #    must not push a single further row into the anonymous bucket.
+        common = set(before) & set(after)
+        blank_before = {rid for rid in common if not before[rid]["key_alias"]}
+        blank_after = {rid for rid in common if not after[rid]["key_alias"]}
+        assert blank_after <= blank_before, (
+            f"revoking every key stripped the alias from {len(blank_after - blank_before)} "
+            f"row(s) that had one a moment earlier (of {len(common)} in both exports). "
+            "This is the cluster measurement reproduced: attribution that evaporates on "
+            "the way out"
+        )
+        unnamed = {rid for rid in common if not after[rid]["principal"]}
+        assert not unnamed, (
+            f"{len(unnamed)} exported row(s) have an empty principal. A blank cell reads "
+            "as no data; a row that genuinely cannot be attributed must say so"
+        )
+
+        # 3. THE COLUMNS THIS CHANGE DID NOT TOUCH must be byte-identical across the two
+        #    exports. The ledger is immutable; only the query over it changed.
+        for rid in sorted(common):
+            for col in ("start_time", "end_time", "model", "end_user", "spend",
+                        "prompt_tokens", "completion_tokens", "total_tokens", "cache_hit"):
+                assert before[rid][col] == after[rid][col], (
+                    f"request {rid} column {col} changed between exports: "
+                    f"{before[rid][col]!r} -> {after[rid][col]!r}"
+                )
+
+        # 4. The archive and the bill must agree about this person, over the same money.
+        #    Two renderings that disagree is finding 34; the export was the third one.
+        bill = httpx.get(f"{control_plane_url}/admin/spend", headers=admin_headers,
+                         timeout=TIMEOUT).json()["by_user_and_surface"]
+        billed = [r for r in bill if r["username"] == username]
+        assert billed, (
+            f"the bill has no row for {username} after revocation while the export does; "
+            "the two renderings of the ledger disagree about who spent the money"
+        )
+        csv_requests = sum(1 for r in after.values() if r["principal"] == username)
+        assert sum(r["requests"] for r in billed) == csv_requests, (
+            f"bill says {sum(r['requests'] for r in billed)} requests for {username}, "
+            f"exported ledger says {csv_requests}"
+        )

@@ -96,13 +96,18 @@ def refresh() -> int:
     return len(_cache)
 
 
-def resolve(value: str) -> str:
-    """Translate one end_user value to a username, or hand it back untouched."""
+def resolve(value: str, *, refresh_on_miss: bool = True) -> str:
+    """Translate one end_user value to a username, or hand it back untouched.
+
+    `refresh_on_miss=False` is for callers translating many rows at once (the ledger
+    export): re-reading Mongo per unknown id is one round trip per unresolvable row, and a
+    departed tenant's export is nothing but unresolvable rows.
+    """
     if not looks_like_chat_id(value):
         return value
     if not _loaded:
         refresh()
-    if value not in _cache:
+    if value not in _cache and refresh_on_miss:
         # A brand new chat account will miss the cache exactly once.
         refresh()
     return _cache.get(value, value)
