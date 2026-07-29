@@ -24,8 +24,17 @@ fi
 # that; test_published_layout.py then failed to import on an existing checkout.
 # pip is a no-op in about a second when the requirements are already satisfied.
 "$VENV/bin/pip" install --quiet pytest==8.4.2 httpx==0.28.1 pyyaml==6.0.2
+# fastapi (pulling in starlette) for control-plane/tests/test_portal_auth.py's TestClient.
+# Pinned to the version control-plane/requirements.txt already runs, so the test venv
+# exercises the same fastapi/starlette Request.client behaviour the service itself does.
+# Deliberately NOT control-plane/requirements.txt wholesale: that also pulls asyncpg and
+# pymongo for a live database the auth test stubs out rather than starts.
+"$VENV/bin/pip" install --quiet fastapi==0.118.0
 # playwright drives the browser suite (make test-browser). Kept here so the venv is
 # complete; the browser binaries are a separate `playwright install`.
 "$VENV/bin/pip" install --quiet playwright
 
-exec "$VENV/bin/pytest" tests/ -v --tb=short "$@"
+# control-plane/tests/ is not under tests/ and pytest.ini's testpaths is overridden by any
+# explicit path given here, so it must be listed alongside tests/ or it silently never
+# runs — which is exactly how it sat green-by-never-executing before this line existed.
+exec "$VENV/bin/pytest" tests/ control-plane/tests/ -v --tb=short "$@"
