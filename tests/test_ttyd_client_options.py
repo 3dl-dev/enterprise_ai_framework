@@ -165,19 +165,26 @@ def _git_show(rev: str, path: str) -> str:
     return result.stdout
 
 
-def test_ttyd_exec_argv_unchanged_since_base_commit():
-    """A `bash -n` syntax check cannot distinguish a correct exec from a silently truncated
-    one — that is exactly the failure this file's own '#' warning describes. This proves
-    the actual reconstructed argv, word for word, is identical before and after the
-    documentation-only edit made on top of BASE_SHA.
+def test_client_option_values_never_contain_a_second_equals():
+    """The standing invariant, not a one-time migration proof (see enterpriseaiframework-7e8):
+    ttyd's --client-option parser silently truncates at a second '=' (see module docstring).
+    Whatever entrypoint.sh's exec argv looks like on any given commit, every
+    --client-option value it passes must contain at most one '=' — otherwise ttyd would
+    silently drop part of it. This should hold forever, unlike comparing against a
+    hardcoded base commit (which goes stale the moment the exec line is legitimately
+    edited, and becomes vacuous the moment someone "fixes" it by bumping the SHA).
     """
-    base_text = _git_show(BASE_SHA, "deploy/workspace/entrypoint.sh")
-    current_text = ENTRYPOINT.read_text()
+    argv = _ttyd_argv_from_script(ENTRYPOINT.read_text())
+    values = _client_option_values(argv)
+    assert len(values) >= 8  # sanity: the flags are actually there
 
-    base_argv = _ttyd_argv_from_script(base_text)
-    current_argv = _ttyd_argv_from_script(current_text)
-
-    assert current_argv == base_argv
+    for raw in values:
+        # raw is "key=value...", i.e. exactly what ttyd's optarg sees.
+        _key, value = raw.split("=", 1)
+        assert value.count("=") == 0, (
+            f"client-option {raw!r} has a second '=' in its value ({value!r}); "
+            f"ttyd would silently truncate it at the second '='"
+        )
 
 
 def test_control_case_has_teeth_on_an_ordinary_value_change():
