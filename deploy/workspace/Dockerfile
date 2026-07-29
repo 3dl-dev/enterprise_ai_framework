@@ -1,11 +1,16 @@
-# The IDE surface: a real terminal in a browser, running real aider.
+# The IDE surface: a real terminal in a browser, running a real terminal coding agent.
+#
+# The agent is OPENCODE (see the pin further down); aider is installed as a fallback and
+# is one word away. The default swapped after aider was measured — it makes the user
+# nominate files before it will act, and finding 23 caught it silently dropping a
+# completed edit when the model named a file outside the chat.
 #
 # ttyd (MIT) serving an actual shell — not `aider --browser`, whose Streamlit GUI drops
 # most slash commands, and not an MCP wrapper, whose one-shot `--message` throws away the
 # context accumulation and the apply/lint/test/repair loop that is the whole product.
 #
-# Everything installed here is OSI-licensed: ttyd MIT, aider Apache-2.0, the rest is
-# Debian main. No component with a paid tier.
+# Everything installed here is OSI-licensed: ttyd MIT, opencode MIT, aider Apache-2.0,
+# the rest is Debian main. No component with a paid tier.
 FROM python:3.12-slim
 
 ARG TTYD_VERSION=1.7.7

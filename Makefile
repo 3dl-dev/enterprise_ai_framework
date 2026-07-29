@@ -72,7 +72,7 @@ forge-config:
 ## a file was served, not that its JavaScript runs.
 ## Screenshots land in $$BROWSER_SHOT_DIR (default /tmp/eai-shots).
 
-## The IDE surface (browser-terminal aider) against the live k3s cluster, with two real
+## The IDE surface (a browser terminal running opencode) against the live k3s cluster, with two real
 ## Keycloak users. Needs the workspaces provisioned first:
 ##   deploy/bin/ensure-second-user.sh student
 ##   deploy/bin/provision-workspace.sh baron && deploy/bin/provision-workspace.sh student

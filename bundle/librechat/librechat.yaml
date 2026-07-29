@@ -149,10 +149,22 @@ endpoints:
       # real models rather than the default one.
       titleModel: "glm-4.7@deepinfra"
       modelDisplayLabel: "Enterprise AI"
-      # NOTE: chat spend currently attributes to the chat surface as a whole, not to the
-      # individual signed-in user. Forwarding the user via addParams was tried and
-      # removed: {{LIBRECHAT_USER_ID}} substitution is only demonstrably supported for
+      # ATTRIBUTION — this note used to say chat spend attributes to the surface as a
+      # whole rather than to the signed-in user, and that forwarding the user via
+      # addParams had been tried and removed. Both are now out of date, corrected against
+      # the cluster ledger 2026-07-29: chat rows carry a per-user `end_user` value, so
+      # chat spend IS attributed per person.
+      #
+      # What arrives there is LibreChat's own primary key (a 24-char Mongo ObjectId),
+      # which is correct, stable, and useless to show a human.
+      # control-plane/app/chat_identity.py translates it, read-only, over one collection.
+      #
+      # Still open (rd f8c): that translation is applied in the portal and NOT in
+      # GET /admin/spend, so `make spend` — the query scope item 4 actually names —
+      # prints hex for the chat surface while the console prints names. Same data, same
+      # query, two answers.
+      #
+      # The original reasoning still stands and is why nothing here forwards the user
+      # explicitly: {{LIBRECHAT_USER_ID}} substitution is only demonstrably supported for
       # headers, and an unsubstituted placeholder would write the literal string into the
       # bill as a username — worse than having no per-user chat attribution at all.
-      # The ledger already prefers end_user where present, so this becomes correct as
-      # soon as the surface is confirmed to forward it. Tracked as an open item.

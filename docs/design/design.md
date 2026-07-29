@@ -381,13 +381,45 @@ defaults*; they may appear as documented swap options with the constraint noted.
 
 Standing constraints carried from the licensing audit, so they are not silently reintroduced:
 
-- **Cline base extension only.** Enterprise tier permanently out of scope.
+- **Cline base extension only, *if* Cline.** Enterprise tier permanently out of scope. The default
+  itself was superseded during v0.1-dogfood — see the ruling immediately below.
+- **The default coding agent is opencode (MIT), served in a browser terminal over ttyd (MIT), with
+  aider (Apache-2.0) retained as an installed fallback.** Cline lost on *shape*, not on licence: it
+  is an IDE extension, and v0.1's coding surface has to be reachable from a browser by a user who
+  installs nothing. The losing argument is worth stating because it was good — Cline is the tool a
+  professional developer already has, and "nothing about the coding experience changes, only the
+  pipe" (§7.2) is the strongest version of the intermediation pitch. It still holds for a customer
+  bringing their own tool, and the base-URL pass-through contract is unchanged. What it could not
+  do is be the *bundled default*, because a bundle whose coding surface requires a local IDE install
+  is not one login to three surfaces. aider was the first replacement and lost to opencode on
+  behaviour: it requires the user to nominate files before it will act, and finding 23 measured it
+  silently discarding a completed edit when the model named a file outside the chat. It stays
+  installed because a known-good fallback measured against this gateway costs one binary.
+  **Consequence for the tier table below: the coding agent remains tier 3** — this changes which
+  agent, not what it delegates.
 - **LiteLLM MIT core only.** Its `enterprise/` directory gates SSO, RBAC and audit behind a key; we
   build those anyway. Do not take a dependency on that directory.
 - **Valkey over Redis.** Redis is tri-licensed since 8.0 and its default packaging steers to SSPL and
   RSAL, neither OSI-approved.
 - **Perses over Grafana** as the default, which removes the AGPL judgment call entirely. Grafana as a
   swap is *configured*, never patched.
+- **LibreChat stays the chat surface, and the paywall objection against it has expired.** Re-examined
+  2026-07-29 because the objection was strong: its code interpreter was its own paid hosted API, and
+  its web search steered to Firecrawl, Jina and Cohere. Three things resolve it. **First, the rule
+  was never violated:** the chat-surface *contract* is "OpenAI-compatible client, delegated auth,
+  emits usage and signal", and every part of that is in the MIT core. Code execution is not in the
+  contract, so a paid interpreter is a paid *adjacent* product, not a gated contracted capability.
+  The distinction matters and is the difference between this and Cline, whose gated features are
+  fleet auth and telemetry export — squarely inside its contract. **Second, the interpreter was open
+  sourced** as `ClickHouse/code-interpreter` under Apache 2.0, self-hostable by compose or Helm, with
+  NsJail and libkrun microVM isolation modes. **Third, only the search leg of web search is
+  mandatory** — `rerankerType: "none"` is supported and the scraper is pluggable at a URL — so
+  SearXNG alone satisfies the required part. The general lesson is worth keeping: **the paywall in
+  this category is not in the chat UI, it is in anti-bot scraping infrastructure**, which every
+  alternative also has to buy or do without. Switching surfaces would not have bought a free
+  scraper. Self-hosted Firecrawl is AGPL-3.0 with a closed-source anti-bot engine, so it is a
+  documented swap under the same HTTP-separation rule as SearXNG and Grafana, never a patched
+  dependency.
 - **Open WebUI is not the default.** It moved off BSD-3 in April 2025 to a source-available license
   with a branding-retention clause; a deployment over 50 users wanting branding removed needs a
   second commercial relationship. It remains a documented swap with the constraint disclosed in
@@ -984,7 +1016,7 @@ standalone product — a customer can stop here forever and the pitch is still t
 | **Provider usage ingestion + reconciliation** | Continuous. Reconciles to the cent against a real invoice. Redacted real-invoice fixtures in the repo. Doubles as the leak detector (§2.5). |
 | **Console** | Perses over the core query API + a thin action API for what dashboards cannot do (enforce a budget stop, disable a user, gate a promotion, roll back). Parity panels (§5.1), decomposition panel (§5.4), 3am kit (§4.10). |
 | **Chat surface** | LibreChat, SSO-delegated, catalog pushed by the control plane. |
-| **Coding agent** | Base-URL redirect pass-through to the gateway. The customer keeps their existing tool. **Nothing about the coding experience changes — only the pipe.** |
+| **Coding agent** | Base-URL redirect pass-through to the gateway. The customer keeps their existing tool. **Nothing about the coding experience changes — only the pipe.** Plus a *bundled* default for customers who have no existing tool: opencode in a browser terminal over ttyd, per the §3.6 ruling. Pass-through and bundled default are two answers to two different customers, not a change of position. |
 | **Egress control** | Documented deployment precondition, three supported mechanisms, coverage metric. |
 | **Breakglass** | Per §4.8, in full. Not deferrable — the egress mandate creates the failure mode on day one. |
 | **Availability** | Per §4.9, in full. Same reasoning. |
@@ -1501,4 +1533,5 @@ For the implementer who needs the short list.
 | Route on price? | **No — route to the cheapest already-contracted path, commitment-aware.** | Cross-vendor arbitrage lost to evidence: 0–10% path deltas dominated by a 15–30% committed discount the customer already holds. |
 | Who owns conformance suites? | **Core, invariant, protected, L3-gated.** | Component-author amendment lost because a suite an implementer can amend to pass is worthless. |
 | Primary evidence? | **The attention/throughput boundary, then the cost ledger.** Adoption is necessary but is not evidence. | "Adoption is the evidence" lost because the thesis is about production cost; adoption measures whether the artifact mattered, a different and lesser claim. |
+| Which coding agent is the default? | **opencode (MIT) in a browser terminal over ttyd (MIT); aider kept as an installed fallback.** §3.6. | Cline lost on shape, not licence — an IDE extension cannot be the bundled default when the claim is one login to three surfaces and the user installs nothing. The pass-through contract for a customer's own tool is unchanged. aider lost to opencode on behaviour: it makes the user nominate files first, and finding 23 measured it silently dropping a completed edit. |
 | What is v0.1? | **Step 0 audit CLI + the intermediation deploy.** No GPUs, no factory, no trainer. Plus breakglass, availability and the exit path, which are not deferrable. | Deferring breakglass and HA lost because the egress mandate creates a company-wide single point of failure on the first day it is enforced. |

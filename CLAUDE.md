@@ -25,6 +25,13 @@ The founder is the first user. The use case is a Claude-like enterprise UX acros
 surfaces — web chat, an IDE coding agent, and a terminal coding agent — behind one login, one
 bill, and one audit trail.
 
+**The product is not specialized to any tenant.** The first deployment serves a coding camp, so
+fixtures, screenshots and the workspace agent's house rules read like they were written for a
+child. That is one tenant's configuration. The same platform serves an enterprise's coders,
+marketers and lawyers unchanged — same login, same gateway, same ledger row, same audit entry.
+Anything that reads "student" or "camper" means "user". Never narrow the product to the camp, and
+never let camp-specific configuration leak into the platform.
+
 Build. Do not gate work on validation artifacts, pre-registration, or cost estimates; that thread
 is closed and is not to be reopened.
 
@@ -73,8 +80,10 @@ quietly deviating.
 
 ## Component defaults (decided, with the traps that produced them)
 
-LibreChat · Cline **base only** — its enterprise tier is out of scope, do not integrate it as a
-convenience · vLLM · **Valkey not Redis** — Redis is tri-licensed since 8.0 and its default
+LibreChat · **opencode (MIT) over ttyd (MIT)** as the bundled coding surface, with aider kept as an
+installed fallback — this replaced Cline, which cannot be the default because an IDE extension is
+not reachable by a user who installs nothing; Cline remains valid as a customer's own tool through
+the pass-through contract, **base only**, its enterprise tier out of scope · vLLM · **Valkey not Redis** — Redis is tri-licensed since 8.0 and its default
 packaging steers to non-OSI · **Perses not Grafana** — Grafana is AGPL; if swapped in, configure
 via `auth.proxy`, never patch, or our integration code becomes AGPL inside an Apache bundle ·
 Keycloak or Ory · **Postgres, welded** — not a swap port · Axolotl · SkyPilot · **LiteLLM MIT

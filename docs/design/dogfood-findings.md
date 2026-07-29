@@ -385,6 +385,15 @@ Two contributing factors, both worth knowing:
 `diff` in `deploy/workspace/model-settings.yml`, with the measurements recorded in the
 file next to the values they justify.
 
+**Postscript, 2026-07-29.** This finding contributed to replacing aider as the default
+terminal agent with **opencode**, which explores the repo itself rather than requiring
+files to be nominated first — so the failure mode above (a re-prompt to add a file
+discarding the edit already made) has no equivalent. aider stays installed as a fallback
+and these edit-format settings still apply to it. The ruling is in design §3.6. The
+measurement itself stands and was not about the camp, despite the sentence above: it asked
+whether an untuned open model can hold an edit format through this gateway, which is a
+platform question with a platform answer — both models can.
+
 ### 24. GLM reasoning tokens are charged against the same output budget as the answer
 
 `glm-5.2` and `glm-4.7` return `reasoning_content` alongside `content`, and the reasoning
@@ -592,3 +601,40 @@ Three failures along the way were the TESTS, not the product: a context leak tha
 a dozen agents in a 1-CPU pod until it answered 429, layout assertions that passed alone
 and failed in a suite because the drawer opens by itself once a project has content, and
 an assertion on the "Ask anything" placeholder that a resumed session correctly replaces.
+
+### 34. The console and the CLI disagreed about who spent the money
+
+`GET /admin/spend` on the cluster, 2026-07-29:
+
+```
+baron                     / ide      223 req   $1.2256
+6a67b18069dba4d1126fef44  / chat     135 req   $0.2247
+(unattributed)            / (unknown) 42 req   $0.1133
+student                   / ide       38 req   $0.0532
+6a680dd2d6a3e58bd5596392  / chat      21 req   $0.0034
+```
+
+The chat surface — the one most people use — reads as a column of hex. Not because
+attribution is broken: `end_user` carries a per-user value, and
+`control-plane/app/chat_identity.py` translates LibreChat's Mongo ObjectId to a username
+correctly. Run inside the pod it loads its map and resolves
+`6a67b18069dba4d1126fef44 → baron` on the first try.
+
+The translation is applied in `portal.py`, at two call sites, and **nowhere else**.
+`main.py` builds `/admin/spend` straight from `metering.spend_by_user_and_surface()`. So
+the web console shows names and `make spend` shows ObjectIds, from the same query, over
+the same money — and `make spend` is the query scope item 4 actually names.
+
+Two things generalise, and the second is the expensive one:
+
+- **A capability proven on one rendering of the evidence is not proven.** "The bill
+  attributes chat spend to the right person" was true and false simultaneously, depending
+  on which of two views you opened. This is the same shape as finding 27 — a presence
+  check is not an attribution check — one level up: a *correct* check, applied to one of
+  two readers.
+- **It survived every test** because `make test` runs against the compose bundle, where
+  chat identities are not LibreChat ObjectIds, so the code path that needs translating is
+  never exercised. The fixture was more uniform than production.
+
+**Not fixed here.** Filed as `enterpriseaiframework-f8c`, which requires a test asserting
+the two renderings agree — the duplication, not the lookup, is the defect.

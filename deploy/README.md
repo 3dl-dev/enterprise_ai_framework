@@ -65,7 +65,7 @@ revoke every key.
 The workshop used to be a per-user NodePort on the house LAN. That made it a separate
 website, unreachable from any other network, where it did not fail cleanly but hung until
 the browser gave up. It is now proxied by the control plane, which already knows who you
-are and routes you to your own pod — so adding a camper needs no routing configuration
+are and routes you to your own pod — so adding a user needs no routing configuration
 anywhere. The per-pod oauth2-proxy is gone; what replaced it is a NetworkPolicy admitting
 7681/7682 only from the control-plane pod, plus a token the pod checks on every request.
 Both are tested in `tests-live/test_workspace_isolation.py` rather than asserted, because

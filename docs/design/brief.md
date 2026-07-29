@@ -168,7 +168,7 @@ its core is permissively licensed.
 | Part | What the contract covers | Default we ship | Swap examples |
 |---|---|---|---|
 | Chat surface | OpenAI-compatible client, delegated auth, emits signal | **LibreChat** (MIT) | AnythingLLM, onyx-foss, in-house |
-| Coding agent | OpenAI-compatible client, delegated auth; outcomes captured at git/CI, not from the tool | **Cline** (Apache 2.0, base only) | Continue, OpenCode, Tabby |
+| Coding agent | OpenAI-compatible client, delegated auth; outcomes captured at git/CI, not from the tool | **opencode** (MIT) in a browser terminal over ttyd (MIT) — *superseded Cline during v0.1-dogfood; ruling and losing argument in design §3.6* | Cline (base only), aider (installed as the fallback), Continue, Tabby |
 | Serving | OpenAI-compatible engine, plus capacity and health introspection | vLLM (Apache 2.0) | SGLang, llm-d, Dynamo, TGI |
 | **Model catalog & routing** | Logical model → physical paths, each with price, feature/latency fingerprint, residency label | **Control-plane core — not swappable** | — |
 | **Provider path** | Frontier adapter: auth, rate limits, price, residency, terms class, capture policy | Direct API adapters | Bedrock, Vertex, aggregators |
@@ -183,7 +183,11 @@ its core is permissively licensed.
 | Console / reporting | Dashboards, alerting, export | **Perses** (Apache 2.0, CNCF) | Superset; Grafana **configured via auth.proxy, never patched** |
 
 **Standing constraints on defaults, so they are not silently reintroduced:**
-- **Cline's enterprise tier is out of scope.** The base extension is clean, and this design never
+- **Cline's enterprise tier is out of scope** — and Cline is no longer the default at all. It was
+  replaced as the *bundled* coding surface during v0.1-dogfood because an IDE extension cannot be
+  reached by a user who installs nothing; the pass-through contract for a customer's own tool is
+  unchanged, and that is where Cline still fits. Ruling in design §3.6. The constraint below still
+  binds anyone who integrates it as a swap. The base extension is clean, and this design never
   needs its fleet features — auth is enforced at the network chokepoint and outcomes come from the
   git/CI shim. Do not integrate "Cline for Enterprise" as a convenience later.
 - **LiteLLM's MIT core only.** Its `enterprise/` directory gates SSO, RBAC, and audit behind a
