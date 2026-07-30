@@ -112,7 +112,10 @@ ENDPOINT_TYPE = "custom"
 # confidence by invoking again — the JSONL means a re-run only performs the calls still
 # missing, it never re-spends what's already recorded.
 RUNS_PER_PROMPT = int(os.environ.get("TOOL_SELECTION_RUNS_PER_PROMPT", "1"))
-TURN_TIMEOUT = 100.0
+# WAS 100.0 -- demonstrably too short for a web_search turn that fetches several pages
+# (killed node-lts and hn-top in wave 6, both recorded as timeouts, not wrong-tool
+# choices). Raised per this wave's fix; override with TOOL_SELECTION_TURN_TIMEOUT.
+TURN_TIMEOUT = float(os.environ.get("TOOL_SELECTION_TURN_TIMEOUT", "220.0"))
 
 # Prompts, deliberately NOT naming a tool, a skill, or an instruction to search/compute.
 # Each carries a stable id (used as the JSONL key, so the file survives edits to the
@@ -277,10 +280,39 @@ def _load_results() -> list[dict]:
     return rows
 
 
+def _outcome(row: dict) -> str:
+    """Three-way classification, not two. A timed-out/errored call (`selected` is null)
+    is a latency/infrastructure outcome — `no-result` — and must never be counted as
+    evidence about tool SELECTION. Only `correct` / `wrong-tool` say anything about
+    whether the model reached for the right tool."""
+    if row.get("error") is not None or row.get("selected") is None:
+        return "no-result"
+    return "correct" if row.get("pass") else "wrong-tool"
+
+
+def _latest_by_run_index(rows, condition, prompt_id) -> dict[int, dict]:
+    """The most recent recorded row per run_index for this (condition, prompt_id), file
+    order = recency since the JSONL is append-only. A retried no-result call appends a
+    SECOND row under the same run_index rather than a new one (see
+    `_completed_run_indices`); this is what makes the retry's outcome the one that
+    counts instead of double-counting the triple."""
+    latest: dict[int, dict] = {}
+    for r in rows:
+        if r.get("condition") == condition and r.get("prompt_id") == prompt_id:
+            latest[r["run_index"]] = r
+    return latest
+
+
 def _completed_run_indices(rows, condition, prompt_id) -> set[int]:
+    """Which run_index values should be SKIPPED on the next invocation. A no-result
+    (timeout/error) row does NOT block a retry of that same call — only a row whose
+    latest attempt actually returned a reply (correct or wrong-tool) counts as done. This
+    is what lets a later dispatch re-attempt exactly the two prompts that timed out
+    without also blocking on their own retry if it happens to time out again."""
+    latest = _latest_by_run_index(rows, condition, prompt_id)
     return {
-        r["run_index"] for r in rows
-        if r.get("condition") == condition and r.get("prompt_id") == prompt_id
+        run_index for run_index, row in latest.items()
+        if _outcome(row) != "no-result"
     }
 
 
@@ -347,24 +379,33 @@ def _run_condition(chat_client, chat_url, label, condition, prompt_prefix, runs_
             )
 
 
-def _score(condition: str, runs_per_prompt: int) -> tuple[int, int, list[str]]:
-    """(prompts_passed, total_prompts, failure_notes) computed as a pure pass over
-    whatever rows are ACTUALLY on disk for this condition right now — not against
-    `runs_per_prompt`, which is only a target for how many NEW runs `_run_condition`
-    attempts. A prompt passes the majority bar (operational guard 9's explicit pass bar,
-    not a retry) if MORE THAN HALF its recorded runs invoked the expected category. This
-    is what makes the file scoreable mid-sweep or after a kill: a prompt with 1 of 3
-    planned runs recorded is scored on that 1, honestly, not treated as unscoreable."""
+def _score(condition: str, runs_per_prompt: int) -> tuple[int, int, list[str], int]:
+    """(prompts_passed, total_prompts, failure_notes, no_result_count) computed as a pure
+    pass over whatever rows are ACTUALLY on disk for this condition right now — not
+    against `runs_per_prompt`, which is only a target for how many NEW runs
+    `_run_condition` attempts. Dedupes to the LATEST row per (prompt_id, run_index) first
+    (see `_latest_by_run_index`) so a retried no-result call is scored once, on its
+    retry's outcome, not twice.
+
+    THREE OUTCOMES, NOT TWO: `correct`, `wrong-tool`, `no-result` (timeout/error,
+    `selected: null`). A prompt passes the majority bar over the runs that RETURNED a
+    reply (`correct` + `wrong-tool`) — a `no-result` run says nothing about tool
+    selection and must not count against (or for) the bar. A prompt with zero returned
+    runs cannot be scored on selection at all and is reported as such rather than
+    silently failed or passed."""
     rows = _load_results()
     passed = 0
     notes = []
+    total_no_result = 0
     for prompt_id, prompt, expected in PROMPTS:
-        prompt_rows = [
-            r for r in rows if r.get("condition") == condition and r.get("prompt_id") == prompt_id
-        ]
-        hits = sum(1 for r in prompt_rows if r.get("pass"))
-        n = len(prompt_rows)
-        ok = n > 0 and hits > n / 2
+        latest = _latest_by_run_index(rows, condition, prompt_id)
+        prompt_rows = list(latest.values())
+        no_result = sum(1 for r in prompt_rows if _outcome(r) == "no-result")
+        returned = [r for r in prompt_rows if _outcome(r) != "no-result"]
+        hits = sum(1 for r in returned if _outcome(r) == "correct")
+        n_returned = len(returned)
+        total_no_result += no_result
+        ok = n_returned > 0 and hits > n_returned / 2
         if ok:
             passed += 1
         else:
@@ -372,12 +413,15 @@ def _score(condition: str, runs_per_prompt: int) -> tuple[int, int, list[str]]:
                 (r.get("selected") if r.get("error") is None else f"ERROR: {r.get('error')}")
                 for r in prompt_rows
             ]
-            notes.append(
-                f"FAILED: {prompt_id} ({prompt!r}) expected {expected!r}, got {hits}/{n} "
-                f"recorded runs matching (target was {runs_per_prompt}/prompt); "
-                f"per-run: {observed}"
+            reason = "no calls returned a reply (all timed out/errored)" if n_returned == 0 else (
+                f"{hits}/{n_returned} returned runs matched (target was "
+                f"{runs_per_prompt}/prompt)"
             )
-    return passed, len(PROMPTS), notes
+            notes.append(
+                f"FAILED: {prompt_id} ({prompt!r}) expected {expected!r} — {reason}; "
+                f"no-result={no_result}; per-run: {observed}"
+            )
+    return passed, len(PROMPTS), notes, total_no_result
 
 
 def _print_score_report(runs_per_prompt: int = RUNS_PER_PROMPT) -> None:
@@ -386,8 +430,12 @@ def _print_score_report(runs_per_prompt: int = RUNS_PER_PROMPT) -> None:
         ("baseline", "BASELINE — no instructions of ours"),
         ("with-instructions", "WITH INSTRUCTIONS — this item's promptPrefix"),
     ):
-        passed, total, notes = _score(condition, runs_per_prompt)
-        print(f"\n{label}: {passed}/{total} prompts pass the majority bar")
+        passed, total, notes, no_result = _score(condition, runs_per_prompt)
+        print(
+            f"\n{label}: {passed}/{total} prompts pass the majority bar "
+            f"(selection rate over calls that returned a reply); "
+            f"no-result (timeout/error) count: {no_result}"
+        )
         for note in notes:
             print(f"  - {note}")
 
@@ -405,7 +453,7 @@ class TestUnpromptedToolSelection:
         print("BASELINE — no instructions of ours (tools attached, no promptPrefix)")
         print("=" * 78)
         _run_condition(chat_client, chat_url, "baseline", "baseline", None, RUNS_PER_PROMPT)
-        baseline_passed, total, baseline_notes = _score("baseline", RUNS_PER_PROMPT)
+        baseline_passed, total, baseline_notes, baseline_no_result = _score("baseline", RUNS_PER_PROMPT)
 
         print("\n" + "=" * 78)
         print("WITH INSTRUCTIONS — the promptPrefix this item added to librechat.yaml")
@@ -414,12 +462,12 @@ class TestUnpromptedToolSelection:
             chat_client, chat_url, "with-instructions", "with-instructions",
             system_prompt, RUNS_PER_PROMPT,
         )
-        after_passed, _, after_notes = _score("with-instructions", RUNS_PER_PROMPT)
+        after_passed, _, after_notes, after_no_result = _score("with-instructions", RUNS_PER_PROMPT)
 
         print("\n" + "=" * 78)
         print(f"RESULT: baseline {baseline_passed}/{total} prompts selected the right tool "
-              f"on the majority of their recorded runs; "
-              f"with instructions {after_passed}/{total}.")
+              f"on the majority of their RETURNED runs (no-result={baseline_no_result}); "
+              f"with instructions {after_passed}/{total} (no-result={after_no_result}).")
         print(f"Raw data: {RESULTS_JSONL}")
         print("=" * 78)
         if baseline_notes:
