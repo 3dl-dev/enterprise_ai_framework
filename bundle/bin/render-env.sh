@@ -98,6 +98,67 @@ GIT_COMMON_DIR="$(_abs_git_path --git-common-dir)"
 
 hex_hash() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
 
+# --- Host-wide port collision avoidance (enterpriseaiframework-7b3) ---
+#
+# The path hash below only proves two enterprise-ai checkouts cannot collide WITH EACH
+# OTHER — it says nothing about the rest of the host. Observed in practice: a worktree
+# hashed to GATEWAY_PORT=10000, which azurite-galtrader already held, and `make up` died
+# mid-sequence at "Bind for 0.0.0.0:10000 failed: port is already allocated" with core
+# services half-started. This host also runs se-server and a 13-pod k3s cluster, so
+# nothing in [1024, 30000) can be assumed free.
+#
+# Fix: treat the path hash as the STARTING bucket of a search, not the answer. Probe the
+# six ports a bucket would produce; if any is bound, walk to the next bucket (wrapping
+# through all 200) until a fully-free bucket is found, or fail loudly if none exists in
+# 200 tries — before anything has been started, since render-env.sh runs before
+# `docker compose up`.
+#
+# port_in_use tests via a real TCP connect on 127.0.0.1, not `ss`/`lsof`/`fuser`, so it
+# has no dependency beyond bash's /dev/tcp — connect succeeds (port in use) or is refused
+# (port free).
+port_in_use() {
+    local port="$1"
+    ( exec 3<>"/dev/tcp/127.0.0.1/${port}" ) 2>/dev/null
+}
+
+# CRITICAL: set_var overwrites the port block on EVERY render, deliberately (see set_var's
+# comment). If the probe above ran unconditionally, re-rendering while THIS checkout's own
+# stack is already up would see its own containers holding those ports, treat that as a
+# collision, and walk the running stack onto a different bucket out from under itself —
+# the search must be idempotent against its own prior result, not just against a fresh
+# host. Guard: if this checkout's own compose project already has running containers,
+# trust the offset already recorded in .env instead of re-probing — those ports are ours,
+# by construction, for as long as the project is up. Falls through to a fresh probe
+# whenever docker is unavailable, the project isn't running, or .env has no prior
+# GATEWAY_PORT to derive an offset from (fresh checkout, nothing can be running yet).
+own_project_running() {
+    local project="$1"
+    command -v docker >/dev/null 2>&1 || return 1
+    [[ -n "$(docker compose -p "$project" ps --status running -q 2>/dev/null)" ]]
+}
+
+# Offsets are multiples of 100 in [100, 20000] — 200 buckets, same invariant as before.
+find_free_offset() {
+    local start_bucket="$1" i bucket off port ok
+    for (( i=0; i<200; i++ )); do
+        bucket=$(( (start_bucket + i) % 200 ))
+        off=$(( (bucket + 1) * 100 ))
+        ok=1
+        for port in $(( 4000 + off )) $(( 8081 + off )) $(( 8082 + off )) \
+                    $(( 8443 + off )) $(( 8090 + off )) $(( 3080 + off )); do
+            if port_in_use "$port"; then
+                ok=0
+                break
+            fi
+        done
+        if [[ "$ok" -eq 1 ]]; then
+            echo "$off"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # The bare name `enterprise-ai` belongs to the PRIMARY checkout and to nothing else. A
 # checkout only earns it by positively proving it is the primary: inside a git repository,
 # with --git-dir and --git-common-dir agreeing. Everything else — a linked worktree, and
@@ -124,10 +185,26 @@ if [[ "$IS_PRIMARY" -eq 0 ]]; then
     # the checkout's own absolute path — which is what the offset is derived from anyway.
     WORKTREE_PATH="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
     HASH="$(hex_hash "$WORKTREE_PATH")"
-    OFFSET=$(( (HASH % 200 + 1) * 100 ))
+    START_BUCKET=$(( HASH % 200 ))
     SHORT_HASH="$(hex_hash "${WORKTREE_PATH}:name")"
-    echo "not the primary checkout (${WORKTREE_PATH}); isolating compose project (offset +${OFFSET})"
-    set_var COMPOSE_PROJECT_NAME "enterprise-ai-${SHORT_HASH:0:8}"
+    PROJECT_NAME="enterprise-ai-${SHORT_HASH:0:8}"
+
+    EXISTING_GATEWAY_PORT=""
+    if [[ -f .env ]] && grep -qE '^GATEWAY_PORT=[0-9]+$' .env; then
+        EXISTING_GATEWAY_PORT="$(grep -E '^GATEWAY_PORT=' .env | head -1 | cut -d= -f2)"
+    fi
+
+    if [[ -n "$EXISTING_GATEWAY_PORT" ]] && own_project_running "$PROJECT_NAME"; then
+        OFFSET=$(( EXISTING_GATEWAY_PORT - 4000 ))
+        echo "not the primary checkout (${WORKTREE_PATH}); own stack already running, keeping offset +${OFFSET}"
+    else
+        OFFSET="$(find_free_offset "$START_BUCKET")" || {
+            echo "error: no free port block found for ${WORKTREE_PATH} across 200 offset buckets on this host" >&2
+            exit 1
+        }
+        echo "not the primary checkout (${WORKTREE_PATH}); isolating compose project (offset +${OFFSET})"
+    fi
+    set_var COMPOSE_PROJECT_NAME "${PROJECT_NAME}"
     set_var GATEWAY_PORT         "$(( 4000 + OFFSET ))"
     set_var CONTROL_PLANE_PORT   "$(( 8081 + OFFSET ))"
     set_var IDP_PORT             "$(( 8082 + OFFSET ))"
