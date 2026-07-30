@@ -53,6 +53,39 @@ spec:
         - ip: "192.168.2.42"
           hostnames:
             - "gateway.tailcb6ef9.ts.net"
+      # A ConfigMap volume is a SYMLINK FARM: Kubernetes materialises the keys under a
+      # timestamped directory and points `..data` at it. LibreChat's deployment-skills
+      # loader refuses symlinks outright — "..data: symlinks are not allowed in deployment
+      # skills" — and that check sits inside the UNGUARDED boot-time await (finding 41),
+      # so the whole surface crash-loops rather than starting without skills. Measured on
+      # this cluster, not reasoned about: mounting the skill ConfigMaps directly at
+      # /app/skill/<name> put chat into CrashLoopBackOff with exactly that message, while
+      # the identical corpus works in the compose bundle because a bind-mount is real
+      # files. This is the gap enterpriseaiframework-0eb warned about — the cluster side
+      # was static-validated and never exercised.
+      #
+      # `cp -rL` dereferences the symlinks into an emptyDir, so the loader sees plain
+      # files. Copy-on-boot also means a skill change needs a pod restart, which is
+      # already true of DEPLOYMENT_SKILLS_DIR (scanned once into a module singleton).
+      initContainers:
+        - name: materialise-skills
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              mkdir -p /skills
+              for d in /src/*; do
+                [ -d "$d" ] || continue
+                n=$(basename "$d")
+                mkdir -p "/skills/$n"
+                cp -rL "$d"/. "/skills/$n"/
+              done
+              echo "materialised: $(ls /skills | tr '\n' ' ')"
+          volumeMounts:
+            - { name: skill-incident-escalation, mountPath: /src/incident-escalation, readOnly: true }
+            - { name: skill-meeting-notes-format, mountPath: /src/meeting-notes-format, readOnly: true }
+            - { name: skills, mountPath: /skills }
       containers:
         - name: librechat
           # Must equal the tag in bundle/docker-compose.yml — asserted by
@@ -187,8 +220,8 @@ spec:
             # one mechanism, never baked into the LibreChat image. Adding a skill means
             # adding both a ConfigMap (created by deploy.sh) and a volume/volumeMount
             # pair here — see deploy/bin/lib/tenant-skills.sh for that tradeoff.
-            - { name: skill-incident-escalation, mountPath: /app/skill/incident-escalation, readOnly: true }
-            - { name: skill-meeting-notes-format, mountPath: /app/skill/meeting-notes-format, readOnly: true }
+            # The materialised copy, NOT the ConfigMap mounts — see the initContainer.
+            - { name: skills, mountPath: /app/skill, readOnly: true }
           readinessProbe:
             httpGet: { path: /health, port: 3080 }
             initialDelaySeconds: 30
@@ -210,3 +243,6 @@ spec:
           configMap: { name: chat-skill-incident-escalation, optional: true }
         - name: skill-meeting-notes-format
           configMap: { name: chat-skill-meeting-notes-format, optional: true }
+        # Real files, materialised from the ConfigMaps above by the initContainer.
+        - name: skills
+          emptyDir: {}
