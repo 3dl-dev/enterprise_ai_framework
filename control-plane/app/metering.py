@@ -13,6 +13,8 @@ import os
 
 import asyncpg
 
+from . import chat_identity
+
 _pool: asyncpg.Pool | None = None
 
 
@@ -127,7 +129,14 @@ def ledger_attribution_sql(shared_param: str) -> dict[str, str]:
 
 
 async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
-    """The single query the scope item names. One row per (user, surface)."""
+    """The single query the scope item names. One row per (principal, surface).
+
+    The principal is named here, by `chat_identity.attribute`, and not by the caller.
+    The chat surface identifies people by LibreChat's internal ObjectId, so the raw
+    column is hex for the surface most people use; translating it in each renderer is
+    what let `/admin/spend` and the portal disagree about who spent the money
+    (finding 34). Every reader of the one bill now gets the same names by construction.
+    """
     where, params = "", []
     if since:
         where = 'WHERE s."startTime" >= $1::text::timestamptz'
@@ -151,7 +160,7 @@ async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
     p = await pool()
     async with p.acquire() as conn:
         rows = await conn.fetch(sql, *params)
-    return [dict(r) for r in rows]
+    return chat_identity.attribute([dict(r) for r in rows])
 
 
 async def totals(since: str | None = None) -> dict:

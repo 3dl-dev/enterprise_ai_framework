@@ -174,18 +174,43 @@ anything other than localhost. Not done.
 The test suite emulates the browser's localhost exception explicitly rather than
 weakening the surface's cookie flags to suit a stricter HTTP client.
 
-### 13. Chat spend attributes to the surface, not to the person
+### 13. Chat spend attributes to the surface, not to the person — SUPERSEDED
 
-The chat surface is a shared client holding one virtual key, so its traffic lands under
-`chat-surface / chat` rather than under the signed-in user. The coding agents, which hold
-per-user keys, attribute correctly.
+**This entry is no longer true and is kept because its reasoning still is.** It read: the
+chat surface is a shared client holding one virtual key, so its traffic lands under
+`chat-surface / chat` rather than under the signed-in user; forwarding the user via
+`addParams: {user: "{{LIBRECHAT_USER_ID}}"}` was tried and removed, because that
+substitution is only demonstrably supported for headers and an unsubstituted placeholder
+would write the literal string `{{LIBRECHAT_USER_ID}}` into the ledger as a username — a
+corrupted bill being worse than a coarse one.
 
-Forwarding the user via `addParams: {user: "{{LIBRECHAT_USER_ID}}"}` was tried and
-removed: that substitution is only demonstrably supported for headers, and an
-unsubstituted placeholder writes the literal string `{{LIBRECHAT_USER_ID}}` into the
-ledger as a username — a corrupted bill is worse than a coarse one. The ledger query
-already prefers `end_user` where present, so this becomes correct the moment the surface
-is confirmed to forward it.
+The cluster ledger disproves the first half. Chat spend rows carry a per-user `end_user`
+value (LibreChat's own user id) and are attributed per person, which is what finding 34
+then found the bill rendering as hex. `chat-surface / chat` remains a real row, but it is
+now only the calls the surface makes on nobody's behalf — conversation titling and the
+like — and it is labelled `(chat surface, no user)` so it cannot be read as a person.
+
+The second half stands and is why nothing in `librechat.yaml` forwards the user through
+`addParams`: an unsubstituted placeholder in the username column is worse than no chat
+attribution at all.
+
+**And nothing needs to, which was never measured until now.** LibreChat sets the outgoing
+request's `user` field to its own Mongo `_id` by itself, with no `addParams` and no
+configuration on our side. Measured in the compose bundle 2026-07-29 by signing in through
+the real identity provider, sending one message through the surface's own message API, and
+reading the raw column the gateway recorded:
+
+```
+end_user                 | user_api_key_alias | model
+6a6a20ca6e4b89f8dd617f90 | chat-surface::chat | fake-gpt-large
+```
+
+`6a6a20ca6e4b89f8dd617f90` is exactly what the surface's own `/api/user` returns as that
+account's `_id`. It is not the email and not the OIDC `sub`. Everything `chat_identity`
+does rests on that being true, and it was previously believed from the shape of cluster
+data rather than demonstrated end to end; it is now asserted by
+`TestChatPrincipalOnTheOneBill::test_the_chat_surface_identifies_a_spender_by_its_own_mongo_id`,
+which fails loudly if a LibreChat upgrade ever changes it.
 
 ### 14. Forge prices only 12 of its 68 models, and the unpriced ones are the interesting ones
 
@@ -1091,3 +1116,59 @@ One incidental correction while there: `interface.artifacts: true` in
 from the served `/api/config`. What actually turns artifacts on is `preset.artifacts` on
 each model spec. The key is left in place with a corrected comment and a test that fails
 if a future release starts honouring it.
+**Fixed** (`enterpriseaiframework-f8c`) by moving the naming of a principal into the query
+itself. `metering.spend_by_user_and_surface` now passes every row through
+`chat_identity.attribute`, so the CLI bill, the user's portal page, the operator console
+and anything added later inherit the same names by construction rather than by each
+remembering to ask. The two call sites in `portal.py` were deleted rather than copied to
+`main.py`: a third copy is a third thing to forget.
+
+Two things the fix had to get right beyond the lookup:
+
+- **A principal that genuinely cannot be resolved is labelled, not dropped and not
+  guessed.** It reads `(unresolved chat user 6a67…)` — the identifier survives for
+  tracing, the money stays on the bill, and `/admin/spend` raises an
+  `unresolved_chat_principal` warning alongside the unpriced-model one. Dropping the row
+  would have been finding 25's shape; printing the bare ObjectId is this finding.
+- **Translation can merge rows.** One person with two chat accounts produced two rows
+  naming the same person, so `attribute` re-merges on (principal, surface) to keep the
+  query's one-row-per-pair contract. Otherwise one reader sums them and another shows the
+  first — finding 34 again, one level down.
+
+**Why it could not be tested before, and can be now:** the bundle never set
+`CHAT_MONGO_URL`, which the cluster has always set — so no chat row in any test carried an
+ObjectId and the translating path was unreachable. `bundle/docker-compose.yml` now sets it
+(and `PORTAL_ADMINS`, without which the console rendering did not exist here either).
+
+**Regression tests:** `TestChatPrincipalOnTheOneBill` (6 integration tests) and
+`tests/test_chat_principal_naming.py` (17 unit tests covering the unreachable-database
+case and every principal that must NOT be relabelled). Against the pre-fix control plane,
+5 of the 6 integration tests and all 17 unit tests fail; the integration ones fail by
+showing hex where a name belongs.
+
+Three of the six are there because the first attempt at this fix was tested in ways that
+looked adequate and were not:
+
+- **The premise is proven, not staged.**
+  `test_the_chat_surface_identifies_a_spender_by_its_own_mongo_id` drives a genuine
+  message through the chat surface's own API as a signed-in user and reads the raw
+  `end_user` the gateway recorded. Nothing in the test chooses that value. The earlier
+  version wrote the Mongo user AND forwarded the id itself, which proved the translation
+  while assuming the thing being translated ever occurs — see finding 13 above.
+- **The control case on the deleted path.**
+  `test_the_portal_still_names_a_user_who_has_no_chat_identity` exercises
+  `/portal/api/spend` for a user with only IDE spend and no chat identity at all. That
+  endpoint is where `chat_identity.resolve()` was deleted, and every other test of it uses
+  a chat user, so the case the change did *not* set out to alter had nothing watching it.
+  It passes against the pre-fix code by design — it is a control — and it fails against a
+  relabelling that is too broad (verified by removing the `looks_like_chat_id` guard from
+  `principal_label`: the ide user's own spend then vanishes from both renderings).
+- **The tests do not disfigure the bill they inspect.** The unresolvable-principal test
+  necessarily writes a row that can never be named. Left behind, it would put a permanent
+  `(unresolved chat user …)` line and a permanent warning on every later `make spend` for
+  that bundle — a test that corrupts its own subject. Its ledger rows are now deleted in a
+  `finally` (so a failed assertion still cleans up) and their absence is asserted
+  afterwards, which makes the reversibility a checked claim. No test in the class creates
+  a synthetic LibreChat account any more: the person they bill is the bundle's real
+  bootstrap user, signed in through the real identity provider, so the rows they leave are
+  rows the bill should carry.

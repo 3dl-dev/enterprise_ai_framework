@@ -155,6 +155,20 @@ services:
       IDP_CLIENT_ID: control-plane
       IDP_CLIENT_SECRET: ${IDP_CLIENT_SECRET:?set IDP_CLIENT_SECRET in .env}
       CONTROL_PLANE_ADMIN_TOKEN: ${CONTROL_PLANE_ADMIN_TOKEN:?set CONTROL_PLANE_ADMIN_TOKEN in .env}
+      # Read-only, one collection, two fields: the map from LibreChat's internal user id
+      # to a username. The cluster has always set this (deploy/k8s/40-control-plane.yaml);
+      # the bundle did not, which is the direct reason `make test` could not see finding
+      # 34 — with no map, no chat row here ever carried an ObjectId, so the code path that
+      # has to translate one was never exercised by any test. The fixture was more uniform
+      # than production. See app/chat_identity.py for how it fails safe when absent.
+      CHAT_MONGO_URL: mongodb://chatdb:27017
+      CHAT_MONGO_DB: librechat
+      # Who sees the operator console. The cluster sets this
+      # (deploy/k8s/40-control-plane.yaml); the bundle did not, so the console rendering
+      # of the bill — one of the two renderings that disagreed in finding 34 — did not
+      # exist here to be tested against. Empty is still the safe default everywhere else:
+      # a deployment that names nobody gets no console.
+      PORTAL_ADMINS: ${PORTAL_ADMINS:-${BOOTSTRAP_USER:-baron}}
     ports:
       - "${CONTROL_PLANE_PORT:-8081}:8000"
     depends_on:
@@ -164,6 +178,11 @@ services:
         condition: service_started
       identity:
         condition: service_started
+      # Only so the map is loadable when the bill is first rendered. The control plane
+      # starts and serves without it — an unreachable chat database costs a label, never
+      # a bill — so this is service_healthy for test determinism, not for correctness.
+      chatdb:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 10s
