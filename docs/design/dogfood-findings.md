@@ -1331,3 +1331,88 @@ parse YAML/JSON — they do not apply it. A `librechat.yaml`-shaped consequence 
 here too: pushing a cluster skill change is a ConfigMap update and a chat restart
 (`DEPLOYMENT_SKILLS_DIR` has no watcher, same as finding 41 already established), which an
 operator runs deliberately via `deploy/bin/deploy.sh`.
+### 41. Web search fetched the pages and then withheld them from the model
+
+Found building web search for the chat surface (`enterpriseaiframework-0be`), by measuring
+the pinned LibreChat v0.8.7 rather than by reading its documentation. The item's premise was
+that LibreChat's native `web_search` splits into search, scrape and rerank, that only the
+search leg is required, and that `rerankerType: none` therefore buys a fully free path.
+Two thirds of that is right. The last third is wrong in a way that produces a working-looking
+feature whose citations are not grounded in anything the system read.
+
+**The scrape leg is not optional, and its absence is silent.** `webSearchAuth.scrapers` in
+LibreChat's own `data-schemas` marks `firecrawlApiKey`, `serperApiKey` and `tavilyApiKey` all
+as required; unlike rerankers there is no `none`. With no key configured the failure is not
+an error:
+
+```js
+// @librechat/agents/dist/cjs/tools/search/firecrawl.cjs
+if (!this.apiKey) return [url, { success: false, error: 'FIRECRAWL_API_KEY is not set' }];
+```
+
+That returns before any HTTP request is made, and `handleTools.js` ignores
+`loadWebSearchAuth`'s `authenticated` flag and builds the tool regardless. So `web_search`
+succeeds, hands the model titles, links and search-engine snippets, and the model writes a
+confident answer citing pages that nothing ever retrieved. One `logger.warn` is the only
+trace. This is the fabricated-citation shape in its purest form, and it is the reason the
+bundle now ships `webfetch/` — an Apache-2.0 service of ours that speaks Firecrawl's
+`/v2/scrape` wire contract, so LibreChat's existing client is pointed at it unmodified.
+Self-hosted Firecrawl stays a documented swap: AGPL-3.0, a closed-source cloud-only anti-bot
+engine, and it brings Postgres, Redis, a browser pool and its own LLM keys.
+
+**The finding that actually matters: fetching a page and showing it to the model are two
+different things.** With the scrape leg working — `webfetch`'s `/fetchlog` recording real
+200s and real byte counts for kernel.org pages of 7,545, 12,758, 16,912 and 23,124 bytes —
+the model still received none of that text. `rerankerType: none` is the cause, through a
+chain nothing upstream documents:
+
+```
+createReranker({rerankerType:'none'})  -> undefined
+getHighlights({reranker:undefined})    -> warns, returns undefined
+addHighlights()                        -> source.highlights = undefined
+formatSource()                         -> always emits `Summary: <snippet>`, and emits the
+                                          Highlights section ONLY if highlights is non-empty
+```
+
+`format.ts` says so in its own comment: "per-source `content` stays in the `WEB_SEARCH`
+artifact for citations." The artifact, not the prompt. Measured on this bundle, same
+question, same model, one config line changed:
+
+| `rerankerType` | model-facing tool output | highlight blocks | grounded in |
+|---|---|---|---|
+| `none` | 3,688 chars | 0 | SearXNG snippets |
+| a reranker present | 17,510 chars | 20 | fetched page text |
+
+So the reranker is optional for **authentication** and mandatory for **grounding**. The
+pages are fetched, the bandwidth is spent, and the content is dropped before the prompt is
+built.
+
+**And the obvious workaround is a trap.** `rerankerType: jina` with no key does produce
+highlights — but not for the reason it appears to. `loadWebSearchAuth` cannot authenticate
+jina without `jinaApiKey`, so it leaves `rerankerType` unset; `createSearchTool` then falls
+back to its *own* default of `cohere`; `CohereReranker` finds no `COHERE_API_KEY`, logs
+`"COHERE_API_KEY is not set. Using default ranking."` and returns the first N chunks with
+score 0. You write `jina` and you get Cohere, via two stacked fallbacks, with the vendor name
+in the config naming neither what runs nor what happens. No outbound call is made, so it is
+not a licence or data-path violation — but it is not a default worth shipping on a hunch.
+
+**Where it was left.** `rerankerType: none` is committed, because it is the only value that
+authenticates with no paid key and no fallbacks, and the cost is written above it in
+`librechat.yaml` in full. Web search on this bundle is therefore **snippet-grounded**, and
+`tests/test_web_search.py::TestWhatTheModelActuallyReceives` asserts that measured behaviour
+against LibreChat's own formatter so it cannot be mistaken for working. The search leg and
+the fetch leg are built, tested and correct; the fetch leg becomes load-bearing the moment
+the reranker question (`enterpriseaiframework-405`) is decided, which is one config line
+plus whichever option wins.
+
+**Two smaller traps found in the same pass, both silent.** First, every required `webSearch`
+value must be written as a `${VAR}` placeholder, never as a literal: LibreChat extracts an
+environment-variable *name* from each value (`extractWebSearchEnvVars` →
+`extractVariableName`), so `searxngInstanceUrl: http://searxng:8080` written directly counts
+as a *missing* field, the provider is skipped, and `searchProvider` falls back to `serper`
+with no key. Demonstrated both ways inside the running container by
+`test_librechat_resolves_our_config_and_rejects_the_literal_form`. Second, SearXNG's default
+`formats` is `[html]` only while LibreChat requests `format=json`, so without that one
+setting SearXNG answers 403 and the search leg reports "no results" rather than a
+misconfiguration — which is why the container's healthcheck runs a real JSON query instead of
+a liveness probe.

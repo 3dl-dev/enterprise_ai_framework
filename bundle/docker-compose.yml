@@ -208,6 +208,79 @@ services:
       retries: 20
     restart: unless-stopped
 
+  # ---- web search (enterpriseaiframework-0be) --------------------------------------
+  #
+  # Three services: all three of LibreChat's native web_search legs are supplied, none
+  # left to LibreChat's own paid-only defaults:
+  #   search  -> searxng   self-hosted, no key, AGPL over HTTP and never patched
+  #   scrape  -> webfetch  ours, Apache-2.0; every option LibreChat ships needs a paid key
+  #   rerank  -> rerank    ours, Apache-2.0; jina/cohere both need a paid key, and
+  #                        `rerankerType: none` authenticates for free but silently
+  #                        withholds every fetched page from the model (see rerank/app.py
+  #                        and the rerankerType comment in librechat.yaml)
+  #
+  # The reason the scrape leg cannot simply be left unset is in webfetch/app.py: with no
+  # scraper key LibreChat's Firecrawl client returns success:false BEFORE issuing any
+  # request, so web_search still answers with search-engine snippets and links and the
+  # model cites pages that were never retrieved. Well-formed and wrong.
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      # Point SearXNG at our mounted config rather than /etc/searxng/settings.yml. The
+      # entrypoint runs `chown -R` over /etc/searxng, which fails noisily against a
+      # read-only bind mount inside it; a separate path keeps the mount read-only and the
+      # startup log clean. Rendered from searxng/settings.template.yml by bin/render-env.sh.
+      SEARXNG_SETTINGS_PATH: /etc/searxng-config/settings.yml
+      SEARXNG_BASE_URL: http://searxng:8080/
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng-config/settings.yml:ro
+    healthcheck:
+      # Probe the JSON API, not /healthz. `format=json` is disabled by default in SearXNG
+      # and is the single setting the whole search leg depends on — a liveness probe would
+      # report healthy on an instance that answers 403 to every query LibreChat makes.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,json,sys;d=json.load(urllib.request.urlopen('http://localhost:8080/search?q=enterprise+ai&format=json',timeout=10));sys.exit(0 if 'results' in d else 1)\""]
+      interval: 15s
+      timeout: 15s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  webfetch:
+    build: ../webfetch
+    environment:
+      # Presented by LibreChat as `firecrawlApiKey`. MUST be non-empty: LibreChat's client
+      # skips the request entirely when its key is empty, and this service fails closed on
+      # an unset token, so an empty value here is the silent no-fetch case twice over.
+      WEBFETCH_TOKEN: ${WEBFETCH_TOKEN:?set WEBFETCH_TOKEN in .env}
+      # Private address space stays blocked. Empty allowlist is the secure default; a
+      # deployment that wants its own intranet searchable names those hosts here.
+      WEBFETCH_ALLOW_HOSTS: ${WEBFETCH_ALLOW_HOSTS:-}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,json,sys;d=json.load(urllib.request.urlopen('http://localhost:3002/health'));sys.exit(0 if d.get('token_configured') else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  rerank:
+    build: ../rerank
+    environment:
+      # Presented by LibreChat as `jinaApiKey`. MUST be non-empty for the same reason
+      # WEBFETCH_TOKEN is: this service fails closed on an unset token, and an empty
+      # value here would make grounding silently fall back to JinaReranker's own
+      # first-N-chunks-score-0 default ranking.
+      RERANK_TOKEN: ${RERANK_TOKEN:?set RERANK_TOKEN in .env}
+    healthcheck:
+      # Asserts token_configured, not just liveness: a reranker that 401s every request
+      # would otherwise look healthy while grounding silently degrades to LibreChat's
+      # built-in fallback (see rerank/app.py's /reranklog, which is what distinguishes
+      # the two).
+      test: ["CMD-SHELL", "python -c \"import urllib.request,json,sys;d=json.load(urllib.request.urlopen('http://localhost:3003/health'));sys.exit(0 if d.get('token_configured') else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   chatdb:
     image: mongo:7
     command: ["--quiet"]
@@ -634,6 +707,29 @@ services:
       CODEAPI_JWT_KID: lc-codeapi-bundle-1
       CODEAPI_JWT_ISSUER: librechat
       CODEAPI_JWT_AUDIENCE: codeapi
+      # ---- web search (enterpriseaiframework-0be) --------------------------------
+      #
+      # These MUST be supplied as environment variables and librechat.yaml MUST reference
+      # them as ${...} placeholders. That is not style — it is load bearing. LibreChat
+      # resolves web-search credentials by extracting an env-var NAME out of each config
+      # value (packages/api extractWebSearchEnvVars -> extractVariableName). A literal
+      # value written directly in librechat.yaml yields no variable name, so the field is
+      # counted as missing, `requiredAuthFields.length !== requiredKeys.length` skips the
+      # provider, and the search provider silently falls back to the default (serper) with
+      # no key. Symptom: web_search offered in the UI and every call failing.
+      SEARXNG_INSTANCE_URL: http://searxng:8080
+      # Scraper leg. `firecrawl` is the WIRE SHAPE, not the vendor — webfetch speaks
+      # Firecrawl's /v2/scrape contract so LibreChat's existing client can be pointed at
+      # it unmodified. Swapping to real Firecrawl (cloud or self-hosted) is these two
+      # values and nothing else.
+      FIRECRAWL_API_URL: http://webfetch:3002
+      FIRECRAWL_API_KEY: ${WEBFETCH_TOKEN:?set WEBFETCH_TOKEN in .env}
+      # Rerank leg. `jina` names the WIRE CONTRACT, not the vendor — rerank/ speaks
+      # Jina's own /v1/rerank shape so LibreChat's existing JinaReranker client works
+      # unmodified. The FULL path is required: the client POSTs jinaApiUrl verbatim and
+      # appends nothing. Swapping to a real Jina/Cohere key is these two values.
+      JINA_API_URL: http://rerank:3003/v1/rerank
+      JINA_API_KEY: ${RERANK_TOKEN:?set RERANK_TOKEN in .env}
     volumes:
       - ./librechat/librechat.yaml:/app/librechat.yaml:ro
       - ./certs:/certs:ro
@@ -655,6 +751,17 @@ services:
       mcp-echo:
         condition: service_healthy
       codeapi:
+        condition: service_healthy
+      # webfetch and rerank both gate startup: without either, web_search either fetches
+      # nothing (no scraper key) or fetches and then withholds it from the model (no
+      # working reranker), and grounding is exactly enterpriseaiframework-0be's outcome.
+      # SearXNG does NOT gate startup — its healthcheck runs a real outbound query, so
+      # gating chat on it would make the whole bundle's startup depend on the public
+      # internet answering, and `make up` must work on a host that cannot reach bing. A
+      # degraded search leg is a degraded feature; it is not a reason for chat to be down.
+      webfetch:
+        condition: service_healthy
+      rerank:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]

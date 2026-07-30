@@ -41,6 +41,36 @@ DEFAULT_PORTS = {
 }
 
 
+# Every template render-env.sh renders, as (source-relative-to-bundle, ...). These tests
+# run the REAL script against a minimal skeleton rather than a full bundle copy, so the
+# script's inputs have to be listed somewhere — and listing them once, here, is the point:
+# each of the four skeletons below used to inline its own copy calls, so adding
+# searxng/settings.template.yml (enterpriseaiframework-0be) turned all five call sites red
+# at once with "No such file or directory" from a redirect deep inside the script. The
+# failure was correct — the script really does need the file — but the diagnosis cost is
+# paid five times. A new template now needs one line here.
+RENDER_INPUTS = (
+    ".env.example",
+    # enterpriseaiframework-082: render-env.sh shells out to this to mint the codeapi
+    # keypair, so a skeleton without it fails at generation rather than at assertion.
+    "bin/render-codeapi-keys.py",
+    "keycloak/realm-export.template.json",
+    "searxng/settings.template.yml",
+)
+
+
+def _skeleton(root: Path) -> Path:
+    """Lay down the minimum bundle render-env.sh needs, under `root`, and return it."""
+    bundle = root / "bundle"
+    (bundle / "bin").mkdir(parents=True)
+    shutil.copy2(RENDER, bundle / "bin" / "render-env.sh")
+    for relative in RENDER_INPUTS:
+        destination = bundle / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(BUNDLE / relative, destination)
+    return root
+
+
 def _git(*args, cwd):
     return subprocess.run(
         ["git", *args], cwd=cwd, capture_output=True, text=True, check=True,
@@ -65,20 +95,7 @@ def rendered(tmp_path_factory):
         pytest.skip("openssl not available; render-env.sh cannot generate secrets")
 
     root = tmp_path_factory.mktemp("isolation")
-    primary = root / "primary"
-    (primary / "bundle" / "bin").mkdir(parents=True)
-    (primary / "bundle" / "keycloak").mkdir(parents=True)
-
-    shutil.copy2(RENDER, primary / "bundle" / "bin" / "render-env.sh")
-    shutil.copy2(
-        BUNDLE / "bin" / "render-codeapi-keys.py",
-        primary / "bundle" / "bin" / "render-codeapi-keys.py",
-    )
-    shutil.copy2(BUNDLE / ".env.example", primary / "bundle" / ".env.example")
-    shutil.copy2(
-        BUNDLE / "keycloak" / "realm-export.template.json",
-        primary / "bundle" / "keycloak" / "realm-export.template.json",
-    )
+    primary = _skeleton(root / "primary")
 
     _git("init", "-q", cwd=primary)
     _git("config", "user.email", "test@example.com", cwd=primary)
@@ -183,18 +200,7 @@ def test_a_primary_env_damaged_by_the_old_detection_repairs_itself(tmp_path):
         pytest.skip("openssl not available")
 
     repo = tmp_path / "repo"
-    (repo / "bundle" / "bin").mkdir(parents=True)
-    (repo / "bundle" / "keycloak").mkdir(parents=True)
-    shutil.copy2(RENDER, repo / "bundle" / "bin" / "render-env.sh")
-    shutil.copy2(
-        BUNDLE / "bin" / "render-codeapi-keys.py",
-        repo / "bundle" / "bin" / "render-codeapi-keys.py",
-    )
-    shutil.copy2(BUNDLE / ".env.example", repo / "bundle" / ".env.example")
-    shutil.copy2(
-        BUNDLE / "keycloak" / "realm-export.template.json",
-        repo / "bundle" / "keycloak" / "realm-export.template.json",
-    )
+    _skeleton(repo)
     _git("init", "-q", cwd=repo)
     _git("config", "user.email", "test@example.com", cwd=repo)
     _git("config", "user.name", "test", cwd=repo)
@@ -232,18 +238,7 @@ def test_self_heal_leaves_a_deliberate_custom_project_name_alone(tmp_path):
         pytest.skip("openssl not available")
 
     repo = tmp_path / "repo"
-    (repo / "bundle" / "bin").mkdir(parents=True)
-    (repo / "bundle" / "keycloak").mkdir(parents=True)
-    shutil.copy2(RENDER, repo / "bundle" / "bin" / "render-env.sh")
-    shutil.copy2(
-        BUNDLE / "bin" / "render-codeapi-keys.py",
-        repo / "bundle" / "bin" / "render-codeapi-keys.py",
-    )
-    shutil.copy2(BUNDLE / ".env.example", repo / "bundle" / ".env.example")
-    shutil.copy2(
-        BUNDLE / "keycloak" / "realm-export.template.json",
-        repo / "bundle" / "keycloak" / "realm-export.template.json",
-    )
+    _skeleton(repo)
     _git("init", "-q", cwd=repo)
     _git("config", "user.email", "test@example.com", cwd=repo)
     _git("config", "user.name", "test", cwd=repo)
@@ -282,18 +277,7 @@ def test_a_non_git_copy_does_not_claim_the_primary_compose_project(tmp_path):
 
     # Deliberately NOT a git repo: no `git init` anywhere above this directory.
     copy = tmp_path / "scratch-copy"
-    (copy / "bundle" / "bin").mkdir(parents=True)
-    (copy / "bundle" / "keycloak").mkdir(parents=True)
-    shutil.copy2(RENDER, copy / "bundle" / "bin" / "render-env.sh")
-    shutil.copy2(
-        BUNDLE / "bin" / "render-codeapi-keys.py",
-        copy / "bundle" / "bin" / "render-codeapi-keys.py",
-    )
-    shutil.copy2(BUNDLE / ".env.example", copy / "bundle" / ".env.example")
-    shutil.copy2(
-        BUNDLE / "keycloak" / "realm-export.template.json",
-        copy / "bundle" / "keycloak" / "realm-export.template.json",
-    )
+    _skeleton(copy)
 
     env = {**os.environ}
     for k in [*DEFAULT_PORTS, "COMPOSE_PROJECT_NAME"]:

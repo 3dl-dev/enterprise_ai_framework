@@ -80,6 +80,9 @@ kubectl -n "$NS" create secret generic enterprise-ai-secrets \
     --from-literal=CODEAPI_REDIS_PASSWORD="$CODEAPI_REDIS_PASSWORD" \
     --from-literal=MINIO_ROOT_USER="$MINIO_ROOT_USER" \
     --from-literal=MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
+    --from-literal=WEBFETCH_TOKEN="${WEBFETCH_TOKEN:?WEBFETCH_TOKEN is unset — run bundle/bin/render-env.sh}" \
+    --from-literal=RERANK_TOKEN="${RERANK_TOKEN:?RERANK_TOKEN is unset — run bundle/bin/render-env.sh}" \
+    --from-literal=SEARXNG_SECRET="${SEARXNG_SECRET:?SEARXNG_SECRET is unset — run bundle/bin/render-env.sh}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
 # The realm JSON carries client secrets, hence a Secret. Rendered by the compose bundle;

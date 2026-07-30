@@ -182,6 +182,103 @@ mcpSettings:
   allowedAddresses:
     - "mcp-echo:8080"
 
+# Web search (enterpriseaiframework-0be). Three legs, and only one of them is free out of
+# the box — measured against the pinned v0.8.7 image, not read off the docs:
+#
+#   search  searxng | serper | tavily     SearXNG self-hosts with no key.        FREE
+#   rerank  jina | cohere | none          `none` disables it outright.           FREE
+#   scrape  firecrawl | serper | tavily   ALL THREE require a paid API key.      NOT FREE
+#
+# The item this implements assumed the scraper was optional. It is not. LibreChat's own
+# auth table (data-schemas webSearchAuth.scrapers) marks firecrawlApiKey, serperApiKey and
+# tavilyApiKey all as required, and there is no `none` for scrapers the way there is for
+# rerankers. What makes it dangerous rather than merely limiting is the failure mode:
+#
+#     // @librechat/agents .../tools/search/firecrawl.cjs
+#     if (!this.apiKey) return [url, { success:false, error:'FIRECRAWL_API_KEY is not set' }];
+#
+# That returns before any HTTP request. handleTools.js ignores loadWebSearchAuth's
+# `authenticated` flag and builds the tool anyway, so with SearXNG configured and no
+# scraper key web_search SUCCEEDS: the model receives titles, links and search-engine
+# snippets, and writes a confident answer citing pages that nothing ever retrieved. One
+# logger.warn is the only trace. That is the fabricated-citation shape this item exists to
+# rule out, so the scraper leg is supplied by webfetch/ (ours, Apache-2.0) speaking
+# Firecrawl's /v2/scrape wire contract.
+#
+# EVERY VALUE BELOW IS A ${...} PLACEHOLDER AND MUST STAY ONE. LibreChat does not read
+# these as literals: extractWebSearchEnvVars pulls an environment-variable NAME out of each
+# value via extractVariableName, then resolves it. A literal URL written here produces no
+# variable name, so the field counts as absent, `requiredAuthFields.length !==
+# requiredKeys.length` skips the whole provider, and searchProvider falls back to its
+# default of `serper` with no key. Hardcoding `searxngInstanceUrl: http://searxng:8080`
+# here — the obvious thing to do — silently disables search. The values live in
+# bundle/docker-compose.yml and deploy/k8s/50-chat.yaml.
+webSearch:
+  searchProvider: searxng
+  searxngInstanceUrl: "${SEARXNG_INSTANCE_URL}"
+
+  # `firecrawl` names the PROTOCOL, not the vendor. firecrawlApiUrl points at our own
+  # service; a deployment that wants real Firecrawl changes these two values and nothing
+  # else. Self-hosted Firecrawl stays a documented swap rather than the default: it is
+  # AGPL-3.0 with a closed-source cloud-only anti-bot engine, and it brings Postgres,
+  # Redis, a browser pool and its own LLM keys (docs/design/design.md §7).
+  scraperProvider: firecrawl
+  firecrawlApiUrl: "${FIRECRAWL_API_URL}"
+  firecrawlApiKey: "${FIRECRAWL_API_KEY}"
+
+  # ***  READ THIS BEFORE ASSUMING web_search IS UNGROUNDED. RESOLVED: rd 0be, ruling on
+  # enterpriseaiframework-405.  ***
+  #
+  # `rerankerType: none` is free and authenticates, but it has a consequence that is not
+  # documented anywhere upstream: WITH rerankerType: none, THE FETCHED PAGE CONTENT NEVER
+  # REACHES THE MODEL. The pages ARE fetched — webfetch's /fetchlog shows real 200s and
+  # real byte counts for every source — and then the content is dropped on the floor
+  # before the prompt is built. The chain, from @librechat/agents' own source:
+  #   createReranker({rerankerType:'none'})            -> returns undefined
+  #   getHighlights({reranker: undefined})             -> warns, returns undefined
+  #   addHighlights()                                  -> source.highlights = undefined
+  #   formatSource()                                   -> emits `Summary: <snippet>` and
+  #                                                       the Highlights section ONLY if
+  #                                                       source.highlights is non-empty
+  # format.ts says it outright: "per-source `content` stays in the WEB_SEARCH artifact for
+  # citations" — the artifact, not the prompt.
+  #
+  # MEASURED on this bundle, same question, same model, one config line different:
+  #   rerankerType: none   tool output  3,688 chars,  0 highlight blocks  (snippets only)
+  #   reranker present     tool output 17,510 chars, 20 highlight blocks  (page text)
+  #
+  # `jina` with no key is a TRAP, not a fix: loadWebSearchAuth cannot authenticate jina
+  # without jinaApiKey, so it leaves rerankerType unset, and createSearchTool then falls
+  # back to its OWN default of `cohere` — you write jina and get CohereReranker, which
+  # finds no COHERE_API_KEY, logs "Using default ranking" and returns the first N chunks
+  # with score 0. `infinity` looks like a free built-in but is UNREACHABLE from this file:
+  # the data-provider RerankerTypes enum is jina|cohere|none and webSearchSchema uses
+  # z.nativeEnum, so `infinity` never resolves. A real Cohere or Jina key is disqualified
+  # by the component-defaults rule (no paid tier in any default path).
+  #
+  # THE RESOLUTION: `jina` IS the value here, pointed at `rerank/` — ours, Apache-2.0,
+  # standard library only, no paid dependency, no provider in the data path — which
+  # speaks Jina's own /v1/rerank wire contract with a key WE mint (RERANK_TOKEN). Same
+  # trick webfetch/ already plays for the scraper leg: LibreChat's unmodified
+  # JinaReranker client is pointed at a service of ours that answers its own protocol.
+  #
+  # RANKING HONESTY, IN CAPITALS BECAUSE IT WILL OTHERWISE BE MISREAD AS SEMANTIC SEARCH:
+  # rerank/app.py ranks with OKAPI BM25 — LEXICAL TERM OVERLAP, NOT SEMANTIC. A chunk that
+  # answers the question in different words than the query scores LOWER than a chunk that
+  # parrots the query's own words back, even if the parroting chunk says less. The score
+  # is a squashed BM25 sum, not a calibrated probability. What this buys is GROUNDING
+  # (fetched page text reaches the model); ranking QUALITY is a separate, weaker claim —
+  # see rerank/app.py's docstring and tests/test_web_search.py for both held apart.
+  rerankerType: jina
+  jinaApiUrl: "${JINA_API_URL}"
+  jinaApiKey: "${JINA_API_KEY}"
+
+  # Above webfetch's own 20s ceiling would let LibreChat give up on a fetch that is still
+  # in flight, which loses content that was retrieved successfully. Below it wastes the
+  # difference. 20000 matches WEBFETCH_TIMEOUT_SECONDS.
+  scraperTimeout: 20000
+  safeSearch: 1
+
 mcpServers:
   # The trivial MCP server (enterpriseaiframework-12b). Proves the wiring ONCE — one
   # tool, `echo`, that returns a value the model cannot produce on its own
