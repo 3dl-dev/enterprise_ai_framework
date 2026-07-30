@@ -1,0 +1,193 @@
+# Web search for the chat surface (enterpriseaiframework-0be).
+#
+# NOT YET APPLIED TO THE CLUSTER. Written in the same commit as the librechat.yaml change
+# that references it, because deploy/bin/deploy.sh renders bundle/librechat/librechat.yaml
+# into the chat-config ConfigMap VERBATIM. The moment that config carries a webSearch block
+# and the namespace has no searxng/webfetch Service, the deployed surface offers web search,
+# fails to resolve SEARXNG_INSTANCE_URL, silently falls back to an unkeyed `serper`, and
+# every search fails — with nothing in the UI to say why. Shipping the manifests alongside
+# the config is what keeps the bundle and the cluster from diverging, which is exactly the
+# class of defect findings 17 and 18 record.
+#
+# Two legs, because LibreChat's native web_search needs two supplied and one turned off:
+#   search  searxng   self-hosted, no API key
+#   scrape  webfetch  ours; every scraper LibreChat ships requires a paid key
+#   rerank  none      set in librechat.yaml; jina and cohere both require a paid key
+#
+# LICENCE: SearXNG is AGPL-3.0 and runs here as an unmodified upstream image reached over
+# HTTP. Nothing links it and nothing patches it — the same rule this project applies to
+# Grafana/Perses. webfetch is ours and Apache-2.0 like the rest of the bundle.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: searxng-config
+  namespace: enterprise-ai
+data:
+  # KEEP IN SYNC WITH bundle/searxng/settings.template.yml. The compose bundle renders
+  # that template with SEARXNG_SECRET substituted; here the secret comes from the
+  # environment instead — see the SEARXNG_SECRET_KEY env var on the Deployment below and
+  # the initContainer that renders it, because this SearXNG has no secret_key env override.
+  settings.yml: |
+    use_default_settings:
+      engines:
+        # LibreChat's client hardcodes engines=google,bing,duckduckgo on every query, so
+        # loading any other engine costs memory and can never be consulted.
+        keep_only:
+          - google
+          - bing
+          - duckduckgo
+
+    server:
+      secret_key: "SEARXNG_SECRET_REPLACED_AT_START"
+      # Reachable only from the chat pod via ClusterIP. The limiter would rate-limit our
+      # own search leg, which issues several parallel queries per web_search call.
+      limiter: false
+      public_instance: false
+      image_proxy: false
+
+    search:
+      # THE SETTING THE WHOLE SEARCH LEG DEPENDS ON. SearXNG's default formats is [html]
+      # only; LibreChat requests format=json and gets a 403 without this.
+      formats:
+        - html
+        - json
+      safe_search: 1
+      autocomplete: ""
+      default_lang: "all"
+
+    outgoing:
+      request_timeout: 6.0
+      max_request_timeout: 10.0
+      pool_connections: 20
+      pool_maxsize: 10
+
+    general:
+      instance_name: "Enterprise AI Search"
+      donation_url: false
+      contact_url: false
+      enable_metrics: false
+
+    ui:
+      static_use_hash: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: searxng
+  namespace: enterprise-ai
+spec:
+  selector: { app: searxng }
+  ports: [{ name: http, port: 8080, targetPort: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: searxng
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: searxng } }
+  template:
+    metadata:
+      labels: { app: searxng }
+    spec:
+      # The ConfigMap mount is read-only, and SearXNG has no environment override for
+      # server.secret_key (verified against the image's settings_loader, not assumed): the
+      # entrypoint only substitutes its placeholder when it CREATES settings.yml, so a
+      # mounted file is used verbatim. This renders the secret into a writable emptyDir
+      # before the server starts — the same problem bundle/bin/render-env.sh solves for
+      # compose, solved the same way.
+      initContainers:
+        - name: render-settings
+          image: busybox:1.36
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              sed "s|SEARXNG_SECRET_REPLACED_AT_START|${SEARXNG_SECRET}|" \
+                /template/settings.yml > /config/settings.yml
+              if grep -q SEARXNG_SECRET_REPLACED_AT_START /config/settings.yml; then
+                echo "secret placeholder was not replaced" >&2
+                exit 1
+              fi
+          env:
+            - name: SEARXNG_SECRET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: SEARXNG_SECRET } }
+          volumeMounts:
+            - { name: template, mountPath: /template, readOnly: true }
+            - { name: config, mountPath: /config }
+      containers:
+        - name: searxng
+          image: searxng/searxng:latest
+          env:
+            - { name: SEARXNG_SETTINGS_PATH, value: "/etc/searxng-config/settings.yml" }
+            - { name: SEARXNG_BASE_URL, value: "http://searxng:8080/" }
+          ports: [{ containerPort: 8080 }]
+          volumeMounts:
+            - { name: config, mountPath: /etc/searxng-config, readOnly: true }
+          readinessProbe:
+            # Probes the JSON API rather than a liveness path: format=json is the one
+            # setting the search leg depends on, and an instance that 403s every JSON
+            # query still answers / with 200.
+            httpGet:
+              path: /search?q=readiness&format=json
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 10
+          resources:
+            requests: { cpu: "100m", memory: "192Mi" }
+            limits: { memory: "512Mi" }
+      volumes:
+        - name: template
+          configMap: { name: searxng-config }
+        - name: config
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webfetch
+  namespace: enterprise-ai
+spec:
+  selector: { app: webfetch }
+  ports: [{ name: http, port: 3002, targetPort: 3002 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webfetch
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: webfetch } }
+  template:
+    metadata:
+      labels: { app: webfetch }
+    spec:
+      containers:
+        - name: webfetch
+          # Substituted at apply time, matching 05-fakeprovider.yaml and 06-mcp-echo.yaml.
+          # Build with kaniko the same way mcp-echo is built (no Docker socket).
+          image: REPLACED_BY_DEPLOY
+          env:
+            # MUST be non-empty. Beyond authenticating the caller, LibreChat's scraper
+            # skips the HTTP request entirely when its own copy of this key is empty, so an
+            # empty value turns web search into citations of pages nobody fetched.
+            - name: WEBFETCH_TOKEN
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: WEBFETCH_TOKEN } }
+            # Private address space stays blocked. In the cluster this matters more than in
+            # compose: unguarded, the fetch leg would reach the gateway, the control plane,
+            # the Kubernetes API and the node's metadata endpoint, and deliver the response
+            # into a model's context. Empty is the correct value.
+            - { name: WEBFETCH_ALLOW_HOSTS, value: "" }
+          ports: [{ containerPort: 3002 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 3002 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "25m", memory: "64Mi" }
+            limits: { memory: "256Mi" }

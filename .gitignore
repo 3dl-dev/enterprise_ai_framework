@@ -7,6 +7,9 @@ __pycache__/
 # Rendered from keycloak/realm-export.template.json at bundle-up; contains client secrets.
 bundle/keycloak/realm-export.json
 
+# Rendered from searxng/settings.template.yml at bundle-up; contains the instance secret.
+bundle/searxng/settings.yml
+
 # test venv
 .venv-test/
 

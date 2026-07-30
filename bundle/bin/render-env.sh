@@ -171,6 +171,17 @@ ensure CHAT_JWT_REFRESH_SECRET     "$(hex 24)"
 ensure CHAT_CREDS_KEY              "$(hex 32)"
 ensure CHAT_CREDS_IV               "$(hex 16)"
 
+# Web search (enterpriseaiframework-0be).
+#
+# WEBFETCH_TOKEN is a real credential, not a formality: it is what LibreChat presents to
+# the fetch service as `firecrawlApiKey`, and the fetch service fails closed without it.
+# It must also be NON-EMPTY for a reason that has nothing to do with authentication —
+# LibreChat's Firecrawl client returns success:false without issuing any HTTP request when
+# its key is empty, so an empty token turns web search into "cite pages nobody fetched".
+ensure WEBFETCH_TOKEN              "wf-$(hex 24)"
+# SearXNG refuses to start on its upstream placeholder secret.
+ensure SEARXNG_SECRET              "$(hex 24)"
+
 # Bootstrap realm user, so a fresh bundle can be signed in to without manual steps.
 # The first two are not secrets, but they must exist in .env for post-up to provision
 # the account — an .env written before these were added would otherwise skip it silently.
@@ -202,5 +213,24 @@ if [[ ! -f keycloak/realm-export.json ]]; then
 else
     echo "keycloak/realm-export.json exists, leaving it alone"
 fi
+
+# SearXNG's secret has to be inside the settings file before the container starts: this
+# SearXNG has no SEARXNG_SECRET environment override, and the image only substitutes its
+# own placeholder when it is CREATING settings.yml — a mounted file is read verbatim.
+#
+# Unlike the realm export this is re-rendered every time rather than left alone once it
+# exists. The realm can only be imported once (Keycloak ignores the file afterwards), so
+# rewriting it would desynchronise the file from the database; SearXNG re-reads its
+# settings on every start, so re-rendering is how a change to the template — a new engine,
+# a changed timeout — actually reaches the running instance instead of being silently
+# ignored on every subsequent `make up`.
+echo "rendering searxng/settings.yml"
+sed -e "s|SEARXNG_SECRET_REPLACED_AT_BUNDLE_UP|${SEARXNG_SECRET}|" \
+    searxng/settings.template.yml > searxng/settings.yml
+if grep -q 'SEARXNG_SECRET_REPLACED_AT_BUNDLE_UP' searxng/settings.yml; then
+    echo "error: searxng settings template still has an unreplaced placeholder" >&2
+    exit 1
+fi
+chmod 644 searxng/settings.yml
 
 echo "ok"

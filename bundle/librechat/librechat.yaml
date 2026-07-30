@@ -174,6 +174,97 @@ mcpSettings:
   allowedAddresses:
     - "mcp-echo:8080"
 
+# Web search (enterpriseaiframework-0be). Three legs, and only one of them is free out of
+# the box — measured against the pinned v0.8.7 image, not read off the docs:
+#
+#   search  searxng | serper | tavily     SearXNG self-hosts with no key.        FREE
+#   rerank  jina | cohere | none          `none` disables it outright.           FREE
+#   scrape  firecrawl | serper | tavily   ALL THREE require a paid API key.      NOT FREE
+#
+# The item this implements assumed the scraper was optional. It is not. LibreChat's own
+# auth table (data-schemas webSearchAuth.scrapers) marks firecrawlApiKey, serperApiKey and
+# tavilyApiKey all as required, and there is no `none` for scrapers the way there is for
+# rerankers. What makes it dangerous rather than merely limiting is the failure mode:
+#
+#     // @librechat/agents .../tools/search/firecrawl.cjs
+#     if (!this.apiKey) return [url, { success:false, error:'FIRECRAWL_API_KEY is not set' }];
+#
+# That returns before any HTTP request. handleTools.js ignores loadWebSearchAuth's
+# `authenticated` flag and builds the tool anyway, so with SearXNG configured and no
+# scraper key web_search SUCCEEDS: the model receives titles, links and search-engine
+# snippets, and writes a confident answer citing pages that nothing ever retrieved. One
+# logger.warn is the only trace. That is the fabricated-citation shape this item exists to
+# rule out, so the scraper leg is supplied by webfetch/ (ours, Apache-2.0) speaking
+# Firecrawl's /v2/scrape wire contract.
+#
+# EVERY VALUE BELOW IS A ${...} PLACEHOLDER AND MUST STAY ONE. LibreChat does not read
+# these as literals: extractWebSearchEnvVars pulls an environment-variable NAME out of each
+# value via extractVariableName, then resolves it. A literal URL written here produces no
+# variable name, so the field counts as absent, `requiredAuthFields.length !==
+# requiredKeys.length` skips the whole provider, and searchProvider falls back to its
+# default of `serper` with no key. Hardcoding `searxngInstanceUrl: http://searxng:8080`
+# here — the obvious thing to do — silently disables search. The values live in
+# bundle/docker-compose.yml and deploy/k8s/50-chat.yaml.
+webSearch:
+  searchProvider: searxng
+  searxngInstanceUrl: "${SEARXNG_INSTANCE_URL}"
+
+  # `firecrawl` names the PROTOCOL, not the vendor. firecrawlApiUrl points at our own
+  # service; a deployment that wants real Firecrawl changes these two values and nothing
+  # else. Self-hosted Firecrawl stays a documented swap rather than the default: it is
+  # AGPL-3.0 with a closed-source cloud-only anti-bot engine, and it brings Postgres,
+  # Redis, a browser pool and its own LLM keys (docs/design/design.md §7).
+  scraperProvider: firecrawl
+  firecrawlApiUrl: "${FIRECRAWL_API_URL}"
+  firecrawlApiKey: "${FIRECRAWL_API_KEY}"
+
+  # ***  READ THIS BEFORE BELIEVING WEB SEARCH IS GROUNDED. UNRESOLVED: rd 0be / enterpriseaiframework-405.  ***
+  #
+  # `none` is the only reranker value that authenticates without a paid key, and it has a
+  # consequence that is NOT documented anywhere upstream and that this comment exists to
+  # stop anyone rediscovering the hard way:
+  #
+  #   WITH rerankerType: none, THE FETCHED PAGE CONTENT NEVER REACHES THE MODEL.
+  #
+  # The pages ARE fetched — webfetch's /fetchlog shows real 200s and real byte counts for
+  # every source — and then the content is dropped on the floor before the prompt is
+  # built. The chain, from @librechat/agents' own source:
+  #   createReranker({rerankerType:'none'})            -> returns undefined
+  #   getHighlights({reranker: undefined})             -> warns, returns undefined
+  #   addHighlights()                                  -> source.highlights = undefined
+  #   formatSource()                                   -> emits `Summary: <snippet>` and
+  #                                                       the Highlights section ONLY if
+  #                                                       source.highlights is non-empty
+  # format.ts says it outright: "per-source `content` stays in the WEB_SEARCH artifact for
+  # citations" — the artifact, not the prompt. So the model sees SearXNG's snippets and
+  # never the pages.
+  #
+  # MEASURED on this bundle, same question, same model, one config line different:
+  #   rerankerType: none   tool output  3,688 chars,  0 highlight blocks  (snippets only)
+  #   reranker present     tool output 17,510 chars, 20 highlight blocks  (page text)
+  #
+  # WHY THE OBVIOUS WORKAROUND IS A TRAP: `rerankerType: jina` with no key does produce
+  # highlights, but not for the reason it looks like. loadWebSearchAuth cannot authenticate
+  # jina without jinaApiKey, so it leaves rerankerType unset, and createSearchTool then
+  # falls back to its OWN default of `cohere` — you write jina and get CohereReranker,
+  # which finds no COHERE_API_KEY, logs "Using default ranking" and returns the first N
+  # chunks with score 0. Verified in this container's log. No outbound call is made, so it
+  # is not a licence or data-path violation, but shipping a default that depends on two
+  # stacked fallbacks and names the wrong vendor is exactly the silent-wrongness this
+  # project keeps paying for. Not adopted without a ruling.
+  #
+  # So this stays `none` — honest, authenticated, no paid key — and web search is
+  # SNIPPET-GROUNDED for now. tests/test_web_search.py asserts that measured behaviour
+  # rather than letting it be mistaken for working. The fetch leg is built, tested and
+  # correct; it becomes load-bearing the moment the reranker question is decided.
+  rerankerType: none
+
+  # Above webfetch's own 20s ceiling would let LibreChat give up on a fetch that is still
+  # in flight, which loses content that was retrieved successfully. Below it wastes the
+  # difference. 20000 matches WEBFETCH_TIMEOUT_SECONDS.
+  scraperTimeout: 20000
+  safeSearch: 1
+
 mcpServers:
   # The trivial MCP server (enterpriseaiframework-12b). Proves the wiring ONCE — one
   # tool, `echo`, that returns a value the model cannot produce on its own
