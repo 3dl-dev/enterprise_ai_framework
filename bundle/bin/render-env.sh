@@ -113,12 +113,54 @@ hex_hash() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
 # 200 tries — before anything has been started, since render-env.sh runs before
 # `docker compose up`.
 #
-# port_in_use tests via a real TCP connect on 127.0.0.1, not `ss`/`lsof`/`fuser`, so it
-# has no dependency beyond bash's /dev/tcp — connect succeeds (port in use) or is refused
-# (port free).
+# port_in_use tests by ATTEMPTING TO BIND the port — the same operation `docker compose
+# up` itself performs — not by connecting to 127.0.0.1. A connect-test only sees a
+# listener that (a) is actually accepting connections on that exact loopback address and
+# (b) speaks enough of the protocol to complete a handshake; it is blind to a listener
+# bound to a single non-loopback interface (this host's tailscale address, for one) or to
+# an IPv6-only address such as `::1` — this host runs a real one (`kubectl port-forward`
+# on `[::1]:18099`) that a 127.0.0.1-connect probe cannot see at all. Binding is what
+# `dockerd` itself does when it publishes a port, so a bind-test fails in exactly the
+# cases a real `docker compose up` would fail, and succeeds in exactly the cases it would
+# succeed.
+#
+# Bind is attempted on BOTH address families — 0.0.0.0 (all IPv4 interfaces) and ::
+# (all IPv6 interfaces) — because compose's default IPv4-only publish still collides at
+# the kernel level with a same-port listener bound to any single IPv4 interface (wildcard
+# vs. specific-address binds on the same port conflict without SO_REUSEADDR on both
+# sides, which this probe deliberately does not set), and because a bare port number is
+# being kept clear on this host regardless of which family holds it first. Needs python3,
+# already a hard dependency elsewhere in this bundle (ensure-user.sh, exit.sh,
+# provision-chat-key.sh) — no new dependency introduced.
+#
+# KNOWN GAP: a listener bound to a specific IPv6 address is only caught if it also blocks
+# the `::` wildcard bind (true for the normal case, since Linux refuses two overlapping
+# binds on one port unless every existing holder opted into SO_REUSEADDR). A listener that
+# itself set SO_REUSEPORT/SO_REUSEADDR before binding could in principle let our probe's
+# bind also succeed, reporting the port free when a real `docker compose up` — which does
+# not set those options either — would still collide. Not modeled here; no such listener
+# has been observed on this host.
 port_in_use() {
     local port="$1"
-    ( exec 3<>"/dev/tcp/127.0.0.1/${port}" ) 2>/dev/null
+    python3 - "$port" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+collision = False
+for family, addr in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+    try:
+        s = socket.socket(family, socket.SOCK_STREAM)
+    except OSError:
+        continue  # this address family is unsupported/disabled on this host
+    try:
+        s.bind((addr, port))
+    except OSError:
+        collision = True
+    finally:
+        s.close()
+sys.exit(0 if collision else 1)
+PY
 }
 
 # CRITICAL: set_var overwrites the port block on EVERY render, deliberately (see set_var's
