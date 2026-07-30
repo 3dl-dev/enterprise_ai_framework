@@ -7,7 +7,15 @@
 # gateway, so chat traffic lands in the same ledger and the same audit trail as the
 # coding agents.
 
-version: 1.2.8
+# Config schema version. Must equal Constants.CONFIG_VERSION in the pinned LibreChat
+# image (packages/data-provider/src/config.ts) — 1.3.13 for v0.8.7, 1.2.8 for v0.8.0.
+# Asserted against the RUNNING container rather than a hardcoded string by
+# tests/test_chat_surface_version.py::test_config_schema_version_matches_the_running_image.
+#
+# A mismatch is advisory, not fatal: packages/api/src/app/checks.ts#checkConfig only
+# logs "Outdated Config version". That is precisely why it is worth a test — nothing
+# else in the stack notices, and the drift is only visible in a log line nobody reads.
+version: 1.3.13
 cache: true
 
 interface:
@@ -16,8 +24,16 @@ interface:
     externalUrl: ""
   termsOfService:
     externalUrl: ""
-  # Claude-like rendering of code and HTML the model produces. Built into the surface,
-  # off by default, and the single biggest difference in how finished this feels.
+  # INERT — and left here deliberately, with a test holding it that way.
+  # `artifacts` is not a key of librechat-data-provider's `interfaceSchema` in v0.8.0 or
+  # v0.8.7, so zod strips it, and packages/data-schemas/src/app/interface.ts never reads
+  # it; it is correspondingly absent from what the surface serves at /api/config. What
+  # actually turns on the Claude-like rendering of code and HTML is `preset.artifacts` on
+  # each model spec below, which is where the real setting lives and where
+  # tests/test_chat_surface_version.py asserts it.
+  # Kept so this note survives: the next person to find artifacts broken must not "fix"
+  # it here. test_the_interface_artifacts_key_is_inert fails if a release starts
+  # honouring the key, which is when this comment needs rewriting.
   artifacts: true
   # Surfaces the memories panel in Settings so a user can see/edit what was stored.
   # Purely a UI toggle — does not gate whether memory is extracted (see `memory` below).
@@ -47,10 +63,24 @@ interface:
 # remembered ("remember that...", "don't forget..."), not opportunistically mined from
 # every message — matching the item's own scenario ("a user tells the chat a durable
 # preference").
+#
+# `agent.enabled: true` is REQUIRED from v0.8.6 onwards and was not required at v0.8.0.
+# packages/data-schemas/src/app/memory.ts#isMemoryAgentEnabled now returns false unless
+# `config.agent.enabled === true`, so the same config that extracted memories on v0.8.0
+# extracts nothing on v0.8.7 — the memories panel still renders, the routes still answer,
+# and every conversation simply stops learning anything. The only signal is one startup
+# line: "[memory] Agent config detected without explicit `enabled: true`". Found by
+# reading the v0.8.7 container's own boot log during enterpriseaiframework-f50, not by
+# reading the changelog, which does not mention it.
+#
+# Safe on v0.8.0 as well: its memorySchema agent union is a plain (non-strict) z.object,
+# so an unknown `enabled` key is stripped rather than rejected, and v0.8.0 extracted
+# unconditionally anyway.
 memory:
   personalize: true
   messageWindowSize: 5
   agent:
+    enabled: true
     provider: "Enterprise AI"
     model: "glm-5.2@deepinfra"
 
@@ -115,6 +145,34 @@ modelSpecs:
 registration:
   # Only identities from the realm. Belt and braces alongside ALLOW_REGISTRATION=false.
   socialLogins: ["openid"]
+
+# MCP SSRF allowlist. NEW REQUIREMENT — v0.8.6+ refuses to connect to any MCP server
+# whose host resolves into private IP space unless it is exempted here
+# (packages/api/src/auth/domain.ts#isMCPDomainAllowed -> isSSRFTarget /
+# resolveHostnameSSRF). `mcp-echo` is a container/Service name on a private network, so
+# without this the v0.8.7 surface starts perfectly healthy and logs
+#   [MCP][echo] Failed to initialize: Domain "http://mcp-echo:8080" is not allowed
+#   [MCP] Initialized with 1 configured server and 0 tools.
+# — one configured server, zero tools. Nothing user-visible fails until a model tries to
+# call the tool and cannot see it. Observed on the v0.8.7 bundle before this block existed.
+#
+# allowedAddresses (host:port exemptions), NOT allowedDomains. An `allowedDomains` list
+# turns SSRF protection off wholesale for MCP —
+# MCPServerInspector.inspect sets `useSSRFProtection = !allowedDomains?.length` — whereas
+# allowedAddresses exempts exactly one host and one port and leaves the protection on for
+# everything else. Same reasoning as NODE_EXTRA_CA_CERTS being scoped to our own CA
+# rather than disabling certificate verification.
+#
+# WARNING — THIS KEY IS FATAL ON v0.8.0. `mcpSettings` does not exist in v0.8.0's
+# configSchema, and the schema is parsed with `.strict()` at the top level, so v0.8.0
+# rejects the whole file and its loadCustomConfig returns null: no custom endpoint, no
+# modelSpecs, no memory, no MCP, and a surface that still answers /health with 200. The
+# image pin and this file must therefore move together on every deployment
+# (bundle/docker-compose.yml and deploy/k8s/50-chat.yaml — deploy/bin/deploy.sh renders
+# THIS file into the cluster's chat-config ConfigMap).
+mcpSettings:
+  allowedAddresses:
+    - "mcp-echo:8080"
 
 mcpServers:
   # The trivial MCP server (enterpriseaiframework-12b). Proves the wiring ONCE — one

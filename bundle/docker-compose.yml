@@ -202,7 +202,22 @@ services:
     restart: unless-stopped
 
   chat:
-    image: ghcr.io/danny-avila/librechat:v0.8.0
+    # v0.8.7 (2026-06-24), not v0.8.0. Agent Skills and subagents shipped in v0.8.6 and
+    # the self-hosted Apache-2.0 code interpreter in v0.8.7, so three p0 features were
+    # blocked on a version rather than on a design (enterpriseaiframework-f50).
+    #
+    # THE PIN AND bundle/librechat/librechat.yaml MOVE TOGETHER. LibreChat validates the
+    # config with `configSchema.strict().safeParse`, and the two versions disagree about
+    # what happens when that fails:
+    #   v0.8.0 (api/server/services/Config/loadCustomConfig.js) logs and `return null` —
+    #     the surface comes up with NO custom config at all: no gateway endpoint, no
+    #     modelSpecs, no memory, no MCP servers. It looks healthy and answers /health 200.
+    #   v0.8.7 logs and `process.exit(1)` unless CONFIG_BYPASS_VALIDATION=true.
+    # So a config carrying a v0.8.7-only key, deployed against a v0.8.0 image, is the
+    # silent-misconfiguration failure this item was written to avoid. tests/
+    # test_chat_surface_version.py pins compose and deploy/k8s/50-chat.yaml to the same
+    # tag so the two deployments cannot drift apart again (rd 634).
+    image: ghcr.io/danny-avila/librechat:v0.8.7
     environment:
       HOST: 0.0.0.0
       PORT: 3080

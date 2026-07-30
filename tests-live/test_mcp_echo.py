@@ -110,6 +110,14 @@ def chat_client(creds) -> httpx.Client:
 def _send_message(client: httpx.Client, text: str) -> dict:
     """POST a real chat message and return the terminal SSE event as a dict.
 
+    ONLY VALID AGAINST v0.8.0 — see the same warning on tests-live/test_memory.py's
+    _send_message. On the v0.8.7 that enterpriseaiframework-f50 pins, this POST returns a
+    JSON job handle rather than a stream and this function reports "stream ended with no
+    terminal event". tests/chat_turn.py handles both shapes; converting this file needs a
+    v0.8.7 surface with a tool-calling model to verify that tool_call blocks survive on
+    the persisted message, so it waits for the cluster upgrade.
+
+
     The route is POST /api/agents/chat/<endpoint>, which LibreChat's own client hits
     for "ephemeral agent" turns — i.e. any message sent on a non-agents endpoint with
     ad-hoc tools attached, which is exactly how MCP tools reach a plain custom-endpoint
