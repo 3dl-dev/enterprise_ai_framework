@@ -1,18 +1,9 @@
-"""Web search: the search leg, the fetch leg, and the trap between them.
+"""Web search: the search leg, the fetch leg, the rerank leg, and the trap between them.
 
 enterpriseaiframework-0be's outcome is "chat answers a question about something current
-and cites pages it ACTUALLY FETCHED". THAT OUTCOME IS NOT YET REACHED, and there is
-deliberately no live test asserting it: with the reranker configuration this bundle can
-ship today, the fetched page content never reaches the model, so the reply is grounded in
-SearXNG's snippets rather than in pages the system read. See
-TestWhatTheModelActuallyReceives below, the `rerankerType` comment in librechat.yaml, and
-enterpriseaiframework-405, which is the open decision. The live grounding test belongs with
-whatever that decision lands.
-
-What this module does prove: the search leg works, the fetch leg works and really
-retrieves pages, and the three silent failures that would otherwise let a fabricated
-citation look exactly like a real one. All three were found by reading the pinned v0.8.7
-image's own code and then DEMONSTRATED by running it, not inferred:
+and cites pages it ACTUALLY FETCHED". Reaching it took two services of ours speaking
+protocols LibreChat already has clients for, because every free-sounding native option
+turned out to have a paid catch:
 
   1. NO SCRAPER KEY MEANS NO FETCH, AND NO ERROR. Every scraper LibreChat ships
      (firecrawl, serper, tavily) requires a paid API key; unlike rerankers there is no
@@ -20,18 +11,35 @@ image's own code and then DEMONSTRATED by running it, not inferred:
      issuing any HTTP request, and api/app/clients/tools/util/handleTools.js ignores
      loadWebSearchAuth's `authenticated` flag and builds the tool regardless. So
      web_search succeeds, hands the model titles/links/snippets from the search engine,
-     and the model writes a fluent answer citing pages nothing ever retrieved.
+     and the model writes a fluent answer citing pages nothing ever retrieved. FIXED by
+     webfetch/ — ours, Apache-2.0, speaking Firecrawl's /v2/scrape wire contract.
 
-  2. A LITERAL VALUE IN librechat.yaml SILENTLY DISABLES THE PROVIDER. LibreChat resolves
+  2. NO WORKING RERANKER MEANS THE FETCHED PAGE NEVER REACHES THE MODEL, AND NO ERROR
+     EITHER. `rerankerType: none` authenticates for free, but createReranker returns
+     undefined, so no `highlights` are ever produced, and formatSource emits per-source
+     scraped `content` ONLY inside the highlights section — format.ts's own comment says
+     the content otherwise "stays in the WEB_SEARCH artifact for citations", not the
+     prompt. Measured on this bundle, same question, same model, one config line
+     different: `none` produced 3,688 chars of tool output and 0 highlight blocks; a
+     working reranker produced 17,510 chars and 20. `rerankerType: jina` with no key is a
+     TRAP, not a fix — see TestConfigurationThatWouldSilentlyDisableSearch below. FIXED
+     by rerank/ — ours, Apache-2.0, speaking Jina's own /v1/rerank wire contract with a
+     key we mint, BM25-ranking the request's own chunks (see rerank/app.py's docstring
+     for the HONESTY OBLIGATION this buys: grounding, not semantic ranking quality).
+
+  3. A LITERAL VALUE IN librechat.yaml SILENTLY DISABLES THE PROVIDER. LibreChat resolves
      web-search config by extracting an env-var NAME from each value
      (extractWebSearchEnvVars -> extractVariableName), so `searxngInstanceUrl:
      http://searxng:8080` written literally yields no name, the field counts as missing,
      and searchProvider falls back to its default of `serper` with no key.
 
-Both failures are well-formed and wrong, which is this codebase's signature defect, and
-neither produces anything a user or an operator would notice. The tests below therefore
+All three are well-formed and wrong, which is this codebase's signature defect, and none
+of them produce anything a user or an operator would notice. The tests below therefore
 assert the WORKING configuration and the BROKEN one side by side, in the same container,
-using LibreChat's own code — so the pass is a measurement rather than a claim.
+using LibreChat's own code — so the pass is a measurement rather than a claim. And
+TestChatCitesAPageItActuallyFetched drives a real turn end to end and proves grounding
+against both fetch and rerank logs — the live test enterpriseaiframework-0be's DONE
+condition asks for, absent while the reranker question stayed open (405) and now present.
 """
 
 import json
@@ -156,6 +164,61 @@ def fetch_log(webfetch_token):
     class Log:
         def entries(self) -> list[dict]:
             return _webfetch(webfetch_token, "/fetchlog")["fetches"]
+
+    return Log()
+
+
+@pytest.fixture(scope="module")
+def rerank_token(env) -> str:
+    token = env.get("RERANK_TOKEN", "")
+    assert token, (
+        "RERANK_TOKEN is empty in bundle/.env. An empty token makes JinaReranker's "
+        "client rejected by our own service, which silently falls back to LibreChat's "
+        "first-N-chunks-score-0 default ranking — the exact failure /reranklog exists "
+        "to distinguish from a working reranker."
+    )
+    return token
+
+
+def _rerank(token: str, path: str, method: str = "GET", body: dict | None = None) -> dict:
+    """Call the rerank service from inside the compose network, mirroring `_webfetch`.
+
+    rerank publishes no host port on purpose, same reasoning as webfetch: nothing outside
+    the compose network has any business asking it to rank arbitrary text.
+    """
+    body_literal = json.dumps(json.dumps(body)) if body is not None else None
+    script_lines = ["import urllib.request,urllib.error,json"]
+    if body_literal is not None:
+        script_lines.append(f"data={body_literal}.encode()")
+    else:
+        script_lines.append("data=None")
+    script_lines += [
+        f"req=urllib.request.Request('http://localhost:3003{path}',data=data,"
+        f"headers={{'Authorization':'Bearer {token}','Content-Type':'application/json'}},"
+        f"method='{method}')",
+        "try:",
+        "    resp=urllib.request.urlopen(req,timeout=30)",
+        "    print(json.dumps({'status':resp.status,'body':json.load(resp)}))",
+        "except urllib.error.HTTPError as e:",
+        "    print(json.dumps({'status':e.code,'body':json.load(e)}))",
+    ]
+    script = "\n".join(script_lines) + "\n"
+    result = _compose("exec", "-T", "rerank", "python", "-c", script, check=False)
+    assert result.returncode == 0, (
+        f"rerank {method} {path} failed\n{result.stdout}\n{result.stderr}"
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+@pytest.fixture
+def rerank_log(rerank_token):
+    """Clear the rerank log, then read it back after the test. Same reasoning as
+    `fetch_log`: clearing first turns "ran at some point" into "ran during this test"."""
+    _rerank(rerank_token, "/reranklog", method="DELETE")
+
+    class Log:
+        def entries(self) -> list[dict]:
+            return _rerank(rerank_token, "/reranklog")["body"]["reranks"]
 
     return Log()
 
@@ -370,6 +433,152 @@ class TestTheFetchLegRetrievesRealPages:
 
 
 # --------------------------------------------------------------------------------------
+# The rerank leg: closes the gap the fetch leg cannot close alone
+
+
+class TestTheRerankLegSpeaksJinasWireContract:
+    """rerank/app.py: ours, Apache-2.0, standard library only, speaking the same wire
+    contract @librechat/agents' JinaReranker already has a client for, with a key we
+    mint. Runs Okapi BM25 over the request's own chunks — see rerank/app.py's docstring
+    for the HONESTY OBLIGATION this buys (grounding, not semantic ranking quality)."""
+
+    def test_reordering_really_happens(self, rerank_log):
+        """The core ranking claim, not a return-input-order stand-in.
+
+        A document that shares the query's vocabulary must outrank one that does not,
+        even though the on-topic document is listed SECOND in the request — if the
+        service merely echoed input order, this would fail.
+        """
+        result = _rerank(
+            self._token, "/v1/rerank", method="POST",
+            body={
+                "model": "jina-reranker-v2-base-multilingual",
+                "query": "enterprise gateway spend ledger audit",
+                "documents": [
+                    "Bananas are a good source of potassium and fibre.",
+                    "The enterprise gateway records every spend event on one audit "
+                    "ledger, so a customer's bill and their audit trail agree.",
+                    "The weather in most temperate climates varies by season.",
+                ],
+                "top_n": 3,
+                "return_documents": True,
+            },
+        )
+        body = result["body"]
+        assert result["status"] == 200, body
+        assert body["results"][0]["index"] == 1, (
+            f"expected the on-topic document (index 1) ranked first, got {body['results']}"
+        )
+        assert body["results"][0]["relevance_score"] > body["results"][1]["relevance_score"], (
+            f"the top result does not outscore the runner-up: {body['results']}"
+        )
+        entries = rerank_log.entries()
+        assert entries and entries[-1]["degenerate"] is False, entries
+
+    def test_no_overlap_degrades_visibly(self, rerank_log):
+        """A query that shares no term with any document must not fabricate a ranking.
+
+        All scores 0.0, first top_n returned in ORIGINAL input order (ties break on
+        index), and the log entry says so explicitly via `degenerate: true` — the ruling
+        input-order case, surfaced rather than hidden.
+        """
+        result = _rerank(
+            self._token, "/v1/rerank", method="POST",
+            body={
+                "query": "zzqxw plonk fripzorble",
+                "documents": ["alpha document text", "beta document text", "gamma text"],
+                "top_n": 3,
+            },
+        )
+        body = result["body"]
+        assert result["status"] == 200, body
+        assert [r["index"] for r in body["results"]] == [0, 1, 2], (
+            f"a no-overlap query did not return input order: {body['results']}"
+        )
+        assert all(r["relevance_score"] == 0.0 for r in body["results"]), body["results"]
+        entries = rerank_log.entries()
+        assert entries and entries[-1]["degenerate"] is True, (
+            f"a no-overlap rerank was not logged as degenerate: {entries}"
+        )
+
+    def test_returned_document_text_is_byte_identical_to_the_input(self, rerank_log):
+        """THE CONSTRAINT NOBODY WOULD GUESS.
+
+        expandHighlights (highlights.cjs) locates a highlight inside the full fetched
+        page with `content.indexOf(highlight.text)` and expands it +/-300 chars.
+        Normalise whitespace, trim, or reflow this text and indexOf returns -1 (or a
+        wrong offset), and the model gets a bare fragment instead of real context.
+        """
+        chunk = "  Some   chunk\twith odd   whitespace\nand a trailing newline\n\n"
+        result = _rerank(
+            self._token, "/rerank", method="POST",
+            body={"query": "chunk whitespace", "documents": [chunk], "top_n": 1},
+        )
+        body = result["body"]
+        assert result["status"] == 200, body
+        assert body["results"][0]["document"]["text"] == chunk, (
+            f"returned text was normalised: {body['results'][0]['document']['text']!r} "
+            f"!= input {chunk!r}"
+        )
+
+    def test_both_paths_answer_the_same_contract(self):
+        """The client POSTs jinaApiUrl verbatim and appends nothing, so a deployment
+        whose jinaApiUrl is the bare origin must not 404 into JinaReranker's own
+        try/catch — that would silently reproduce the fallback this service exists to
+        replace."""
+        for path in ("/v1/rerank", "/rerank"):
+            result = _rerank(
+                self._token, path, method="POST",
+                body={"query": "same contract", "documents": ["same contract text"], "top_n": 1},
+            )
+            assert result["status"] == 200, (path, result)
+
+    def test_the_rerank_service_refuses_every_credential_but_the_real_one(self, rerank_log):
+        """Same three rejections webfetch is held to, for the same reasons: a wrong
+        token, an empty token (must not read as auth-disabled), and a non-ASCII token
+        (hmac.compare_digest raises on non-ASCII str; must be 401, not 500)."""
+        for tok in ("wrong-token", "", "énonascii"):
+            result = _rerank(
+                tok, "/v1/rerank", method="POST",
+                body={"query": "q", "documents": ["d"], "top_n": 1},
+            )
+            assert result["status"] == 401, (tok, result)
+        assert rerank_log.entries() == [], (
+            "a rejected caller left a rerank-log entry — authentication is being "
+            f"checked after ranking rather than before it: {rerank_log.entries()}"
+        )
+
+    def test_the_log_carries_counts_and_never_query_or_document_text(self, rerank_log):
+        """Counts only. A list of what a user searched for is not worth holding."""
+        query = "a rather distinctive query nobody else would type verbatim"
+        document = "a rather distinctive document body nobody else would type verbatim"
+        _rerank(
+            self._token, "/v1/rerank", method="POST",
+            body={"query": query, "documents": [document], "top_n": 1},
+        )
+        entries = rerank_log.entries()
+        assert entries, "no log entry was recorded for a successful rerank"
+        entry = entries[-1]
+        assert set(entry) == {"at", "query_chars", "documents", "returned", "top_score",
+                               "degenerate"}, entry
+        blob = json.dumps(entry)
+        assert query not in blob and document not in blob, (
+            f"the rerank log leaked query or document text: {entry}"
+        )
+        assert entry["query_chars"] == len(query)
+        assert entry["documents"] == 1
+
+    def test_health_reports_token_configured(self):
+        result = _rerank(self._token, "/health")
+        assert result["status"] == 200
+        assert result["body"]["token_configured"] is True, result["body"]
+
+    @pytest.fixture(autouse=True)
+    def _inject_token(self, rerank_token):
+        self._token = rerank_token
+
+
+# --------------------------------------------------------------------------------------
 # The search leg
 
 
@@ -479,7 +688,8 @@ class TestConfigurationThatWouldSilentlyDisableSearch:
         key. The next person to "simplify" this by inlining the URL gets a red test instead
         of a silently broken feature.
         """
-        for key in ("searxngInstanceUrl", "firecrawlApiUrl", "firecrawlApiKey"):
+        for key in ("searxngInstanceUrl", "firecrawlApiUrl", "firecrawlApiKey",
+                    "jinaApiUrl", "jinaApiKey"):
             value = web_search_config.get(key)
             assert value, f"webSearch.{key} is not set in librechat.yaml"
             assert value.startswith("${") and value.endswith("}"), (
@@ -506,7 +716,8 @@ class TestConfigurationThatWouldSilentlyDisableSearch:
             'const ph={searchProvider:"searxng",'
             'searxngInstanceUrl:"${SEARXNG_INSTANCE_URL}",scraperProvider:"firecrawl",'
             'firecrawlApiUrl:"${FIRECRAWL_API_URL}",'
-            'firecrawlApiKey:"${FIRECRAWL_API_KEY}",rerankerType:"none"};'
+            'firecrawlApiKey:"${FIRECRAWL_API_KEY}",rerankerType:"jina",'
+            'jinaApiUrl:"${JINA_API_URL}",jinaApiKey:"${JINA_API_KEY}"};'
             'const lit={...ph,searxngInstanceUrl:"http://searxng:8080"};'
             "const out={};"
             "for(const [k,cfg] of [[\"placeholder\",ph],[\"literal\",lit]]){"
@@ -527,9 +738,9 @@ class TestConfigurationThatWouldSilentlyDisableSearch:
         assert good["resolvedUrl"] == "http://searxng:8080", (
             f"the placeholder did not resolve to the in-network SearXNG: {good}"
         )
-        assert good["rerankerType"] == "none", (
-            f"rerankerType did not resolve to none — a paid reranker key is now "
-            f"required: {good}"
+        assert good["rerankerType"] == "jina", (
+            f"rerankerType did not resolve to jina — grounding depends on the rerank "
+            f"service being authenticated and selected: {good}"
         )
 
         bad = result["literal"]
@@ -559,23 +770,47 @@ class TestConfigurationThatWouldSilentlyDisableSearch:
             "every scrape will be rejected with 401"
         )
 
+    def test_the_rerank_key_reaching_the_surface_is_not_empty(self, env):
+        """Same claim as the scraper key above, for the reranker: an empty key here
+        would make our own rerank service reject the client with 401, and JinaReranker's
+        catch would fall back to first-N-chunks-score-0 — highlights would still appear,
+        but with no ranking behind them, and silently."""
+        result = _compose(
+            "exec", "-T", "chat", "printenv", "JINA_API_KEY", check=False
+        )
+        value = result.stdout.strip()
+        assert value, (
+            "JINA_API_KEY is empty inside the chat container. An empty key here makes "
+            "our rerank service reject the client with 401 and silently reproduces "
+            "JinaReranker's own no-ranking fallback."
+        )
+        assert value == env["RERANK_TOKEN"], (
+            "the surface holds a rerank key that is not the rerank service's token, so "
+            "every rerank call will be rejected with 401"
+        )
+
     def test_no_paid_web_search_credential_is_configured_anywhere(self, web_search_config):
         """The constraint from the item: no paid API keys anywhere in this path.
 
-        Named explicitly so that "just add a Serper key" cannot pass review by accident.
-        `firecrawlApiKey` is exempt because it is our own token for our own service — the
-        assertion above pins it to WEBFETCH_TOKEN, so it cannot quietly become a vendor
-        credential.
+        Named explicitly so that "just add a real Jina or Cohere key" cannot pass review
+        by accident. `firecrawlApiKey` and `jinaApiKey` are exempt because they are our
+        own tokens for our own services — the assertions above pin them to
+        WEBFETCH_TOKEN and RERANK_TOKEN respectively, so neither can quietly become a
+        vendor credential.
         """
-        for paid in ("serperApiKey", "tavilyApiKey", "jinaApiKey", "cohereApiKey"):
+        for paid in ("serperApiKey", "tavilyApiKey", "cohereApiKey"):
             assert paid not in web_search_config, (
                 f"webSearch.{paid} is configured. The search path must contain no paid "
-                "credential (enterpriseaiframework-0be); SearXNG plus rerankerType:none "
-                "plus a self-hosted fetch leg is the free path."
+                "credential (enterpriseaiframework-0be); SearXNG plus a self-hosted "
+                "fetch leg plus a self-hosted rerank leg is the free path."
             )
-        assert web_search_config.get("rerankerType") == "none", (
-            "rerankerType must be `none`: jina and cohere are the only implementations "
-            "and both require a paid key"
+        assert web_search_config.get("rerankerType") == "jina", (
+            "rerankerType changed away from jina. If this is now `none`, the fetched "
+            "content no longer reaches the model — grounding is lost. If it is `cohere`, "
+            "a real vendor key would be required."
+        )
+        assert web_search_config.get("jinaApiUrl") == "${JINA_API_URL}", (
+            "jinaApiUrl no longer points at our own rerank service via a placeholder"
         )
 
 
@@ -584,13 +819,17 @@ class TestConfigurationThatWouldSilentlyDisableSearch:
 
 
 class TestWhatTheModelActuallyReceives:
-    """The finding that stopped enterpriseaiframework-0be short of its DONE condition.
+    """The finding that stopped enterpriseaiframework-0be short of its DONE condition,
+    and the configuration that closes it.
 
-    Fetching a page and putting that page in front of the model are two different things,
-    and this deployment currently does the first but not the second. That is asserted here
-    — against LibreChat's own formatter — so that "web search works" can never be inferred
-    from "web search returns sources". See the long comment on `rerankerType` in
-    librechat.yaml, and rd 0be / enterpriseaiframework-405.
+    Fetching a page and putting that page in front of the model are two different
+    things. `test_with_no_reranker_the_fetched_content_is_withheld_from_the_model` proves
+    the general mechanism against LibreChat's own formatter, independent of this
+    bundle's configuration, so "web search works" can never be inferred from "web search
+    returns sources". `test_the_bundle_ships_a_grounded_configuration` then pins THIS
+    deployment to the side of that mechanism that reaches the model: rerankerType: jina,
+    authenticated against rerank/, not none. See the `rerankerType` comment in
+    librechat.yaml and rd 0be's ruling on enterpriseaiframework-405.
     """
 
     def test_with_no_reranker_the_fetched_content_is_withheld_from_the_model(self):
@@ -639,27 +878,24 @@ class TestWhatTheModelActuallyReceives:
             "diagnosis in librechat.yaml (highlights are the only channel) is wrong"
         )
 
-    def test_the_bundle_ships_the_snippet_grounded_configuration_knowingly(
-        self, web_search_config
-    ):
-        """A tripwire on the pair of settings, not on either one alone.
+    def test_the_bundle_ships_a_grounded_configuration(self, web_search_config):
+        """The inverse tripwire: this bundle no longer ships the snippet-grounded
+        configuration, and nothing in librechat.yaml is left claiming that it does.
 
-        `rerankerType: none` is only defensible while the comment above it explains what it
-        costs. If someone changes the value, this fails and forces the comment — and the
-        test above — to be revisited together, rather than letting the file claim one thing
-        while the deployment does another.
+        `rerankerType: none` would be free but leaves web search snippet-grounded — see
+        the test above for the mechanism. If someone changes this back to `none`, this
+        fails and forces a deliberate decision, exactly as the ORIGINAL version of this
+        test forced one for `jina`.
         """
-        assert web_search_config["rerankerType"] == "none", (
-            "rerankerType changed. If a reranker is now configured, the fetched content "
-            "DOES reach the model and web search is grounded — update the comment in "
-            "librechat.yaml, revisit "
-            "TestWhatTheModelActuallyReceives, and add the live grounding test that "
-            "rd 0be's DONE condition asks for."
+        assert web_search_config["rerankerType"] == "jina", (
+            "rerankerType is not jina. If this is `none`, the fetched content no longer "
+            "reaches the model and web search is snippet-grounded again — see "
+            "TestWhatTheModelActuallyReceives above and rd 0be / enterpriseaiframework-405."
         )
-        assert LIBRECHAT_YAML.read_text().count("SNIPPET-GROUNDED") == 1, (
-            "the rerankerType comment no longer states that answers are snippet-grounded. "
-            "That sentence is the only thing standing between this configuration and "
-            "someone believing citations are backed by pages the system read."
+        assert LIBRECHAT_YAML.read_text().count("SNIPPET-GROUNDED") == 0, (
+            "librechat.yaml still claims answers are SNIPPET-GROUNDED, but rerankerType "
+            "is jina — the comment is now stale and misleading about what this "
+            "deployment actually grounds citations in."
         )
 
 
@@ -699,12 +935,12 @@ class TestTheBundleAndTheClusterAgree:
             )
 
     def test_the_cluster_has_a_service_for_each_leg(self):
-        """A manifest for searxng and webfetch must exist, or the ConfigMap names hosts
-        that do not resolve in the namespace."""
+        """A manifest for searxng, webfetch and rerank must exist, or the ConfigMap
+        names hosts that do not resolve in the namespace."""
         manifests = "\n".join(
             p.read_text() for p in sorted((REPO / "deploy" / "k8s").glob("*.yaml"))
         )
-        for service in ("searxng", "webfetch"):
+        for service in ("searxng", "webfetch", "rerank"):
             assert f"name: {service}" in manifests, (
                 f"no Kubernetes Service named {service} in deploy/k8s/. librechat.yaml "
                 f"points the chat surface at http://{service}:<port>, which will not "

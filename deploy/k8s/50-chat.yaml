@@ -141,6 +141,12 @@ spec:
             - { name: FIRECRAWL_API_URL, value: "http://webfetch:3002" }
             - name: FIRECRAWL_API_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: WEBFETCH_TOKEN } }
+            # `jina` is the WIRE CONTRACT, not the vendor: rerank/ speaks Jina's own
+            # /v1/rerank shape so LibreChat's existing JinaReranker client works
+            # unmodified. FULL path required — the client appends nothing to jinaApiUrl.
+            - { name: JINA_API_URL, value: "http://rerank:3003/v1/rerank" }
+            - name: JINA_API_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: RERANK_TOKEN } }
           ports: [{ containerPort: 3080 }]
           volumeMounts:
             - { name: config, mountPath: /app/librechat.yaml, subPath: librechat.yaml, readOnly: true }

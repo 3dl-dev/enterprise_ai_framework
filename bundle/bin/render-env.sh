@@ -179,6 +179,11 @@ ensure CHAT_CREDS_IV               "$(hex 16)"
 # LibreChat's Firecrawl client returns success:false without issuing any HTTP request when
 # its key is empty, so an empty token turns web search into "cite pages nobody fetched".
 ensure WEBFETCH_TOKEN              "wf-$(hex 24)"
+# RERANK_TOKEN gates rerank/, the reranker of ours that closes the grounding gap
+# `rerankerType: none` leaves open (enterpriseaiframework-0be). Same non-empty
+# requirement as WEBFETCH_TOKEN, same reason: an empty value here would silently
+# reproduce LibreChat's own no-ranking fallback instead of failing loudly.
+ensure RERANK_TOKEN                "rr-$(hex 24)"
 # SearXNG refuses to start on its upstream placeholder secret.
 ensure SEARXNG_SECRET              "$(hex 24)"
 

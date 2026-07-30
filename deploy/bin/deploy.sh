@@ -72,6 +72,7 @@ kubectl -n "$NS" create secret generic enterprise-ai-secrets \
     --from-literal=OPENID_ISSUER="${PUBLIC_BASE_URL}/realms/${IDP_REALM:-enterprise-ai}" \
     --from-literal=FORGE_API_KEY="${FORGE_API_KEY:-}" \
     --from-literal=WEBFETCH_TOKEN="${WEBFETCH_TOKEN:?WEBFETCH_TOKEN is unset — run bundle/bin/render-env.sh}" \
+    --from-literal=RERANK_TOKEN="${RERANK_TOKEN:?RERANK_TOKEN is unset — run bundle/bin/render-env.sh}" \
     --from-literal=SEARXNG_SECRET="${SEARXNG_SECRET:?SEARXNG_SECRET is unset — run bundle/bin/render-env.sh}" \
     --dry-run=client -o yaml | kubectl apply -f -
 

@@ -324,11 +324,6 @@ def fetch(url: str) -> dict:
 
         truncated = len(body) > MAX_BYTES
         body = body[:MAX_BYTES]
-        _record({
-            "url": current, "requested": url, "ok": True, "status": status,
-            "bytes": len(body), "truncated": truncated, "at": time.time(),
-            "content_type": content_type,
-        })
 
         charset = "utf-8"
         match = re.search(r"charset=([\w\-]+)", content_type, re.I)
@@ -346,6 +341,19 @@ def fetch(url: str) -> dict:
             text, title = html_to_text(raw)
         else:
             text, title = raw.strip(), None
+
+        # Recorded AFTER extraction, not right after the HTTP response, and carrying
+        # `text_chars` beside `bytes` — this is what makes grounding PROVABLE rather than
+        # merely plausible. LibreChat only ever SHRINKS what it receives (chunking,
+        # snippeting, highlight-expansion all remove text, never add it), so
+        # `0 < len(model-facing content) <= text_chars` holds if and only if that content
+        # came from THIS fetch. A byte count alone cannot say that: it is pre-decode and
+        # pre-markup-stripping, so it does not bound the text a model could ever see.
+        _record({
+            "url": current, "requested": url, "ok": True, "status": status,
+            "bytes": len(body), "text_chars": len(text), "truncated": truncated,
+            "at": time.time(), "content_type": content_type,
+        })
 
         if not text:
             return {

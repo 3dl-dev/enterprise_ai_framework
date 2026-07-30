@@ -218,17 +218,14 @@ webSearch:
   firecrawlApiUrl: "${FIRECRAWL_API_URL}"
   firecrawlApiKey: "${FIRECRAWL_API_KEY}"
 
-  # ***  READ THIS BEFORE BELIEVING WEB SEARCH IS GROUNDED. UNRESOLVED: rd 0be / enterpriseaiframework-405.  ***
+  # ***  READ THIS BEFORE ASSUMING web_search IS UNGROUNDED. RESOLVED: rd 0be, ruling on
+  # enterpriseaiframework-405.  ***
   #
-  # `none` is the only reranker value that authenticates without a paid key, and it has a
-  # consequence that is NOT documented anywhere upstream and that this comment exists to
-  # stop anyone rediscovering the hard way:
-  #
-  #   WITH rerankerType: none, THE FETCHED PAGE CONTENT NEVER REACHES THE MODEL.
-  #
-  # The pages ARE fetched — webfetch's /fetchlog shows real 200s and real byte counts for
-  # every source — and then the content is dropped on the floor before the prompt is
-  # built. The chain, from @librechat/agents' own source:
+  # `rerankerType: none` is free and authenticates, but it has a consequence that is not
+  # documented anywhere upstream: WITH rerankerType: none, THE FETCHED PAGE CONTENT NEVER
+  # REACHES THE MODEL. The pages ARE fetched — webfetch's /fetchlog shows real 200s and
+  # real byte counts for every source — and then the content is dropped on the floor
+  # before the prompt is built. The chain, from @librechat/agents' own source:
   #   createReranker({rerankerType:'none'})            -> returns undefined
   #   getHighlights({reranker: undefined})             -> warns, returns undefined
   #   addHighlights()                                  -> source.highlights = undefined
@@ -236,28 +233,37 @@ webSearch:
   #                                                       the Highlights section ONLY if
   #                                                       source.highlights is non-empty
   # format.ts says it outright: "per-source `content` stays in the WEB_SEARCH artifact for
-  # citations" — the artifact, not the prompt. So the model sees SearXNG's snippets and
-  # never the pages.
+  # citations" — the artifact, not the prompt.
   #
   # MEASURED on this bundle, same question, same model, one config line different:
   #   rerankerType: none   tool output  3,688 chars,  0 highlight blocks  (snippets only)
   #   reranker present     tool output 17,510 chars, 20 highlight blocks  (page text)
   #
-  # WHY THE OBVIOUS WORKAROUND IS A TRAP: `rerankerType: jina` with no key does produce
-  # highlights, but not for the reason it looks like. loadWebSearchAuth cannot authenticate
-  # jina without jinaApiKey, so it leaves rerankerType unset, and createSearchTool then
-  # falls back to its OWN default of `cohere` — you write jina and get CohereReranker,
-  # which finds no COHERE_API_KEY, logs "Using default ranking" and returns the first N
-  # chunks with score 0. Verified in this container's log. No outbound call is made, so it
-  # is not a licence or data-path violation, but shipping a default that depends on two
-  # stacked fallbacks and names the wrong vendor is exactly the silent-wrongness this
-  # project keeps paying for. Not adopted without a ruling.
+  # `jina` with no key is a TRAP, not a fix: loadWebSearchAuth cannot authenticate jina
+  # without jinaApiKey, so it leaves rerankerType unset, and createSearchTool then falls
+  # back to its OWN default of `cohere` — you write jina and get CohereReranker, which
+  # finds no COHERE_API_KEY, logs "Using default ranking" and returns the first N chunks
+  # with score 0. `infinity` looks like a free built-in but is UNREACHABLE from this file:
+  # the data-provider RerankerTypes enum is jina|cohere|none and webSearchSchema uses
+  # z.nativeEnum, so `infinity` never resolves. A real Cohere or Jina key is disqualified
+  # by the component-defaults rule (no paid tier in any default path).
   #
-  # So this stays `none` — honest, authenticated, no paid key — and web search is
-  # SNIPPET-GROUNDED for now. tests/test_web_search.py asserts that measured behaviour
-  # rather than letting it be mistaken for working. The fetch leg is built, tested and
-  # correct; it becomes load-bearing the moment the reranker question is decided.
-  rerankerType: none
+  # THE RESOLUTION: `jina` IS the value here, pointed at `rerank/` — ours, Apache-2.0,
+  # standard library only, no paid dependency, no provider in the data path — which
+  # speaks Jina's own /v1/rerank wire contract with a key WE mint (RERANK_TOKEN). Same
+  # trick webfetch/ already plays for the scraper leg: LibreChat's unmodified
+  # JinaReranker client is pointed at a service of ours that answers its own protocol.
+  #
+  # RANKING HONESTY, IN CAPITALS BECAUSE IT WILL OTHERWISE BE MISREAD AS SEMANTIC SEARCH:
+  # rerank/app.py ranks with OKAPI BM25 — LEXICAL TERM OVERLAP, NOT SEMANTIC. A chunk that
+  # answers the question in different words than the query scores LOWER than a chunk that
+  # parrots the query's own words back, even if the parroting chunk says less. The score
+  # is a squashed BM25 sum, not a calibrated probability. What this buys is GROUNDING
+  # (fetched page text reaches the model); ranking QUALITY is a separate, weaker claim —
+  # see rerank/app.py's docstring and tests/test_web_search.py for both held apart.
+  rerankerType: jina
+  jinaApiUrl: "${JINA_API_URL}"
+  jinaApiKey: "${JINA_API_KEY}"
 
   # Above webfetch's own 20s ceiling would let LibreChat give up on a fetch that is still
   # in flight, which loses content that was retrieved successfully. Below it wastes the

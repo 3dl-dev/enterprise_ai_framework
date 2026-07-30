@@ -9,14 +9,16 @@
 # the config is what keeps the bundle and the cluster from diverging, which is exactly the
 # class of defect findings 17 and 18 record.
 #
-# Two legs, because LibreChat's native web_search needs two supplied and one turned off:
+# Three legs, all supplied, none left to LibreChat's paid-only defaults:
 #   search  searxng   self-hosted, no API key
 #   scrape  webfetch  ours; every scraper LibreChat ships requires a paid key
-#   rerank  none      set in librechat.yaml; jina and cohere both require a paid key
+#   rerank  rerank    ours; jina/cohere both require a paid key, and `rerankerType: none`
+#                     authenticates for free but silently withholds fetched pages from
+#                     the model — see rerank/app.py and enterpriseaiframework-0be
 #
 # LICENCE: SearXNG is AGPL-3.0 and runs here as an unmodified upstream image reached over
 # HTTP. Nothing links it and nothing patches it — the same rule this project applies to
-# Grafana/Perses. webfetch is ours and Apache-2.0 like the rest of the bundle.
+# Grafana/Perses. webfetch and rerank are ours and Apache-2.0 like the rest of the bundle.
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -189,5 +191,50 @@ spec:
             initialDelaySeconds: 3
             periodSeconds: 5
           resources:
+            requests: { cpu: "25m", memory: "64Mi" }
+            limits: { memory: "256Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rerank
+  namespace: enterprise-ai
+spec:
+  selector: { app: rerank }
+  ports: [{ name: http, port: 3003, targetPort: 3003 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rerank
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: rerank } }
+  template:
+    metadata:
+      labels: { app: rerank }
+    spec:
+      containers:
+        - name: rerank
+          # Substituted at apply time, matching webfetch and mcp-echo above.
+          # Build with kaniko the same way mcp-echo is built (no Docker socket).
+          image: REPLACED_BY_DEPLOY
+          env:
+            # MUST be non-empty. This service fails closed on an unset token, and an
+            # empty value here would silently reproduce JinaReranker's own
+            # first-N-chunks-score-0 fallback instead of running our BM25 ranking.
+            - name: RERANK_TOKEN
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: RERANK_TOKEN } }
+          ports: [{ containerPort: 3003 }]
+          readinessProbe:
+            # BM25 needs no GPU and no warm-up — the whole reason a reranker of ours is
+            # affordable beside the chat surface — so a plain HTTP probe is sufficient.
+            httpGet: { path: /health, port: 3003 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            # No GPU, no model weights, no warm-up: BM25 over ~30 chunks from one page is
+            # arithmetic over strings, not inference.
             requests: { cpu: "25m", memory: "64Mi" }
             limits: { memory: "256Mi" }
