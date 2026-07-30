@@ -145,6 +145,27 @@ $("code-retry").addEventListener("click", () => {
   loadFrame("code");
 });
 
+// A dead workshop cannot be caught from `error` — an iframe whose navigation came back
+// with an HTTP error status still fires `load`, never `error`, so listening for a failed
+// load reports nothing and the raw 502 body renders straight at the user. What DOES tell
+// the two apart, because workshop_proxy is same-origin, is the framed document itself:
+// the proxy's own error responses come back `application/json` (FastAPI's HTTPException
+// body); the real workshop page is `text/html`. Checked on every load, not only the
+// first, so the panel also clears the moment a retry actually lands on a live pod, and
+// re-appears if a retry lands on a pod that is still down.
+$("frame-code").addEventListener("load", () => {
+  const frame = $("frame-code");
+  if (!frame.dataset.loaded) return; // the iframe's own initial about:blank, not a mount
+  let broken;
+  try {
+    broken = frame.contentDocument?.contentType === "application/json";
+  } catch {
+    // Cross-origin would mean this is not our proxy's response at all; nothing to flag.
+    broken = false;
+  }
+  $("code-fallback").hidden = !broken;
+});
+
 /* ---------------------------------------------------------------- user menu */
 
 function toggleMenu(show) {

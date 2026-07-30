@@ -297,20 +297,26 @@ def test_the_portal_is_reachable_from_inside_the_workshop_tab(browser, hosted_wo
     p.assert_clean("the portal with the workshop showing")
 
 
-@pytest.mark.parametrize("broken,status,body_says,browser_reports", [
-    # The workshop is not running: the proxy answers 502 and the iframe shows that body.
-    # MEASURED, not assumed: this Chromium does log "Failed to load resource … 502" for a
-    # subframe navigation that returns an error status, so this case happens to be caught
-    # twice over.
-    ("down", 502, "your workshop is not running", True),
+@pytest.mark.parametrize("broken,status,body_says,where,browser_reports", [
+    # The workshop is not running: the proxy answers 502. The iframe still navigates
+    # there and still gets that raw body -- unavoidable, and enterpriseaiframework-176
+    # is precisely that this is no longer what a user is SHOWN, because #code-fallback
+    # is an opaque panel over the frame's whole rectangle and app.js now flips it visible
+    # for this case. MEASURED, not assumed: this Chromium does log "Failed to load
+    # resource … 502" for a subframe navigation that returns an error status, so this
+    # case happens to be caught twice over.
+    ("down", 502, "Your workshop is not running", "fallback", True),
     # The one that nothing sees. A 200 that is not the workshop — an authenticating proxy
     # in front of the pod serving its own sign-in page, a stale index, another tenant's
     # document. No failed request, no console error, no page error, and the iframe's
-    # rectangle in the parent document is exactly where it always is.
-    ("impostor", 200, "Sign in to continue", False),
+    # rectangle in the parent document is exactly where it always is. Its content-type is
+    # `text/html`, same as the real workshop, so the fallback panel has no signal to fire
+    # on here and must stay hidden -- asserted below as the unchanged path, not left
+    # implicit.
+    ("impostor", 200, "Sign in to continue", "frame", False),
 ])
 def test_the_route_back_holds_when_the_workshop_does_not(
-        browser, hosted_no_workshop, broken, status, body_says, browser_reports):
+        browser, hosted_no_workshop, broken, status, body_says, where, browser_reports):
     """Why a box measurement is not the evidence, and what the item asked for under failure.
 
     Two things are pinned here. First, that `_chrome_is_not_covered` passes in both of
@@ -318,6 +324,14 @@ def test_the_route_back_holds_when_the_workshop_does_not(
     contains, which is why the content assertions above exist. Second, the thing the item
     is actually about: a user whose Code tab is broken is not stranded. The header, the
     tabs and a working account menu are all still there, and Chat is one click away.
+
+    enterpriseaiframework-176: for `down` specifically, "what the frame contains" is no
+    longer the user-visible claim. app.js listens for the frame's `load` (an HTTP error
+    status fires `load`, never `error`) and reads the framed document's `contentType`:
+    `application/json` means the proxy's own error body, `text/html` means the real page.
+    So the assertion that matters for `down` is on #code-fallback, in the parent document
+    -- and the frame's raw-JSON body is still checked too, but only as the mechanism the
+    panel's visibility depends on, not as what a person sees.
     """
     hosted = hosted_no_workshop
     if broken == "impostor":
@@ -327,7 +341,21 @@ def test_the_route_back_holds_when_the_workshop_does_not(
     p.page.click("#tab-code")
 
     code = p.page.frame_locator("#frame-code")
-    expect(code.locator("body")).to_contain_text(body_says, timeout=30000)
+    if where == "fallback":
+        # What a person actually sees: the friendly panel, not FastAPI's JSON.
+        expect(p.page.locator("#code-fallback")).to_be_visible(timeout=30000)
+        expect(p.page.locator("#code-fallback")).to_contain_text(body_says)
+        # What is still true one layer underneath -- the signal the panel's visibility
+        # depends on, not the user-visible claim. Kept so that a regression which made
+        # the panel appear unconditionally (rather than because the frame really is the
+        # error body) would still be caught by something.
+        expect(code.locator("body")).to_contain_text(
+            "your workshop is not running", timeout=30000)
+    else:
+        expect(code.locator("body")).to_contain_text(body_says, timeout=30000)
+        # The unchanged path, asserted rather than assumed: a 200 impostor must not
+        # accidentally trip the panel this item added.
+        expect(p.page.locator("#code-fallback")).to_be_hidden()
 
     # 1. What a box measurement sees: nothing wrong, in either case.
     _chrome_is_not_covered(p)
