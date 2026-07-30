@@ -70,7 +70,14 @@ def _load_env() -> dict:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, _, v = line.partition("=")
-        out[k.strip()] = v.strip()
+        v = v.strip()
+        # PEM-bearing vars (e.g. CODEAPI_JWT_PRIVATE_KEY) are single-quoted in .env —
+        # the only quoting form bash, compose, and both JS parsers all agree on
+        # (enterpriseaiframework-082). Strip the quotes here too, or a test reading
+        # `env["CODEAPI_JWT_PUBLIC_KEY"]` gets the quote characters as part of the PEM.
+        if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
+            v = v[1:-1]
+        out[k.strip()] = v
     return out
 
 

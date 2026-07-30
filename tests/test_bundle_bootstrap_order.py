@@ -45,7 +45,7 @@ def _scratch_bundle(tmp_path: Path) -> Path:
     """
     scratch = tmp_path / "bundle"
     (scratch / "bin").mkdir(parents=True)
-    for name in ("make-certs.sh", "render-env.sh"):
+    for name in ("make-certs.sh", "render-env.sh", "render-codeapi-keys.py"):
         src = BUNDLE / "bin" / name
         dst = scratch / "bin" / name
         shutil.copy2(src, dst)
