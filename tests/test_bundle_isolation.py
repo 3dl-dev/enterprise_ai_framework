@@ -70,6 +70,10 @@ def rendered(tmp_path_factory):
     (primary / "bundle" / "keycloak").mkdir(parents=True)
 
     shutil.copy2(RENDER, primary / "bundle" / "bin" / "render-env.sh")
+    shutil.copy2(
+        BUNDLE / "bin" / "render-codeapi-keys.py",
+        primary / "bundle" / "bin" / "render-codeapi-keys.py",
+    )
     shutil.copy2(BUNDLE / ".env.example", primary / "bundle" / ".env.example")
     shutil.copy2(
         BUNDLE / "keycloak" / "realm-export.template.json",
@@ -182,6 +186,10 @@ def test_a_primary_env_damaged_by_the_old_detection_repairs_itself(tmp_path):
     (repo / "bundle" / "bin").mkdir(parents=True)
     (repo / "bundle" / "keycloak").mkdir(parents=True)
     shutil.copy2(RENDER, repo / "bundle" / "bin" / "render-env.sh")
+    shutil.copy2(
+        BUNDLE / "bin" / "render-codeapi-keys.py",
+        repo / "bundle" / "bin" / "render-codeapi-keys.py",
+    )
     shutil.copy2(BUNDLE / ".env.example", repo / "bundle" / ".env.example")
     shutil.copy2(
         BUNDLE / "keycloak" / "realm-export.template.json",
@@ -227,6 +235,10 @@ def test_self_heal_leaves_a_deliberate_custom_project_name_alone(tmp_path):
     (repo / "bundle" / "bin").mkdir(parents=True)
     (repo / "bundle" / "keycloak").mkdir(parents=True)
     shutil.copy2(RENDER, repo / "bundle" / "bin" / "render-env.sh")
+    shutil.copy2(
+        BUNDLE / "bin" / "render-codeapi-keys.py",
+        repo / "bundle" / "bin" / "render-codeapi-keys.py",
+    )
     shutil.copy2(BUNDLE / ".env.example", repo / "bundle" / ".env.example")
     shutil.copy2(
         BUNDLE / "keycloak" / "realm-export.template.json",
@@ -273,6 +285,10 @@ def test_a_non_git_copy_does_not_claim_the_primary_compose_project(tmp_path):
     (copy / "bundle" / "bin").mkdir(parents=True)
     (copy / "bundle" / "keycloak").mkdir(parents=True)
     shutil.copy2(RENDER, copy / "bundle" / "bin" / "render-env.sh")
+    shutil.copy2(
+        BUNDLE / "bin" / "render-codeapi-keys.py",
+        copy / "bundle" / "bin" / "render-codeapi-keys.py",
+    )
     shutil.copy2(BUNDLE / ".env.example", copy / "bundle" / ".env.example")
     shutil.copy2(
         BUNDLE / "keycloak" / "realm-export.template.json",

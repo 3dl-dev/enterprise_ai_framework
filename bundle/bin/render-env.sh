@@ -7,7 +7,8 @@
 # forcing a teardown.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 hex() { openssl rand -hex "$1"; }
 
@@ -18,6 +19,16 @@ if [[ ! -f .env ]]; then
 fi
 
 # name:generator — generator is a command whose stdout becomes the value.
+#
+# The fill-in-place branch used to be `sed "s|^${var}=$|${var}=${value}|"`
+# (enterpriseaiframework-082 wave 18's defect #1): GNU sed's replacement string
+# interprets a literal `\n` in ${value} as an actual newline, so any generated value
+# containing that two-character sequence — a PEM collapsed to one line, which is
+# exactly the form render-codeapi-keys.py produces — came out split across three lines
+# in .env. `--env-file` (and every `set -a; . ./.env` sourcing) then kept only the
+# first line, the surface booted fine, and it failed later at signing time with a
+# truncated key. python does the substitution with no shell/sed string interpolation
+# of ${value} at all, so this class of corruption cannot recur.
 ensure() {
     local var="$1" value="$2"
     if grep -qE "^${var}=.+$" .env; then
@@ -25,7 +36,21 @@ ensure() {
     fi
     if grep -qE "^${var}=$" .env; then
         # Present but empty: fill it in place, preserving position in the file.
-        sed "s|^${var}=$|${var}=${value}|" .env > .env.tmp && mv .env.tmp .env
+        VAR="$var" VALUE="$value" python3 - <<'PYEOF'
+import os
+env_path = ".env"
+var = os.environ["VAR"]
+value = os.environ["VALUE"]
+with open(env_path) as f:
+    lines = f.readlines()
+target = f"{var}=\n"
+for i, line in enumerate(lines):
+    if line == target:
+        lines[i] = f"{var}={value}\n"
+        break
+with open(env_path, "w") as f:
+    f.writelines(lines)
+PYEOF
     else
         printf '%s=%s\n' "$var" "$value" >> .env
     fi
@@ -177,6 +202,27 @@ ensure CHAT_CREDS_IV               "$(hex 16)"
 ensure BOOTSTRAP_USER              "baron"
 ensure BOOTSTRAP_EMAIL             "baron@3dl.dev"
 ensure BOOTSTRAP_PASSWORD          "$(hex 16)"
+
+# --- codeapi (enterpriseaiframework-082) ---
+# The code-execution sandbox's own Valkey, never the bundle's shared one — the shared
+# instance has no password and every codeapi component requires REDIS_PASSWORD.
+ensure CODEAPI_REDIS_PASSWORD        "$(hex 24)"
+# Shared secret between codeapi's own components (api/worker/file-server/tool-call-
+# server/egress-gateway) — internal service-to-service auth, never seen by LibreChat
+# or by the sandbox container itself (secure-startup.ts's hardened-mode boot check
+# refuses to start a sandbox that can see anything matching SECRET|TOKEN|PASSWORD).
+ensure CODEAPI_INTERNAL_SERVICE_TOKEN "$(hex 32)"
+# Egress gateway's own handle-encryption secret. Sandbox-runner, service-api and
+# service-worker never receive this one either — only the egress gateway does.
+ensure CODEAPI_EGRESS_GRANT_SECRET   "$(hex 32)"
+ensure MINIO_ROOT_USER                "codeapi"
+ensure MINIO_ROOT_PASSWORD            "$(hex 24)"
+
+# The two Ed25519 keypairs codeapi needs — the LibreChat-auth JWT pair and the
+# execution-manifest pair — are generated together, atomically, by a python helper,
+# never by ensure() above: ensure() fills ONE variable from ONE generator command,
+# but a keypair is two variables that must come from the SAME key or nothing verifies.
+python3 "$SCRIPT_DIR/render-codeapi-keys.py"
 
 chmod 600 .env
 set -a; . ./.env; set +a

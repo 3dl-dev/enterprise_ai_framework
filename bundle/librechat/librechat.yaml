@@ -99,6 +99,14 @@ modelSpecs:
         endpoint: "Enterprise AI"
         model: "glm-5.2@deepinfra"
         artifacts: "default"
+        # A real zod key (data-provider/src/models.ts's tModelSpecPresetSchema), unlike
+        # `interface.artifacts` above — turns on the codeapi sandbox
+        # (enterpriseaiframework-082) for turns on this model spec by default, on top of
+        # the per-turn `ephemeralAgent.execute_code` a caller can also set explicitly.
+        # Gated together with `endpoints.agents.capabilities`, which defaults to
+        # including `execute_code` (data-provider's defaultAgentCapabilities) and is not
+        # overridden anywhere in this file.
+        executeCode: true
         # Matches the provider: 200k context, and the full output budget. These models
         # spend part of the output budget reasoning, so a short cap truncates the answer
         # after the thinking rather than producing a smaller answer.

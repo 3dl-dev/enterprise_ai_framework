@@ -71,6 +71,15 @@ kubectl -n "$NS" create secret generic enterprise-ai-secrets \
     --from-literal=PUBLIC_BASE_URL="$PUBLIC_BASE_URL" \
     --from-literal=OPENID_ISSUER="${PUBLIC_BASE_URL}/realms/${IDP_REALM:-enterprise-ai}" \
     --from-literal=FORGE_API_KEY="${FORGE_API_KEY:-}" \
+    --from-literal=CODEAPI_JWT_PRIVATE_KEY="$CODEAPI_JWT_PRIVATE_KEY" \
+    --from-literal=CODEAPI_JWT_PUBLIC_KEY="$CODEAPI_JWT_PUBLIC_KEY" \
+    --from-literal=CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY="$CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY" \
+    --from-literal=SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY="$SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY" \
+    --from-literal=CODEAPI_INTERNAL_SERVICE_TOKEN="$CODEAPI_INTERNAL_SERVICE_TOKEN" \
+    --from-literal=CODEAPI_EGRESS_GRANT_SECRET="$CODEAPI_EGRESS_GRANT_SECRET" \
+    --from-literal=CODEAPI_REDIS_PASSWORD="$CODEAPI_REDIS_PASSWORD" \
+    --from-literal=MINIO_ROOT_USER="$MINIO_ROOT_USER" \
+    --from-literal=MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
     --dry-run=client -o yaml | kubectl apply -f -
 
 # The realm JSON carries client secrets, hence a Secret. Rendered by the compose bundle;

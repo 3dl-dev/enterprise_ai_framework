@@ -30,6 +30,12 @@ fi
 # Deliberately NOT control-plane/requirements.txt wholesale: that also pulls asyncpg and
 # pymongo for a live database the auth test stubs out rather than starts.
 "$VENV/bin/pip" install --quiet fastapi==0.118.0
+# PyJWT[crypto] (pulls in `cryptography`) for tests/test_code_execution.py's cross-user
+# isolation probe: it mints its own EdDSA codeapi bearer JWTs with the SAME signing key
+# and claim shape LibreChat's packages/api/src/auth/codeapi.ts uses, so it can drive
+# codeapi's session-key isolation logic directly for two genuine, already-authenticated
+# users without needing to intercept LibreChat's own per-request token minting.
+"$VENV/bin/pip" install --quiet "pyjwt[crypto]==2.12.1"
 # playwright drives the browser suite (make test-browser). Kept here so the venv is
 # complete; the browser binaries are a separate `playwright install`.
 "$VENV/bin/pip" install --quiet playwright
