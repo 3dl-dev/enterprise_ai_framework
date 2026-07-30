@@ -7,7 +7,8 @@
 # forcing a teardown.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 hex() { openssl rand -hex "$1"; }
 
@@ -221,7 +222,7 @@ ensure MINIO_ROOT_PASSWORD            "$(hex 24)"
 # execution-manifest pair — are generated together, atomically, by a python helper,
 # never by ensure() above: ensure() fills ONE variable from ONE generator command,
 # but a keypair is two variables that must come from the SAME key or nothing verifies.
-python3 "$(dirname "$0")/render-codeapi-keys.py"
+python3 "$SCRIPT_DIR/render-codeapi-keys.py"
 
 chmod 600 .env
 set -a; . ./.env; set +a

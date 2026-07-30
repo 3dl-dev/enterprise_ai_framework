@@ -121,6 +121,23 @@ spec:
             - { name: BAN_VIOLATIONS, value: "false" }
             - name: CHAT_VIRTUAL_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_VIRTUAL_KEY } }
+
+            # Code execution (enterpriseaiframework-082). See deploy/k8s/70-codeapi.yaml
+            # for the sandbox stack this points at. LIBRECHAT_CODE_API_KEY is
+            # DELIBERATELY ABSENT — it does not exist in the pinned image (v0.8.7) and
+            # setting it configures nothing. The real credential is a per-request EdDSA
+            # JWT LibreChat mints naming the AUTHENTICATED user
+            # (packages/api/src/auth/codeapi.ts), turned on by CODEAPI_AUTH_PROVIDER
+            # below and signed with the private half of the keypair in
+            # enterprise-ai-secrets — never the caller-asserted user_id in the request
+            # body, which the service treats as informational only (Finding 27).
+            - { name: LIBRECHAT_CODE_BASEURL, value: "http://codeapi:3112/v1" }
+            - { name: CODEAPI_AUTH_PROVIDER, value: "librechat-jwt" }
+            - { name: CODEAPI_JWT_KID, value: "lc-codeapi-bundle-1" }
+            - { name: CODEAPI_JWT_ISSUER, value: "librechat" }
+            - { name: CODEAPI_JWT_AUDIENCE, value: "codeapi" }
+            - name: CODEAPI_JWT_PRIVATE_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_JWT_PRIVATE_KEY } }
           ports: [{ containerPort: 3080 }]
           volumeMounts:
             - { name: config, mountPath: /app/librechat.yaml, subPath: librechat.yaml, readOnly: true }
