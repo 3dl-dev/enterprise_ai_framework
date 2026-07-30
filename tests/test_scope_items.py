@@ -18,6 +18,7 @@ import uuid
 import httpx
 import pytest
 
+import chat_turn
 import oidc_login
 from conftest import BUNDLE, DOGFOOD_USER, compose, set_user_enabled
 
@@ -794,28 +795,23 @@ class TestChatPrincipalOnTheOneBill:
         model = "fake-large" if "fake-large" in models else models[0]
 
         text = f"one bill premise {uuid.uuid4().hex}"
-        r = client.post(
-            f"{chat_url}/api/agents/chat/{urllib.parse.quote(endpoint)}",
-            headers=self._chat_headers(client, chat_url),
-            json={
-                "endpoint": endpoint,
-                "endpointType": "custom",
-                "model": model,
-                "text": text,
-                "conversationId": None,
-                "parentMessageId": "00000000-0000-0000-0000-000000000000",
-                "messageId": str(uuid.uuid4()),
-                "sender": "User",
-                "isCreatedByUser": True,
-                "ephemeralAgent": {"execute_code": False, "web_search": False,
-                                   "file_search": False, "mcp": []},
-            },
-            timeout=TIMEOUT * 3,
+        # Routed through chat_turn rather than posting here, because the POST response is
+        # NOT the answer on every version. This test was written against v0.8.0, where the
+        # POST body WAS the SSE stream and `on_message_delta` appeared in it. v0.8.7 answers
+        # {"streamId", "conversationId", "status": "started"} and delivers the reply on a
+        # separate GET — so the old assertion failed with "the chat surface never produced
+        # an answer, so nothing reached the gateway", blaming the gateway for a protocol
+        # change in the surface. chat_turn.send_turn reads the PERSISTED assistant message
+        # from GET /api/messages/<conversationId>, which is true on both versions.
+        # Same defect as enterpriseaiframework-614; do not reintroduce a protocol-specific
+        # assertion here.
+        reply = chat_turn.send_turn(
+            client, chat_url, text, model=model, endpoint=endpoint,
+            headers=self._chat_headers(client, chat_url), timeout=TIMEOUT * 3,
         )
-        assert r.status_code == 200, f"chat message rejected: {r.status_code} {r.text[:400]}"
-        assert "on_message_delta" in r.text, (
-            f"the chat surface never produced an answer, so nothing reached the "
-            f"gateway: {r.text[:500]}"
+        assert reply, (
+            "the chat surface persisted no assistant message, so nothing reached the "
+            "gateway for this turn"
         )
         return text
 
