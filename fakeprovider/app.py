@@ -43,6 +43,21 @@ CHARS_PER_TOKEN = 4
 # for the same reason the rest of it is.
 CALLS_BY_PROMPT: defaultdict[str, int] = defaultdict(int)
 
+# WHY THE COUNTER SHIPS A BOOT ID WITH IT
+#
+# CALLS_BY_PROMPT lives in this process and nowhere else, so anything that restarts this
+# container silently resets it to zero — `restart: unless-stopped` after an OOM, a
+# `compose up --build` while a suite is running, a health-check restart. Every test that
+# reads it then reads a smaller number than the truth, and the direction that goes wrong is
+# the dangerous one: "the second call did not reach the provider, so it was a cache hit" is
+# exactly what a zeroed counter looks like. The cache test would pass with the cache
+# switched off.
+#
+# So the counter is published with the identity of the process that counted. A test takes
+# the boot id before its measurement and asserts it is the same one afterwards; if this
+# process restarted in between, the test says so instead of quietly believing the count.
+BOOT_ID = hashlib.sha256(f"{os.getpid()}\x00{time.time_ns()}".encode()).hexdigest()[:16]
+
 
 def prompt_digest(prompt: str) -> str:
     return hashlib.sha256(prompt.encode()).hexdigest()[:16]
@@ -278,8 +293,11 @@ async def debug_calls(prompt: str | None = None):
     why a test cannot get this from the response body.
     """
     if prompt is not None:
-        return {"prompt_digest": prompt_digest(prompt), "calls": CALLS_BY_PROMPT[prompt_digest(prompt)]}
-    return {"total": sum(CALLS_BY_PROMPT.values()), "by_prompt": dict(CALLS_BY_PROMPT)}
+        return {"prompt_digest": prompt_digest(prompt),
+                "calls": CALLS_BY_PROMPT[prompt_digest(prompt)],
+                "boot_id": BOOT_ID}
+    return {"total": sum(CALLS_BY_PROMPT.values()), "by_prompt": dict(CALLS_BY_PROMPT),
+            "boot_id": BOOT_ID}
 
 
 @app.get("/health")

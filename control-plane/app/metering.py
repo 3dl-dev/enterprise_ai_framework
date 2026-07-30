@@ -148,21 +148,72 @@ _CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
 
 # WHY A FAILED REQUEST STAYS IN `requests` AND IS NAMED SEPARATELY (enterpriseaiframework-e69)
 #
-# There are two ways a request reaches the ledger having cost nothing, and until this row
-# the bill could only explain one of them.
+# THREE OUTCOMES REACH THIS LEDGER, NOT TWO. The first version of this comment said two,
+# and the code below matched the comment rather than the database. Every class was then
+# re-measured on the bundle, one fresh key each, and dumped raw:
 #
-#   cache hit        served, free, real tokens        cache_hit='True'  spend 0
-#   upstream failure served to NOBODY, no tokens      status='failure'  spend 0
+#   outcome                        status    llm_provider  spend  tokens  alias on row
+#   ------------------------------ --------- ------------- -----  ------  ------------
+#   served                         success   (no error)    real   real    yes
+#   served from cache              success   (no error)    0      real    yes
+#   upstream 500                   failure   openai        0      0       yes
+#   upstream refused the call *    failure   openai        0      0       yes
+#   no attributable principal **   failure   ''            0      0       NO
+#   rate limit the GATEWAY imposed failure   ''            0      0       yes
+#   model not on the key's list    failure   ''            0      0       NO
+#   over the key's budget          failure   ''            0      0       NO
+#   model not in the catalogue     failure   ''            0      0       yes
 #
-# A third and fourth way exist and never reach the ledger at all: over budget, and a model
-# not on the key's list. Both are refused in LiteLLM's `user_api_key_auth`, a route
-# dependency that runs before the router, so no row is ever written and the bill neither
-# counts nor charges them. Measured, one fresh key per class, in finding 41.
+#   *  a /v1/embeddings call the fake provider has no route for: NotFoundError, a
+#      different litellm exception class from the 500, and it populates llm_provider too.
+#   ** deploy/gateway/require_principal.py, finding 36.
+#
+# THE PREMISE THIS CORRECTS. It was recorded as measured that over-budget and
+# model-not-permitted refusals "never reach the ledger at all". They do. The earlier
+# measurement looked at the REFUSED USER'S line on the bill, saw the right number there,
+# and concluded no row existed — but those rows are written with no key alias, so they
+# land under `(unattributed)` where nobody was looking. `(unattributed)` is the bucket
+# finding 36 exists to empty; counting refusals refills it with a phantom principal.
+#
+# So `status = 'failure'` is not "the provider did not answer". It is "this request did
+# not succeed", and it spans two things an operator must never see added together:
+#
+#   THE PROVIDER FAILED     the gateway admitted the request, called an upstream, and got
+#                           nothing back. The provider may well have charged for the
+#                           attempt while LiteLLM recorded spend 0, so the count is the
+#                           only signal that would let anyone notice that against an
+#                           invoice. This is a fault, and it is ours to see.
+#   THE GATEWAY REFUSED     the gateway declined the request itself — no principal, over
+#                           budget, not entitled to the model, rate limited, no such
+#                           model. No upstream was called, so no money could have been
+#                           spent by anyone. This is the layer WORKING, and counting it as
+#                           usage means the bill grows when a user is DENIED service.
+#
+# THE DISCRIMINATOR is `metadata->'error_information'->>'llm_provider'`. litellm's own
+# exception classes carry the provider they were raised for; the proxy-level refusals are
+# FastAPI `HTTPException`, `BudgetExceededError`, `ProxyException` and
+# `ProxyModelNotFoundError`, which have no such attribute, so the field serialises as the
+# empty string. Measured non-vacuously: two different provider exception classes populate
+# it (InternalServerError, NotFoundError) and four different refusal classes leave it
+# empty. Not `error_code` — a gateway rate limit and a provider rate limit are both 429.
+#
+# WHICH WAY IT FAILS IF THE SHAPE EVER CHANGES. A refusal must be positively proven: the
+# error object must exist AND name no provider. Anything unrecognised counts as admitted
+# and, if it failed, as a provider failure. That direction over-reports faults; the other
+# direction would delete requests from the count, which is this codebase's signature
+# defect and the thing reason 3 below is about.
 #
 # THE RULING (enterpriseaiframework-e69, and the founder may reverse it — see finding 41).
 # `requests` counts every request the gateway ADMITTED, and each way of costing nothing
 # gets its own named subtotal beside it. It does NOT become a count of requests that
-# succeeded.
+# succeeded, and it does NOT count a request the gateway refused — a refusal was never
+# admitted, so it is reported BESIDE `requests` as `refused_requests` rather than inside
+# it. Three numbers, and the arithmetic is closed:
+#
+#   requests           = admitted             = answered + failed_requests
+#   cached_requests    ⊆ requests             answered without calling a provider
+#   failed_requests    ⊆ requests             a provider was called and did not answer
+#   refused_requests   ∩ requests = ∅         the gateway declined; nothing was called
 #
 # The losing option was to subtract failures out of `requests`, which is cheaper and reads
 # better — "4 requests, $0.01" becomes "1 request, $0.01" and every number on the line then
@@ -183,10 +234,13 @@ _CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
 #      surviving rows all look healthy. The count is the ONLY trace a failure leaves: it
 #      has no spend and no tokens to show up in.
 #
-# NEITHER OPTION TOUCHES MONEY, which is what makes this decidable at all. Both leave
-# SUM(s.spend) byte-identical, because a failure contributes 0 to it either way, so the
-# cent-level agreement with the provider's own invoice (finding 9) is not on the table
-# here and no version of this trades it.
+# NEITHER OPTION TOUCHES MONEY, which is what makes this decidable at all. Every class
+# above except a served request carries spend 0, so SUM(s.spend) is byte-identical under
+# both options AND under the refusal split — the cent-level agreement with the provider's
+# own invoice (finding 9) is not on the table here and no version of this trades it. The
+# sums below are therefore taken over EVERY row, refusals included, deliberately: if a
+# refusal ever did carry spend, that is money and it must appear, not be filtered out by a
+# predicate written when refusals were free.
 #
 # Read against `status`, not against spend or tokens. That is not hypothetical: measured on
 # this bundle's ledger, `spend = 0` matches the cache-hit row AND all ten failure rows, so
@@ -200,6 +254,54 @@ _CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
 # does not guarantee a clean value. Failing to 'not a failure' is the right direction —
 # the bill should under-claim failures rather than invent them.
 _FAILED = "lower(COALESCE(s.status, '')) = 'failure'"
+
+# The provider named on a failure, or NULL if none was. `jsonb_typeof(...) = 'object'` is
+# not decoration: without it a malformed `error_information` — a bare JSON string, say —
+# would extract as NULL and be read as "no provider named", i.e. as a refusal, which
+# subtracts a request that really happened. With it, only a well-formed error object that
+# explicitly names no provider can classify a row as refused.
+_ERROR_INFO = "s.metadata->'error_information'"
+_ERROR_PROVIDER = f"""CASE WHEN jsonb_typeof({_ERROR_INFO}) = 'object'
+    THEN NULLIF({_ERROR_INFO}->>'llm_provider', '') END"""
+
+# The gateway declined this request itself. No upstream was called.
+#
+# THE COALESCE IS THE WHOLE PREDICATE'S CORRECTNESS, not a tidy-up. `jsonb_typeof()` of an
+# absent key is NULL, so on a failure row with no `error_information` at all this expression
+# evaluates to NULL — and `COUNT(*) FILTER (WHERE ...)` counts only rows where the condition
+# is TRUE. Without the COALESCE such a row is excluded from `refused_requests` AND, through
+# `NOT (...)`, from `requests` as well: it vanishes off the bill entirely, which is the
+# precise defect reason 3 above is about, reintroduced by the fix for it. Found by running
+# the predicate over synthetic rows rather than by reading it. Defaulting to FALSE makes the
+# row admitted and, since it failed, a provider fault — the direction that over-reports
+# faults instead of deleting requests.
+_REFUSED = f"""COALESCE({_FAILED}
+    AND jsonb_typeof({_ERROR_INFO}) = 'object'
+    AND {_ERROR_PROVIDER} IS NULL, false)"""
+
+# The gateway let this request through. Everything that is not a proven refusal, so an
+# unrecognised row is counted rather than silently dropped from the bill.
+_ADMITTED = f"NOT {_REFUSED}"
+
+# An admitted request the provider did not answer.
+_PROVIDER_FAILED = f"({_FAILED} AND {_ADMITTED})"
+
+
+def refused_sql() -> str:
+    """The one definition of "the gateway declined this request", as SQL.
+
+    Exposed for the same reason ledger_attribution_sql is: the per-request CSV the exit
+    path hands a departing customer has to label rows by the SAME rule the aggregate bill
+    counts them by, or the archive and the bill disagree about which requests were
+    refusals. That exact drift has happened twice to the attribution join. Assumes the
+    ledger is aliased `s`, as ledger_attribution_sql()["join"] does.
+    """
+    return _REFUSED
+
+
+def failed_sql() -> str:
+    """`status = 'failure'`, refusals included. Pair with refused_sql() to separate them."""
+    return _FAILED
 
 
 async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
@@ -215,9 +317,10 @@ async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
     SELECT
         {attr["principal"]} AS username,
         COALESCE({attr["surface"]}, '(unknown)') AS surface,
-        COUNT(*)                                  AS requests,
+        COUNT(*) FILTER (WHERE {_ADMITTED})::bigint AS requests,
         COUNT(*) FILTER (WHERE {_CACHE_HIT})::bigint AS cached_requests,
-        COUNT(*) FILTER (WHERE {_FAILED})::bigint AS failed_requests,
+        COUNT(*) FILTER (WHERE {_PROVIDER_FAILED})::bigint AS failed_requests,
+        COUNT(*) FILTER (WHERE {_REFUSED})::bigint AS refused_requests,
         COALESCE(SUM(s.spend), 0)::float8         AS spend,
         COALESCE(SUM(s.prompt_tokens), 0)::bigint AS prompt_tokens,
         COALESCE(SUM(s.completion_tokens), 0)::bigint AS completion_tokens
@@ -238,9 +341,10 @@ async def totals(since: str | None = None) -> dict:
         where = 'WHERE s."startTime" >= $1::text::timestamptz'
         params.append(since)
     sql = f"""
-    SELECT COUNT(*) AS requests,
+    SELECT COUNT(*) FILTER (WHERE {_ADMITTED})::bigint AS requests,
            COUNT(*) FILTER (WHERE {_CACHE_HIT})::bigint AS cached_requests,
-           COUNT(*) FILTER (WHERE {_FAILED})::bigint AS failed_requests,
+           COUNT(*) FILTER (WHERE {_PROVIDER_FAILED})::bigint AS failed_requests,
+           COUNT(*) FILTER (WHERE {_REFUSED})::bigint AS refused_requests,
            COALESCE(SUM(s.spend), 0)::float8 AS spend,
            COUNT(DISTINCT {_ALIAS}) AS active_keys
     {_LEDGER_JOIN}

@@ -48,11 +48,32 @@ KEY_COLUMNS = ("username", "surface", "key_alias", "status", "max_budget", "crea
 # third rendering of the ledger, and the two before it each had to be corrected twice
 # because a fix landed in one and was forgotten in the others (see
 # metering.ledger_attribution_sql).
+#
+# `outcome` is the derived column `status` turned out to need. LiteLLM writes 'failure' for
+# two things a departing customer must not add together: a request the gateway ADMITTED
+# and a provider then failed to answer (a fault, and one the provider may have charged for
+# while this row says $0), and a request the GATEWAY REFUSED — over budget, rate limited,
+# not entitled to the model, no attributable principal — where no provider was ever
+# called. Measured: both write status='failure', spend 0, zero tokens and cache_hit
+# 'False', so nothing already in this file separates them. The rule is
+# metering._REFUSED, shared with the aggregate bill so the archive and the bill cannot
+# disagree about which rows were refusals.
+#
+# Derived, and `status` stays beside it verbatim, for the reason `end_user` stays verbatim:
+# this file is evidence. A reader who distrusts our derivation can check `outcome` against
+# `status` and against the provider's own invoice; a file that had silently replaced
+# `status` with our interpretation could not be checked against anything.
 SPEND_COLUMNS = (
     "request_id", "start_time", "end_time", "model", "key_alias", "surface",
-    "end_user", "principal", "status", "spend", "prompt_tokens",
+    "end_user", "principal", "status", "outcome", "spend", "prompt_tokens",
     "completion_tokens", "total_tokens", "cache_hit",
 )
+
+# The three values `outcome` takes. Named here rather than spelled inline so a test can
+# assert the vocabulary rather than a literal it copied from the query.
+OUTCOME_SERVED = "served"
+OUTCOME_PROVIDER_FAILED = "provider_failed"
+OUTCOME_GATEWAY_REFUSED = "gateway_refused"
 
 
 def _csv_line(values) -> str:
@@ -134,6 +155,11 @@ async def spend_csv() -> AsyncIterator[str]:
                COALESCE(s.end_user, '')        AS end_user,
                {attr["principal"]}             AS principal,
                COALESCE(s.status, '')          AS status,
+               CASE
+                   WHEN {metering.refused_sql()} THEN '{OUTCOME_GATEWAY_REFUSED}'
+                   WHEN {metering.failed_sql()}  THEN '{OUTCOME_PROVIDER_FAILED}'
+                   ELSE '{OUTCOME_SERVED}'
+               END                             AS outcome,
                s.spend, s.prompt_tokens, s.completion_tokens, s.total_tokens,
                COALESCE(s.cache_hit, '')       AS cache_hit
         {attr["join"]}

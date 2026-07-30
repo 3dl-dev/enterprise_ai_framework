@@ -70,7 +70,8 @@ def _row(**over):
         "request_id": "req-1", "start_time": "2026-07-29T00:00:00+00:00",
         "end_time": "2026-07-29T00:00:01+00:00", "model": "fake-large",
         "key_alias": "baron::ide", "surface": "ide", "end_user": "",
-        "principal": "baron", "status": "success", "spend": 0.001, "prompt_tokens": 1,
+        "principal": "baron", "status": "success", "outcome": "served",
+        "spend": 0.001, "prompt_tokens": 1,
         "completion_tokens": 2, "total_tokens": 3, "cache_hit": "",
     }
     base.update(over)
@@ -224,6 +225,9 @@ def test_a_per_user_key_still_cannot_name_somebody_else_in_the_export():
 def test_the_csv_header_carries_both_columns_in_a_stable_order():
     """A header is a contract with whatever the customer reads this file in."""
     assert export.SPEND_COLUMNS.index("end_user") + 1 == export.SPEND_COLUMNS.index("principal")
+    # Raw beside derived, both times, so the derivation stays checkable by whoever reads
+    # this file after the deployment is gone: end_user -> principal, status -> outcome.
+    assert export.SPEND_COLUMNS.index("status") + 1 == export.SPEND_COLUMNS.index("outcome")
     for required in ("request_id", "key_alias", "surface", "spend", "total_tokens"):
         assert required in export.SPEND_COLUMNS, required
 
@@ -264,3 +268,78 @@ def test_a_failed_row_is_distinguishable_from_a_free_one_in_the_archive():
     )
     # And the money is untouched by any of it — the reason this was decidable at all.
     assert failed["spend"] == 0 and cached["spend"] == 0
+
+
+def test_the_archive_says_whether_a_provider_was_ever_called():
+    """`status` says "did not succeed". That is two different things to a customer.
+
+    A provider fault and a refusal the gateway issued both write status='failure', spend 0,
+    zero tokens and cache_hit 'False' — measured on the bundle, one fresh key per class. So
+    nothing already in this file separated them, and the difference is the one a customer
+    reconciling against an invoice cares about most: for a provider fault the provider may
+    have charged for the attempt while this row says $0, and for a refusal no provider was
+    ever contacted and no charge is possible.
+    """
+    fault = _as_dict(export.spend_row(_row(
+        status="failure", outcome=export.OUTCOME_PROVIDER_FAILED,
+        spend=0, prompt_tokens=0, completion_tokens=0, total_tokens=0, cache_hit="False",
+    )))
+    refusal = _as_dict(export.spend_row(_row(
+        status="failure", outcome=export.OUTCOME_GATEWAY_REFUSED,
+        spend=0, prompt_tokens=0, completion_tokens=0, total_tokens=0, cache_hit="False",
+    )))
+
+    # Every column that used to be the discriminator agrees on these two rows. That is the
+    # premise; if any of these assertions ever fails, `outcome` may no longer be needed and
+    # the argument for it should be rechecked rather than this test relaxed.
+    for column in ("status", "spend", "total_tokens", "cache_hit"):
+        assert fault[column] == refusal[column], (
+            f"{column} now separates a provider fault from a gateway refusal, so this "
+            f"test's premise is stale"
+        )
+    assert fault["outcome"] != refusal["outcome"], (
+        "the archive cannot tell a request the provider failed from one the gateway "
+        "refused, so a departing customer reconciling $0 rows against an invoice has no "
+        "way to know which ones a provider could have charged for"
+    )
+    # Non-vacuous against SPEND_COLUMNS specifically: remove `outcome` from the tuple and
+    # both lookups raise KeyError rather than quietly comparing something else.
+    assert "outcome" in export.SPEND_COLUMNS
+
+
+def test_the_archive_and_the_bill_share_one_definition_of_a_refusal():
+    """Not a fourth copy of the predicate.
+
+    The ledger is rendered three ways and a rule copied into each is a rule that gets
+    corrected in one of them — that is finding 25 and finding 34, twice over, on the
+    attribution join. The refusal rule is exposed by `metering.refused_sql()` and the
+    export's `outcome` column is built from it, so the archive and the aggregate bill
+    cannot disagree about which rows were refusals.
+    """
+    refused = metering.refused_sql()
+    assert "llm_provider" in refused, (
+        f"the refusal rule no longer reads the provider named on the error, so it is "
+        f"deciding on something else: {refused}"
+    )
+    assert "error_information" in refused, refused
+    # A malformed error object must NOT classify as a refusal — that direction deletes a
+    # request that really happened, which is the defect this whole item is about.
+    assert "jsonb_typeof" in refused, (
+        f"without the type guard, a malformed error_information extracts as NULL and the "
+        f"row is read as 'no provider named', i.e. as a refusal, and a request that really "
+        f"happened vanishes from the count: {refused}"
+    )
+    assert metering.failed_sql() in refused, (
+        f"a refusal must be a failure first; this predicate could match a successful "
+        f"request: {refused}"
+    )
+    # And it must be TOTAL. `jsonb_typeof()` of an absent key is NULL, so without a
+    # COALESCE this predicate is NULL on a failure row carrying no error object — and
+    # `COUNT(*) FILTER (WHERE ...)` counts only TRUE, so such a row falls out of
+    # refused_requests AND, through `NOT (...)`, out of `requests` too. It vanishes off the
+    # bill. That was a real defect in the first draft of this predicate, found by running it
+    # over synthetic rows; this assertion is what stops it coming back.
+    assert "COALESCE" in refused and "false" in refused, (
+        f"the refusal predicate can evaluate to NULL, which drops the row from BOTH the "
+        f"request count and the refusal count instead of choosing one: {refused}"
+    )

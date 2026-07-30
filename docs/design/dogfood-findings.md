@@ -1089,8 +1089,8 @@ not take the same path through the gateway:
 
 | how it ends | where it is stopped | ledger row? | counted in `requests`? |
 |---|---|---|---|
-| over budget | `user_api_key_auth`, before the router | no | no |
-| model not on the key's list | `user_api_key_auth`, before the router | no | no |
+| over budget | `user_api_key_auth`, before the router | ~~no~~ **yes, unattributed** | see §Correction |
+| model not on the key's list | `user_api_key_auth`, before the router | ~~no~~ **yes, unattributed** | see §Correction |
 | the upstream itself fails | past the router, on the failure callback | **yes** | **yes** |
 
 Measured on the bundle, one key per class, unique prompts throughout:
@@ -1100,6 +1100,14 @@ budget:    2 served,  6 refused  -> ledger 2 rows, bill 2 requests
 model:     1 served,  3 denied   -> ledger 1 row,  bill 1 request
 upstream:  1 served,  3 failed   -> ledger 4 rows, bill 4 requests
 ```
+
+> **The first two lines of that table are wrong, and the §Correction section at the end of
+> this finding is the whole reason this entry is worth reading twice.** The measurement was
+> real but it was taken in the wrong place: it read the *refused user's line on the bill*,
+> where the number was right, and concluded from that that no row existed. Those refusals
+> do write rows — with no key alias, so they land under `(unattributed)` where nobody
+> looked. Everything between here and §Correction is the original reasoning, left intact
+> because the ruling it produced survives; only its premise about refusals was replaced.
 
 The three upstream-failure rows carry `status='failure'`, `spend=0`, `total_tokens=0`,
 `cache_hit='False'`. So the bill tells an operator that this person made four requests
@@ -1173,13 +1181,14 @@ it. That was checked rather than assumed: `TestPricingIntegrity` is unchanged an
 passes, and `test_a_cache_hit_is_not_reported_as_a_failure` re-asserts d58's exact
 `spend == one call's cost` on the case this change did not touch.
 
-**On whether a refusal should count as usage at all.** The two pre-router classes — over
+**On whether a refusal should count as usage at all.** ~~The two pre-router classes — over
 budget, and a model not on the key's list — write no row and are counted nowhere, and this
-ruling leaves that alone. It is the right asymmetry: the gateway declining is not the same
-event as the provider failing, and only one of them consumed anything outside this layer.
-Counting refusals would also make the bill grow when a user is *denied* service, which
-inverts what a budget is for. `test_a_refusal_the_gateway_issued_is_still_no_request_at_all`
-pins that side.
+ruling leaves that alone.~~ **The conclusion here is right and the mechanism is wrong; see
+§Correction below.** Those classes *do* write rows, and this ruling as first implemented
+counted them. What survives is the asymmetry: the gateway declining is not the same event as
+the provider failing, only one of them consumed anything outside this layer, and counting
+refusals makes the bill grow when a user is *denied* service, which inverts what a budget is
+for. That is now enforced by a computed predicate rather than assumed from a code path.
 
 Landed in all three renderings of the ledger, because the two before it each had to be
 corrected twice for being fixed in one place only:
@@ -1195,6 +1204,136 @@ corrected twice for being fixed in one place only:
 `test_the_request_count_is_not_quietly_reduced` exists to fail if someone later implements
 the rejected option — it names this finding in its failure message so the reversal is made
 on purpose rather than by accident.
+
+#### Correction: `status='failure'` is not "the provider did not answer"
+
+The ruling above rests on a claim about what `status='failure'` *means*, and that claim was
+never measured — it was inferred from the only failure any test could reach. The fake
+provider's `FAIL_MARKER` injects an upstream 500, that 500 is genuinely the litellm failure
+callback firing, and everything about the path is real. What was not real is the
+*generalisation*: the 500 was treated as the sole failure class, so `status='failure'`
+became a synonym for "a provider was called and did not answer".
+
+Re-measured on the bundle, one fresh key per class, dumping the **raw ledger row** rather
+than reading the bill. Nine outcomes reach the ledger, not three:
+
+| outcome | `status` | `error_information.llm_provider` | spend | tokens | alias on row |
+|---|---|---|---|---|---|
+| served | `success` | *(no error object)* | real | real | yes |
+| served from cache | `success` | *(no error object)* | 0 | real | yes |
+| upstream 500 | `failure` | `openai` | 0 | 0 | yes |
+| upstream refused the call † | `failure` | `openai` | 0 | 0 | yes |
+| no attributable principal ‡ | `failure` | *(empty)* | 0 | 0 | **no** |
+| rate limit the **gateway** imposed | `failure` | *(empty)* | 0 | 0 | yes |
+| model not on the key's list | `failure` | *(empty)* | 0 | 0 | **no** |
+| over the key's budget | `failure` | *(empty)* | 0 | 0 | **no** |
+| model not in the catalogue | `failure` | *(empty)* | 0 | 0 | yes |
+
+† a `/v1/embeddings` call the fake provider has no route for — `NotFoundError`, a *different*
+litellm exception class from the 500, which is what makes the discriminator below
+non-vacuous rather than a synonym for the marker.
+‡ `deploy/gateway/require_principal.py`, finding 36.
+
+**Why the false premise survived two dispatches.** The refusal rows carry no key alias, so
+`ledger_attribution_sql` resolves them to `(unattributed)`. Every measurement had been taken
+by reading the *refused user's* line, which correctly showed only the served requests, and
+`test_a_refusal_the_gateway_issued_is_still_no_request_at_all` asserted exactly that and
+passed — truthfully, about that line, while the refusals sat one row down the page. A
+presence check on the right row is not a correctness check on the ledger.
+
+**What the operator was actually shown**, measured on this bundle before the fix:
+
+```
+a key with rpm_limit=1 sending 6 requests   ->  bill: 6 requests, 5 failed, $0.000198
+                                                truth: 1 served, 5 refused by us, 0 faults
+(unattributed)                              ->  bill: 46 requests, 46 failed, $0.00
+                                                truth: 46 refusals working correctly
+```
+
+The second is the sharper one. Finding 36 exists to make `(unattributed)` **empty** — money
+that no bill can name is the exact failure this project exists to prevent. Counting
+refusals refilled it with a phantom principal that made requests and failed every one.
+
+**The discriminator is `metadata->'error_information'->>'llm_provider'`.** litellm's own
+exception classes carry the provider they were raised for; the proxy-level refusals are
+`HTTPException`, `BudgetExceededError`, `ProxyException` and `ProxyModelNotFoundError`,
+which have no such attribute, so the field serialises as the empty string. Not `error_code`:
+a gateway rate limit and a provider rate limit are both `429`.
+
+The type guard on that expression is load-bearing, not defensive style — demonstrated by
+running both variants over synthetic rows:
+
+```
+                              refused WITH guard   refused WITHOUT guard
+provider 500, well formed             f                     f
+gateway refusal, well formed          t                     t
+MALFORMED: a bare JSON string         f                     t      <-- a real request vanishes
+MALFORMED: absent                   null                    t      <-- a real request vanishes
+```
+
+A refusal has to be *positively proven*: a well-formed error object that names no provider.
+Anything unrecognised counts as admitted, and if it failed, as a provider fault. That
+direction over-reports faults; the other direction deletes requests that really happened,
+which is reason 3 above turned on the fix itself.
+
+**The ruling, unchanged in substance and sharper in predicate.** `requests` still counts
+what the gateway ADMITTED and still keeps provider failures inside it, named by
+`failed_requests`; all three reasons above survive intact. What changes is that *admitted*
+is now computed rather than assumed, and a third column joins the row:
+
+```
+requests          = admitted          = answered + failed_requests
+cached_requests   ⊆ requests            answered without calling a provider
+failed_requests   ⊆ requests            a provider was called and did not answer
+refused_requests  ∩ requests = ∅        the gateway declined; nothing was called
+```
+
+`refused_requests` is *reported* rather than dropped, for reason 3's logic: a client stuck
+in refusal — a script wired to the master key, which is finding 36's real scenario — leaves
+no other trace anywhere, no spend and no tokens, and an operator who cannot see it cannot
+fix it. It sits outside `requests` because charging a request count to somebody the layer
+just denied is the same defect as charging them money for it.
+
+**The founder may still pick the other option for the failure half.** Nothing here
+forecloses excluding `status='failure'` from `requests`; the table above still applies and
+`TestARefusalIsNotAFailedRequestAndIsNotUsage` would need only its expected numbers changed.
+The refusal half is a different question and is not offered as a choice: a refusal was never
+served, never priced and never reached a provider, so there is no reading of "requests"
+under which it is one.
+
+**Money is untouched, verified by execution over the populated ledger** rather than argued:
+
+```
+sum(spend), every row             0.010194000000000002
+sum(spend), refusals excluded     0.010194000000000002      difference: 0
+```
+
+And `spend = 0` remains useless as a predicate, which is why all three columns read their
+own: over the same ledger it matches 95 refusals, 34 provider faults **and** 7 cache hits.
+
+What the operator now sees, all three renderings agreeing at totals, person and surface
+level: `requests 94, cached 7, failed 34, refused 95, spend $0.010194`, with
+`(unattributed)` reading **0 requests / 95→46 refused / $0.00**.
+
+Landed alongside the columns above: `spend.csv` gains a derived `outcome`
+(`served` / `provider_failed` / `gateway_refused`) built from the *same* predicate the bill
+counts by (`metering.refused_sql()`), with `status` kept verbatim beside it — because the
+archive is evidence, and `status` alone cannot tell a fault the provider may have charged
+for from a refusal that could not possibly have been charged. Both portal spend tables gain
+a **Refused** column.
+
+**Also closed here:** the fake provider's call counter is in-process, so a restart zeroed it
+— and a zeroed counter is indistinguishable from a working cache, which would have made
+every cache assertion pass with the cache switched off. `/debug/calls` now publishes a
+`boot_id`, and the two tests that read a low count as evidence of caching assert it did not
+change. Demonstrated by removing the field: both fail rather than passing quietly.
+
+**Still open, deliberately.** `unpriced_models` excludes refusals only incidentally, via
+`total_tokens > 0`. If a refusal or a partial-stream failure ever recorded tokens, the leak
+detector would flag its model as unpriced. Worth an item if that is ever seen; there is no
+evidence for it now. `make test-forge` — finding 9's live reconciliation against a real
+provider — was **not** run: it needs real credentials and a live upstream, and running with
+Forge credentials visible drops the fake upstreams the whole suite is built on.
 
 ### 42. `make up` failed the first time and passed on a re-run, in a clean checkout
 

@@ -199,6 +199,10 @@ async function loadSpend() {
       // And how many reached the provider and came back an error — the other $0 row
       // (e69). Distinct from Free: a cache hit was delivered, this was not.
       `<td class="num">${compact(r.failed_requests)}</td>` +
+      // Refused is NOT a subtotal of Requests. The gateway declined these before any
+      // provider was called, so they are not usage; they are shown because a client stuck
+      // in refusal leaves no other trace. See metering._FAILED.
+      `<td class="num">${compact(r.refused_requests)}</td>` +
       `<td class="num">${compact(tokens)}</td>` +
       `<td class="num">${money(r.spend)}</td>`;
     // textContent, not innerHTML: the surface name comes from a key alias and is not
@@ -361,6 +365,8 @@ async function loadAdmin() {
       `<td class="num">${compact(p.requests)}</td>` +
       `<td class="num">${compact(p.cached_requests)}</td>` +
       `<td class="num">${compact(p.failed_requests)}</td>` +
+      // Outside Requests, not inside it — see the spend table above and metering._FAILED.
+      `<td class="num">${compact(p.refused_requests)}</td>` +
       `<td class="num">${compact(tokens)}</td>` +
       `<td class="num">${money(p.spend)}</td>` +
       `<td class="num">${cap}</td>`;

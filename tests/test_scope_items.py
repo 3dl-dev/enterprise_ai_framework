@@ -1080,6 +1080,26 @@ class TestCacheHitsBudgetAndTheBill:
         assert r.status_code == 200, r.text
         return r.json()["calls"]
 
+    @staticmethod
+    def _provider_boot(fakeprovider_url):
+        """Which incarnation of the fake provider did the counting.
+
+        The counter is in-process, so a restart resets it to zero — and the direction that
+        breaks is the silent one: a LOW count is how "the gateway did not call the provider,
+        so this was a cache hit" is proved, and a restarted provider produces a low count
+        with the cache switched off entirely. Every assertion that reads a low count as
+        evidence of caching pairs it with this, so a restart mid-measurement fails the test
+        instead of confirming its hypothesis.
+        """
+        r = httpx.get(f"{fakeprovider_url}/debug/calls", timeout=TIMEOUT)
+        assert r.status_code == 200, r.text
+        boot = r.json().get("boot_id")
+        assert boot, (
+            "the fake provider does not publish which process counted, so a restart "
+            "mid-test would zero the counter and read as a cache hit"
+        )
+        return boot
+
     def test_a_repeated_request_is_answered_without_calling_the_provider(
         self, gateway_url, master_headers, fakeprovider_url
     ):
@@ -1087,6 +1107,7 @@ class TestCacheHitsBudgetAndTheBill:
         key = self._new_key(gateway_url, master_headers, f"cache-{uuid.uuid4().hex[:8]}::chat")
         prompt = f"cache me {uuid.uuid4().hex}"
 
+        boot = self._provider_boot(fakeprovider_url)
         assert self._provider_calls(fakeprovider_url, prompt) == 0, "prompt was not fresh"
 
         first = self._ask(gateway_url, key, prompt)
@@ -1099,6 +1120,12 @@ class TestCacheHitsBudgetAndTheBill:
             "the gateway called the provider again for a prompt it had already answered "
             "— the response cache is not doing anything, and every cache assertion in "
             "this class is vacuous"
+        )
+        # A restarted provider zeroes the counter, and a zeroed counter is exactly what a
+        # working cache looks like. Checked last, so it guards every count above it.
+        assert self._provider_boot(fakeprovider_url) == boot, (
+            "the fake provider restarted mid-test, so its call counter was reset and the "
+            "assertions above proved nothing about the cache"
         )
         assert second.json()["choices"][0]["message"]["content"] == \
             first.json()["choices"][0]["message"]["content"]
@@ -1268,22 +1295,25 @@ class TestCacheHitsBudgetAndTheBill:
     #
     # The three tests below replace one that asserted "a refusal is not billed" as a flat
     # claim, checked it against a single budget refusal, and was therefore both passing
-    # and wrong: it advertised a general rule while exercising one special case. Measured
-    # on this bundle, the three classes split two-to-one:
+    # and wrong: it advertised a general rule while exercising one special case.
     #
-    #   budget exceeded      refused in user_api_key_auth, before the router   NOT billed
-    #   model not entitled   refused in user_api_key_auth, before the router   NOT billed
-    #   upstream 500         past the router, onto the failure callback        BILLED
+    #   budget exceeded      refused in user_api_key_auth, before the router
+    #   model not entitled   refused in user_api_key_auth, before the router
+    #   upstream 500         past the router, onto the failure callback
     #
-    # The third writes a real row — status 'failure', spend 0, zero tokens — and the bill
-    # counts it in `requests`. So "a refusal is not billed" is true of what a user gets
-    # refused and false of what breaks downstream, and each test now names which it means.
+    # ALL THREE WRITE A ROW. That is a correction: this block used to say the first two
+    # reached the ledger "not at all", on the strength of a measurement that read the
+    # REFUSED USER's line on the bill and found the right number there. Re-measured against
+    # the raw ledger, the refusals do write rows — status 'failure', spend 0, zero tokens —
+    # but with NO key alias, so they land under `(unattributed)` rather than on the user's
+    # line, which is why looking at the user's line could not see them. The tests below are
+    # still correct about the user's line; what they never checked, and
+    # TestARefusalIsNotAFailedRequestAndIsNotUsage now does, is the rest of the ledger.
     #
-    # The third was left asserted as it BEHAVED, pending the product decision raised as
-    # enterpriseaiframework-e69 / finding 41. That decision is now made: it stays in
-    # `requests` and is named by `failed_requests`. The tests for it are in
-    # TestFailedRequestsAreNamedNotErased below, and the ruling with its rejected
-    # alternative is in metering._FAILED.
+    # The ruling is that a refusal is a request nowhere, on any line: `requests` counts
+    # what the gateway ADMITTED, provider failures included and named by failed_requests,
+    # while a refusal is reported beside it as refused_requests. See metering._FAILED for
+    # the ruling and the option the founder may still take instead.
 
     def test_a_budget_refusal_is_not_billed_as_usage(
         self, gateway_url, control_plane_url, master_headers, admin_headers
@@ -1553,12 +1583,15 @@ class TestCacheHitsBudgetAndTheBill:
         ):
             headers = _table_headers(page, table_id)
             cells = _row_template_cells(script, row_marker)
-            # Both kinds of $0 row need a heading and a cell. "Free" is d58's cache-hit
-            # count; "Failed" is e69's upstream-failure count. They are checked in one
-            # loop because the failure mode is identical for both and was real for the
-            # first: a number added to the JSON and never rendered.
+            # Every way a request can cost nothing needs a heading and a cell. "Free" is
+            # d58's cache-hit count; "Failed" is e69's upstream-failure count; "Refused" is
+            # the count of requests the gateway declined itself, which is NOT inside
+            # Requests. They are checked in one loop because the failure mode is identical
+            # for all three and was real for the first: a number added to the JSON and
+            # never rendered.
             for heading, field in (("free", "cached_requests"),
-                                   ("failed", "failed_requests")):
+                                   ("failed", "failed_requests"),
+                                   ("refused", "refused_requests")):
                 assert any(heading == h.lower() for h in headers), (
                     f"the {table_id} header has no '{heading}' column, so the "
                     f"{field} count never reaches the operator's eyes: {headers}"
@@ -1605,6 +1638,7 @@ class TestFailedRequestsAreNamedNotErased:
     _new_key = TestCacheHitsBudgetAndTheBill.__dict__["_new_key"]
     _ask = TestCacheHitsBudgetAndTheBill.__dict__["_ask"]
     _provider_calls = TestCacheHitsBudgetAndTheBill.__dict__["_provider_calls"]
+    _provider_boot = TestCacheHitsBudgetAndTheBill.__dict__["_provider_boot"]
     _bill_row = TestCacheHitsBudgetAndTheBill.__dict__["_bill_row"]
     INPUT_COST = TestCacheHitsBudgetAndTheBill.INPUT_COST
     OUTPUT_COST = TestCacheHitsBudgetAndTheBill.OUTPUT_COST
@@ -1697,6 +1731,7 @@ class TestFailedRequestsAreNamedNotErased:
         key = self._new_key(gateway_url, master_headers, f"{username}::chat")
         prompt = f"cached not failed {uuid.uuid4().hex}"
 
+        boot = self._provider_boot(fakeprovider_url)
         first = self._ask(gateway_url, key, prompt)
         assert first.status_code == 200, first.text
         usage = first.json()["usage"]
@@ -1705,6 +1740,10 @@ class TestFailedRequestsAreNamedNotErased:
         assert self._provider_calls(fakeprovider_url, prompt) == 1, (
             "the second call reached the provider, so there is no cache hit here and this "
             "test is not measuring what it claims"
+        )
+        assert self._provider_boot(fakeprovider_url) == boot, (
+            "the fake provider restarted mid-test; its counter was zeroed, so 'one call' "
+            "is not evidence that the second request was cached"
         )
 
         row = self._bill_row(control_plane_url, admin_headers, username)
@@ -1729,16 +1768,18 @@ class TestFailedRequestsAreNamedNotErased:
         """The line the ruling draws, asserted on the side it did not move.
 
         A request the gateway refuses at the door — here, a model the key was never
-        entitled to — is not admitted, writes no ledger row, and appears in neither
-        `requests` nor `failed_requests`. That asymmetry with an upstream failure is
-        deliberate and is the reason `requests` can be described in one sentence:
-        it counts what the gateway admitted. A refusal was never admitted; a failure was
-        admitted and then came back empty.
+        entitled to — is not admitted, and appears in neither `requests` nor
+        `failed_requests`. That asymmetry with an upstream failure is deliberate and is the
+        reason `requests` can be described in one sentence: it counts what the gateway
+        admitted. A refusal was never admitted; a failure was admitted and then came back
+        empty.
 
-        This is the unchanged path. It is asserted because "failures are now named" would
-        be an easy change to make by widening the count to include pre-router refusals
-        too, which would break the one-sentence rule and start charging usage for
-        requests the layer itself declined.
+        IT DOES WRITE A ROW, contrary to what this docstring used to say. The row carries
+        no key alias, so it lands under `(unattributed)` and not on this user's line — which
+        is why an earlier version of this test passed while believing no row existed. This
+        test is still correct about THIS user's line and is left asserting exactly that;
+        the whole-ledger claim it cannot make is in
+        TestARefusalIsNotAFailedRequestAndIsNotUsage.
         """
         username = f"refusednotfailed-{uuid.uuid4().hex[:8]}"
         key = self._new_key(gateway_url, master_headers, f"{username}::chat")
@@ -1896,6 +1937,438 @@ class TestFailedRequestsAreNamedNotErased:
             # The point of the column: these rows were NOT cache hits, so cache_hit alone
             # could never have explained their zero.
             assert (f["cache_hit"] or "").lower() != "true", f
+
+        # `status` alone is not enough, which is the correction this class carries. It says
+        # "did not succeed", and that covers a provider fault AND the gateway declining to
+        # serve — opposite meanings for a customer reconciling against an invoice.
+        assert "outcome" in rows[0], (
+            f"the archive marks a row 'failure' without saying whether a provider was ever "
+            f"called, so a fault the provider may have charged for is indistinguishable "
+            f"from the gateway refusing service: {sorted(rows[0])}"
+        )
+        provider_failed = [r_ for r_ in failed if r_["outcome"] == "provider_failed"]
+        assert provider_failed, (
+            f"the failure this test made was a real upstream 500, and no row in the "
+            f"archive is labelled provider_failed: "
+            f"{sorted({r_['outcome'] for r_ in failed})}"
+        )
+        for f in provider_failed:
+            assert f["status"].lower() == "failure", (
+                f"outcome and status contradict each other, so one of them is derived "
+                f"wrong: {f}"
+            )
+        # And the vocabulary is closed — an unrecognised value means a class nobody
+        # classified, which is how a refusal would end up read as a fault.
+        assert {r_["outcome"] for r_ in rows} <= {
+            "served", "provider_failed", "gateway_refused"
+        }, sorted({r_["outcome"] for r_ in rows})
+        for r_ in rows:
+            if r_["outcome"] == "served":
+                assert r_["status"].lower() != "failure", (
+                    f"a row the provider failed is labelled 'served' in the archive: {r_}"
+                )
+
+
+class TestARefusalIsNotAFailedRequestAndIsNotUsage:
+    """enterpriseaiframework-e69, second pass — the correction the first pass needed.
+
+    WHAT WAS WRONG WITH THE FIRST PASS, and it was the shape of the claim rather than the
+    code. `status = 'failure'` was treated as synonymous with "the provider was called and
+    did not answer", because the only failure any test could reach was an injected upstream
+    500 (fakeprovider FAIL_MARKER). Re-measured on the bundle, one fresh key per class,
+    with the RAW ledger row dumped rather than the bill read: FOUR more things write
+    status='failure', and none of them is a provider fault.
+
+        HTTPException 403     require_principal refused it     finding 36, no alias on row
+        HTTPException 429     the GATEWAY's own rate limiter   alias present
+        BudgetExceededError   over the key's budget            no alias on row
+        ProxyException        model not on the key's list      no alias on row
+        ProxyModelNotFoundError  no such model in the catalogue  alias present
+
+    And the premise that made the first pass look safe was false. It was recorded as
+    measured that over-budget and model-not-permitted refusals "never reach the ledger at
+    all". They do. The earlier measurement looked at the refused user's line on the bill,
+    which was right, and never looked at the whole ledger — those rows carry no key alias,
+    so they land under `(unattributed)`, which is the bucket finding 36 exists to EMPTY.
+    Counting refusals refills it with a phantom principal that made requests and failed
+    every one of them.
+
+    Two operator-visible consequences, both measured on this bundle before the fix:
+      - a key with rpm_limit=1 sending four requests billed as "4 requests, 3 failed". The
+        gateway refused three; the provider failed none.
+      - `(unattributed)` reading "5 requests, 5 failed, $0.00" where all five were the
+        layer correctly refusing to serve a credential it could not name.
+
+    THE RULING, UNCHANGED IN SUBSTANCE, SHARPER IN PREDICATE. `requests` still counts what
+    the gateway ADMITTED and still keeps provider failures inside it, named by
+    failed_requests — all three reasons in metering._FAILED survive. What changes is that
+    "admitted" is now computed rather than assumed: a refusal is not admitted, so it is
+    reported BESIDE requests as refused_requests, never inside it. Charging a request count
+    to somebody the layer just denied is the same defect as billing them for it.
+
+    THE FOUNDER MAY STILL PICK THE OTHER OPTION for the failure half — exclude
+    status='failure' from `requests` entirely. Nothing here forecloses it, and this class
+    would need only its expected numbers changed. The refusal half is not the same question
+    and is not offered as a choice: a refusal was never served, never priced, and never
+    reached a provider, so there is no reading of "requests" under which it is one.
+    """
+
+    _new_key = TestCacheHitsBudgetAndTheBill.__dict__["_new_key"]
+    _ask = TestCacheHitsBudgetAndTheBill.__dict__["_ask"]
+    _provider_calls = TestCacheHitsBudgetAndTheBill.__dict__["_provider_calls"]
+    _provider_boot = TestCacheHitsBudgetAndTheBill.__dict__["_provider_boot"]
+    _bill_row = TestCacheHitsBudgetAndTheBill.__dict__["_bill_row"]
+    INPUT_COST = TestCacheHitsBudgetAndTheBill.INPUT_COST
+    OUTPUT_COST = TestCacheHitsBudgetAndTheBill.OUTPUT_COST
+
+    @staticmethod
+    def _rate_limited_key(gateway_url, master_headers, alias, rpm):
+        """A key the GATEWAY will refuse past `rpm` requests a minute.
+
+        LiteLLM enforces this in its own pre-call hook, past authentication and past the
+        point where a key alias is stamped on the row — which is what makes this the one
+        refusal class that lands on a REAL person's line instead of in `(unattributed)`.
+        That is why it is the primary test here: the defect is visible on the bill of
+        somebody who exists.
+        """
+        r = httpx.post(
+            f"{gateway_url}/key/generate",
+            headers=master_headers,
+            json={"key_alias": alias, "models": ["fake-large"], "rpm_limit": rpm},
+            timeout=TIMEOUT,
+        )
+        assert r.status_code == 200, r.text
+        return r.json()["key"]
+
+    def test_a_rate_limit_the_gateway_imposed_is_not_a_provider_failure(
+        self, gateway_url, control_plane_url, master_headers, admin_headers
+    ):
+        """The measured defect, on a named person's own line.
+
+        Counts are derived from the responses actually received rather than hardcoded. The
+        rate-limit window is per minute, so a run straddling a minute boundary legitimately
+        gets a different split — hardcoding it would buy an intermittent failure, and
+        deriving it keeps the assertion exact.
+        """
+        username = f"gwratelimit-{uuid.uuid4().hex[:8]}"
+        key = self._rate_limited_key(gateway_url, master_headers, f"{username}::chat", 1)
+
+        served = refused = 0
+        for _ in range(6):
+            r = self._ask(gateway_url, key, f"ratelimited {uuid.uuid4().hex}")
+            if r.status_code == 429:
+                assert "rate limit" in r.text.lower(), f"refused for another reason: {r.text}"
+                refused += 1
+            else:
+                assert r.status_code == 200, f"{r.status_code} {r.text[:200]}"
+                served += 1
+        assert refused >= 3, f"only {refused} refusals; nothing to measure"
+        assert served >= 1, "nothing was served, so there is no baseline"
+
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "the served call is missing from the bill"
+        assert row["requests"] == served, (
+            f"{served} requests were served and {refused} were refused by the gateway's "
+            f"own rate limiter, which never called a provider. The bill counts "
+            f"{row['requests']} requests — a refusal is being billed as usage: {row}"
+        )
+        assert row["failed_requests"] == 0, (
+            f"the gateway refusing to serve was reported to the operator as the PROVIDER "
+            f"failing. Nothing was called; there is no fault here to see: {row}"
+        )
+        assert row["refused_requests"] == refused, (
+            f"{refused} refusals, {row['refused_requests']} reported. A client stuck in "
+            f"refusal has to be visible somewhere or it leaves no trace at all: {row}"
+        )
+        assert row["cached_requests"] == 0, row
+        assert row["spend"] > 0, (
+            f"the served request lost its price when the refusals were separated out: {row}"
+        )
+
+    def test_a_credential_the_ledger_cannot_name_makes_no_phantom_request(
+        self, gateway_url, control_plane_url, master_headers, admin_headers
+    ):
+        """finding 36's refusal must not reappear as usage under `(unattributed)`.
+
+        The master key is refused by deploy/gateway/require_principal.py before any
+        provider is called, and the row it writes carries no alias — so it lands in exactly
+        the bucket that finding 36 exists to empty. Asserted as a DELTA across the refusal,
+        because the bundle's own bootstrap and other tests populate that bucket too and an
+        absolute count here would be measuring the rest of the suite.
+        """
+        def unattributed():
+            bill = httpx.get(
+                f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+            ).json()
+            rows = [r for r in bill["by_user_and_surface"]
+                    if r["username"] == "(unattributed)"]
+            return {
+                "requests": sum(r["requests"] for r in rows),
+                "failed_requests": sum(r["failed_requests"] for r in rows),
+                "refused_requests": sum(r["refused_requests"] for r in rows),
+                "spend": sum(r["spend"] for r in rows),
+            }
+
+        time.sleep(25)
+        before = unattributed()
+
+        for _ in range(3):
+            # The master key itself, via the fixture that carries it. This is finding 36's
+            # exact scenario: the gateway's administrative root credential asking for
+            # inference, refused because no bill could ever name it.
+            r = httpx.post(
+                f"{gateway_url}/v1/chat/completions",
+                headers=master_headers,
+                json={"model": "fake-large",
+                      "messages": [{"role": "user", "content": f"root {uuid.uuid4().hex}"}]},
+                timeout=TIMEOUT,
+            )
+            assert r.status_code == 403, f"{r.status_code} {r.text[:200]}"
+            assert "no_attributable_principal" in r.text, r.text[:300]
+
+        after = self._wait_for_refusals(unattributed, before, 3)
+
+        assert after["requests"] == before["requests"], (
+            f"the gateway refused three requests it could not attribute, and the bill "
+            f"gained {after['requests'] - before['requests']} requests under "
+            f"'(unattributed)'. That is the bucket finding 36 exists to empty, now being "
+            f"refilled by the refusals that emptied it: {before} -> {after}"
+        )
+        assert after["failed_requests"] == before["failed_requests"], (
+            f"a credential the layer correctly refused was reported as the provider "
+            f"failing: {before} -> {after}"
+        )
+        assert after["refused_requests"] - before["refused_requests"] >= 3, (
+            f"the refusals are counted nowhere at all, so a script wired to the master "
+            f"key would be invisible on every operator surface: {before} -> {after}"
+        )
+        assert after["spend"] == pytest.approx(before["spend"], abs=1e-12), (
+            f"a refusal moved money: {before} -> {after}"
+        )
+
+    @staticmethod
+    def _wait_for_refusals(read, before, n, timeout=90):
+        """Poll until at least n more refusals have flushed, then return the reading.
+
+        The gateway batches spend rows on a 7-13s timer, so a flat sleep is either slow or
+        flaky. Returning the LAST reading either way is deliberate: if the refusals never
+        arrive, the caller's own assertion about refused_requests is what fails, and it
+        says something useful.
+        """
+        deadline = time.monotonic() + timeout
+        seen = read()
+        while time.monotonic() < deadline:
+            seen = read()
+            if seen["refused_requests"] - before["refused_requests"] >= n:
+                break
+            time.sleep(3)
+        return seen
+
+    def test_a_provider_failure_is_still_counted_and_still_named(
+        self, gateway_url, control_plane_url, master_headers, admin_headers, fakeprovider_url
+    ):
+        """The path this change must NOT move — asserted, not assumed.
+
+        Separating refusals out of `requests` is one predicate away from separating
+        genuine provider failures out too, which is the option e69 rejected. This is the
+        same claim TestFailedRequestsAreNamedNotErased makes, restated against the new
+        predicate: an upstream 500 is still ADMITTED, still inside `requests`, still named
+        by failed_requests, and is NOT a refusal.
+        """
+        username = f"stillfailed-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(gateway_url, master_headers, f"{username}::chat")
+
+        assert self._ask(gateway_url, key, f"ok {uuid.uuid4().hex}").status_code == 200
+        for _ in range(3):
+            prompt = f"{FAKE_FAIL_MARKER} {uuid.uuid4().hex}"
+            broke = self._ask(gateway_url, key, prompt)
+            assert broke.status_code >= 500, f"{broke.status_code} {broke.text[:200]}"
+            assert self._provider_calls(fakeprovider_url, prompt) >= 1, (
+                "the gateway never called the provider, so this is a refusal and the test "
+                "is measuring the wrong class"
+            )
+
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "the served call is missing from the bill"
+        assert row["requests"] == 4, (
+            f"an upstream failure was reclassified as a refusal and dropped out of the "
+            f"request count. The provider WAS called and may have charged for the "
+            f"attempt; this count is the only trace: {row}"
+        )
+        assert row["failed_requests"] == 3, row
+        assert row["refused_requests"] == 0, (
+            f"the gateway did not refuse anything here — it called the provider four "
+            f"times and got three errors: {row}"
+        )
+        assert row["requests"] - row["failed_requests"] == 1, row
+
+    def test_the_bill_tells_the_two_kinds_of_failure_apart_on_one_line(
+        self, gateway_url, control_plane_url, master_headers, admin_headers, fakeprovider_url
+    ):
+        """Both classes on ONE key, because a per-class test cannot catch a merge.
+
+        A predicate that classified everything as a refusal would pass
+        test_a_rate_limit... and a predicate that classified everything as a fault would
+        pass test_a_provider_failure..., each in isolation. This is the test that fails if
+        they are ever collapsed into each other.
+
+        Counts derived from the observed responses, for the minute-window reason above.
+        """
+        username = f"bothkinds-{uuid.uuid4().hex[:8]}"
+        key = self._rate_limited_key(gateway_url, master_headers, f"{username}::chat", 2)
+
+        served = provider_failed = refused = 0
+        # The first two attempts are inside the limit: one served, one an upstream 500.
+        # Everything after is refused before the provider is reached.
+        plan = [("ok", 0), ("fail", 0)] + [("ok", 0)] * 6
+        for kind, _ in plan:
+            prompt = (f"{FAKE_FAIL_MARKER} {uuid.uuid4().hex}" if kind == "fail"
+                      else f"both {uuid.uuid4().hex}")
+            r = self._ask(gateway_url, key, prompt)
+            if r.status_code == 429:
+                refused += 1
+            elif r.status_code >= 500:
+                assert self._provider_calls(fakeprovider_url, prompt) >= 1, (
+                    "a 5xx that never reached the provider is not an upstream failure"
+                )
+                provider_failed += 1
+            else:
+                assert r.status_code == 200, f"{r.status_code} {r.text[:200]}"
+                served += 1
+        assert provider_failed >= 1, "the upstream failure was refused before it happened"
+        assert refused >= 3, f"only {refused} refusals; nothing to distinguish"
+        assert served >= 1, "nothing was served"
+
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "the traffic never reached the bill"
+        assert row["requests"] == served + provider_failed, (
+            f"`requests` must count what the gateway admitted: {served} served + "
+            f"{provider_failed} the provider failed. It reads {row['requests']}, so the "
+            f"{refused} refusals are either in it or the failures have fallen out: {row}"
+        )
+        assert row["failed_requests"] == provider_failed, (
+            f"the two kinds of failure have been merged: {provider_failed} provider "
+            f"faults and {refused} gateway refusals, reported as "
+            f"{row['failed_requests']} failed and {row['refused_requests']} refused: {row}"
+        )
+        assert row["refused_requests"] == refused, row
+        # The arithmetic the ruling promises, on a row that holds all three classes.
+        assert row["requests"] - row["failed_requests"] == served, row
+
+    def test_an_over_budget_refusal_is_a_request_nowhere_on_the_whole_ledger(
+        self, gateway_url, control_plane_url, master_headers, admin_headers
+    ):
+        """The assertion whose absence let the false premise stand for two dispatches.
+
+        The existing budget test checks the REFUSED USER's line and is right about it —
+        those rows carry no key alias, so they never appear there. What it never checked is
+        the rest of the ledger, and that is exactly where they went. This asserts the
+        whole-ledger totals, which is the only place the claim "a refusal is not a request"
+        can actually be falsified.
+        """
+        username = f"budgetnowhere-{uuid.uuid4().hex[:8]}"
+        key = self._new_key(
+            gateway_url, master_headers, f"{username}::chat", max_budget=0.00025
+        )
+
+        def totals():
+            return httpx.get(
+                f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+            ).json()["totals"]
+
+        time.sleep(25)
+        before = totals()
+
+        served = refused = 0
+        deadline = time.monotonic() + 150
+        while time.monotonic() < deadline and refused < 4:
+            r = self._ask(gateway_url, key, f"budgetnowhere {uuid.uuid4().hex}")
+            if r.status_code >= 400:
+                assert "budget" in r.text.lower(), f"refused for another reason: {r.text}"
+                refused += 1
+            else:
+                served += 1
+            time.sleep(2)
+        assert refused == 4, f"only {refused} refusals; nothing to measure"
+        assert served >= 1, "nothing was served, so there is no baseline"
+
+        after = self._wait_for_refusals(totals, before, refused)
+        gained = after["requests"] - before["requests"]
+        assert gained == served, (
+            f"{served} requests were served past the cap and {refused} were refused at "
+            f"it. The whole-ledger request count went up by {gained}. A refusal is not a "
+            f"request anywhere: {before} -> {after}"
+        )
+        assert after["failed_requests"] == before["failed_requests"], (
+            f"a budget refusal was reported as the provider failing: {before} -> {after}"
+        )
+        assert after["refused_requests"] - before["refused_requests"] >= refused, (
+            f"{refused} budget refusals are counted nowhere, so an operator cannot see "
+            f"that somebody is stuck at their cap: {before} -> {after}"
+        )
+
+    def test_the_portal_and_the_bill_agree_about_the_refusals(
+        self, gateway_url, control_plane_url, master_headers, admin_headers
+    ):
+        """All three renderings, because two of them have drifted before (finding f8c).
+
+        d58's cached_requests reached three JSON endpoints and was rendered by none;
+        finding 34's attribution was fixed in the portal and left wrong in /admin/spend.
+        A number added to one rendering gets checked against the others here.
+        """
+        username = f"refusedviews-{uuid.uuid4().hex[:8]}"
+        key = self._rate_limited_key(gateway_url, master_headers, f"{username}::chat", 1)
+
+        refused = 0
+        for _ in range(5):
+            r = self._ask(gateway_url, key, f"views {uuid.uuid4().hex}")
+            if r.status_code == 429:
+                refused += 1
+        assert refused >= 3, f"only {refused} refusals"
+
+        row = self._bill_row(control_plane_url, admin_headers, username)
+        assert row is not None, "the traffic never reached the bill"
+        assert row["refused_requests"] == refused, row
+
+        bill = httpx.get(
+            f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+        ).json()
+        assert "refused_requests" in bill["totals"], (
+            f"the per-user lines name the refusals and the total does not, so the two "
+            f"halves of the same page disagree: {bill['totals']}"
+        )
+        assert bill["totals"]["refused_requests"] >= refused, bill["totals"]
+
+        status, body = portal_get("/portal/api/spend", username)
+        assert status == 200, body[:300]
+        portal = json.loads(body)
+        assert portal["total"]["refused_requests"] == row["refused_requests"], (
+            f"the bill says {row['refused_requests']} refused and the user's own page "
+            f"says {portal['total']['refused_requests']}"
+        )
+        assert portal["total"]["requests"] == row["requests"], (
+            "the two renderings disagree about the request count itself"
+        )
+
+        status, body = portal_get("/portal/api/admin/overview", "baron")
+        assert status == 200, body[:300]
+        overview = json.loads(body)
+        assert "refused_requests" in overview["totals"], overview["totals"]
+        person = next(
+            (p for p in overview["people"] if p["username"] == username), None
+        )
+        assert person is not None, (
+            f"the operator console has no line for a user whose only traffic was refused, "
+            f"which is the case an operator most needs to see: "
+            f"{[p['username'] for p in overview['people']]}"
+        )
+        assert person["refused_requests"] == refused, person
+        assert person["requests"] == row["requests"], person
+        # Per-surface, not just per-person: d58's column reached the person level and
+        # stopped there in one of the three renderings.
+        surfaces = {s["surface"]: s for s in person["surfaces"]}
+        assert "chat" in surfaces, person
+        assert surfaces["chat"]["refused_requests"] == refused, surfaces["chat"]
 
 
 # ---------------------------------------------------------------------------

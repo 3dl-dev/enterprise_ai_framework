@@ -79,8 +79,14 @@
              "Failed" is the other kind of $0 row (enterpriseaiframework-e69): the provider
              was called and returned nothing, so no tokens and no money. Both are subtotals
              OF Requests, not deductions from it — Requests counts what the gateway
-             admitted, and these two columns say which of those cost nothing and why. -->
-        <thead><tr><th>Surface</th><th class="num">Requests</th><th class="num" title="Answered from cache — no provider call, so no cost">Free</th><th class="num" title="The provider was called and returned an error — nothing delivered, nothing charged">Failed</th><th class="num">Tokens</th><th class="num">Spend</th></tr></thead>
+             admitted, and these two columns say which of those cost nothing and why.
+             "Refused" sits OUTSIDE Requests, and the distinction is the point: the gateway
+             declined those itself — over budget, rate limited, not entitled to the model —
+             so no provider was called and nothing could have been charged. Reading them as
+             usage would make a bill grow when somebody is denied service. They are shown
+             rather than dropped because a client stuck in refusal (a script wired to the
+             master key, finding 36) leaves no other trace at all. -->
+        <thead><tr><th>Surface</th><th class="num">Requests</th><th class="num" title="Answered from cache — no provider call, so no cost">Free</th><th class="num" title="The provider was called and returned an error — nothing delivered, nothing charged">Failed</th><th class="num" title="The gateway declined these itself — over budget, rate limited, or not entitled. No provider was called, so they are not counted as requests">Refused</th><th class="num">Tokens</th><th class="num">Spend</th></tr></thead>
         <tbody id="spend-rows"></tbody>
       </table>
       <p class="empty" id="spend-empty" hidden>Nothing yet. Spend appears here as you use the surfaces above.</p>
@@ -115,7 +121,7 @@
       </div>
       <div class="total"><span class="amount" id="admin-total">—</span><span class="unit">across everyone</span></div>
       <table class="tbl" id="admin-table">
-        <thead><tr><th>Person</th><th>Surfaces</th><th class="num">Requests</th><th class="num" title="Answered from cache — no provider call, so no cost">Free</th><th class="num" title="The provider was called and returned an error — nothing delivered, nothing charged">Failed</th><th class="num">Tokens</th><th class="num">Spend</th><th class="num">Cap</th></tr></thead>
+        <thead><tr><th>Person</th><th>Surfaces</th><th class="num">Requests</th><th class="num" title="Answered from cache — no provider call, so no cost">Free</th><th class="num" title="The provider was called and returned an error — nothing delivered, nothing charged">Failed</th><th class="num" title="The gateway declined these itself — over budget, rate limited, or not entitled. No provider was called, so they are not counted as requests">Refused</th><th class="num">Tokens</th><th class="num">Spend</th><th class="num">Cap</th></tr></thead>
         <tbody id="admin-rows"></tbody>
       </table>
       <p class="warn" id="admin-unpriced" hidden></p>
