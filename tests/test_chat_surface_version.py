@@ -142,7 +142,14 @@ def _logs_since(container: str, since: float) -> str:
     before the turn is what makes the assertion mean what it says.
     """
     result = subprocess.run(
-        ["docker", "logs", "--since", f"{since:.0f}", container],
+        # int() TRUNCATES; f"{since:.0f}" ROUNDS. Rounding a fractional timestamp up moves
+        # the window's start into the FUTURE by up to half a second, so a line the turn
+        # emitted inside that gap is invisible and the poll times out — intermittently,
+        # depending only on the fractional part of the clock when the test began, which is
+        # why this failed under load and passed in isolation (enterpriseaiframework-c8d).
+        # Truncating widens the window backwards by under a second instead, which is safe:
+        # `since` is captured immediately before the turn, so nothing else of ours is in it.
+        ["docker", "logs", "--since", str(int(since)), container],
         capture_output=True, text=True, check=True,
     )
     return result.stdout + result.stderr
