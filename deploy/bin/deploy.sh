@@ -116,7 +116,15 @@ kubectl -n "$NS" create configmap chat-config \
     --dry-run=client -o yaml | kubectl apply -f -
 rm -f /tmp/librechat-k8s.yaml
 
-CFG_SUM=$( { cat bundle/litellm/config.generated.yaml bundle/librechat/librechat.yaml deploy/gateway/strip_reasoning.py deploy/gateway/require_principal.py deploy/gateway/flush_spend_on_shutdown.py; } | sha256sum | cut -c1-16)
+# enterpriseaiframework-6ff: the tenant Agent Skills corpus, one ConfigMap per skill
+# directory under bundle/skills/ — see deploy/bin/lib/tenant-skills.sh for why not one
+# combined ConfigMap. Named `chat-skill-*` and shared verbatim by the workspace pods
+# (deploy/k8s/61-workspace.template.yaml), so the chat surface and the terminal agent
+# load the identical corpus through their own separate native loaders.
+source deploy/bin/lib/tenant-skills.sh
+ensure_tenant_skill_configmaps "$NS" chat-skill bundle/skills
+
+CFG_SUM=$( { cat bundle/litellm/config.generated.yaml bundle/librechat/librechat.yaml deploy/gateway/strip_reasoning.py deploy/gateway/require_principal.py deploy/gateway/flush_spend_on_shutdown.py bundle/skills/*/SKILL.md; } | sha256sum | cut -c1-16)
 
 echo "==> build and push control-plane image -> ${IMAGE}"
 docker build -q -t "$IMAGE" ./control-plane

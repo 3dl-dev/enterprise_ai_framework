@@ -121,9 +121,31 @@ spec:
             - { name: BAN_VIOLATIONS, value: "false" }
             - name: CHAT_VIRTUAL_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_VIRTUAL_KEY } }
+            # enterpriseaiframework-6ff: same filesystem loader the bundle uses
+            # (bundle/docker-compose.yml), scanned ONCE at boot into a module-level
+            # singleton (packages/api/src/skills/deployment.ts) — NOT a live-reload
+            # mechanism, so a skill content change needs a restart of this Deployment
+            # regardless of how the ConfigMap below is mounted. A malformed SKILL.md
+            # throws in that unguarded boot-time await (finding 41) and would crash-loop
+            # this shared deployment; guarded on OUR side by test-gating, not by patching
+            # the image — tests/test_skill_corpus.py boots the identical corpus in the
+            # bundle and asserts /health before any turn runs, so malformed content fails
+            # `make test` before anyone pushes this ConfigMap. NOT APPLIED by this
+            # commit — an operator runs `deploy/bin/deploy.sh`, which is a ConfigMap
+            # update and a chat restart, same as any librechat.yaml change.
+            - { name: DEPLOYMENT_SKILLS_DIR, value: "/app/skill" }
           ports: [{ containerPort: 3080 }]
           volumeMounts:
             - { name: config, mountPath: /app/librechat.yaml, subPath: librechat.yaml, readOnly: true }
+            # One ConfigMap per skill (deploy/bin/lib/tenant-skills.sh) — see that file
+            # for why not one combined ConfigMap. Tenant content, not platform content
+            # (same principle as the workspace house rules, enterpriseaiframework-cbf):
+            # a camp's skills and a law firm's skills are different directories on this
+            # one mechanism, never baked into the LibreChat image. Adding a skill means
+            # adding both a ConfigMap (created by deploy.sh) and a volume/volumeMount
+            # pair here — see deploy/bin/lib/tenant-skills.sh for that tradeoff.
+            - { name: skill-incident-escalation, mountPath: /app/skill/incident-escalation, readOnly: true }
+            - { name: skill-meeting-notes-format, mountPath: /app/skill/meeting-notes-format, readOnly: true }
           readinessProbe:
             httpGet: { path: /health, port: 3080 }
             initialDelaySeconds: 30
@@ -136,3 +158,12 @@ spec:
         - name: config
           configMap:
             name: chat-config
+        # Seeded by deploy/bin/lib/tenant-skills.sh from bundle/skills/, one ConfigMap
+        # per skill directory. `optional: true` so a namespace where deploy.sh has never
+        # run yet still starts (with no skills loaded — DEPLOYMENT_SKILLS_DIR silently
+        # loads nothing from a directory that resolves empty) instead of hanging in
+        # ContainerCreating for a ConfigMap that does not exist yet.
+        - name: skill-incident-escalation
+          configMap: { name: chat-skill-incident-escalation, optional: true }
+        - name: skill-meeting-notes-format
+          configMap: { name: chat-skill-meeting-notes-format, optional: true }

@@ -40,6 +40,12 @@
 # deploy/bin/lib/tenant-instructions.sh and deploy/workspace/Dockerfile). Platform facts
 # that must hold regardless of what any operator writes here live separately, baked into
 # the image at /etc/opencode/PLATFORM.md.
+#
+# The Agent Skills corpus (enterpriseaiframework-6ff, `chat-skill-*` ConfigMaps,
+# deploy/k8s/61-workspace.template.yaml) is NOT created here — deploy/bin/deploy.sh
+# creates it once from bundle/skills/ and both the chat surface and every workspace this
+# script provisions mount the same ConfigMaps. Nothing for this script to do beyond
+# templating the volume/volumeMount pairs already baked into 61-workspace.template.yaml.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

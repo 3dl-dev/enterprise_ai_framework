@@ -175,6 +175,45 @@ class TestTheCorpusIsShapedForBothSurfaces:
                 "the shared chat deployment down at boot (operational guard 6)"
             )
 
+    def test_the_cluster_manifests_mirror_the_bundle_mount(self):
+        """Committed, NOT applied (operational guard 7) — a ConfigMap change here is a
+        real deploy + chat restart, which `deploy/bin/deploy.sh` performs, this test does
+        not, and this test does not pretend to.
+
+        Checks the two k8s templates carry a volume + volumeMount pair for every skill
+        currently in the corpus, so an added skill that forgets the YAML side (the real
+        cost `deploy/bin/lib/tenant-skills.sh` documents) fails here rather than only
+        being discovered against a live cluster.
+        """
+        chat_yaml = (REPO / "deploy" / "k8s" / "50-chat.yaml").read_text()
+        workspace_yaml = (REPO / "deploy" / "k8s" / "61-workspace.template.yaml").read_text()
+        assert "DEPLOYMENT_SKILLS_DIR" in chat_yaml, (
+            "deploy/k8s/50-chat.yaml does not set DEPLOYMENT_SKILLS_DIR — the cluster chat "
+            "surface would never load the skill ConfigMaps below even if they exist"
+        )
+        for d in _skill_dirs():
+            configmap_name = f"chat-skill-{d.name}"
+            assert configmap_name in chat_yaml, (
+                f"deploy/k8s/50-chat.yaml has no volume for {configmap_name!r} — the chat "
+                f"pod would never mount bundle/skills/{d.name}"
+            )
+            assert configmap_name in workspace_yaml, (
+                f"deploy/k8s/61-workspace.template.yaml has no volume for "
+                f"{configmap_name!r} — opencode's skills.paths would never see "
+                f"bundle/skills/{d.name}"
+            )
+
+    def test_opencode_points_at_the_shared_tenant_skills_directory(self):
+        """opencode's OWN native skill loader, pointed at the same corpus (finding 41):
+        no invocation code of ours on this surface either.
+        """
+        config = yaml.safe_load((REPO / "deploy" / "workspace" / "opencode.json").read_text())
+        paths = (config.get("skills") or {}).get("paths") or []
+        assert "/etc/opencode/tenant-skills" in paths, (
+            f"deploy/workspace/opencode.json's skills.paths is {paths!r} — opencode has no "
+            "configured source for the tenant skill corpus"
+        )
+
     def test_the_bundle_mounts_the_corpus_as_deployment_skills(self):
         """librechat.yaml's `skills` capability is necessary but not sufficient — this is
         the OTHER, filesystem mechanism (finding 41) that actually puts content there.

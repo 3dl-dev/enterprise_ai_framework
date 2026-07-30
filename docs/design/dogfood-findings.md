@@ -1283,3 +1283,51 @@ surface even though we configure `endpoints.custom` rather than `endpoints.agent
 conversation gets skills subject to a per-conversation toggle, and `resolveModelSpecSkillIds`
 lets a `modelSpecs` entry name skills by name — which is a `librechat.yaml` change, i.e. a
 ConfigMap deploy.
+
+### 42. Built on 41: the corpus, wired to both surfaces, measured against the real container
+
+`enterpriseaiframework-6ff` built. Two skills (`bundle/skills/incident-escalation`,
+`bundle/skills/meeting-notes-format`) mounted read-only at `DEPLOYMENT_SKILLS_DIR` in the
+bundle (`bundle/docker-compose.yml`); the chat container's own boot log confirms
+`[deploymentSkills] Loaded 2 deployment skill(s) from /app/skill`. Neither surface runs
+invocation code of ours — LibreChat's filesystem loader and opencode's native
+`skill({name})` tool both read the same directory shape.
+
+**Measured, not asserted, against the real running container** (`tests/test_skill_corpus.py`):
+manually invoking `incident-escalation` (`manualSkills: ["incident-escalation"]` +
+`ephemeralAgent.skills: true` — the wire shape `extractManualSkills`/
+`resolveAgentScopedSkillIds` require) delivers the literal string
+`ESCALATION-CODE: TRIDENT-8841-QUARTZ`, which lives nowhere but that SKILL.md's body, to
+the upstream request `fakeprovider` actually receives. An identical un-invoked turn (same
+typed text) carries neither skill's secret; the upstream prompt equals the raw user text
+byte for byte. `fakeprovider` gained a `/debug/prompts` capture seam
+(`GET /debug/prompts?contains=<nonce>`) for this — the existing digest-only contract other
+tests rely on (`reply_text = sha256(model + prompt)`) proves a turn happened but not WHAT
+changed it; reading the actual delivered prompt does.
+
+**Guard 6 (the unguarded boot-time throw), resolved by test-gating, not by patching the
+image.** `loadDeploymentSkill` still throws on malformed frontmatter and the `await` in
+`api/server/index.js` is still unguarded — "integrate, do not reimplement" forbids
+carrying a fork of LibreChat to fix that. Instead: `tests/test_skill_corpus.py` boots this
+exact corpus in the disposable bundle and asserts `/health` before any turn runs, and a
+static pass (`test_no_skill_uses_a_frontmatter_key_librechat_rejects`,
+`test_every_skill_name_is_kebab_case...`) checks the corpus against
+`ALLOWED_FRONTMATTER_KEYS` and `validateSkillName`'s pattern directly. Malformed tenant
+content fails `make test` on a throwaway worktree before it ever reaches the cluster's
+`chat-skill-*` ConfigMaps (`deploy/bin/lib/tenant-skills.sh`, applied only by
+`deploy/bin/deploy.sh`, which this item did not run — cluster manifests are committed,
+not applied, per operational guard 7).
+
+**The cluster/workspace wiring is committed but unproven against a live cluster** (no
+cluster access from this environment, and guard 7 forbids applying regardless): one
+ConfigMap per skill (`chat-skill-<name>`), because `kubectl create configmap
+--from-file=<dir>` does not recurse into per-skill subdirectories — see
+`deploy/bin/lib/tenant-skills.sh` for the resulting cost, stated rather than hidden: a
+third skill needs a new ConfigMap block AND a new volume/volumeMount pair in both
+`deploy/k8s/50-chat.yaml` and `deploy/k8s/61-workspace.template.yaml`, not just a new
+directory under `bundle/skills/`. Static tests check the two k8s templates and
+`deploy/workspace/opencode.json`'s `skills.paths` stay in sync with the corpus, but they
+parse YAML/JSON — they do not apply it. A `librechat.yaml`-shaped consequence applies
+here too: pushing a cluster skill change is a ConfigMap update and a chat restart
+(`DEPLOYMENT_SKILLS_DIR` has no watcher, same as finding 41 already established), which an
+operator runs deliberately via `deploy/bin/deploy.sh`.
