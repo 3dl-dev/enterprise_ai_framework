@@ -12,6 +12,7 @@ assert on them.
 import hashlib
 import json
 import os
+import re
 import time
 
 from fastapi import APIRouter, FastAPI, Request
@@ -23,9 +24,101 @@ app = FastAPI(title="fake-provider")
 # so these numbers flow all the way through to the ledger and the tests assert on them.
 CHARS_PER_TOKEN = 4
 
+# --------------------------------------------------------------------------
+# Prompt capture — a test seam, not a feature. reply_text() only ever hands a
+# caller a hash of what it received, which is enough to prove two requests
+# differed but not enough to prove WHAT changed. enterpriseaiframework-6ff
+# needs the stronger claim ("this exact secret string, which lives nowhere but
+# a SKILL.md body, reached the upstream request") without guessing at
+# LibreChat's internal message-join format. So every request's fully
+# extracted prompt is kept in a bounded ring buffer, inspectable over
+# /debug/prompts by any test that knows a substring (a nonce) to search for.
+# Nothing about the deterministic reply_text()/reply-digest contract other
+# tests already rely on changes.
+# --------------------------------------------------------------------------
+_CAPTURED_PROMPTS: list[dict] = []
+_CAPTURE_LIMIT = 500
+
+
+def _capture_prompt(model: str, prompt: str) -> None:
+    _CAPTURED_PROMPTS.append({"model": model, "prompt": prompt})
+    if len(_CAPTURED_PROMPTS) > _CAPTURE_LIMIT:
+        del _CAPTURED_PROMPTS[: len(_CAPTURED_PROMPTS) - _CAPTURE_LIMIT]
+
+
+@app.get("/debug/prompts")
+async def debug_prompts(contains: str | None = None):
+    """Recent extracted prompts, optionally filtered to ones containing `contains`.
+
+    `contains` should be a nonce unique to the test's own turn — the buffer is
+    shared across every caller hitting this process, including other tests
+    running in the same suite.
+    """
+    if contains:
+        return [c for c in _CAPTURED_PROMPTS if contains in c["prompt"]]
+    return _CAPTURED_PROMPTS
+
 
 def count_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
+
+
+# --------------------------------------------------------------------------
+# Code-execution tool calling (enterpriseaiframework-082)
+#
+# fakeprovider cannot run arbitrary code, so no in-bundle test could otherwise prove a
+# model-driven code execution — every other test in this suite proves "the gateway/chat
+# wiring works", never "an answer arrived that fakeprovider could not have guessed".
+#
+# The fix is an inversion, not a workaround: fakeprovider learns to turn a marker in the
+# user's own message into a real `bash_tool` call (LibreChat's actual code-execution tool
+# name, Constants.BASH_TOOL in @librechat/agents), and to relay whatever the REAL sandbox
+# sends back verbatim as the final reply — while staying deliberately unable to compute
+# the answer itself. That is what makes a correct sha256 (or any other value the marker's
+# command produces) appearing in a persisted conversation evidence of execution having
+# actually happened, rather than a plausible string a stub or a real model guessed.
+# --------------------------------------------------------------------------
+
+EXECUTE_MARKER_RE = re.compile(r"EXECUTE_BASH:(.*)", re.DOTALL)
+
+BASH_TOOL_NAME = "bash_tool"
+
+
+def _message_text(message: dict) -> str:
+    content = message.get("content", "")
+    if isinstance(content, list):
+        # OpenAI/Anthropic content-block shape.
+        content = "".join(
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type", "text") == "text"
+        )
+    return str(content)
+
+
+def find_tool_result(messages: list) -> str | None:
+    """The content of the most recent tool-role message, if this turn already carries
+    a `bash_tool` result to relay. None on the turn that should trigger the call."""
+    for m in messages or []:
+        if m.get("role") == "tool":
+            return _message_text(m)
+    return None
+
+
+def find_exec_command(messages: list) -> str | None:
+    """The command from a user-authored `EXECUTE_BASH:<command>` marker, most recent
+    user message first. None if no message carries one."""
+    for m in reversed(messages or []):
+        if m.get("role") != "user":
+            continue
+        match = EXECUTE_MARKER_RE.search(_message_text(m))
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def tool_call_id(command: str) -> str:
+    return "call_" + hashlib.sha256(command.encode()).hexdigest()[:24]
 
 
 def reply_text(prompt: str, model: str) -> str:
@@ -63,15 +156,173 @@ async def openai_models():
     }
 
 
+def _tool_call_completion(cid: str, model: str, created: int, command: str) -> dict:
+    call_id = tool_call_id(command)
+    arguments = json.dumps({"command": command})
+    return {
+        "id": cid,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": BASH_TOOL_NAME, "arguments": arguments},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": count_tokens(command),
+            "completion_tokens": count_tokens(arguments),
+            "total_tokens": count_tokens(command) + count_tokens(arguments),
+        },
+    }
+
+
+def _tool_call_stream(cid: str, model: str, created: int, command: str):
+    call_id = tool_call_id(command)
+    arguments = json.dumps({"command": command})
+
+    def chunk(delta: dict, finish=None) -> str:
+        payload = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+        return f"data: {json.dumps(payload)}\n\n"
+
+    async def stream():
+        yield chunk({"role": "assistant", "content": None})
+        yield chunk(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": BASH_TOOL_NAME, "arguments": ""},
+                    }
+                ]
+            }
+        )
+        yield chunk(
+            {"tool_calls": [{"index": 0, "function": {"arguments": arguments}}]}
+        )
+        final = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {
+                "prompt_tokens": count_tokens(command),
+                "completion_tokens": count_tokens(arguments),
+                "total_tokens": count_tokens(command) + count_tokens(arguments),
+            },
+        }
+        yield f"data: {json.dumps(final)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
+
+
 @openai_router.post("/chat/completions")
 async def openai_chat(request: Request):
     body = await request.json()
     model = body.get("model", "fake-gpt-large")
-    prompt = extract_prompt(body.get("messages", []))
+    messages = body.get("messages", [])
+    created = int(time.time())
+
+    # Capture before any early return, so a tool-call or relay turn is recorded too
+    # (enterpriseaiframework-6ff's skill tests read this to see what LibreChat sent).
+    _capture_prompt(model, extract_prompt(messages))
+
+    # Code-execution tool calling takes priority over the deterministic-ack default
+    # (enterpriseaiframework-082). Two states, mutually exclusive: either this turn
+    # already carries the real sandbox's result to relay, or it carries a fresh
+    # EXECUTE_BASH: marker to turn into a tool call. Neither path lets fakeprovider
+    # compute an answer itself.
+    tool_result = find_tool_result(messages)
+    if tool_result is not None:
+        cid = "fakecmpl-" + hashlib.sha256(tool_result.encode()).hexdigest()[:16]
+        prompt_tokens = count_tokens(tool_result)
+        completion_tokens = count_tokens(tool_result)
+        if not body.get("stream"):
+            return {
+                "id": cid,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        # Relayed VERBATIM — this is the real sandbox's own output,
+                        # not anything fakeprovider produced or altered.
+                        "message": {"role": "assistant", "content": tool_result},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+            }
+
+        def relay_chunk(delta: dict, finish=None) -> str:
+            payload = {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }
+            return f"data: {json.dumps(payload)}\n\n"
+
+        async def relay_stream():
+            yield relay_chunk({"role": "assistant", "content": ""})
+            for word in tool_result.split(" "):
+                yield relay_chunk({"content": word + " "})
+            final = {
+                "id": cid,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+            }
+            yield f"data: {json.dumps(final)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(relay_stream(), media_type="text/event-stream")
+
+    exec_command = find_exec_command(messages)
+    if exec_command is not None:
+        cid = "fakecmpl-" + hashlib.sha256(exec_command.encode()).hexdigest()[:16]
+        if not body.get("stream"):
+            return _tool_call_completion(cid, model, created, exec_command)
+        return _tool_call_stream(cid, model, created, exec_command)
+
+    prompt = extract_prompt(messages)
     text = reply_text(prompt, model)
     prompt_tokens = count_tokens(prompt)
     completion_tokens = count_tokens(text)
-    created = int(time.time())
     cid = "fakecmpl-" + hashlib.sha256(prompt.encode()).hexdigest()[:16]
 
     if not body.get("stream"):
@@ -141,6 +392,7 @@ async def anthropic_messages(request: Request):
     prompt = extract_prompt(body.get("messages", []))
     if body.get("system"):
         prompt = str(body["system"]) + "\n" + prompt
+    _capture_prompt(model, prompt)
     text = reply_text(prompt, model)
     input_tokens = count_tokens(prompt)
     output_tokens = count_tokens(text)

@@ -1,0 +1,79 @@
+# SearXNG — the search leg of web search. TEMPLATE, not the live file.
+#
+# bundle/bin/render-env.sh renders this into searxng/settings.yml with SEARXNG_SECRET
+# substituted, the same way keycloak/realm-export.template.json is rendered. The rendered
+# file is gitignored because it carries a secret.
+#
+# WHY A RENDERED FILE AND NOT AN ENV VAR: this SearXNG (2026.7.x) has no SEARXNG_SECRET
+# environment override — its settings_loader reads only SEARXNG_SETTINGS_PATH. The image's
+# entrypoint substitutes the literal `ultrasecretkey` ONLY when creating settings.yml from
+# its own template, i.e. only when the file does not already exist. A mounted settings.yml
+# is therefore used verbatim, placeholder and all, so the secret has to be baked in before
+# the container starts. Verified by reading the image's entrypoint.sh, not assumed.
+#
+# LICENCE: SearXNG is AGPL-3.0. It runs as a separate service reached over HTTP and is
+# never patched and never linked, which is the same rule this bundle already applies to
+# Grafana/Perses. No file here modifies SearXNG; this is configuration it reads.
+
+# Inherit the upstream engine definitions rather than restating 200 engines here.
+use_default_settings:
+  engines:
+    # LibreChat's SearXNG client hardcodes `engines: "google,bing,duckduckgo"` on every
+    # query (@librechat/agents createSearXNGAPI), so any other engine loaded here can
+    # never be consulted — it would only cost memory and startup time on a host that is
+    # also running a k3s cluster. Keeping exactly the three it asks for means the set
+    # SearXNG loads and the set LibreChat requests are the same set.
+    #
+    # Google frequently answers a datacenter IP with a consent/CAPTCHA page and
+    # contributes nothing; bing and duckduckgo carry the results in practice. That is a
+    # graceful partial failure — SearXNG returns the engines that answered — not an
+    # outage, and it is why more than one engine is kept.
+    keep_only:
+      - google
+      - bing
+      - duckduckgo
+
+server:
+  # Rendered by bin/render-env.sh. SearXNG refuses to start on the upstream default.
+  secret_key: "SEARXNG_SECRET_REPLACED_AT_BUNDLE_UP"
+  # The limiter exists to stop the public internet abusing a public instance. This
+  # instance is reachable only from the chat container on a private compose network / a
+  # ClusterIP Service, and the only client is our own search leg. Leaving it on would
+  # rate-limit US: LibreChat issues up to four parallel queries per web_search call
+  # (general plus optional images/videos/news), which reads as burst abuse.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  # THE ONE SETTING THAT MAKES THIS WORK AT ALL. SearXNG's default `formats` is [html]
+  # only, and LibreChat's client requests `format=json`. Without `json` here SearXNG
+  # answers 403, the search leg reports "SearXNG API request failed", and web_search
+  # returns an empty result set — a total failure that looks like "no results found".
+  formats:
+    - html
+    - json
+  # LibreChat passes safesearch per request (from webSearch.safeSearch); this is only the
+  # value used when it does not.
+  safe_search: 1
+  autocomplete: ""
+  default_lang: "all"
+
+outgoing:
+  # Below LibreChat's own 10s client timeout on the search call, so a slow engine surfaces
+  # as SearXNG returning the engines that did answer rather than as the whole search
+  # timing out client-side with nothing.
+  request_timeout: 6.0
+  max_request_timeout: 10.0
+  pool_connections: 20
+  pool_maxsize: 10
+
+general:
+  instance_name: "Enterprise AI Search"
+  # No donation link, no public contact: this is infrastructure, not a public instance.
+  donation_url: false
+  contact_url: false
+  enable_metrics: false
+
+ui:
+  static_use_hash: true

@@ -71,6 +71,18 @@ kubectl -n "$NS" create secret generic enterprise-ai-secrets \
     --from-literal=PUBLIC_BASE_URL="$PUBLIC_BASE_URL" \
     --from-literal=OPENID_ISSUER="${PUBLIC_BASE_URL}/realms/${IDP_REALM:-enterprise-ai}" \
     --from-literal=FORGE_API_KEY="${FORGE_API_KEY:-}" \
+    --from-literal=CODEAPI_JWT_PRIVATE_KEY="$CODEAPI_JWT_PRIVATE_KEY" \
+    --from-literal=CODEAPI_JWT_PUBLIC_KEY="$CODEAPI_JWT_PUBLIC_KEY" \
+    --from-literal=CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY="$CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY" \
+    --from-literal=SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY="$SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY" \
+    --from-literal=CODEAPI_INTERNAL_SERVICE_TOKEN="$CODEAPI_INTERNAL_SERVICE_TOKEN" \
+    --from-literal=CODEAPI_EGRESS_GRANT_SECRET="$CODEAPI_EGRESS_GRANT_SECRET" \
+    --from-literal=CODEAPI_REDIS_PASSWORD="$CODEAPI_REDIS_PASSWORD" \
+    --from-literal=MINIO_ROOT_USER="$MINIO_ROOT_USER" \
+    --from-literal=MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
+    --from-literal=WEBFETCH_TOKEN="${WEBFETCH_TOKEN:?WEBFETCH_TOKEN is unset — run bundle/bin/render-env.sh}" \
+    --from-literal=RERANK_TOKEN="${RERANK_TOKEN:?RERANK_TOKEN is unset — run bundle/bin/render-env.sh}" \
+    --from-literal=SEARXNG_SECRET="${SEARXNG_SECRET:?SEARXNG_SECRET is unset — run bundle/bin/render-env.sh}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
 # The realm JSON carries client secrets, hence a Secret. Rendered by the compose bundle;
@@ -116,7 +128,15 @@ kubectl -n "$NS" create configmap chat-config \
     --dry-run=client -o yaml | kubectl apply -f -
 rm -f /tmp/librechat-k8s.yaml
 
-CFG_SUM=$( { cat bundle/litellm/config.generated.yaml bundle/librechat/librechat.yaml deploy/gateway/strip_reasoning.py deploy/gateway/require_principal.py deploy/gateway/flush_spend_on_shutdown.py; } | sha256sum | cut -c1-16)
+# enterpriseaiframework-6ff: the tenant Agent Skills corpus, one ConfigMap per skill
+# directory under bundle/skills/ — see deploy/bin/lib/tenant-skills.sh for why not one
+# combined ConfigMap. Named `chat-skill-*` and shared verbatim by the workspace pods
+# (deploy/k8s/61-workspace.template.yaml), so the chat surface and the terminal agent
+# load the identical corpus through their own separate native loaders.
+source deploy/bin/lib/tenant-skills.sh
+ensure_tenant_skill_configmaps "$NS" chat-skill bundle/skills
+
+CFG_SUM=$( { cat bundle/litellm/config.generated.yaml bundle/librechat/librechat.yaml deploy/gateway/strip_reasoning.py deploy/gateway/require_principal.py deploy/gateway/flush_spend_on_shutdown.py bundle/skills/*/SKILL.md; } | sha256sum | cut -c1-16)
 
 echo "==> build and push control-plane image -> ${IMAGE}"
 docker build -q -t "$IMAGE" ./control-plane

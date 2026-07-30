@@ -1,0 +1,369 @@
+# codeapi: ClickHouse/code-interpreter (Apache 2.0, vendored at bundle/codeapi, pinned
+# 4b72e9d0) — the sandbox that gives chat real code execution (enterpriseaiframework-082).
+#
+# NOT YET APPLIED, AND ITS IMAGES ARE NOT YET PUBLISHED. Committed per this item's own
+# operational guard ("commit manifests; applying is the operator's call") so the cluster
+# shape is not a silent gap, not because it has been exercised. `image: REPLACED_BY_DEPLOY`
+# below follows 06-mcp-echo.yaml's manual-substitution convention (no automated deploy
+# script owns this yet). helm/codeapi/kaniko-build.sh's ConfigMap context (~700KB cap)
+# cannot carry this source tree — it needs `kaniko --context=git://...#<pinned-sha>`
+# against the vendored upstream commit instead of the tarball-via-ConfigMap path the
+# existing script uses; that is new plumbing, not written here.
+#
+# Mirrors bundle/docker-compose.yml's service split exactly: api / worker / file-server /
+# tool-call-server / egress-gateway / sandbox (NsJail mode only — KVM_ENABLED=false, no
+# libkrun microVM guest kernel, deliberately deferred, see the compose file's own note),
+# its own Valkey and its own MinIO (S3), fed by a one-shot package-init Job populating a
+# PVC the sandbox mounts read-only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeapi-redis
+  namespace: enterprise-ai
+spec:
+  selector: { app: codeapi-redis }
+  ports: [{ name: redis, port: 6379, targetPort: 6379 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeapi-redis
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: codeapi-redis } }
+  template:
+    metadata: { labels: { app: codeapi-redis } }
+    spec:
+      containers:
+        - name: redis
+          image: valkey/valkey:8-alpine
+          args: ["valkey-server", "--requirepass", "$(CODEAPI_REDIS_PASSWORD)", "--save", "60", "1", "--appendonly", "no"]
+          env:
+            - name: CODEAPI_REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_REDIS_PASSWORD } }
+          ports: [{ containerPort: 6379 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeapi-minio
+  namespace: enterprise-ai
+spec:
+  selector: { app: codeapi-minio }
+  ports: [{ name: s3, port: 9000, targetPort: 9000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeapi-minio
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: codeapi-minio } }
+  template:
+    metadata: { labels: { app: codeapi-minio } }
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: MINIO_ROOT_USER } }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: MINIO_ROOT_PASSWORD } }
+          ports: [{ containerPort: 9000 }]
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: codeapi-minio-data }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: codeapi-minio-data
+  namespace: enterprise-ai
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 5Gi } }
+---
+# One-shot: populates the /pkgs PVC (Python/Node/Bun/Bash for NsJail) that codeapi-sandbox
+# mounts read-only. Re-run (delete + re-apply) after a package manifest change;
+# package-init.sh itself no-ops on an already-current tree.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: codeapi-package-init
+  namespace: enterprise-ai
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: package-init
+          image: REPLACED_BY_DEPLOY # codeapi, docker/Dockerfile.package-init
+          volumeMounts: [{ name: pkgs, mountPath: /pkgs }]
+      volumes:
+        - name: pkgs
+          persistentVolumeClaim: { claimName: codeapi-pkgs }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: codeapi-pkgs
+  namespace: enterprise-ai
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 8Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeapi
+  namespace: enterprise-ai
+spec:
+  selector: { app: codeapi }
+  ports: [{ name: http, port: 3112, targetPort: 3112 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeapi
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: codeapi } }
+  template:
+    metadata: { labels: { app: codeapi } }
+    spec:
+      containers:
+        - name: codeapi
+          image: REPLACED_BY_DEPLOY # codeapi, service/Dockerfile, target api
+          env:
+            - { name: LOCAL_MODE, value: "false" }
+            - { name: CODEAPI_HARDENED_SANDBOX_MODE, value: "true" }
+            - { name: CODEAPI_AUTH_PROVIDER, value: "librechat-jwt" }
+            - name: CODEAPI_JWT_PUBLIC_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_JWT_PUBLIC_KEY } }
+            - { name: CODEAPI_JWT_KID, value: "lc-codeapi-bundle-1" }
+            - { name: CODEAPI_JWT_ISSUER, value: "librechat" }
+            - { name: CODEAPI_JWT_AUDIENCE, value: "codeapi" }
+            - { name: CODEAPI_JWT_ALLOWED_ALGS, value: "EdDSA" }
+            - { name: SERVICE_PORT, value: "3112" }
+            - { name: SANDBOX_ENDPOINT, value: "http://codeapi-sandbox:2000/api/v2" }
+            - { name: EGRESS_GATEWAY_URL, value: "http://codeapi-egress-gateway:3190" }
+            - { name: FILE_SERVER_URL, value: "http://codeapi-file-server:3000" }
+            - { name: TOOL_CALL_SERVER_URL, value: "http://codeapi-tool-call-server:3033" }
+            - name: CODEAPI_INTERNAL_SERVICE_TOKEN
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_INTERNAL_SERVICE_TOKEN } }
+            - { name: REDIS_HOST, value: "codeapi-redis" }
+            - { name: REDIS_PORT, value: "6379" }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_REDIS_PASSWORD } }
+          ports: [{ containerPort: 3112 }]
+          readinessProbe:
+            httpGet: { path: /v1/health, port: 3112 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeapi-worker
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: codeapi-worker } }
+  template:
+    metadata: { labels: { app: codeapi-worker } }
+    spec:
+      containers:
+        - name: codeapi-worker
+          image: REPLACED_BY_DEPLOY # codeapi, service/Dockerfile, target worker
+          env:
+            - { name: LOCAL_MODE, value: "false" }
+            - { name: CODEAPI_HARDENED_SANDBOX_MODE, value: "true" }
+            - { name: CODEAPI_AUTH_PROVIDER, value: "librechat-jwt" }
+            - name: CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY } }
+            - { name: SANDBOX_ENDPOINT, value: "http://codeapi-sandbox:2000/api/v2" }
+            - { name: EGRESS_GATEWAY_URL, value: "http://codeapi-egress-gateway:3190" }
+            - name: CODEAPI_INTERNAL_SERVICE_TOKEN
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_INTERNAL_SERVICE_TOKEN } }
+            - { name: REDIS_HOST, value: "codeapi-redis" }
+            - { name: REDIS_PORT, value: "6379" }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_REDIS_PASSWORD } }
+            - { name: PYTHON_CONCURRENCY, value: "1" }
+            - { name: OTHER_CONCURRENCY, value: "4" }
+            - { name: WORKER_HEALTH_PORT, value: "3113" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeapi-file-server
+  namespace: enterprise-ai
+spec:
+  selector: { app: codeapi-file-server }
+  ports: [{ name: http, port: 3000, targetPort: 3000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeapi-file-server
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: codeapi-file-server } }
+  template:
+    metadata: { labels: { app: codeapi-file-server } }
+    spec:
+      containers:
+        - name: codeapi-file-server
+          image: REPLACED_BY_DEPLOY # codeapi, service/Dockerfile, target production
+          env:
+            - { name: MINIO_BUCKET, value: "codeapi-sessions" }
+            - { name: MINIO_ENDPOINT, value: "codeapi-minio" }
+            - { name: MINIO_PORT, value: "9000" }
+            - { name: MINIO_USE_SSL, value: "false" }
+            - name: MINIO_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: MINIO_ROOT_USER } }
+            - name: MINIO_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: MINIO_ROOT_PASSWORD } }
+            - { name: FILE_SERVER_PORT, value: "3000" }
+            - { name: REDIS_HOST, value: "codeapi-redis" }
+            - { name: REDIS_PORT, value: "6379" }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_REDIS_PASSWORD } }
+            - name: CODEAPI_INTERNAL_SERVICE_TOKEN
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_INTERNAL_SERVICE_TOKEN } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeapi-tool-call-server
+  namespace: enterprise-ai
+spec:
+  selector: { app: codeapi-tool-call-server }
+  ports: [{ name: http, port: 3033, targetPort: 3033 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeapi-tool-call-server
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: codeapi-tool-call-server } }
+  template:
+    metadata: { labels: { app: codeapi-tool-call-server } }
+    spec:
+      containers:
+        - name: codeapi-tool-call-server
+          image: REPLACED_BY_DEPLOY # codeapi, service/Dockerfile.tool-call-server, target production
+          env:
+            - { name: TOOL_CALL_SERVER_PORT, value: "3033" }
+            - { name: TOOL_CALL_REQUEST_TIMEOUT, value: "300000" }
+            - { name: TOOL_CALL_SESSION_EXPIRY, value: "600" }
+            - { name: REDIS_HOST, value: "codeapi-redis" }
+            - { name: REDIS_PORT, value: "6379" }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_REDIS_PASSWORD } }
+            - name: CODEAPI_INTERNAL_SERVICE_TOKEN
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_INTERNAL_SERVICE_TOKEN } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeapi-egress-gateway
+  namespace: enterprise-ai
+spec:
+  selector: { app: codeapi-egress-gateway }
+  ports: [{ name: http, port: 3190, targetPort: 3190 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeapi-egress-gateway
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: codeapi-egress-gateway } }
+  template:
+    metadata: { labels: { app: codeapi-egress-gateway } }
+    spec:
+      containers:
+        - name: codeapi-egress-gateway
+          image: REPLACED_BY_DEPLOY # codeapi, service/Dockerfile.egress-gateway, target production
+          env:
+            - { name: SERVICE_NAME, value: "egress-gateway" }
+            - { name: CODEAPI_HARDENED_SANDBOX_MODE, value: "true" }
+            - { name: CODEAPI_EGRESS_LEDGER_REQUIRED, value: "true" }
+            - { name: EGRESS_GATEWAY_PORT, value: "3190" }
+            - { name: EGRESS_GATEWAY_FILE_SERVER_URL, value: "http://codeapi-file-server:3000" }
+            - { name: EGRESS_GATEWAY_TOOL_CALL_SERVER_URL, value: "http://codeapi-tool-call-server:3033" }
+            - { name: EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES, value: "1048576" }
+            - name: CODEAPI_EGRESS_GRANT_SECRET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_EGRESS_GRANT_SECRET } }
+            - name: CODEAPI_INTERNAL_SERVICE_TOKEN
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_INTERNAL_SERVICE_TOKEN } }
+            - { name: REDIS_HOST, value: "codeapi-redis" }
+            - { name: REDIS_PORT, value: "6379" }
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_REDIS_PASSWORD } }
+          ports: [{ containerPort: 3190 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeapi-sandbox
+  namespace: enterprise-ai
+spec:
+  selector: { app: codeapi-sandbox }
+  ports: [{ name: http, port: 2000, targetPort: 2000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeapi-sandbox
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: codeapi-sandbox } }
+  template:
+    metadata: { labels: { app: codeapi-sandbox } }
+    spec:
+      # NsJail mode needs real namespace/cgroup/mount capabilities — no Docker socket,
+      # no privileged pod, same capability list as bundle/docker-compose.yml's
+      # codeapi-sandbox (mirrors upstream's own docker-compose.mac.yml, its reference
+      # recipe for running this target without /dev/kvm).
+      containers:
+        - name: codeapi-sandbox
+          image: REPLACED_BY_DEPLOY # codeapi, api/Dockerfile, target sandbox-build
+          command: ["/sandbox_api/entrypoint.sh"]
+          securityContext:
+            capabilities:
+              add: [SYS_ADMIN, SYS_CHROOT, SYS_PTRACE, SETUID, SETGID, NET_ADMIN,
+                    DAC_OVERRIDE, DAC_READ_SEARCH, CHOWN, FOWNER, FSETID, KILL,
+                    SETFCAP, MKNOD]
+          env:
+            - { name: KVM_ENABLED, value: "false" }
+            - { name: CODEAPI_HARDENED_SANDBOX_MODE, value: "true" }
+            - { name: EGRESS_GATEWAY_URL, value: "http://codeapi-egress-gateway:3190" }
+            - { name: SANDBOX_PACKAGES_DIRECTORY, value: "/pkgs" }
+            - { name: SANDBOX_MAX_CONCURRENT_JOBS, value: "4" }
+            - { name: SANDBOX_PER_JOB_UIDS, value: "true" }
+            - { name: SANDBOX_JOB_UID_BASE, value: "200000" }
+            - { name: SANDBOX_JOB_GID_BASE, value: "200000" }
+            - { name: SANDBOX_ALLOWED_LOCAL_NETWORK_PORT, value: "3190" }
+            - { name: SANDBOX_FORWARD_TARGET, value: "codeapi-egress-gateway:3190" }
+            - { name: SANDBOX_REQUIRE_EGRESS_MANIFEST, value: "true" }
+            - name: SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY } }
+          ports: [{ containerPort: 2000 }]
+          volumeMounts:
+            - { name: pkgs, mountPath: /pkgs, readOnly: true }
+      volumes:
+        - name: pkgs
+          persistentVolumeClaim: { claimName: codeapi-pkgs }

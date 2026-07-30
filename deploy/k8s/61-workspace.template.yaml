@@ -161,6 +161,16 @@ spec:
             # before applying this template), but the guarantee should not depend on that
             # ordering never being violated.
             - { name: tenant-instructions, mountPath: /etc/opencode/tenant, readOnly: true }
+            # enterpriseaiframework-6ff: the SAME tenant Agent Skills corpus the chat
+            # surface loads (deploy/k8s/50-chat.yaml), read here by opencode's OWN native
+            # skill loader — `skills.paths` in deploy/workspace/opencode.json points at
+            # /etc/opencode/tenant-skills. No invocation code of ours on either surface;
+            # only the directory is shared. One ConfigMap per skill, same reasoning as
+            # the chat surface's mount — see deploy/bin/lib/tenant-skills.sh for why not
+            # one combined ConfigMap, and note the same cost here: a new skill needs a
+            # new volume/volumeMount pair below, not just a new directory in the corpus.
+            - { name: skill-incident-escalation, mountPath: /etc/opencode/tenant-skills/incident-escalation, readOnly: true }
+            - { name: skill-meeting-notes-format, mountPath: /etc/opencode/tenant-skills/meeting-notes-format, readOnly: true }
           resources:
             # k3s-worker runs live GPU training. A student running `make -j` must not be
             # able to take the node down with them, so the limit is real and the request
@@ -203,3 +213,11 @@ spec:
         # true` matches the volumeMount above.
         - name: tenant-instructions
           configMap: { name: workspace-tenant-instructions, optional: true }
+        # Seeded by deploy/bin/lib/tenant-skills.sh from bundle/skills/ — the identical
+        # corpus and identical ConfigMaps the chat surface mounts above 50-chat.yaml.
+        # `optional: true` for the same reason as tenant-instructions: a pod scheduled
+        # before deploy.sh has run still starts, with no skills, instead of hanging.
+        - name: skill-incident-escalation
+          configMap: { name: chat-skill-incident-escalation, optional: true }
+        - name: skill-meeting-notes-format
+          configMap: { name: chat-skill-meeting-notes-format, optional: true }

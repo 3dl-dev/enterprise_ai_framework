@@ -208,6 +208,79 @@ services:
       retries: 20
     restart: unless-stopped
 
+  # ---- web search (enterpriseaiframework-0be) --------------------------------------
+  #
+  # Three services: all three of LibreChat's native web_search legs are supplied, none
+  # left to LibreChat's own paid-only defaults:
+  #   search  -> searxng   self-hosted, no key, AGPL over HTTP and never patched
+  #   scrape  -> webfetch  ours, Apache-2.0; every option LibreChat ships needs a paid key
+  #   rerank  -> rerank    ours, Apache-2.0; jina/cohere both need a paid key, and
+  #                        `rerankerType: none` authenticates for free but silently
+  #                        withholds every fetched page from the model (see rerank/app.py
+  #                        and the rerankerType comment in librechat.yaml)
+  #
+  # The reason the scrape leg cannot simply be left unset is in webfetch/app.py: with no
+  # scraper key LibreChat's Firecrawl client returns success:false BEFORE issuing any
+  # request, so web_search still answers with search-engine snippets and links and the
+  # model cites pages that were never retrieved. Well-formed and wrong.
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      # Point SearXNG at our mounted config rather than /etc/searxng/settings.yml. The
+      # entrypoint runs `chown -R` over /etc/searxng, which fails noisily against a
+      # read-only bind mount inside it; a separate path keeps the mount read-only and the
+      # startup log clean. Rendered from searxng/settings.template.yml by bin/render-env.sh.
+      SEARXNG_SETTINGS_PATH: /etc/searxng-config/settings.yml
+      SEARXNG_BASE_URL: http://searxng:8080/
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng-config/settings.yml:ro
+    healthcheck:
+      # Probe the JSON API, not /healthz. `format=json` is disabled by default in SearXNG
+      # and is the single setting the whole search leg depends on — a liveness probe would
+      # report healthy on an instance that answers 403 to every query LibreChat makes.
+      test: ["CMD-SHELL", "python -c \"import urllib.request,json,sys;d=json.load(urllib.request.urlopen('http://localhost:8080/search?q=enterprise+ai&format=json',timeout=10));sys.exit(0 if 'results' in d else 1)\""]
+      interval: 15s
+      timeout: 15s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  webfetch:
+    build: ../webfetch
+    environment:
+      # Presented by LibreChat as `firecrawlApiKey`. MUST be non-empty: LibreChat's client
+      # skips the request entirely when its key is empty, and this service fails closed on
+      # an unset token, so an empty value here is the silent no-fetch case twice over.
+      WEBFETCH_TOKEN: ${WEBFETCH_TOKEN:?set WEBFETCH_TOKEN in .env}
+      # Private address space stays blocked. Empty allowlist is the secure default; a
+      # deployment that wants its own intranet searchable names those hosts here.
+      WEBFETCH_ALLOW_HOSTS: ${WEBFETCH_ALLOW_HOSTS:-}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,json,sys;d=json.load(urllib.request.urlopen('http://localhost:3002/health'));sys.exit(0 if d.get('token_configured') else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  rerank:
+    build: ../rerank
+    environment:
+      # Presented by LibreChat as `jinaApiKey`. MUST be non-empty for the same reason
+      # WEBFETCH_TOKEN is: this service fails closed on an unset token, and an empty
+      # value here would make grounding silently fall back to JinaReranker's own
+      # first-N-chunks-score-0 default ranking.
+      RERANK_TOKEN: ${RERANK_TOKEN:?set RERANK_TOKEN in .env}
+    healthcheck:
+      # Asserts token_configured, not just liveness: a reranker that 401s every request
+      # would otherwise look healthy while grounding silently degrades to LibreChat's
+      # built-in fallback (see rerank/app.py's /reranklog, which is what distinguishes
+      # the two).
+      test: ["CMD-SHELL", "python -c \"import urllib.request,json,sys;d=json.load(urllib.request.urlopen('http://localhost:3003/health'));sys.exit(0 if d.get('token_configured') else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   chatdb:
     image: mongo:7
     command: ["--quiet"]
@@ -219,6 +292,317 @@ services:
       timeout: 5s
       retries: 20
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------------
+  # codeapi: ClickHouse/code-interpreter (Apache 2.0, vendored at bundle/codeapi, pinned
+  # 4b72e9d0), the sandbox that gives chat real code execution (enterpriseaiframework-082).
+  #
+  # RULING (see rd item history): option (a), this sandbox alone. No workspace-pod
+  # execution — chat and the terminal agent stay separate worlds, no shared files. That
+  # is an accepted product loss, chosen because a workspace-scoped path can be added
+  # later (additive, reversible) while the reverse cannot be withdrawn once files and
+  # user expectations accumulate.
+  #
+  # NsJail isolation mode ONLY (KVM_ENABLED=false, target sandbox-build). The libkrun
+  # microVM path — its own guest kernel, the Rust launcher, a baked ext4 rootfs, ~15-20GB
+  # of build peak — is real ADDITIVE hardening this deployment does NOT have yet. NsJail
+  # alone (namespaces/cgroups + seccomp + the egress gateway in front of all
+  # sandbox-originated traffic + hardened-sandbox-mode) is still a serious isolation
+  # boundary — more than this item would have built from scratch — just weaker than the
+  # microVM configuration upstream's own README calls out by name. That gap is
+  # deliberate and is not to be closed silently; see docs/design/dogfood-findings.md.
+  #
+  # Its own Valkey and its own S3 store (MinIO) — never the bundle's shared Valkey,
+  # which has no password and every codeapi component requires REDIS_PASSWORD.
+  codeapi-redis:
+    image: valkey/valkey:8-alpine
+    command:
+      - valkey-server
+      - --requirepass
+      - ${CODEAPI_REDIS_PASSWORD:?set CODEAPI_REDIS_PASSWORD in .env}
+      - --save
+      - "60"
+      - "1"
+      - --appendonly
+      - "no"
+    volumes:
+      - codeapiredisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli --no-auth-warning -a \"$$CODEAPI_REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    environment:
+      CODEAPI_REDIS_PASSWORD: ${CODEAPI_REDIS_PASSWORD}
+    restart: unless-stopped
+
+  codeapi-minio:
+    image: quay.io/minio/minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - codeapiminiodata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # HTTP gateway. LibreChat's LIBRECHAT_CODE_BASEURL points here. Named `codeapi` (not
+  # `codeapi-api`) because that hostname is baked into the chat container's env below.
+  codeapi:
+    build:
+      context: ./codeapi
+      dockerfile: service/Dockerfile
+      target: api
+    environment:
+      LOCAL_MODE: "false"
+      CODEAPI_HARDENED_SANDBOX_MODE: "true"
+      # LibreChat mints a <=300s EdDSA JWT per request naming the AUTHENTICATED user
+      # (packages/api/src/auth/codeapi.ts) — the ONLY credential that gets to assert who
+      # the caller is (Finding 27). LIBRECHAT_CODE_API_KEY does not exist in the pinned
+      # LibreChat image (v0.8.7) and setting it configures nothing; do not add it back.
+      CODEAPI_AUTH_PROVIDER: librechat-jwt
+      CODEAPI_JWT_PUBLIC_KEY: ${CODEAPI_JWT_PUBLIC_KEY}
+      CODEAPI_JWT_KID: lc-codeapi-bundle-1
+      CODEAPI_JWT_ISSUER: librechat
+      CODEAPI_JWT_AUDIENCE: codeapi
+      CODEAPI_JWT_ALLOWED_ALGS: EdDSA
+      SERVICE_PORT: "3112"
+      SANDBOX_ENDPOINT: http://codeapi-sandbox:2000/api/v2
+      EGRESS_GATEWAY_URL: http://codeapi-egress-gateway:3190
+      FILE_SERVER_URL: http://codeapi-file-server:3000
+      TOOL_CALL_SERVER_URL: http://codeapi-tool-call-server:3033
+      CODEAPI_INTERNAL_SERVICE_TOKEN: ${CODEAPI_INTERNAL_SERVICE_TOKEN}
+      REDIS_HOST: codeapi-redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${CODEAPI_REDIS_PASSWORD}
+    depends_on:
+      codeapi-redis:
+        condition: service_healthy
+      codeapi-tool-call-server:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request;urllib.request.urlopen('http://localhost:3112/v1/health')\" || node -e \"require('http').get('http://localhost:3112/v1/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+  codeapi-worker:
+    build:
+      context: ./codeapi
+      dockerfile: service/Dockerfile
+      target: worker
+    environment:
+      LOCAL_MODE: "false"
+      CODEAPI_HARDENED_SANDBOX_MODE: "true"
+      CODEAPI_AUTH_PROVIDER: librechat-jwt
+      # Signs a per-job execution manifest (base64 DER — NOT the JWT PEM pair above;
+      # the two encodings are not interchangeable, execution-manifest.ts base64-decodes
+      # before createPrivateKey). codeapi-sandbox verifies with the public half only —
+      # it never receives this private key.
+      CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY: ${CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY}
+      SANDBOX_ENDPOINT: http://codeapi-sandbox:2000/api/v2
+      EGRESS_GATEWAY_URL: http://codeapi-egress-gateway:3190
+      CODEAPI_INTERNAL_SERVICE_TOKEN: ${CODEAPI_INTERNAL_SERVICE_TOKEN}
+      REDIS_HOST: codeapi-redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${CODEAPI_REDIS_PASSWORD}
+      PYTHON_CONCURRENCY: "1"
+      OTHER_CONCURRENCY: "4"
+      WORKER_HEALTH_PORT: "3113"
+    depends_on:
+      codeapi-redis:
+        condition: service_healthy
+      codeapi-sandbox:
+        condition: service_healthy
+    restart: unless-stopped
+
+  codeapi-file-server:
+    build:
+      context: ./codeapi
+      dockerfile: service/Dockerfile
+      target: production
+    environment:
+      MINIO_BUCKET: codeapi-sessions
+      MINIO_ENDPOINT: codeapi-minio
+      MINIO_PORT: "9000"
+      MINIO_USE_SSL: "false"
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      FILE_SERVER_PORT: "3000"
+      REDIS_HOST: codeapi-redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${CODEAPI_REDIS_PASSWORD}
+      CODEAPI_INTERNAL_SERVICE_TOKEN: ${CODEAPI_INTERNAL_SERVICE_TOKEN}
+    depends_on:
+      codeapi-redis:
+        condition: service_healthy
+      codeapi-minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  codeapi-tool-call-server:
+    build:
+      context: ./codeapi
+      dockerfile: service/Dockerfile.tool-call-server
+      target: production
+    environment:
+      TOOL_CALL_SERVER_PORT: "3033"
+      TOOL_CALL_REQUEST_TIMEOUT: "300000"
+      TOOL_CALL_SESSION_EXPIRY: "600"
+      REDIS_HOST: codeapi-redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${CODEAPI_REDIS_PASSWORD}
+      CODEAPI_INTERNAL_SERVICE_TOKEN: ${CODEAPI_INTERNAL_SERVICE_TOKEN}
+    depends_on:
+      codeapi-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  codeapi-egress-gateway:
+    build:
+      context: ./codeapi
+      dockerfile: service/Dockerfile.egress-gateway
+      target: production
+    environment:
+      SERVICE_NAME: egress-gateway
+      CODEAPI_HARDENED_SANDBOX_MODE: "true"
+      CODEAPI_EGRESS_LEDGER_REQUIRED: "true"
+      EGRESS_GATEWAY_PORT: "3190"
+      EGRESS_GATEWAY_FILE_SERVER_URL: http://codeapi-file-server:3000
+      EGRESS_GATEWAY_TOOL_CALL_SERVER_URL: http://codeapi-tool-call-server:3033
+      EGRESS_GATEWAY_MAX_TOOL_CALL_BYTES: "1048576"
+      CODEAPI_EGRESS_GRANT_SECRET: ${CODEAPI_EGRESS_GRANT_SECRET}
+      CODEAPI_INTERNAL_SERVICE_TOKEN: ${CODEAPI_INTERNAL_SERVICE_TOKEN}
+      REDIS_HOST: codeapi-redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${CODEAPI_REDIS_PASSWORD}
+    depends_on:
+      codeapi-redis:
+        condition: service_healthy
+      codeapi-file-server:
+        condition: service_started
+      codeapi-tool-call-server:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3190/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Direct NsJail sandbox — target `sandbox-build` (api/Dockerfile), NOT the
+  # `sandbox-runner-*` family (that chain builds the Fedora + Rust + libkrun launcher and
+  # the ext4 guest rootfs for the microVM path this deployment deliberately does not
+  # build). The capability list and seccomp profile mirror the codeapi project's own
+  # docker-compose.mac.yml, which is upstream's OWN reference for running this same
+  # target without /dev/kvm — the closest thing to a validated NsJail-direct recipe that
+  # ships with the vendored source, rather than a configuration invented here from Docker
+  # capability documentation alone.
+  codeapi-sandbox:
+    build:
+      context: ./codeapi
+      dockerfile: api/Dockerfile
+      target: sandbox-build
+    entrypoint: ["/sandbox_api/entrypoint.sh"]
+    # NsJail's cgroupv2 delegation needs the HOST cgroup namespace, not the private one
+    # Docker gives a container by default — without this it fails
+    # enableCgroupSubtree() at the very first job with "nsjail MUST be run from root and
+    # the cgroup mount path must refer to the root/host cgroup", which reads like a
+    # privilege problem but is actually just this one setting. Measured by actually
+    # running it, not inferred from upstream's docker-compose.mac.yml (Docker Desktop's
+    # VM does not need this the same way a native Linux host does).
+    cgroup: host
+    security_opt:
+      - seccomp=./codeapi/seccomp/nsjail.json
+      # Docker's default AppArmor profile (docker-default) has an unconditional `deny
+      # mount,` rule that overrides Linux capabilities outright — SYS_ADMIN grants the
+      # capability, AppArmor still vetoes the syscall, and nsjail failed at
+      # buildMountTree() with a bare "Permission denied" that reads like a missing
+      # capability rather than a second, independent confinement layer. NsJail's own
+      # restrictive syscall whitelist (the seccomp profile above) is this container's
+      # confinement instead of the host's generic profile, which is not written for a
+      # process whose whole job is namespaces and mounts.
+      - apparmor:unconfined
+    cap_add:
+      - SYS_ADMIN
+      - SYS_CHROOT
+      - SYS_PTRACE
+      - SETUID
+      - SETGID
+      - NET_ADMIN
+      - DAC_OVERRIDE
+      - DAC_READ_SEARCH
+      - CHOWN
+      - FOWNER
+      - FSETID
+      - KILL
+      - SETFCAP
+      - MKNOD
+    volumes:
+      - codeapipkgs:/pkgs:ro
+    environment:
+      KVM_ENABLED: "false"
+      CODEAPI_HARDENED_SANDBOX_MODE: "true"
+      # Docker mounts /sys/fs/cgroup read-only inside a non-privileged container even
+      # with `cgroup: host` above (which fixes the namespace, not the mount mode), so
+      # NsJail's own cgroup v2 delegation (creating a subtree per job) fails with
+      # "Read-only file system" rather than a permissions error. Upstream's OWN
+      # docker-compose.mac.yml sets exactly this to false for its direct-NsJail path —
+      # not a workaround invented here. Isolation cost, stated plainly: per-job
+      # memory/pids cgroup LIMITS are not enforced; namespaces (PID/mount/net/user),
+      # seccomp, and the egress gateway in front of all sandbox traffic still are.
+      SANDBOX_USE_CGROUPV2: "false"
+      EGRESS_GATEWAY_URL: http://codeapi-egress-gateway:3190
+      SANDBOX_PACKAGES_DIRECTORY: /pkgs
+      SANDBOX_LOG_LEVEL: INFO
+      SANDBOX_OUTPUT_MAX_SIZE: "65536"
+      SANDBOX_MAX_CONCURRENT_JOBS: "4"
+      SANDBOX_PER_JOB_UIDS: "true"
+      SANDBOX_JOB_UID_BASE: "200000"
+      SANDBOX_JOB_GID_BASE: "200000"
+      SANDBOX_WORKSPACE_REAPER_MAX_AGE_SECONDS: "3600"
+      SANDBOX_RUN_TIMEOUT: "300000"
+      SANDBOX_RUN_CPU_TIME: "60000"
+      SANDBOX_COMPILE_TIMEOUT: "30000"
+      SANDBOX_ALLOWED_LOCAL_NETWORK_PORT: "3190"
+      SANDBOX_FORWARD_TARGET: codeapi-egress-gateway:3190
+      SANDBOX_REQUIRE_EGRESS_MANIFEST: "true"
+      # Verifies the worker's per-job manifest (base64 DER public half). The private
+      # half above never reaches this container — secure-startup.ts's hardened-mode
+      # boot check would refuse to start if it could see it (any CODEAPI_*/REDIS_*/
+      # AWS_*/S3_*/MINIO_* var, or anything matching SECRET|TOKEN|PASSWORD|PRIVATE_KEY).
+      SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY: ${SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY}
+    depends_on:
+      codeapi-egress-gateway:
+        condition: service_healthy
+      codeapi-package-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "bun -e \"fetch('http://localhost:2000/api/v2/runtimes').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    restart: unless-stopped
+
+  # One-shot job: populates the /pkgs volume (Python/Node/Bun/Bash runtimes for NsJail)
+  # before codeapi-sandbox starts. Runs once; `docker compose up` re-runs it but
+  # package-init.sh no-ops when the marker file shows the tree is already current.
+  codeapi-package-init:
+    build:
+      context: ./codeapi
+      dockerfile: docker/Dockerfile.package-init
+    volumes:
+      - codeapipkgs:/pkgs
+    restart: "no"
 
   chat:
     # v0.8.7 (2026-06-24), not v0.8.0. Agent Skills and subagents shipped in v0.8.6 and
@@ -291,9 +675,70 @@ services:
 
       # The surface never holds a provider key — only its virtual key.
       CHAT_VIRTUAL_KEY: ${CHAT_VIRTUAL_KEY:-}
+
+      # enterpriseaiframework-6ff: the tenant's Agent Skills corpus. A DIFFERENT
+      # mechanism from librechat.yaml's `skills` capability flag — this is the
+      # filesystem loader (packages/api/src/skills/deployment.ts,
+      # initializeDeploymentSkills), scanned ONCE at boot into a module-level
+      # singleton, NOT persisted as Mongo Skill documents. Two consequences worth
+      # restating here rather than only in dogfood-findings.md finding 41:
+      #   - Editing ./skills requires restarting this container; there is no
+      #     watcher. `docker compose restart chat` after any change.
+      #   - A malformed SKILL.md throws at boot and takes the whole surface down
+      #     (the awaited call in api/server/index.js is unguarded). We do not
+      #     patch LibreChat to guard that await — "integrate, do not reimplement"
+      #     forbids carrying a fork of the image. Instead this is guarded ON OUR
+      #     SIDE: tests/test_skill_corpus.py boots this exact container with this
+      #     exact ./skills directory and asserts /health before any turn is sent,
+      #     so malformed tenant content fails `make test` (a disposable bundle,
+      #     not a shared deployment) before anyone pushes it toward the cluster's
+      #     chat-skills ConfigMap (deploy/k8s/50-chat.yaml).
+      DEPLOYMENT_SKILLS_DIR: /app/skill
+
+      # Code execution (enterpriseaiframework-082). LIBRECHAT_CODE_API_KEY is
+      # DELIBERATELY ABSENT — it does not exist in v0.8.7 (nothing under /app in the
+      # pinned image reads it) and setting it configures nothing while looking like
+      # auth. The real credential is CODEAPI_AUTH_PROVIDER=librechat-jwt, which turns on
+      # packages/api/src/auth/codeapi.ts's per-request JWT minting: a <=300s EdDSA token
+      # whose `sub` is the AUTHENTICATED user, signed with the private half below.
+      LIBRECHAT_CODE_BASEURL: http://codeapi:3112/v1
+      CODEAPI_AUTH_PROVIDER: librechat-jwt
+      CODEAPI_JWT_PRIVATE_KEY: ${CODEAPI_JWT_PRIVATE_KEY}
+      CODEAPI_JWT_KID: lc-codeapi-bundle-1
+      CODEAPI_JWT_ISSUER: librechat
+      CODEAPI_JWT_AUDIENCE: codeapi
+      # ---- web search (enterpriseaiframework-0be) --------------------------------
+      #
+      # These MUST be supplied as environment variables and librechat.yaml MUST reference
+      # them as ${...} placeholders. That is not style — it is load bearing. LibreChat
+      # resolves web-search credentials by extracting an env-var NAME out of each config
+      # value (packages/api extractWebSearchEnvVars -> extractVariableName). A literal
+      # value written directly in librechat.yaml yields no variable name, so the field is
+      # counted as missing, `requiredAuthFields.length !== requiredKeys.length` skips the
+      # provider, and the search provider silently falls back to the default (serper) with
+      # no key. Symptom: web_search offered in the UI and every call failing.
+      SEARXNG_INSTANCE_URL: http://searxng:8080
+      # Scraper leg. `firecrawl` is the WIRE SHAPE, not the vendor — webfetch speaks
+      # Firecrawl's /v2/scrape contract so LibreChat's existing client can be pointed at
+      # it unmodified. Swapping to real Firecrawl (cloud or self-hosted) is these two
+      # values and nothing else.
+      FIRECRAWL_API_URL: http://webfetch:3002
+      FIRECRAWL_API_KEY: ${WEBFETCH_TOKEN:?set WEBFETCH_TOKEN in .env}
+      # Rerank leg. `jina` names the WIRE CONTRACT, not the vendor — rerank/ speaks
+      # Jina's own /v1/rerank shape so LibreChat's existing JinaReranker client works
+      # unmodified. The FULL path is required: the client POSTs jinaApiUrl verbatim and
+      # appends nothing. Swapping to a real Jina/Cohere key is these two values.
+      JINA_API_URL: http://rerank:3003/v1/rerank
+      JINA_API_KEY: ${RERANK_TOKEN:?set RERANK_TOKEN in .env}
     volumes:
       - ./librechat/librechat.yaml:/app/librechat.yaml:ro
       - ./certs:/certs:ro
+      # Tenant content, not platform content (same principle as workspace house
+      # rules, enterpriseaiframework-cbf): a camp's skills and a law firm's
+      # skills are different directories on this one mechanism, so this lives in
+      # the bundle, never in the LibreChat image. Read-only — this deployment
+      # does not author skills through the UI.
+      - ./skills:/app/skill:ro
     ports:
       - "${CHAT_PORT:-3080}:3080"
     depends_on:
@@ -304,6 +749,19 @@ services:
       gateway:
         condition: service_healthy
       mcp-echo:
+        condition: service_healthy
+      codeapi:
+        condition: service_healthy
+      # webfetch and rerank both gate startup: without either, web_search either fetches
+      # nothing (no scraper key) or fetches and then withholds it from the model (no
+      # working reranker), and grounding is exactly enterpriseaiframework-0be's outcome.
+      # SearXNG does NOT gate startup — its healthcheck runs a real outbound query, so
+      # gating chat on it would make the whole bundle's startup depend on the public
+      # internet answering, and `make up` must work on a host that cannot reach bing. A
+      # degraded search leg is a degraded feature; it is not a reason for chat to be down.
+      webfetch:
+        condition: service_healthy
+      rerank:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
@@ -317,3 +775,6 @@ volumes:
   pgdata:
   valkeydata:
   chatdbdata:
+  codeapiredisdata:
+  codeapiminiodata:
+  codeapipkgs:

@@ -45,19 +45,23 @@ def _scratch_bundle(tmp_path: Path) -> Path:
     """
     scratch = tmp_path / "bundle"
     (scratch / "bin").mkdir(parents=True)
-    for name in ("make-certs.sh", "render-env.sh"):
+    for name in ("make-certs.sh", "render-env.sh", "render-codeapi-keys.py"):
         src = BUNDLE / "bin" / name
         dst = scratch / "bin" / name
         shutil.copy2(src, dst)
         dst.chmod(0o755)
-    shutil.copy2(BUNDLE / ".env.example", scratch / ".env.example")
-    # render-env.sh also renders keycloak/realm-export.json from this template — needed
-    # for the script to exit 0, irrelevant to what this test is checking.
-    (scratch / "keycloak").mkdir()
-    shutil.copy2(
-        BUNDLE / "keycloak" / "realm-export.template.json",
-        scratch / "keycloak" / "realm-export.template.json",
-    )
+    # render-env.sh renders a config file from each of these templates and exits non-zero
+    # if one is missing — needed for the script to exit 0, irrelevant to what this test is
+    # checking. Kept as a list rather than inline copies so that adding a template to
+    # render-env.sh does not surface here as an unexplained "No such file or directory"
+    # from a shell redirect. tests/test_bundle_isolation.py::RENDER_INPUTS is the same list
+    # for the same reason.
+    for relative in (".env.example",
+                     "keycloak/realm-export.template.json",
+                     "searxng/settings.template.yml"):
+        destination = scratch / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(BUNDLE / relative, destination)
     return scratch
 
 

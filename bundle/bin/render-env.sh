@@ -7,7 +7,8 @@
 # forcing a teardown.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/.."
 
 hex() { openssl rand -hex "$1"; }
 
@@ -18,6 +19,16 @@ if [[ ! -f .env ]]; then
 fi
 
 # name:generator — generator is a command whose stdout becomes the value.
+#
+# The fill-in-place branch used to be `sed "s|^${var}=$|${var}=${value}|"`
+# (enterpriseaiframework-082 wave 18's defect #1): GNU sed's replacement string
+# interprets a literal `\n` in ${value} as an actual newline, so any generated value
+# containing that two-character sequence — a PEM collapsed to one line, which is
+# exactly the form render-codeapi-keys.py produces — came out split across three lines
+# in .env. `--env-file` (and every `set -a; . ./.env` sourcing) then kept only the
+# first line, the surface booted fine, and it failed later at signing time with a
+# truncated key. python does the substitution with no shell/sed string interpolation
+# of ${value} at all, so this class of corruption cannot recur.
 ensure() {
     local var="$1" value="$2"
     if grep -qE "^${var}=.+$" .env; then
@@ -25,7 +36,21 @@ ensure() {
     fi
     if grep -qE "^${var}=$" .env; then
         # Present but empty: fill it in place, preserving position in the file.
-        sed "s|^${var}=$|${var}=${value}|" .env > .env.tmp && mv .env.tmp .env
+        VAR="$var" VALUE="$value" python3 - <<'PYEOF'
+import os
+env_path = ".env"
+var = os.environ["VAR"]
+value = os.environ["VALUE"]
+with open(env_path) as f:
+    lines = f.readlines()
+target = f"{var}=\n"
+for i, line in enumerate(lines):
+    if line == target:
+        lines[i] = f"{var}={value}\n"
+        break
+with open(env_path, "w") as f:
+    f.writelines(lines)
+PYEOF
     else
         printf '%s=%s\n' "$var" "$value" >> .env
     fi
@@ -171,12 +196,49 @@ ensure CHAT_JWT_REFRESH_SECRET     "$(hex 24)"
 ensure CHAT_CREDS_KEY              "$(hex 32)"
 ensure CHAT_CREDS_IV               "$(hex 16)"
 
+# Web search (enterpriseaiframework-0be).
+#
+# WEBFETCH_TOKEN is a real credential, not a formality: it is what LibreChat presents to
+# the fetch service as `firecrawlApiKey`, and the fetch service fails closed without it.
+# It must also be NON-EMPTY for a reason that has nothing to do with authentication —
+# LibreChat's Firecrawl client returns success:false without issuing any HTTP request when
+# its key is empty, so an empty token turns web search into "cite pages nobody fetched".
+ensure WEBFETCH_TOKEN              "wf-$(hex 24)"
+# RERANK_TOKEN gates rerank/, the reranker of ours that closes the grounding gap
+# `rerankerType: none` leaves open (enterpriseaiframework-0be). Same non-empty
+# requirement as WEBFETCH_TOKEN, same reason: an empty value here would silently
+# reproduce LibreChat's own no-ranking fallback instead of failing loudly.
+ensure RERANK_TOKEN                "rr-$(hex 24)"
+# SearXNG refuses to start on its upstream placeholder secret.
+ensure SEARXNG_SECRET              "$(hex 24)"
+
 # Bootstrap realm user, so a fresh bundle can be signed in to without manual steps.
 # The first two are not secrets, but they must exist in .env for post-up to provision
 # the account — an .env written before these were added would otherwise skip it silently.
 ensure BOOTSTRAP_USER              "baron"
 ensure BOOTSTRAP_EMAIL             "baron@3dl.dev"
 ensure BOOTSTRAP_PASSWORD          "$(hex 16)"
+
+# --- codeapi (enterpriseaiframework-082) ---
+# The code-execution sandbox's own Valkey, never the bundle's shared one — the shared
+# instance has no password and every codeapi component requires REDIS_PASSWORD.
+ensure CODEAPI_REDIS_PASSWORD        "$(hex 24)"
+# Shared secret between codeapi's own components (api/worker/file-server/tool-call-
+# server/egress-gateway) — internal service-to-service auth, never seen by LibreChat
+# or by the sandbox container itself (secure-startup.ts's hardened-mode boot check
+# refuses to start a sandbox that can see anything matching SECRET|TOKEN|PASSWORD).
+ensure CODEAPI_INTERNAL_SERVICE_TOKEN "$(hex 32)"
+# Egress gateway's own handle-encryption secret. Sandbox-runner, service-api and
+# service-worker never receive this one either — only the egress gateway does.
+ensure CODEAPI_EGRESS_GRANT_SECRET   "$(hex 32)"
+ensure MINIO_ROOT_USER                "codeapi"
+ensure MINIO_ROOT_PASSWORD            "$(hex 24)"
+
+# The two Ed25519 keypairs codeapi needs — the LibreChat-auth JWT pair and the
+# execution-manifest pair — are generated together, atomically, by a python helper,
+# never by ensure() above: ensure() fills ONE variable from ONE generator command,
+# but a keypair is two variables that must come from the SAME key or nothing verifies.
+python3 "$SCRIPT_DIR/render-codeapi-keys.py"
 
 chmod 600 .env
 set -a; . ./.env; set +a
@@ -202,5 +264,24 @@ if [[ ! -f keycloak/realm-export.json ]]; then
 else
     echo "keycloak/realm-export.json exists, leaving it alone"
 fi
+
+# SearXNG's secret has to be inside the settings file before the container starts: this
+# SearXNG has no SEARXNG_SECRET environment override, and the image only substitutes its
+# own placeholder when it is CREATING settings.yml — a mounted file is read verbatim.
+#
+# Unlike the realm export this is re-rendered every time rather than left alone once it
+# exists. The realm can only be imported once (Keycloak ignores the file afterwards), so
+# rewriting it would desynchronise the file from the database; SearXNG re-reads its
+# settings on every start, so re-rendering is how a change to the template — a new engine,
+# a changed timeout — actually reaches the running instance instead of being silently
+# ignored on every subsequent `make up`.
+echo "rendering searxng/settings.yml"
+sed -e "s|SEARXNG_SECRET_REPLACED_AT_BUNDLE_UP|${SEARXNG_SECRET}|" \
+    searxng/settings.template.yml > searxng/settings.yml
+if grep -q 'SEARXNG_SECRET_REPLACED_AT_BUNDLE_UP' searxng/settings.yml; then
+    echo "error: searxng settings template still has an unreplaced placeholder" >&2
+    exit 1
+fi
+chmod 644 searxng/settings.yml
 
 echo "ok"

@@ -41,12 +41,39 @@ BROWSER_UA = (
 )
 
 
-def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=None):
+def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=None,
+                  manual_skills=None, execute_code=False, web_search=False):
     """The body LibreChat's own client sends for an ephemeral-agent turn.
 
     `ephemeralAgent.mcp` is what attaches an MCP server to an otherwise plain
     custom-endpoint turn; the entries are server names from `mcpServers` in
     librechat.yaml, not tool names.
+
+    `manual_skills` is the `$`-popover's wire shape (enterpriseaiframework-6ff):
+    a top-level `manualSkills` array of skill NAMES (not `ephemeralAgent.mcp`'s
+    shape) plus `ephemeralAgent.skills: true`, the per-conversation skills-badge
+    toggle. Both are required — packages/api/src/agents/skills.ts only resolves
+    `manualSkills` against an `accessibleSkillIds` set that is empty unless the
+    toggle is on (`resolveAgentScopedSkillIds`'s ephemeral-agent branch falls
+    through to `ephemeralSkillsToggle ? ... : []`), so sending names without the
+    toggle silently primes nothing.
+
+    `ephemeralAgent.execute_code` (enterpriseaiframework-082) is the per-turn switch for
+    the codeapi sandbox — a real zod key (data-provider/src/models.ts's
+    tModelSpecPresetSchema has the modelSpec-level twin, `executeCode`; this is the
+    ephemeral-agent one, read in api/server/services/Endpoints/agents/added.ts:
+    `ephemeralAgent?.execute_code === true || modelSpec?.executeCode === true`). Needed
+    when a turn is sent against a bare model name (e.g. "fake-large") rather than
+    through a modelSpec, which is exactly how the hermetic suite talks to the fake
+    upstream.
+
+    `web_search=True` sets `ephemeralAgent.web_search`, which is the ONLY thing that
+    attaches the built-in web_search tool to a turn on a custom endpoint. In v0.8.7 the
+    check is literally `ephemeralAgent?.web_search === true || modelSpec?.webSearch ===
+    true` — a truthy value is not enough, and configuring `webSearch` in librechat.yaml
+    does NOT attach the tool by itself. A turn sent without this flag gets no tool, the
+    model answers from weights alone, and the reply can look entirely reasonable while
+    citing nothing — so a test that forgot the flag would be testing the model's memory.
     """
     body = {
         "text": text,
@@ -63,8 +90,18 @@ def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=Non
         "isTemporary": False,
         "isRegenerate": False,
     }
+    ephemeral_agent = {}
     if mcp_servers:
-        body["ephemeralAgent"] = {"mcp": list(mcp_servers)}
+        ephemeral_agent["mcp"] = list(mcp_servers)
+    if manual_skills:
+        ephemeral_agent["skills"] = True
+        body["manualSkills"] = list(manual_skills)
+    if execute_code:
+        ephemeral_agent["execute_code"] = True
+    if web_search:
+        ephemeral_agent["web_search"] = True
+    if ephemeral_agent:
+        body["ephemeralAgent"] = ephemeral_agent
     return body
 
 
@@ -183,9 +220,14 @@ def tool_calls(message):
 
 
 def send_turn(client, chat_url, text, model, endpoint, endpoint_type="custom",
-              mcp_servers=None, headers=None, timeout=180.0):
+              mcp_servers=None, manual_skills=None, execute_code=False,
+              web_search=False, headers=None, timeout=180.0):
     """One turn, end to end, on either protocol. Returns the persisted assistant message."""
-    payload = build_payload(text, model, endpoint, endpoint_type, mcp_servers)
+    payload = build_payload(
+        text, model, endpoint, endpoint_type, mcp_servers,
+        manual_skills=manual_skills, execute_code=execute_code,
+        web_search=web_search,
+    )
     conversation_id, _ = start_turn(
         client, chat_url, payload, headers=headers, timeout=timeout
     )

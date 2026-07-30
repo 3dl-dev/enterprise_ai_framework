@@ -1172,3 +1172,247 @@ looked adequate and were not:
   a synthetic LibreChat account any more: the person they bill is the bundle's real
   bootstrap user, signed in through the real identity provider, so the rows they leave are
   rows the bill should carry.
+
+### 41. Both surfaces already ship a native Skills primitive, and their SKILL.md dialects disagree
+
+Preparatory investigation for `enterpriseaiframework-6ff`, whose architecture decision is
+reserved for the founder. Nothing here was built; this records what is true so the ruling
+can be made from measurement rather than from the item's original premise, which is wrong
+in three places.
+
+**Measured on the cluster (read-only).** `GET /api/config` on the chat NodePort answers
+`"buildInfo": {"branch": "v0.8.7", "commitShort": "9e74cc0", "buildDate":
+"2026-06-24"}` — the upgraded image is serving. Our `bundle/librechat/librechat.yaml` has
+no `endpoints.agents` block, so `defaultAgentCapabilities` applies verbatim, and
+`AgentCapabilities.skills` is in that list (`packages/data-provider/src/config.ts:689`).
+The chat Deployment mounts exactly one volume — `chat-config` → `/app/librechat.yaml` —
+and sets no `DEPLOYMENT_SKILLS_DIR`. So the capability is on and there is no skill content
+of any kind in the deployment today.
+
+**Everything below is a read of the shipped v0.8.7 image and of opencode's pinned
+v1.18.7 source, not a runtime measurement.** Stated plainly because the distinction
+matters: none of it has been exercised end to end.
+
+**A v0.8.7 skill is a database row, not a directory.** `createSkill` writes a Mongo
+`Skill` document (`packages/data-schemas/src/schema/skill.ts`) and `upsertSkillFile`
+writes each accompanying file through the *file-storage strategy* under a uuid-prefixed
+name. Three ingestion paths converge on that same row: the UI author, `POST
+/api/skills/import` (`.md` / `.zip` / `.skill`, 50 MB), and `skillSync.github`. The
+filesystem is only a *fourth* and different thing — `DEPLOYMENT_SKILLS_DIR` (default
+`/app/skill`) is scanned once by `initializeDeploymentSkills` and held in a
+module-level singleton, explicitly "not persisted as Skill documents in MongoDB".
+
+Three consequences of that fourth path, all load-bearing:
+
+- **It reloads only on restart.** There is no watcher and no re-scan; `registry` is
+  assigned once in `api/server/index.js:124`. Editing a mounted skill means restarting
+  the shared chat Deployment.
+- **A bad skill takes the surface down at boot.** That `await` is unguarded, and both
+  `loadDeploymentSkillsFromDirectory` (missing directory, when explicitly configured) and
+  `loadDeploymentSkill` (malformed `SKILL.md`) throw. Tenant content becomes a boot-time
+  hard dependency of chat.
+- **It has no tenant scoping.** `loadDeploymentSkill` takes no `tenantId` and the README
+  says "exposed read-only to all users with Skills enabled". `skillSync.github` sources
+  *do* carry `tenantId`. So the cheap filesystem path is per-deployment, and the
+  tenant-scoped path is the GitHub one.
+
+**`skillSync.github` cannot be air-gapped.** `GITHUB_API_BASE` is the hardcoded constant
+`'https://api.github.com'` in `packages/api/src/skills/sync/github.ts:28`. There is no
+base-URL override in `skillSyncGitHubSourceSchema` (`owner`, `repo`, `ref`, `paths`,
+`credentialKey`/`token`, `tenantId`), so GitHub Enterprise, Gitea and GitLab are all out,
+and so is any deployment with no route to github.com. It also writes to Mongo and to the
+file-storage strategy — **not** to a filesystem tree another surface could read.
+
+**The frontmatter contract is strict, and it is a different set on each surface.**
+LibreChat validates in strict mode and *rejects* unknown keys
+(`validateSkillFrontmatter`, `ALLOWED_FRONTMATTER_KEYS` at
+`packages/data-schemas/src/methods/skill.ts:244`): `name`, `description`, `when-to-use`,
+`allowed-tools`, `arguments`, `argument-hint`, `user-invocable`,
+`disable-model-invocation`, `always-apply`/`alwaysApply`, `model`, `effort`, `context`,
+`agent`, `paths`, `shell`, `hooks`, `version`, `license`, `metadata`. opencode 1.18.7
+decodes `name`, `description`, `slash` through an Effect `Schema.Struct` with
+`decodeUnknownOption` (`packages/core/src/skill.ts`), which *strips* excess properties
+rather than erroring. The asymmetry is the useful part: **a SKILL.md written to
+LibreChat's key set is readable by opencode; the reverse is not true** — `slash` and
+`compatibility` are rejected by LibreChat. The portable-by-construction intersection is
+`name`, `description`, `license`, `metadata`.
+
+**opencode has its own native `skill` tool, so "MCP-served skills" is dominated.** The
+item's premise was that native skills are LibreChat-only and MCP was the only way to reach
+the terminal agent. opencode 1.18.7 discovers `SKILL.md` from `.opencode/skills/`,
+`~/.config/opencode/skills/`, and the Claude-Code-compatible `.claude/skills/` and
+`.agents/skills/`, walking up to the git worktree root, and exposes a native
+`skill({name})` tool with `allow`/`deny`/`ask` permission patterns. Its config schema at
+that version also accepts a top-level `skills` key —
+`{ paths: [...], urls: [...] }` (`packages/core/src/v1/config/skills.ts`) — which our
+`deploy/workspace/opencode.json` does not currently set. Neither surface needs an MCP
+server to have skills.
+
+**The URL source is a real cross-surface transport, with two catches.**
+`SkillDiscovery.pull` does `GET <base>/index.json`, expecting
+`{"skills":[{"name","version?","files":["SKILL.md", ...]}]}`, then fetches
+`<base>/<name>/<file>` for each — same-origin enforced, path traversal rejected, `version`
+used as a cache key against `.opencode-version`. Catch one: `download` issues a plain
+`HttpClientRequest.get` with no credential, so the index and every file must be readable
+**unauthenticated** — an index of tenant skills is not an access-controlled object. Catch
+two: per finding 22 and `enterpriseaiframework-784`, a workspace pod's NetworkPolicy
+permits egress to kube-dns and the gateway only, so the URL would have to be served from
+the gateway or from a newly permitted destination, which is the authority grant 784 exists
+to review.
+
+**The item's done-condition depends on `enterpriseaiframework-082`.** 6ff asks for
+behaviour that uses "a resource from the skill directory the model could not have known
+otherwise". Two different mechanisms carry a skill into a turn, and only one of them is
+free. The `SKILL.md` **body** is injected as a `HumanMessage` tagged
+`additional_kwargs.source = 'skill'` and needs nothing else. The skill's **files**
+(`references/`, `scripts/`, assets) reach the model only through the code-execution
+sandbox: `primeInvokedSkills` gates the whole upload on
+`if (deps.codeEnvAvailable && skillsWithFiles.length > 0)`
+(`packages/api/src/agents/skillFiles.ts:394`) and pushes them via
+`batchUploadCodeEnvFiles` into a `Constants.EXECUTE_CODE` session. With no code
+environment the files are silently never delivered — no error, no log the user sees, the
+model simply cannot see `references/*`. So a reference-file demonstration is blocked on
+the code-execution decision (082); a body-only demonstration is not.
+
+Two smaller corrections to the item text while here. `allowed-tools` does exist and is
+forwarded verbatim as `allowedTools`, but the schema comment says it unions into the
+effective tool set for **manually-primed** skills only — a model-invoked skill gets no tool
+union, because adding a tool mid-turn would require a graph rebuild. And skills work on our
+surface even though we configure `endpoints.custom` rather than `endpoints.agents`:
+`resolveAgentScopedSkillIds` has an `isEphemeralAgentId` branch, so a plain custom-endpoint
+conversation gets skills subject to a per-conversation toggle, and `resolveModelSpecSkillIds`
+lets a `modelSpecs` entry name skills by name — which is a `librechat.yaml` change, i.e. a
+ConfigMap deploy.
+
+### 42. Built on 41: the corpus, wired to both surfaces, measured against the real container
+
+`enterpriseaiframework-6ff` built. Two skills (`bundle/skills/incident-escalation`,
+`bundle/skills/meeting-notes-format`) mounted read-only at `DEPLOYMENT_SKILLS_DIR` in the
+bundle (`bundle/docker-compose.yml`); the chat container's own boot log confirms
+`[deploymentSkills] Loaded 2 deployment skill(s) from /app/skill`. Neither surface runs
+invocation code of ours — LibreChat's filesystem loader and opencode's native
+`skill({name})` tool both read the same directory shape.
+
+**Measured, not asserted, against the real running container** (`tests/test_skill_corpus.py`):
+manually invoking `incident-escalation` (`manualSkills: ["incident-escalation"]` +
+`ephemeralAgent.skills: true` — the wire shape `extractManualSkills`/
+`resolveAgentScopedSkillIds` require) delivers the literal string
+`ESCALATION-CODE: TRIDENT-8841-QUARTZ`, which lives nowhere but that SKILL.md's body, to
+the upstream request `fakeprovider` actually receives. An identical un-invoked turn (same
+typed text) carries neither skill's secret; the upstream prompt equals the raw user text
+byte for byte. `fakeprovider` gained a `/debug/prompts` capture seam
+(`GET /debug/prompts?contains=<nonce>`) for this — the existing digest-only contract other
+tests rely on (`reply_text = sha256(model + prompt)`) proves a turn happened but not WHAT
+changed it; reading the actual delivered prompt does.
+
+**Guard 6 (the unguarded boot-time throw), resolved by test-gating, not by patching the
+image.** `loadDeploymentSkill` still throws on malformed frontmatter and the `await` in
+`api/server/index.js` is still unguarded — "integrate, do not reimplement" forbids
+carrying a fork of LibreChat to fix that. Instead: `tests/test_skill_corpus.py` boots this
+exact corpus in the disposable bundle and asserts `/health` before any turn runs, and a
+static pass (`test_no_skill_uses_a_frontmatter_key_librechat_rejects`,
+`test_every_skill_name_is_kebab_case...`) checks the corpus against
+`ALLOWED_FRONTMATTER_KEYS` and `validateSkillName`'s pattern directly. Malformed tenant
+content fails `make test` on a throwaway worktree before it ever reaches the cluster's
+`chat-skill-*` ConfigMaps (`deploy/bin/lib/tenant-skills.sh`, applied only by
+`deploy/bin/deploy.sh`, which this item did not run — cluster manifests are committed,
+not applied, per operational guard 7).
+
+**The cluster/workspace wiring is committed but unproven against a live cluster** (no
+cluster access from this environment, and guard 7 forbids applying regardless): one
+ConfigMap per skill (`chat-skill-<name>`), because `kubectl create configmap
+--from-file=<dir>` does not recurse into per-skill subdirectories — see
+`deploy/bin/lib/tenant-skills.sh` for the resulting cost, stated rather than hidden: a
+third skill needs a new ConfigMap block AND a new volume/volumeMount pair in both
+`deploy/k8s/50-chat.yaml` and `deploy/k8s/61-workspace.template.yaml`, not just a new
+directory under `bundle/skills/`. Static tests check the two k8s templates and
+`deploy/workspace/opencode.json`'s `skills.paths` stay in sync with the corpus, but they
+parse YAML/JSON — they do not apply it. A `librechat.yaml`-shaped consequence applies
+here too: pushing a cluster skill change is a ConfigMap update and a chat restart
+(`DEPLOYMENT_SKILLS_DIR` has no watcher, same as finding 41 already established), which an
+operator runs deliberately via `deploy/bin/deploy.sh`.
+### 41. Web search fetched the pages and then withheld them from the model
+
+Found building web search for the chat surface (`enterpriseaiframework-0be`), by measuring
+the pinned LibreChat v0.8.7 rather than by reading its documentation. The item's premise was
+that LibreChat's native `web_search` splits into search, scrape and rerank, that only the
+search leg is required, and that `rerankerType: none` therefore buys a fully free path.
+Two thirds of that is right. The last third is wrong in a way that produces a working-looking
+feature whose citations are not grounded in anything the system read.
+
+**The scrape leg is not optional, and its absence is silent.** `webSearchAuth.scrapers` in
+LibreChat's own `data-schemas` marks `firecrawlApiKey`, `serperApiKey` and `tavilyApiKey` all
+as required; unlike rerankers there is no `none`. With no key configured the failure is not
+an error:
+
+```js
+// @librechat/agents/dist/cjs/tools/search/firecrawl.cjs
+if (!this.apiKey) return [url, { success: false, error: 'FIRECRAWL_API_KEY is not set' }];
+```
+
+That returns before any HTTP request is made, and `handleTools.js` ignores
+`loadWebSearchAuth`'s `authenticated` flag and builds the tool regardless. So `web_search`
+succeeds, hands the model titles, links and search-engine snippets, and the model writes a
+confident answer citing pages that nothing ever retrieved. One `logger.warn` is the only
+trace. This is the fabricated-citation shape in its purest form, and it is the reason the
+bundle now ships `webfetch/` — an Apache-2.0 service of ours that speaks Firecrawl's
+`/v2/scrape` wire contract, so LibreChat's existing client is pointed at it unmodified.
+Self-hosted Firecrawl stays a documented swap: AGPL-3.0, a closed-source cloud-only anti-bot
+engine, and it brings Postgres, Redis, a browser pool and its own LLM keys.
+
+**The finding that actually matters: fetching a page and showing it to the model are two
+different things.** With the scrape leg working — `webfetch`'s `/fetchlog` recording real
+200s and real byte counts for kernel.org pages of 7,545, 12,758, 16,912 and 23,124 bytes —
+the model still received none of that text. `rerankerType: none` is the cause, through a
+chain nothing upstream documents:
+
+```
+createReranker({rerankerType:'none'})  -> undefined
+getHighlights({reranker:undefined})    -> warns, returns undefined
+addHighlights()                        -> source.highlights = undefined
+formatSource()                         -> always emits `Summary: <snippet>`, and emits the
+                                          Highlights section ONLY if highlights is non-empty
+```
+
+`format.ts` says so in its own comment: "per-source `content` stays in the `WEB_SEARCH`
+artifact for citations." The artifact, not the prompt. Measured on this bundle, same
+question, same model, one config line changed:
+
+| `rerankerType` | model-facing tool output | highlight blocks | grounded in |
+|---|---|---|---|
+| `none` | 3,688 chars | 0 | SearXNG snippets |
+| a reranker present | 17,510 chars | 20 | fetched page text |
+
+So the reranker is optional for **authentication** and mandatory for **grounding**. The
+pages are fetched, the bandwidth is spent, and the content is dropped before the prompt is
+built.
+
+**And the obvious workaround is a trap.** `rerankerType: jina` with no key does produce
+highlights — but not for the reason it appears to. `loadWebSearchAuth` cannot authenticate
+jina without `jinaApiKey`, so it leaves `rerankerType` unset; `createSearchTool` then falls
+back to its *own* default of `cohere`; `CohereReranker` finds no `COHERE_API_KEY`, logs
+`"COHERE_API_KEY is not set. Using default ranking."` and returns the first N chunks with
+score 0. You write `jina` and you get Cohere, via two stacked fallbacks, with the vendor name
+in the config naming neither what runs nor what happens. No outbound call is made, so it is
+not a licence or data-path violation — but it is not a default worth shipping on a hunch.
+
+**Where it was left.** `rerankerType: none` is committed, because it is the only value that
+authenticates with no paid key and no fallbacks, and the cost is written above it in
+`librechat.yaml` in full. Web search on this bundle is therefore **snippet-grounded**, and
+`tests/test_web_search.py::TestWhatTheModelActuallyReceives` asserts that measured behaviour
+against LibreChat's own formatter so it cannot be mistaken for working. The search leg and
+the fetch leg are built, tested and correct; the fetch leg becomes load-bearing the moment
+the reranker question (`enterpriseaiframework-405`) is decided, which is one config line
+plus whichever option wins.
+
+**Two smaller traps found in the same pass, both silent.** First, every required `webSearch`
+value must be written as a `${VAR}` placeholder, never as a literal: LibreChat extracts an
+environment-variable *name* from each value (`extractWebSearchEnvVars` →
+`extractVariableName`), so `searxngInstanceUrl: http://searxng:8080` written directly counts
+as a *missing* field, the provider is skipped, and `searchProvider` falls back to `serper`
+with no key. Demonstrated both ways inside the running container by
+`test_librechat_resolves_our_config_and_rejects_the_literal_form`. Second, SearXNG's default
+`formats` is `[html]` only while LibreChat requests `format=json`, so without that one
+setting SearXNG answers 403 and the search leg reports "no results" rather than a
+misconfiguration — which is why the container's healthcheck runs a real JSON query instead of
+a liveness probe.
