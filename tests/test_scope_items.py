@@ -1620,6 +1620,16 @@ class TestItem9ExitPath:
         subprocess.run([str(BUNDLE / "bin" / "provision-chat-key.sh")], check=False,
                        capture_output=True)
         compose("up", "-d", "chat", check=False)
+        # rag-api holds a virtual key too (enterpriseaiframework-c7c), and the exit path
+        # revokes EVERY key, not just chat's. Restoring only chat left file search dead
+        # for the next run: a second consecutive full-suite run failed 4/4 on a 500 from
+        # the upload endpoint, with rag-api logging 401 token_not_found_in_db - a failure
+        # that names the wrong thing entirely. Within a single run the ordering hides it
+        # (file search at 29%, the exit test at 51%), so only a re-run surfaces it.
+        # provision-rag-key.sh is idempotent and re-mints on an invalid key.
+        subprocess.run([str(BUNDLE / "bin" / "provision-rag-key.sh")], check=False,
+                       capture_output=True)
+        compose("up", "-d", "rag-api", check=False)
         httpx.post(f"{control_plane_url}/admin/sync", headers=admin_headers, timeout=TIMEOUT)
         subprocess.run([str(BUNDLE / "bin" / "wait-healthy.sh")], check=False,
                        capture_output=True)
