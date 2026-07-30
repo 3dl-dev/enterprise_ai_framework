@@ -439,8 +439,25 @@ services:
       dockerfile: api/Dockerfile
       target: sandbox-build
     entrypoint: ["/sandbox_api/entrypoint.sh"]
+    # NsJail's cgroupv2 delegation needs the HOST cgroup namespace, not the private one
+    # Docker gives a container by default — without this it fails
+    # enableCgroupSubtree() at the very first job with "nsjail MUST be run from root and
+    # the cgroup mount path must refer to the root/host cgroup", which reads like a
+    # privilege problem but is actually just this one setting. Measured by actually
+    # running it, not inferred from upstream's docker-compose.mac.yml (Docker Desktop's
+    # VM does not need this the same way a native Linux host does).
+    cgroup: host
     security_opt:
       - seccomp=./codeapi/seccomp/nsjail.json
+      # Docker's default AppArmor profile (docker-default) has an unconditional `deny
+      # mount,` rule that overrides Linux capabilities outright — SYS_ADMIN grants the
+      # capability, AppArmor still vetoes the syscall, and nsjail failed at
+      # buildMountTree() with a bare "Permission denied" that reads like a missing
+      # capability rather than a second, independent confinement layer. NsJail's own
+      # restrictive syscall whitelist (the seccomp profile above) is this container's
+      # confinement instead of the host's generic profile, which is not written for a
+      # process whose whole job is namespaces and mounts.
+      - apparmor:unconfined
     cap_add:
       - SYS_ADMIN
       - SYS_CHROOT
@@ -461,6 +478,15 @@ services:
     environment:
       KVM_ENABLED: "false"
       CODEAPI_HARDENED_SANDBOX_MODE: "true"
+      # Docker mounts /sys/fs/cgroup read-only inside a non-privileged container even
+      # with `cgroup: host` above (which fixes the namespace, not the mount mode), so
+      # NsJail's own cgroup v2 delegation (creating a subtree per job) fails with
+      # "Read-only file system" rather than a permissions error. Upstream's OWN
+      # docker-compose.mac.yml sets exactly this to false for its direct-NsJail path —
+      # not a workaround invented here. Isolation cost, stated plainly: per-job
+      # memory/pids cgroup LIMITS are not enforced; namespaces (PID/mount/net/user),
+      # seccomp, and the egress gateway in front of all sandbox traffic still are.
+      SANDBOX_USE_CGROUPV2: "false"
       EGRESS_GATEWAY_URL: http://codeapi-egress-gateway:3190
       SANDBOX_PACKAGES_DIRECTORY: /pkgs
       SANDBOX_LOG_LEVEL: INFO

@@ -34,6 +34,7 @@ import uuid
 import pytest
 
 import chat_turn
+import oidc_login
 from conftest import compose
 
 pytestmark = pytest.mark.usefixtures("stack_up")
@@ -41,6 +42,30 @@ pytestmark = pytest.mark.usefixtures("stack_up")
 TIMEOUT = 180.0
 MODEL = "fake-large"
 ENDPOINT_NAME = "Enterprise AI"
+
+# chat_session (conftest.py) only carries the session cookie from the OIDC login —
+# LibreChat's own API additionally wants a short-lived bearer token minted from that
+# session (packages/api's refresh route), the same two-part scheme
+# tests/test_scope_items.py's _chat_token/_chat_headers use. Duplicated here rather than
+# imported: test_scope_items.py's helper is private to that module by convention, not by
+# any accident this file should route around.
+
+
+def _chat_token(client, chat_url: str) -> str:
+    r = client.post(
+        f"{chat_url}/api/auth/refresh",
+        headers={"Cookie": oidc_login._cookie_header(client)},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["token"]
+
+
+def _chat_headers(client, chat_url: str) -> dict:
+    return {
+        "Authorization": f"Bearer {_chat_token(client, chat_url)}",
+        "Cookie": oidc_login._cookie_header(client),
+    }
 
 
 def _redis_session_key_count(env) -> int:
@@ -72,8 +97,9 @@ class TestChatRunsRealCode:
     def test_correct_answer_the_model_cannot_predict_and_an_afterward_artifact(
         self, chat_session, chat_url, env
     ):
+        headers = _chat_headers(chat_session, chat_url)
         models = chat_session.get(
-            f"{chat_url}/api/models", timeout=TIMEOUT
+            f"{chat_url}/api/models", headers=headers, timeout=TIMEOUT
         ).json().get(ENDPOINT_NAME, [])
         assert MODEL in models, (
             f"{MODEL!r} not offered on {ENDPOINT_NAME!r}: {models} — codeapi wiring "
@@ -92,7 +118,7 @@ class TestChatRunsRealCode:
 
         reply = chat_turn.send_turn(
             chat_session, chat_url, text, model=MODEL, endpoint=ENDPOINT_NAME,
-            execute_code=True, timeout=TIMEOUT,
+            execute_code=True, headers=headers, timeout=TIMEOUT,
         )
         assert reply, "no assistant message was persisted for this turn"
         reply_text = chat_turn.reply_text(reply)
@@ -126,16 +152,23 @@ class TestChatRunsRealCode:
             r"^(CODEAPI_|REDIS_|AWS_|S3_|MINIO_)|SECRET|TOKEN|PASSWORD|PRIVATE_KEY",
             re.IGNORECASE,
         )
-        # The one CODEAPI_*-named exception, by design: a PUBLIC key the sandbox needs
-        # to verify the worker's execution manifest. Not a credential — nothing signs
-        # with it, nothing authenticates with it, and the pattern above would otherwise
-        # also (correctly, but redundantly with this test's own purpose) flag it.
-        allowed_exception = "SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY"
+        # Two CODEAPI_*-named exceptions, matching api/src/secure-startup.ts's own
+        # forbiddenEnvNames() exactly rather than a stricter check this test invents:
+        # - SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY: a PUBLIC key the sandbox needs to
+        #   verify the worker's execution manifest. Not a credential — nothing signs or
+        #   authenticates with it.
+        # - CODEAPI_HARDENED_SANDBOX_MODE: the switch this very check reads to decide
+        #   whether to run at all (`if (name === 'CODEAPI_HARDENED_SANDBOX_MODE')
+        #   continue`) — it cannot both gate the check and be forbidden by it.
+        allowed_exceptions = {
+            "SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY",
+            "CODEAPI_HARDENED_SANDBOX_MODE",
+        }
 
         offenders = []
         for line in _codeapi_sandbox_env(env):
             name = line.partition("=")[0]
-            if not name or name == allowed_exception:
+            if not name or name in allowed_exceptions:
                 continue
             if forbidden.search(name):
                 offenders.append(name)
