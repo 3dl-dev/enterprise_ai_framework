@@ -42,7 +42,8 @@ BROWSER_UA = (
 
 
 def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=None,
-                  manual_skills=None, execute_code=False, web_search=False):
+                  manual_skills=None, execute_code=False, web_search=False,
+                  skills_catalog=False, prompt_prefix=None):
     """The body LibreChat's own client sends for an ephemeral-agent turn.
 
     `ephemeralAgent.mcp` is what attaches an MCP server to an otherwise plain
@@ -74,6 +75,30 @@ def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=Non
     does NOT attach the tool by itself. A turn sent without this flag gets no tool, the
     model answers from weights alone, and the reply can look entirely reasonable while
     citing nothing — so a test that forgot the flag would be testing the model's memory.
+
+    `skills_catalog=True` (enterpriseaiframework-e6f) is the OTHER skills toggle,
+    distinct from `manual_skills` above: it sets `ephemeralAgent.skills = True` with NO
+    `manualSkills` names, which is what exposes the model's own `skill(name)` tool over
+    the FULL accessible catalog (`resolveAgentScopedSkillIds`'s ephemeral-agent branch:
+    `agent.skills_enabled` unset -> `ephemeralSkillsToggle ? scopeSkillIds(..., undefined)
+    : []` — the toggle alone, no forced name, yields the whole catalog). This is
+    "automatic discovery" — the model deciding on its own whether a loaded skill
+    applies — as opposed to `manual_skills`, which is the `$`-popover forcing one in.
+    Setting both is redundant, not additive: `manual_skills` already flips the same
+    toggle, it just also forces specific names via `manualSkills`.
+
+    `prompt_prefix` sets the top-level `promptPrefix` field of the request body.
+    `packages/api/src/agents/load.ts#loadEphemeralAgent` reads it as
+    `req.body?.promptPrefix` and uses it as the ephemeral agent's `instructions` whenever
+    the turn carries no model-spec-level `promptPrefix` of its own (`const instructions =
+    typeof modelPromptPrefix === "string" ? modelPromptPrefix : requestPromptPrefix`).
+    This is the SAME field a modelSpec's own `preset.promptPrefix` populates when a
+    conversation is opened through a spec (`applyModelSpecPreset` merges it into the
+    parsed body before `buildOptions` strips it into `model_parameters`) — sending it
+    directly here exercises the identical server-side code path without needing to
+    resolve a `spec` name against `modelSpecs.list` first, which is what lets a test
+    compare "this system prompt" against "no system prompt" on a turn sent by bare
+    model + endpoint, exactly as every other test in this module already does.
     """
     body = {
         "text": text,
@@ -96,12 +121,16 @@ def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=Non
     if manual_skills:
         ephemeral_agent["skills"] = True
         body["manualSkills"] = list(manual_skills)
+    elif skills_catalog:
+        ephemeral_agent["skills"] = True
     if execute_code:
         ephemeral_agent["execute_code"] = True
     if web_search:
         ephemeral_agent["web_search"] = True
     if ephemeral_agent:
         body["ephemeralAgent"] = ephemeral_agent
+    if prompt_prefix is not None:
+        body["promptPrefix"] = prompt_prefix
     return body
 
 
@@ -221,12 +250,14 @@ def tool_calls(message):
 
 def send_turn(client, chat_url, text, model, endpoint, endpoint_type="custom",
               mcp_servers=None, manual_skills=None, execute_code=False,
-              web_search=False, headers=None, timeout=180.0):
+              web_search=False, skills_catalog=False, prompt_prefix=None,
+              headers=None, timeout=180.0):
     """One turn, end to end, on either protocol. Returns the persisted assistant message."""
     payload = build_payload(
         text, model, endpoint, endpoint_type, mcp_servers,
         manual_skills=manual_skills, execute_code=execute_code,
-        web_search=web_search,
+        web_search=web_search, skills_catalog=skills_catalog,
+        prompt_prefix=prompt_prefix,
     )
     conversation_id, _ = start_turn(
         client, chat_url, payload, headers=headers, timeout=timeout
