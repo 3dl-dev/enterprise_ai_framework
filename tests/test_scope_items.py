@@ -1570,6 +1570,17 @@ class TestCacheHitsBudgetAndTheBill:
         <th> silently shifts every column after it, so the operator reads the free count
         under "Tokens" and the spend under nothing. That is a rendering bug this test
         catches; whether the browser paints it is not.
+
+        THE PER-SURFACE SUBTOTALS ARE NOT COVERED HERE, and cannot be: there is no
+        per-surface table in the operator console to parse. `/portal/api/admin/overview`
+        carries requests / cached / failed / refused per surface inside each person, and the
+        admin table renders surfaces as a comma-joined list of names only. That is the same
+        shape as d58's defect — a number carried in JSON and rendered nowhere — and it is
+        stated rather than left to be discovered. The per-surface numbers ARE asserted at the
+        API level by
+        TestARefusalIsNotAFailedRequestAndIsNotUsage::test_the_portal_and_the_bill_agree_about_the_refusals,
+        so they cannot drift from the person-level ones; what is not proven is that any
+        operator ever sees them.
         """
         admin = "anyone"  # /portal/ and its assets need a user, not an operator.
         status, page = portal_get("/portal/", admin)
