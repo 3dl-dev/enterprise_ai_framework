@@ -281,6 +281,80 @@ services:
       retries: 20
     restart: unless-stopped
 
+  # ---- file search (enterpriseaiframework-c7c) -------------------------------------
+  #
+  # Storage and retrieval are ours: a dedicated Postgres/pgvector instance (same
+  # database technology as the welded platform state, a separate instance for the same
+  # reason chatdb is a separate Mongo — this is rag_api's own requirement, not a change
+  # to the platform's state layer) plus rag_api itself (danny-avila/rag_api, MIT,
+  # no user-count/seat/feature trigger), the FastAPI service LibreChat's own
+  # file_search tool talks to. No hosted/third-party vector service is in the data
+  # path — everything below runs in this compose network.
+  ragvector:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ragapi
+      POSTGRES_USER: ${RAGVECTOR_USER:-ragapi}
+      POSTGRES_PASSWORD: ${RAGVECTOR_PASSWORD:?set RAGVECTOR_PASSWORD in .env}
+    volumes:
+      - ragvectordata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${RAGVECTOR_USER:-ragapi} -d ragapi"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # LibreChat's own document_routes.py double-checks every /query against the
+  # embedding-time `user_id` stored in pgvector's document metadata, independent of
+  # whatever LibreChat's backend already filtered — partition by construction at TWO
+  # layers, not one, and the identity on both sides comes from a JWT LibreChat's
+  # backend signs SERVER-SIDE with the AUTHENTICATED user's id (packages/api's
+  # generateShortLivedToken), never from anything a caller asserts (Finding 27). Shares
+  # JWT_SECRET with `chat` for exactly that reason: rag_api verifies the signature
+  # itself rather than trusting the bearer at face value.
+  #
+  # RAG_OPENAI_BASEURL points at the GATEWAY, not at any provider directly — an
+  # uploaded file's embedding call is billed and audited like any other request,
+  # attributed to the RAG_VIRTUAL_KEY principal minted below (bin/provision-rag-key.sh).
+  # Measured, not assumed: tests/test_file_search.py asserts a ledger row lands under
+  # that alias for every embed call. What it does NOT do — see the same test file and
+  # the item's own finding — is attribute that spend to the individual uploading user;
+  # rag_api's embeddings client is one process-wide instance with no per-request `user`
+  # field, so the granularity here is "the file-search service", not "the uploader",
+  # same shape as chat's own CHAT_VIRTUAL_KEY being one shared surface credential.
+  #
+  # `EMBEDDINGS_MODEL: fake-embed` is the bundle default (fakeprovider/app.py's
+  # deterministic /v1/embeddings, scope item 8: testable with no provider account).
+  # Swap to a real embeddings model by pointing this at one already in the gateway's
+  # catalog — no other file changes.
+  rag-api:
+    image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest
+    environment:
+      DB_HOST: ragvector
+      DB_PORT: "5432"
+      POSTGRES_DB: ragapi
+      POSTGRES_USER: ${RAGVECTOR_USER:-ragapi}
+      POSTGRES_PASSWORD: ${RAGVECTOR_PASSWORD:?set RAGVECTOR_PASSWORD in .env}
+      RAG_PORT: "8000"
+      JWT_SECRET: ${CHAT_JWT_SECRET:?set CHAT_JWT_SECRET in .env}
+      EMBEDDINGS_PROVIDER: openai
+      EMBEDDINGS_MODEL: fake-embed
+      RAG_OPENAI_BASEURL: http://gateway:4000/v1
+      RAG_OPENAI_API_KEY: ${RAG_VIRTUAL_KEY:-}
+    depends_on:
+      ragvector:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
   chatdb:
     image: mongo:7
     command: ["--quiet"]
@@ -783,6 +857,13 @@ services:
       MEILI_HOST: http://meilisearch:7700
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY in .env}
       MEILI_NO_SYNC: "false"
+      # File search (enterpriseaiframework-c7c). Unset, this is exactly the
+      # "RAG API is either not running or not reachable at undefined" warning the item
+      # started from — LibreChat's file_search tool silently has nowhere to embed or
+      # query uploaded documents. Ours: storage and retrieval are both on this compose
+      # network (bundle/docker-compose.yml's `ragvector` + `rag-api`), no hosted
+      # third-party vector service in the data path.
+      RAG_API_URL: http://rag-api:8000
     volumes:
       - ./librechat/librechat.yaml:/app/librechat.yaml:ro
       - ./certs:/certs:ro
@@ -822,6 +903,11 @@ services:
         condition: service_healthy
       rerank:
         condition: service_healthy
+      # Same reasoning as webfetch/rerank above: rag-api is entirely ours, on this
+      # network, with no external dependency, so an unreachable RAG API is a real
+      # failure to surface at startup rather than a degraded-but-tolerable leg.
+      rag-api:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
       interval: 10s
@@ -835,6 +921,7 @@ volumes:
   valkeydata:
   chatdbdata:
   meilidata:
+  ragvectordata:
   codeapiredisdata:
   codeapiminiodata:
   codeapipkgs:

@@ -43,7 +43,8 @@ BROWSER_UA = (
 
 def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=None,
                   manual_skills=None, execute_code=False, web_search=False,
-                  skills_catalog=False, prompt_prefix=None):
+                  skills_catalog=False, prompt_prefix=None, file_search=False,
+                  files=None):
     """The body LibreChat's own client sends for an ephemeral-agent turn.
 
     `ephemeralAgent.mcp` is what attaches an MCP server to an otherwise plain
@@ -99,6 +100,23 @@ def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=Non
     resolve a `spec` name against `modelSpecs.list` first, which is what lets a test
     compare "this system prompt" against "no system prompt" on a turn sent by bare
     model + endpoint, exactly as every other test in this module already does.
+
+    `file_search=True` (enterpriseaiframework-c7c) sets `ephemeralAgent.file_search`,
+    the file_search twin of `web_search` above — `packages/api/src/agents/added.ts`'s
+    check is the identical shape: `ephemeralAgent?.file_search === true ||
+    modelSpec?.fileSearch === true`. Without it the turn gets no file_search tool even
+    if `files` below names real, previously-uploaded, embedded files.
+
+    `files` is the wire shape LibreChat's own upload response already comes in
+    (`[{file_id, filename, type, ...}, ...]` from `POST /api/files`) — passed straight
+    through as the message's top-level `files` field, `api/server/controllers/
+    agents/request.js`'s `req.body.files`. THIS ALONE DOES NOT GRANT ACCESS: the
+    server re-resolves every file_id against `req.user.id`
+    (`packages/data-schemas/src/methods/file.ts#updateFileUsage`'s owner-scoped
+    query) before it becomes an attachment the file_search tool can see — a file_id
+    naming someone else's document is silently dropped, not served. That
+    fail-closed, identity-from-the-session (not from this field) behavior is exactly
+    what tests/test_file_search.py's cross-user test exercises.
     """
     body = {
         "text": text,
@@ -127,10 +145,14 @@ def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=Non
         ephemeral_agent["execute_code"] = True
     if web_search:
         ephemeral_agent["web_search"] = True
+    if file_search:
+        ephemeral_agent["file_search"] = True
     if ephemeral_agent:
         body["ephemeralAgent"] = ephemeral_agent
     if prompt_prefix is not None:
         body["promptPrefix"] = prompt_prefix
+    if files:
+        body["files"] = list(files)
     return body
 
 
@@ -251,13 +273,13 @@ def tool_calls(message):
 def send_turn(client, chat_url, text, model, endpoint, endpoint_type="custom",
               mcp_servers=None, manual_skills=None, execute_code=False,
               web_search=False, skills_catalog=False, prompt_prefix=None,
-              headers=None, timeout=180.0):
+              file_search=False, files=None, headers=None, timeout=180.0):
     """One turn, end to end, on either protocol. Returns the persisted assistant message."""
     payload = build_payload(
         text, model, endpoint, endpoint_type, mcp_servers,
         manual_skills=manual_skills, execute_code=execute_code,
         web_search=web_search, skills_catalog=skills_catalog,
-        prompt_prefix=prompt_prefix,
+        prompt_prefix=prompt_prefix, file_search=file_search, files=files,
     )
     conversation_id, _ = start_turn(
         client, chat_url, payload, headers=headers, timeout=timeout

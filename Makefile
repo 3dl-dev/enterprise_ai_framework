@@ -20,9 +20,10 @@ up:
 	@$(BUNDLE)/bin/render-env.sh
 	@$(BUNDLE)/bin/make-certs.sh
 	@$(BUNDLE)/bin/render-gateway-config.py
-	@$(COMPOSE) up -d --build postgres valkey fakeprovider identity gateway control-plane
+	@$(COMPOSE) up -d --build postgres valkey fakeprovider identity gateway control-plane ragvector
 	@$(BUNDLE)/bin/wait-healthy.sh
 	@$(BUNDLE)/bin/provision-chat-key.sh
+	@$(BUNDLE)/bin/provision-rag-key.sh
 	@$(COMPOSE) up -d --build
 	@$(BUNDLE)/bin/wait-healthy.sh
 	@$(BUNDLE)/bin/post-up.sh

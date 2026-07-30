@@ -1,0 +1,146 @@
+# File search for the chat surface (enterpriseaiframework-c7c).
+#
+# NOT YET APPLIED TO THE CLUSTER. Same reasoning as 07-web-search.yaml: written in the
+# same commit as the chat Deployment change that references it (deploy/k8s/50-chat.yaml's
+# RAG_API_URL env var), because a chat pod that offers file_search with no reachable RAG
+# API is exactly the cluster's own observed symptom this item started from —
+#   warn: RAG API is either not running or not reachable at undefined, you may
+#   experience errors with file uploads
+# — a silent failure mode with nothing in the UI to say why.
+#
+# Storage and retrieval are ours: a dedicated Postgres/pgvector instance (`ragvector`,
+# same reasoning as `chatdb` being a separate Mongo instance — this is rag_api's own
+# storage requirement, not a change to the welded platform state layer) plus rag_api
+# itself (`rag-api`, danny-avila/rag_api, MIT, no user-count/seat/revenue/feature
+# trigger — see bundle/docker-compose.yml for the fuller reasoning). No hosted
+# third-party vector service is in the data path.
+#
+# rag-api's embedding calls go through the GATEWAY (RAG_OPENAI_BASEURL below), billed
+# and audited under the RAG_VIRTUAL_KEY secret this manifest expects to already exist —
+# minted the same way CHAT_VIRTUAL_KEY is (deploy/bin/post-deploy.sh), not baked in here.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ragvector
+  namespace: enterprise-ai
+spec:
+  clusterIP: None          # headless — the StatefulSet addresses it directly
+  selector:
+    app: ragvector
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ragvector
+  namespace: enterprise-ai
+spec:
+  serviceName: ragvector
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ragvector
+  template:
+    metadata:
+      labels:
+        app: ragvector
+    spec:
+      # Same collision class 07-web-search.yaml's webfetch/rerank comments document: a
+      # Service named `ragvector` would inject RAGVECTOR_PORT, and one named `rag-api`
+      # below would inject RAG_API_PORT — neither container reads a var by either name,
+      # but every new Service here still gets this set explicitly rather than relying on
+      # that being true forever.
+      enableServiceLinks: false
+      containers:
+        - name: ragvector
+          image: pgvector/pgvector:pg16
+          env:
+            - name: POSTGRES_DB
+              value: ragapi
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: RAGVECTOR_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: RAGVECTOR_PASSWORD } }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d ragapi"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { memory: "1Gi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rag-api
+  namespace: enterprise-ai
+spec:
+  selector: { app: rag-api }
+  ports: [{ name: http, port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rag-api
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: rag-api } }
+  template:
+    metadata:
+      labels: { app: rag-api }
+    spec:
+      enableServiceLinks: false
+      containers:
+        - name: rag-api
+          image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest
+          env:
+            - name: DB_HOST
+              value: ragvector
+            - { name: DB_PORT, value: "5432" }
+            - { name: POSTGRES_DB, value: ragapi }
+            - name: POSTGRES_USER
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: RAGVECTOR_USER } }
+            - name: POSTGRES_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: RAGVECTOR_PASSWORD } }
+            - { name: RAG_PORT, value: "8000" }
+            # Verifies the SAME short-lived JWT LibreChat mints per file_search/embed
+            # request naming the AUTHENTICATED user (packages/api's
+            # generateShortLivedToken) — never a caller-asserted identity (Finding 27).
+            - name: JWT_SECRET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_JWT_SECRET } }
+            - { name: EMBEDDINGS_PROVIDER, value: "openai" }
+            # Bundle default is fake-embed (fakeprovider's deterministic /v1/embeddings).
+            # A real deployment points this at a real embeddings model already in the
+            # gateway's catalog — no other value here changes.
+            - { name: EMBEDDINGS_MODEL, value: "fake-embed" }
+            - { name: RAG_OPENAI_BASEURL, value: "http://gateway:4000/v1" }
+            - name: RAG_OPENAI_API_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: RAG_VIRTUAL_KEY } }
+          ports: [{ containerPort: 8000 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 15
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { memory: "1Gi" }

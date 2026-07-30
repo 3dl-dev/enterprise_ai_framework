@@ -112,6 +112,38 @@ MCP_ECHO_MARKER_RE = re.compile(r"CALL_MCP_ECHO:(.*)", re.DOTALL)
 
 MCP_ECHO_TOOL_NAME = "echo_mcp_echo"
 
+# --------------------------------------------------------------------------
+# File search tool calling (enterpriseaiframework-c7c)
+#
+# Same inversion as EXECUTE_BASH/CALL_MCP_ECHO above, for the same reason: fakeprovider
+# must never be the thing that proves a document was retrieved, because it could just as
+# easily make up plausible-sounding file content on its own. A nonce planted in an
+# uploaded file and echoed back by the model would prove nothing about whether
+# file_search — and the real RAG API, and the real embedding call through the gateway —
+# ever ran.
+#
+# So fakeprovider only ever DECIDES to call the real `file_search` tool (LibreChat's
+# agents framework then executes it against the real rag_api service over the real
+# network) and relays whatever comes back verbatim — the existing find_tool_result()
+# relay branch below already does this for ANY tool, unmodified.
+# --------------------------------------------------------------------------
+
+FILE_SEARCH_MARKER_RE = re.compile(r"SEARCH_FILES:(.*)", re.DOTALL)
+
+FILE_SEARCH_TOOL_NAME = "file_search"
+
+
+def find_file_search_query(messages: list) -> str | None:
+    """The query from a user-authored `SEARCH_FILES:<query>` marker, most recent user
+    message first. None if no message carries one."""
+    for m in reversed(messages or []):
+        if m.get("role") != "user":
+            continue
+        match = FILE_SEARCH_MARKER_RE.search(_message_text(m))
+        if match:
+            return match.group(1).strip()
+    return None
+
 
 def _message_text(message: dict) -> str:
     content = message.get("content", "")
@@ -192,8 +224,60 @@ async def openai_models():
         "object": "list",
         "data": [
             {"id": m, "object": "model", "owned_by": "fake-provider"}
-            for m in ("fake-gpt-large", "fake-gpt-small")
+            for m in ("fake-gpt-large", "fake-gpt-small", "fake-embed")
         ],
+    }
+
+
+# --------------------------------------------------------------------------
+# Embeddings (enterpriseaiframework-c7c) — file search's embedding leg.
+#
+# rag_api's own vector-store client determines a fixed dimension ONCE at startup
+# (embedding a probe string) and every later call must return vectors of the same
+# length, or pgvector's fixed-width column rejects the insert. Deterministic hashing
+# into a FIXED_DIMS-length vector satisfies that without needing any real model:
+# same input text always yields the same vector, different text yields a different
+# one, and the length never varies. It is not semantically meaningful — this bundle
+# never asks it to distinguish between multiple candidate documents by relevance, only
+# to prove the round trip (gateway -> fakeprovider -> pgvector -> back out) works and
+# is billed like any other request.
+# --------------------------------------------------------------------------
+
+EMBED_DIMS = 64
+
+
+def _deterministic_embedding(text: str) -> list[float]:
+    vec: list[float] = []
+    counter = 0
+    while len(vec) < EMBED_DIMS:
+        digest = hashlib.sha256(f"{counter}\x00{text}".encode()).digest()
+        for i in range(0, len(digest) - 1, 2):
+            if len(vec) >= EMBED_DIMS:
+                break
+            # Two bytes -> a value in [-1.0, 1.0].
+            raw = int.from_bytes(digest[i : i + 2], "big")
+            vec.append((raw / 65535.0) * 2.0 - 1.0)
+        counter += 1
+    return vec
+
+
+@openai_router.post("/embeddings")
+async def openai_embeddings(request: Request):
+    body = await request.json()
+    model = body.get("model", "fake-embed")
+    raw_input = body.get("input", "")
+    texts = raw_input if isinstance(raw_input, list) else [raw_input]
+    texts = [str(t) for t in texts]
+    data = [
+        {"object": "embedding", "index": i, "embedding": _deterministic_embedding(t)}
+        for i, t in enumerate(texts)
+    ]
+    tokens = sum(count_tokens(t) for t in texts) or 1
+    return {
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": {"prompt_tokens": tokens, "total_tokens": tokens},
     }
 
 
@@ -378,6 +462,13 @@ async def openai_chat(request: Request):
         if not body.get("stream"):
             return _tool_call_completion(cid, model, created, MCP_ECHO_TOOL_NAME, {"text": mcp_echo_arg})
         return _tool_call_stream(cid, model, created, MCP_ECHO_TOOL_NAME, {"text": mcp_echo_arg})
+
+    file_search_query = find_file_search_query(messages)
+    if file_search_query is not None:
+        cid = "fakecmpl-" + hashlib.sha256(("file-search:" + file_search_query).encode()).hexdigest()[:16]
+        if not body.get("stream"):
+            return _tool_call_completion(cid, model, created, FILE_SEARCH_TOOL_NAME, {"query": file_search_query})
+        return _tool_call_stream(cid, model, created, FILE_SEARCH_TOOL_NAME, {"query": file_search_query})
 
     prompt = extract_prompt(messages)
     text = reply_text(prompt, model)
