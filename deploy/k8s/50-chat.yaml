@@ -210,6 +210,13 @@ spec:
             - { name: JINA_API_URL, value: "http://rerank:3003/v1/rerank" }
             - name: JINA_API_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: RERANK_TOKEN } }
+            # Conversation search (enterpriseaiframework-2a6): LibreChat's own native
+            # search (api/server/routes/search.js, the mongoMeili mongoose plugin),
+            # not something we built. Service in deploy/k8s/11-data.yaml.
+            - { name: SEARCH, value: "true" }
+            - { name: MEILI_HOST, value: "http://meilisearch:7700" }
+            - name: MEILI_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: MEILI_MASTER_KEY } }
           ports: [{ containerPort: 3080 }]
           volumeMounts:
             - { name: config, mountPath: /app/librechat.yaml, subPath: librechat.yaml, readOnly: true }

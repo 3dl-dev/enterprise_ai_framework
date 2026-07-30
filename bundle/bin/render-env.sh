@@ -212,6 +212,13 @@ ensure RERANK_TOKEN                "rr-$(hex 24)"
 # SearXNG refuses to start on its upstream placeholder secret.
 ensure SEARXNG_SECRET              "$(hex 24)"
 
+# Conversation search (enterpriseaiframework-2a6). This is LibreChat's own native
+# search feature (packages/data-schemas/src/models/plugins/mongoMeili.ts) — MEILI_HOST
+# + MEILI_MASTER_KEY + SEARCH=true turn it on. MEILI_MASTER_KEY authenticates
+# LibreChat's Meilisearch client against the self-hosted meilisearch service below;
+# it is never sent anywhere outside the bundle.
+ensure MEILI_MASTER_KEY            "ms-$(hex 24)"
+
 # Bootstrap realm user, so a fresh bundle can be signed in to without manual steps.
 # The first two are not secrets, but they must exist in .env for post-up to provision
 # the account — an .env written before these were added would otherwise skip it silently.

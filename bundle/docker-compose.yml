@@ -291,6 +291,48 @@ services:
       interval: 10s
       timeout: 5s
       retries: 20
+
+  # ---------------------------------------------------------------------------------
+  # meilisearch: conversation search (enterpriseaiframework-2a6). Configuration, not
+  # construction — LibreChat v0.8.7 ships native search (api/server/routes/search.js,
+  # packages/data-schemas/src/methods/conversation.ts's meiliSearch branch of
+  # getConvosByCursor, and the mongoMeili mongoose plugin that indexes every message
+  # and conversation on save). Turning it on is SEARCH=true + MEILI_HOST +
+  # MEILI_MASTER_KEY on the chat container below and this service.
+  #
+  # LICENSE: self-hosting the OSS `getmeili/meilisearch` image. The engine itself is
+  # MIT (LICENSE-MIT); only Meilisearch's Enterprise Edition extensions (multi-tenant
+  # SSO/RBAC dashboards, analytics add-ons) sit under a separate BSL-1.1 file
+  # (LICENSE-EE) and are not used here — this deployment runs the community search
+  # and filter API only, no seat/feature/user-count gate on the capability we use.
+  # Passes the component-defaults rule.
+  #
+  # Per-user scoping is NOT something we build: mongoMeili tags every indexed
+  # document with the owning user, api/server/routes/convos.js's GET / always scopes
+  # its Mongo query to req.user.id first, and the meiliSearch call itself is issued
+  # with `filter: user = "<searching user's id>"`. Search never returns another
+  # user's conversation. tests/test_conversation_search.py proves this end to end,
+  # including the negative case (rd 2a6 done condition).
+  meilisearch:
+    image: getmeili/meilisearch:v1.11
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY in .env}
+      MEILI_ENV: production
+      # Air-gap capable: MEILI_NO_ANALYTICS stops Meilisearch's own anonymous-usage
+      # ping to its own telemetry endpoint. Not 3DL's telemetry (there is none in this
+      # data path either way) — this is Meilisearch's own default phone-home, off.
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meilidata:/meili_data
+    healthcheck:
+      # 127.0.0.1, NOT localhost: this image resolves `localhost` to ::1 first via
+      # /etc/hosts/nsswitch, but meilisearch only binds the IPv4 0.0.0.0:7700 —
+      # `wget http://localhost:7700` connection-refuses forever against ::1 while the
+      # server is genuinely healthy on IPv4. Measured on this exact image (v1.11).
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:7700/health | grep -q available"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------------
@@ -730,6 +772,16 @@ services:
       # appends nothing. Swapping to a real Jina/Cohere key is these two values.
       JINA_API_URL: http://rerank:3003/v1/rerank
       JINA_API_KEY: ${RERANK_TOKEN:?set RERANK_TOKEN in .env}
+      # ---- conversation search (enterpriseaiframework-2a6) ------------------------
+      # LibreChat's own native feature (see the meilisearch service comment above).
+      # SEARCH=true turns on both api/server/routes/search.js's /enable check and the
+      # mongoMeili plugin's real-time index-on-save for every Message and
+      # Conversation document. MEILI_MASTER_KEY is never presented to the browser —
+      # it stays server-side, between chat and meilisearch.
+      SEARCH: "true"
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY in .env}
+      MEILI_NO_SYNC: "false"
     volumes:
       - ./librechat/librechat.yaml:/app/librechat.yaml:ro
       - ./certs:/certs:ro
@@ -751,6 +803,12 @@ services:
       mcp-echo:
         condition: service_healthy
       codeapi:
+        condition: service_healthy
+      # Gates startup: search silently returning nothing (a healthy-looking chat
+      # surface whose meiliSearch calls always 5xx) is exactly the failure mode this
+      # item exists to close, so meilisearch being up is a precondition, same as
+      # webfetch/rerank below.
+      meilisearch:
         condition: service_healthy
       # webfetch and rerank both gate startup: without either, web_search either fetches
       # nothing (no scraper key) or fetches and then withholds it from the model (no
@@ -775,6 +833,7 @@ volumes:
   pgdata:
   valkeydata:
   chatdbdata:
+  meilidata:
   codeapiredisdata:
   codeapiminiodata:
   codeapipkgs:

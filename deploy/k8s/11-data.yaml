@@ -81,3 +81,55 @@ spec:
       spec:
         accessModes: ["ReadWriteOnce"]
         resources: { requests: { storage: 10Gi } }
+---
+# Meilisearch: backs LibreChat's own conversation search (enterpriseaiframework-2a6).
+# MIT-licensed core (LICENSE-MIT in getmeili/meilisearch) — only the separate
+# Enterprise Edition file (LICENSE-EE, BSL-1.1) is not what runs here. Same
+# durability posture as chatdb above: it holds a derived index over LibreChat's own
+# Mongo state, not anything of ours, so a PVC belongs here for the same reason.
+apiVersion: v1
+kind: Service
+metadata:
+  name: meilisearch
+  namespace: enterprise-ai
+spec:
+  selector: { app: meilisearch }
+  ports: [{ port: 7700, targetPort: 7700 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: meilisearch
+  namespace: enterprise-ai
+spec:
+  serviceName: meilisearch
+  replicas: 1
+  selector: { matchLabels: { app: meilisearch } }
+  template:
+    metadata:
+      labels: { app: meilisearch }
+    spec:
+      containers:
+        - name: meilisearch
+          image: getmeili/meilisearch:v1.11
+          env:
+            - name: MEILI_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: MEILI_MASTER_KEY } }
+            - { name: MEILI_ENV, value: "production" }
+            # Air-gap capable: stops Meilisearch's own anonymous-usage ping to ITS
+            # telemetry endpoint (not 3DL's — there is none in this path either way).
+            - { name: MEILI_NO_ANALYTICS, value: "true" }
+          ports: [{ containerPort: 7700 }]
+          volumeMounts: [{ name: data, mountPath: /meili_data }]
+          readinessProbe:
+            httpGet: { path: /health, port: 7700 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { memory: "1Gi" }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 5Gi } }
