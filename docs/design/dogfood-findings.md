@@ -1172,3 +1172,114 @@ looked adequate and were not:
   a synthetic LibreChat account any more: the person they bill is the bundle's real
   bootstrap user, signed in through the real identity provider, so the rows they leave are
   rows the bill should carry.
+
+### 41. Both surfaces already ship a native Skills primitive, and their SKILL.md dialects disagree
+
+Preparatory investigation for `enterpriseaiframework-6ff`, whose architecture decision is
+reserved for the founder. Nothing here was built; this records what is true so the ruling
+can be made from measurement rather than from the item's original premise, which is wrong
+in three places.
+
+**Measured on the cluster (read-only).** `GET /api/config` on the chat NodePort answers
+`"buildInfo": {"branch": "v0.8.7", "commitShort": "9e74cc0", "buildDate":
+"2026-06-24"}` — the upgraded image is serving. Our `bundle/librechat/librechat.yaml` has
+no `endpoints.agents` block, so `defaultAgentCapabilities` applies verbatim, and
+`AgentCapabilities.skills` is in that list (`packages/data-provider/src/config.ts:689`).
+The chat Deployment mounts exactly one volume — `chat-config` → `/app/librechat.yaml` —
+and sets no `DEPLOYMENT_SKILLS_DIR`. So the capability is on and there is no skill content
+of any kind in the deployment today.
+
+**Everything below is a read of the shipped v0.8.7 image and of opencode's pinned
+v1.18.7 source, not a runtime measurement.** Stated plainly because the distinction
+matters: none of it has been exercised end to end.
+
+**A v0.8.7 skill is a database row, not a directory.** `createSkill` writes a Mongo
+`Skill` document (`packages/data-schemas/src/schema/skill.ts`) and `upsertSkillFile`
+writes each accompanying file through the *file-storage strategy* under a uuid-prefixed
+name. Three ingestion paths converge on that same row: the UI author, `POST
+/api/skills/import` (`.md` / `.zip` / `.skill`, 50 MB), and `skillSync.github`. The
+filesystem is only a *fourth* and different thing — `DEPLOYMENT_SKILLS_DIR` (default
+`/app/skill`) is scanned once by `initializeDeploymentSkills` and held in a
+module-level singleton, explicitly "not persisted as Skill documents in MongoDB".
+
+Three consequences of that fourth path, all load-bearing:
+
+- **It reloads only on restart.** There is no watcher and no re-scan; `registry` is
+  assigned once in `api/server/index.js:124`. Editing a mounted skill means restarting
+  the shared chat Deployment.
+- **A bad skill takes the surface down at boot.** That `await` is unguarded, and both
+  `loadDeploymentSkillsFromDirectory` (missing directory, when explicitly configured) and
+  `loadDeploymentSkill` (malformed `SKILL.md`) throw. Tenant content becomes a boot-time
+  hard dependency of chat.
+- **It has no tenant scoping.** `loadDeploymentSkill` takes no `tenantId` and the README
+  says "exposed read-only to all users with Skills enabled". `skillSync.github` sources
+  *do* carry `tenantId`. So the cheap filesystem path is per-deployment, and the
+  tenant-scoped path is the GitHub one.
+
+**`skillSync.github` cannot be air-gapped.** `GITHUB_API_BASE` is the hardcoded constant
+`'https://api.github.com'` in `packages/api/src/skills/sync/github.ts:28`. There is no
+base-URL override in `skillSyncGitHubSourceSchema` (`owner`, `repo`, `ref`, `paths`,
+`credentialKey`/`token`, `tenantId`), so GitHub Enterprise, Gitea and GitLab are all out,
+and so is any deployment with no route to github.com. It also writes to Mongo and to the
+file-storage strategy — **not** to a filesystem tree another surface could read.
+
+**The frontmatter contract is strict, and it is a different set on each surface.**
+LibreChat validates in strict mode and *rejects* unknown keys
+(`validateSkillFrontmatter`, `ALLOWED_FRONTMATTER_KEYS` at
+`packages/data-schemas/src/methods/skill.ts:244`): `name`, `description`, `when-to-use`,
+`allowed-tools`, `arguments`, `argument-hint`, `user-invocable`,
+`disable-model-invocation`, `always-apply`/`alwaysApply`, `model`, `effort`, `context`,
+`agent`, `paths`, `shell`, `hooks`, `version`, `license`, `metadata`. opencode 1.18.7
+decodes `name`, `description`, `slash` through an Effect `Schema.Struct` with
+`decodeUnknownOption` (`packages/core/src/skill.ts`), which *strips* excess properties
+rather than erroring. The asymmetry is the useful part: **a SKILL.md written to
+LibreChat's key set is readable by opencode; the reverse is not true** — `slash` and
+`compatibility` are rejected by LibreChat. The portable-by-construction intersection is
+`name`, `description`, `license`, `metadata`.
+
+**opencode has its own native `skill` tool, so "MCP-served skills" is dominated.** The
+item's premise was that native skills are LibreChat-only and MCP was the only way to reach
+the terminal agent. opencode 1.18.7 discovers `SKILL.md` from `.opencode/skills/`,
+`~/.config/opencode/skills/`, and the Claude-Code-compatible `.claude/skills/` and
+`.agents/skills/`, walking up to the git worktree root, and exposes a native
+`skill({name})` tool with `allow`/`deny`/`ask` permission patterns. Its config schema at
+that version also accepts a top-level `skills` key —
+`{ paths: [...], urls: [...] }` (`packages/core/src/v1/config/skills.ts`) — which our
+`deploy/workspace/opencode.json` does not currently set. Neither surface needs an MCP
+server to have skills.
+
+**The URL source is a real cross-surface transport, with two catches.**
+`SkillDiscovery.pull` does `GET <base>/index.json`, expecting
+`{"skills":[{"name","version?","files":["SKILL.md", ...]}]}`, then fetches
+`<base>/<name>/<file>` for each — same-origin enforced, path traversal rejected, `version`
+used as a cache key against `.opencode-version`. Catch one: `download` issues a plain
+`HttpClientRequest.get` with no credential, so the index and every file must be readable
+**unauthenticated** — an index of tenant skills is not an access-controlled object. Catch
+two: per finding 22 and `enterpriseaiframework-784`, a workspace pod's NetworkPolicy
+permits egress to kube-dns and the gateway only, so the URL would have to be served from
+the gateway or from a newly permitted destination, which is the authority grant 784 exists
+to review.
+
+**The item's done-condition depends on `enterpriseaiframework-082`.** 6ff asks for
+behaviour that uses "a resource from the skill directory the model could not have known
+otherwise". Two different mechanisms carry a skill into a turn, and only one of them is
+free. The `SKILL.md` **body** is injected as a `HumanMessage` tagged
+`additional_kwargs.source = 'skill'` and needs nothing else. The skill's **files**
+(`references/`, `scripts/`, assets) reach the model only through the code-execution
+sandbox: `primeInvokedSkills` gates the whole upload on
+`if (deps.codeEnvAvailable && skillsWithFiles.length > 0)`
+(`packages/api/src/agents/skillFiles.ts:394`) and pushes them via
+`batchUploadCodeEnvFiles` into a `Constants.EXECUTE_CODE` session. With no code
+environment the files are silently never delivered — no error, no log the user sees, the
+model simply cannot see `references/*`. So a reference-file demonstration is blocked on
+the code-execution decision (082); a body-only demonstration is not.
+
+Two smaller corrections to the item text while here. `allowed-tools` does exist and is
+forwarded verbatim as `allowedTools`, but the schema comment says it unions into the
+effective tool set for **manually-primed** skills only — a model-invoked skill gets no tool
+union, because adding a tool mid-turn would require a graph rebuild. And skills work on our
+surface even though we configure `endpoints.custom` rather than `endpoints.agents`:
+`resolveAgentScopedSkillIds` has an `isEphemeralAgentId` branch, so a plain custom-endpoint
+conversation gets skills subject to a per-conversation toggle, and `resolveModelSpecSkillIds`
+lets a `modelSpecs` entry name skills by name — which is a `librechat.yaml` change, i.e. a
+ConfigMap deploy.
