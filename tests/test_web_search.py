@@ -878,6 +878,80 @@ class TestWhatTheModelActuallyReceives:
             "diagnosis in librechat.yaml (highlights are the only channel) is wrong"
         )
 
+    def test_our_rerank_service_through_the_real_client_and_formatter_grounds_the_prompt(
+        self,
+    ):
+        """RESTORES A REAL MEASUREMENT (enterpriseaiframework-0be re-dispatch,
+        challenge 3). The test above proves the FORMATTER'S contract with a hand-built
+        highlights fixture — a marker the test itself invented, standing in for what a
+        reranker would produce. That is legitimate for what it proves, but it is not
+        proof that rerank/'s OWN output, run through the pipeline, ever produces a
+        highlight: the previous version of this branch had a live measurement of that
+        (highlight-block count on a real turn) and it was dropped in favour of the
+        config-string assertion below. This restores it, offline and deterministically.
+
+        Three real things chained, none synthetic:
+          1. rerank/ itself — a real HTTP call to the running container, BM25-ranking
+             real documents.
+          2. @librechat/agents' OWN JinaReranker class (rerankers.cjs), constructed with
+             this bundle's OWN JINA_API_URL/JINA_API_KEY env vars — the exact code path
+             createReranker({rerankerType:'jina', ...}) takes at runtime, not a
+             reimplementation of its request/response mapping.
+          3. The OWN formatResultsForLLM, as above.
+
+        If any of the three were faked, this would not be a stronger claim than the test
+        above. It is stronger because none of them are: the marker text below reaches
+        the model-facing output only if rerank/'s real ranking, JinaReranker's real HTTP
+        client, and format.cjs's real highlight rendering all did their real jobs.
+        """
+        marker = "MARKER-0be-restored-live-measurement-QZX9"
+        on_topic = (
+            f"The enterprise gateway records every spend event on one audit ledger "
+            f"{marker}, so a customer's bill and their audit trail agree."
+        )
+        result = _node_in_chat(
+            "const {createReranker}=require(\"/app/node_modules/@librechat/agents/"
+            'dist/cjs/tools/search/rerankers.cjs");'
+            'const f=require("/app/node_modules/@librechat/agents/dist/cjs/tools/'
+            'search/format.cjs");'
+            "(async()=>{"
+            "const reranker=createReranker({rerankerType:'jina',"
+            "jinaApiKey:process.env.JINA_API_KEY,jinaApiUrl:process.env.JINA_API_URL});"
+            "const query='enterprise gateway spend ledger audit';"
+            "const documents=["
+            "'Bananas are a good source of potassium and fibre.',"
+            f"{json.dumps(on_topic)},"
+            "'The weather in most temperate climates varies by season.'];"
+            "const highlights=await reranker.rerank(query,documents,3);"
+            "const results={organic:[{position:1,title:'T',"
+            "link:'https://example.com/p',snippet:'a short search snippet',highlights}],"
+            "topStories:[],images:[],videos:[],news:[],relatedSearches:[]};"
+            "const out=f.formatResultsForLLM(0,results,50000).output;"
+            "console.log(JSON.stringify({out,highlights}));"
+            "})();"
+        )
+        highlights = result["highlights"]
+        assert len(highlights) == 3, (
+            f"rerank/'s real output did not reach JinaReranker as 3 ranked documents: "
+            f"{highlights}"
+        )
+        assert highlights[0]["text"] == on_topic, (
+            f"the on-topic document was not ranked first by our real BM25 service: "
+            f"{highlights}"
+        )
+        assert highlights[0]["score"] > highlights[1]["score"], (
+            f"the top result does not outscore the runner-up: {highlights}"
+        )
+
+        out = result["out"]
+        assert marker in out, (
+            f"rerank/'s real ranked output, through the real JinaReranker client and "
+            f"the real formatter, did not reach the model-facing output at all: {out!r}"
+        )
+        assert out.count("### Highlight") == 3, (
+            f"expected 3 highlight blocks in the model-facing output, got: {out!r}"
+        )
+
     def test_the_bundle_ships_a_grounded_configuration(self, web_search_config):
         """The inverse tripwire: this bundle no longer ships the snippet-grounded
         configuration, and nothing in librechat.yaml is left claiming that it does.
