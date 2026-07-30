@@ -112,7 +112,32 @@ modelSpecs:
         # after the thinking rather than producing a smaller answer.
         maxContextTokens: 200000
         maxOutputTokens: 32768
+        # TOOL SELECTION (enterpriseaiframework-e6f). This is the "reaches for the right
+        # tool on its own" instruction — deliberately generic, naming no specific skill,
+        # because skills are TENANT content (guard #10) and this file is platform
+        # config. Measured against a live model, before/after this paragraph existed:
+        # see tests-live/test_tool_selection.py for the scripted prompts and the
+        # before/after tool-selection rates this text is responsible for.
         promptPrefix: |
+          Decide for yourself, on every turn, whether a tool would make your answer
+          better founded than answering from memory alone. Do not wait to be told which
+          one to use, and do not name or ask permission to use one — just use it.
+
+          - Search the web when the question turns on something that could have
+            changed since your training, or a specific current fact you are not
+            certain of from memory: a version number, a price, a date, a status, a
+            score, a fact tied to a specific external page.
+          - Run code when the question needs an exact computation, a nontrivial
+            transformation of data, or a result that should be verified rather than
+            estimated — execute it and report the real output, not a predicted one.
+          - Use a loaded skill when one of the skills available to you states a
+            purpose matching what the user is asking; its procedure is what this
+            deployment has decided is correct for that request, so follow it instead
+            of improvising an equivalent yourself.
+
+          Most turns call for none of these — use a tool only when the request
+          actually needs it.
+
           When you produce a self-contained HTML/CSS/JS page, a React component, a
           Mermaid diagram or an SVG, emit it as an artifact.
 
@@ -135,7 +160,29 @@ modelSpecs:
         artifacts: "default"
         maxContextTokens: 128000
         maxOutputTokens: 32768
+        # TOOL SELECTION (enterpriseaiframework-e6f) — same paragraph as the glm-5-2
+        # spec above; kept identical rather than DRY'd out because librechat.yaml has
+        # no include mechanism and a divergence between the two would be silent.
         promptPrefix: |
+          Decide for yourself, on every turn, whether a tool would make your answer
+          better founded than answering from memory alone. Do not wait to be told which
+          one to use, and do not name or ask permission to use one — just use it.
+
+          - Search the web when the question turns on something that could have
+            changed since your training, or a specific current fact you are not
+            certain of from memory: a version number, a price, a date, a status, a
+            score, a fact tied to a specific external page.
+          - Run code when the question needs an exact computation, a nontrivial
+            transformation of data, or a result that should be verified rather than
+            estimated — execute it and report the real output, not a predicted one.
+          - Use a loaded skill when one of the skills available to you states a
+            purpose matching what the user is asking; its procedure is what this
+            deployment has decided is correct for that request, so follow it instead
+            of improvising an equivalent yourself.
+
+          Most turns call for none of these — use a tool only when the request
+          actually needs it.
+
           When you produce a self-contained HTML/CSS/JS page, a React component, a
           Mermaid diagram or an SVG, emit it as an artifact.
 
