@@ -10,39 +10,49 @@ the Code tab froze the tab, the preview rendered nothing, and the terminal came 
 wrong size. None of those were visible to anything smaller than this.
 
 Slow on purpose: it waits on a real model. Not part of `make test`.
+
+WHOSE ACCOUNT IT DRIVES (enterpriseaiframework-cf5)
+
+Every step here is irreducibly live. It types at a real agent, waits for a real model to
+write a real file, runs it, publishes it to a real volume, and then reads the bill the spend
+actually landed on. There is no hermetic version of that — a stand-in for the model or the
+pod would make it a test of the stand-in, and this file exists precisely because smaller
+tests were green on a day the Code tab froze and the terminal came up the wrong size.
+
+What it must not do is drive a PERSON's pod, which is what it did: `account` read
+secret/workspace-user-student, and step 3 then started a session in that person's own
+workspace — rewriting `.meta/<project>.session` and clearing `.new-session`. So the whole
+module is marked `needs_real_user` and resolves its identity through live_identity.py, which
+refuses any account not explicitly named AND marked throwaway. conftest.py deselects the
+module unless one is named, so `pytest tests-live/` is safe to run at any hour.
 """
 
-import base64
 import re
-import subprocess
 import time
 
 import httpx
 import pytest
 from playwright.sync_api import sync_playwright
 
-NS = "enterprise-ai"
+import live_identity
+
+# The whole journey signs in and drives that account's workspace pod. There is no step in
+# it that does not.
+pytestmark = pytest.mark.needs_real_user
+
 SHOTS = "/tmp/eai-shots"
 AGENT_BUDGET_S = 420          # a real generation, not a stub
 
 
-def _secret(name: str, key: str) -> str:
-    out = subprocess.run(
-        ["kubectl", "-n", NS, "get", "secret", name, "-o", f"jsonpath={{.data.{key}}}"],
-        capture_output=True, text=True, timeout=60, check=True,
-    ).stdout
-    return base64.b64decode(out).decode()
-
-
 @pytest.fixture(scope="module")
 def base_url() -> str:
-    return _secret("enterprise-ai-secrets", "PUBLIC_BASE_URL").rstrip("/")
+    return live_identity.public_base_url()
 
 
 @pytest.fixture(scope="module")
-def account() -> tuple[str, str]:
-    return (_secret("workspace-user-student", "USERNAME"),
-            _secret("workspace-user-student", "PASSWORD"))
+def account(request) -> tuple[str, str]:
+    """The throwaway account, or a loud refusal. Never a person's credential."""
+    return live_identity.account(request)
 
 
 @pytest.fixture(scope="module")

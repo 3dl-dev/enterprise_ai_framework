@@ -16,6 +16,26 @@ Two things are being proved, and they fail in different directions:
     the user types, on a node shared with live GPU training. Every claim about what it
     cannot reach is checked by trying it from inside the user's own shell, not by reading
     the manifest.
+
+WHOSE SHELLS THESE ARE (enterpriseaiframework-cf5)
+
+There is no hermetic version of this file and there should not be. Every claim in it is
+about the cluster: a NodePort, an oauth2-proxy allow-list rendered per user, a CNI that
+resolves packets on the destination's ingress rules, a service-account token that must not
+be mounted, a pod's own issued key. A loopback stand-in would answer whatever it was written
+to answer, which is the failure mode the module docstring above already warns about twice.
+
+What was wrong is WHOSE shells it typed into. `users` resolved to BOOTSTRAP_USER out of
+secret/enterprise-ai-secrets — the founder — and to secret/workspace-test-user, which names
+`student`. Both are people, and the tests below do not merely look: they run `make test` in
+those shells, delete `.pytest_cache`, write `/workspace/OWNER.txt`, and let aider rewrite
+`app.py` and commit it. That is somebody's working directory.
+
+So the module is marked `needs_real_user` and both principals come from live_identity.py,
+which refuses anything not explicitly named AND marked THROWAWAY. Two principals are
+required — one user proves nothing about isolation — so the suite now needs two throwaway
+accounts rather than borrowing two real ones; `EAI_LIVE_TEST_USER` names the first and
+`EAI_LIVE_TEST_USER_2` the second. conftest.py deselects the module until they are named.
 """
 
 from __future__ import annotations
@@ -29,7 +49,12 @@ import uuid
 
 import pytest
 
+import live_identity
 from workspace_client import login, run_in_terminal, secret
+
+# Every test in here logs in as, or reads the pod of, a workspace account. The ones that
+# type into a shell are the reason this is at module scope rather than per test.
+pytestmark = pytest.mark.needs_real_user
 
 NS = "enterprise-ai"
 ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
@@ -70,17 +95,24 @@ def workspace_url(user: str) -> str:
 # ---------------------------------------------------------------- fixtures
 
 @pytest.fixture(scope="session")
-def users() -> list[dict]:
-    """The two principals whose isolation is the point of the exercise."""
+def users(request) -> list[dict]:
+    """The two principals whose isolation is the point of the exercise.
+
+    Two, not one, and that is not negotiable: the refusal being tested is made by the
+    DESTINATION workspace's own oauth2-proxy against its own allow-list, and those manifests
+    are rendered per user, so a one-directional probe cannot see a per-user rendering error.
+
+    Both are throwaway, and both must be named. The pair used to be the founder and
+    `student`; see the module docstring.
+    """
+    first, second = live_identity.account(request), live_identity.second_account(request)
+    assert first[0] != second[0], (
+        f"both principals resolved to {first[0]!r}; the isolation claim would be vacuous — "
+        f"set {live_identity.ENV_USER_2} to a DIFFERENT throwaway account"
+    )
     return [
-        {
-            "name": secret("enterprise-ai-secrets", "BOOTSTRAP_USER"),
-            "password": secret("enterprise-ai-secrets", "BOOTSTRAP_PASSWORD"),
-        },
-        {
-            "name": secret("workspace-test-user", "USERNAME"),
-            "password": secret("workspace-test-user", "PASSWORD"),
-        },
+        {"name": first[0], "password": first[1]},
+        {"name": second[0], "password": second[1]},
     ]
 
 

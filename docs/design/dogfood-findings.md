@@ -1045,3 +1045,129 @@ One incidental correction while there: `interface.artifacts: true` in
 from the served `/api/config`. What actually turns artifacts on is `preset.artifacts` on
 each model spec. The key is left in place with a corrected comment and a test that fails
 if a future release starts honouring it.
+
+### 41. The test suites signed in as a real person and mutated their workspace session
+
+**Found by:** a review of `enterpriseaiframework-68e`'s first attempt, which was rejected
+for producing its evidence this way. Filed as `enterpriseaiframework-cf5`.
+
+Four live suites resolved their identity out of `secret/workspace-user-student`:
+
+```python
+(_secret("workspace-user-student", "USERNAME"), _secret("workspace-user-student", "PASSWORD"))
+```
+
+`student` is a person. This was not a read. Opening the Code tab drives that account's own
+pod — switching to it starts a session, rewrites `.meta/<project>.session` and `rm -f`s the
+`.new-session` flag — and a measured run on the previous attempt changed both, which can
+silently convert somebody's session. `tests-live/test_workspace.py` went further: it typed
+into two people's shells (the second principal being `BOOTSTRAP_USER`, the founder), ran
+`make test` there, deleted `.pytest_cache`, wrote `/workspace/OWNER.txt`, and let aider
+rewrite and commit `app.py`. `tests-live/test_memory.py` planted durable memory in a
+person's chat account and restarted the shared `chat` Deployment.
+
+**The mechanism failure is the interesting part.** Every one of those files already carried
+a comment saying not to run it while anybody was signed in. The warning was there and a run
+happened anyway. `make test-browser`, `make test-e2e` and `make test-workspace` were
+therefore unrunnable in practice, which blocked the done-conditions of items that needed
+them.
+
+**What it was NOT fixed with:** a throwaway cluster identity and a repointed fixture. That
+relocates the hazard rather than removing it, and leaves the browser suite needing a cluster.
+
+**Fixed by hosting the product instead.** `tests-live/portal_harness.py` (from 68e) already
+served the shipped portal page, `require_user`, the `me()` payload, `workshop_proxy` and the
+real `deploy/workspace/shell-server.py` on loopback over a throwaway projects root, minting
+its own per-process token rather than reading the shared per-deployment secret. It was
+extended to serve the settings sheet's handlers too — `my_spend`, `my_keys`, `my_published`,
+`rotate_my_key` — with the stand-ins pushed out to the four OUTER data sources (Postgres,
+LiteLLM's key list, chat_identity's Mongo lookup, the published volume's listing). Every line
+of this repo's own filtering, translating, projecting and sorting still runs.
+
+**Ten of twelve browser tests now need no account, no cluster and no credential**, and run in
+about 9 seconds. The two that remain need ttyd's own xterm.js reporting what IT fitted to and
+a real opencode resolving a real model; a stand-in for either makes the test a test of the
+stand-in.
+
+**The converted tests assert MORE than the live ones did, which is the unexpected result.**
+Against the cluster, `test_portal_panels_actually_populate` could only check `total != "—"`,
+`rows > 0`, `keys > 0` — presence checks, because a live deployment's data cannot be relied
+on to contain a second account's spend row, a key carrying a secret, or a chat row keyed by a
+LibreChat ObjectId. A fixture can. Five mutations of the shipped handlers were applied and
+run: dropping the per-user spend filter (bill became `$7.51`), filtering before translating
+the chat id (`$0.00421`, the chat row silently gone), dropping the key-owner filter, leaking
+the key `token` into the alias, and letting a file in the published listing become a project.
+**All five are caught now; the old suite would have missed all five** — `$7.51` and `$0.00421`
+both satisfy "starts with `$`". Likewise the rotation test's "Decline. Nothing should be
+rotated by a test run." was an unverifiable comment; the harness records every rotate call, so
+declining is now a claim with a check behind it.
+
+**Two gates, because either alone has a hole.** `tests-live/live_identity.py` is the only
+place a human identity may be resolved:
+
+1. `EAI_LIVE_TEST_USER` must name the account — no default, ever — and
+   `tests-live/conftest.py` deselects marked tests at COLLECTION when it is unset. Collection,
+   not setup: a session-scoped credential fixture is armed by collecting the file, so running
+   one unrelated test in it was enough.
+2. That account's Secret must carry `THROWAWAY`, which `deploy/bin/ensure-second-user.sh
+   --throwaway` writes and a person's account does not have. Verified against the live
+   cluster: `EAI_LIVE_TEST_USER=student` is refused, and refused *before* the password is
+   read. The env var alone would leave the hazard one impatient command away.
+
+`ensure-second-user.sh` also stopped repointing `secret/workspace-test-user` ("the account
+tests-live signs in as"). Nothing had to be wrong for that indirection to aim the suites at a
+camper — it named `student` — and nothing reads it now.
+
+**Two defects in the guard itself, both found by running it rather than by reading it**, and
+both worth recording because they fail in opposite directions:
+
+* `request.node.get_closest_marker(...)` is the obvious way to ask "is this test marked", and
+  it is wrong for any fixture broader than function scope: `request.node` is the Session or
+  the Module, neither of which carries the test's markers. It returned None for a perfectly
+  marked test and refused everything — failing CLOSED, which is the dangerous kind, because
+  the marked suites become permanently unrunnable and the pressure goes on deleting the guard.
+  `request._pyfuncitem` is the triggering item at every scope.
+* The marker check inside the credential function cannot see CACHED reuse. A session-scoped
+  fixture is set up once, so an unmarked test sharing it with a marked one gets the credential
+  with no check at all and pytest never re-enters the fixture body. The first backstop watched
+  a counter of credentials served and the probe walked straight through it, because nothing is
+  served on a cache hit. What survives caching is the fixture CLOSURE: `item.fixturenames`
+  names the fixture for every consumer. That probe is now
+  `test_an_unmarked_test_cannot_reuse_a_cached_credential`.
+
+**Guarded by `tests/test_live_suite_identity.py`**, in the hermetic suite so it runs on every
+`make test` with no cluster and no credential — a guard that only runs in the suite it guards
+is not a guard. Three of its twelve tests fail on the pre-fix tree (verified by restoring the
+originals and running it). It pins the credential read to one module, drives pytest's own
+collection to prove the gate holds in both directions, and pins the hermetic browser count so
+that coverage cannot be traded for hermeticity — which is the failure mode this item existed
+to avoid.
+
+**Residual hazards, recorded rather than narrowed:**
+
+* `tests-live/test_memory.py`'s `creds_a` still reads `BOOTSTRAP_USER`/`BOOTSTRAP_PASSWORD`
+  from `bundle/.env` and signs in with them against the CLUSTER. If those are the same
+  credential as the deployed realm's operator, that is still a login as the founder. Not
+  changed here: the second half of its isolation claim needs an identity the throwaway pair
+  cannot supply, and swapping it blind would change what the suite proves. The module is
+  gated on both markers so it cannot run unattended.
+* The three operator-console tests in `tests-live/test_portal.py` genuinely need a member of
+  `PORTAL_ADMINS`, and the only operator on the deployment is a person. A throwaway account
+  cannot become one without a control-plane configuration change, so
+  `live_identity.operator_account()` requires `EAI_LIVE_TEST_OPERATOR` to name them
+  explicitly every run instead of taking the founder's credential silently.
+  `test_the_operator_sees_everyone` still asserts on the literal names `baron` and `student`;
+  that is a real claim about the deployment's population and was left alone.
+* No throwaway account exists on the cluster yet, so the gated suites currently fail loudly
+  with the provisioning command rather than running. That is strictly better than the prior
+  state, where they ran against a person, but it is not "green" — provisioning is a cluster
+  write and needs a maintenance window.
+* `tests-live/test_workspace_instructions.py` still creates ConfigMaps and Pods and runs
+  `provision-workspace.sh` from several UNGATED tests. Every object it makes carries a uuid
+  suffix and is deleted in a fixture teardown, and the accounts it drives (`cbftest`,
+  `cbftest2`) were already throwaway — so it is not the identity hazard this finding is
+  about, and only its two `workspace-tenant-instructions` tests were gated (that ConfigMap is
+  the one every real pod mounts). Whether a suite that writes throwaway cluster objects should
+  also need a maintenance window is a separate question and is not decided here. Deliberately
+  not over-marked: gating a test makes it invisible, and this finding is partly about not
+  trading coverage for safety.

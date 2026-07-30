@@ -26,9 +26,27 @@ anyone else using the chat surface at that moment; this suite is meant to be run
 deliberately (dogfood verification), not on a timer.
 
 Run: .venv-test/bin/pytest tests-live/test_memory.py -v --tb=short -p no:cacheprovider
+
+WHOSE ACCOUNTS, AND THE RESTART (enterpriseaiframework-cf5)
+
+"Meant to be run deliberately, not on a timer" was the whole of the guard, and a comment is
+not a guard. Two gates now stand in front of it, both applied at collection:
+
+  * `needs_real_user` — `creds_b` read secret/workspace-test-user, which names `student`, a
+    person, and this suite then writes durable MEMORY into that person's chat account. It
+    now comes from live_identity.py, which refuses anything not explicitly named AND marked
+    THROWAWAY.
+  * `mutates_live_deployment` — the restart. A few seconds of downtime is a person's
+    conversation interrupted mid-sentence, and this is the only suite in the repo that does
+    it, so it needs a maintenance window rather than good intentions.
+
+`creds_a` is left reading BOOTSTRAP_USER/BOOTSTRAP_PASSWORD out of bundle/.env and is NOT
+fixed here: that is the deployment's bootstrap operator, the second half of the isolation
+claim needs an identity the throwaway pair cannot supply on its own, and swapping it blind
+would change what this suite proves. It is a real remaining hazard, recorded rather than
+quietly narrowed.
 """
 
-import base64
 import subprocess
 import time
 import urllib.parse
@@ -42,7 +60,12 @@ ROOT = Path(__file__).resolve().parent.parent
 BUNDLE = ROOT / "bundle"
 NAMESPACE = "enterprise-ai"
 
+import live_identity  # noqa: E402
 import oidc_login  # noqa: E402  (pytest.ini sets pythonpath = tests)
+
+# Signs in as two real Keycloak identities AND restarts the shared chat Deployment. Both
+# gates, both at module scope, because there is no test in here that does neither.
+pytestmark = [pytest.mark.needs_real_user, pytest.mark.mutates_live_deployment]
 
 # /api/agents/chat rejects non-browser User-Agents with "Illegal request"
 # (dogfood-findings.md finding 19) -- not a bug to work around, a precondition.
@@ -75,17 +98,11 @@ def _env() -> dict:
     return out
 
 
-def _kubectl_secret(name: str, key: str) -> str:
-    r = subprocess.run(
-        ["kubectl", "-n", NAMESPACE, "get", "secret", name, "-o", f"jsonpath={{.data.{key}}}"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0 or not r.stdout.strip():
-        pytest.fail(
-            f"could not read secret/{name} key {key} in namespace {NAMESPACE}: "
-            f"{r.stderr.strip() or r.stdout.strip()}"
-        )
-    return base64.b64decode(r.stdout.strip()).decode()
+# A local `_kubectl_secret` helper used to live here, and its only caller read a person's
+# login out of secret/workspace-test-user. It is deleted rather than left unused: a helper
+# that reads any Secret by name is how the same credential read ended up copied into four
+# files, and tests/test_live_suite_identity.py now fails the build if one reappears.
+# Deployment secrets that are not logins go through live_identity.deployment_secret.
 
 
 @pytest.fixture(scope="module")
@@ -101,18 +118,19 @@ def creds_a() -> tuple[str, str]:
 
 
 @pytest.fixture(scope="module")
-def creds_b() -> tuple[str, str]:
-    """The second realm user, reused rather than created.
+def creds_b(request) -> tuple[str, str]:
+    """The second realm user: a throwaway account, named explicitly.
 
-    deploy/bin/ensure-second-user.sh (enterpriseaiframework-b73, the parallel workspace
-    item) already created this account and pinned its password in
-    secret/workspace-test-user so reruns of either item's live tests do not invalidate
-    each other's credential. If the secret is missing, this fails loudly rather than
-    minting a third identity -- the item said to reuse it.
+    This read secret/workspace-test-user, whose USERNAME is `student` -- a person. The
+    suite does not merely sign in as them: it states a preference in their chat account and
+    then proves it PERSISTED, which means it deliberately writes durable memory into
+    somebody's account and leaves it there. A test that plants a durable fact in a person's
+    profile is not a read under any reading.
+
+    live_identity.account() refuses any account that is not both named by
+    EAI_LIVE_TEST_USER and marked THROWAWAY in its own Secret.
     """
-    user = _kubectl_secret("workspace-test-user", "USERNAME")
-    password = _kubectl_secret("workspace-test-user", "PASSWORD")
-    return user, password
+    return live_identity.account(request)
 
 
 def _login_client(chat_url: str, user: str, password: str) -> httpx.Client:

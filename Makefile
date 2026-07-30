@@ -1,4 +1,4 @@
-.PHONY: up down logs ps sync spend audit test test-forge test-e2e test-browser test-workspace forge-config export exit-direct exit nuke
+.PHONY: up down logs ps sync spend audit test test-forge test-e2e test-browser test-browser-pod test-workspace test-workspace-isolation forge-config export exit-direct exit nuke
 
 BUNDLE := bundle
 COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env
@@ -78,25 +78,68 @@ test-forge:
 forge-config:
 	@$(BUNDLE)/bin/render-gateway-config.py
 
-## Drive both UIs in a real Chromium against the live cluster: signs in, asserts on the
-## rendered DOM, fails on any console error, and reads the terminal's xterm buffer to
-## prove the agent actually booted. HTTP-level tests cannot see any of that — they prove
-## a file was served, not that its JavaScript runs.
+## ---------------------------------------------------------------------------------------
+## THE LIVE SUITES, AND WHICH OF THEM YOU CAN RUN WHILE SOMEBODY IS WORKING
+##
+## These used to sign in as `student` out of secret/workspace-user-student — a person — and
+## the Code tab drives that account's OWN pod: switching to it starts a session, rewrites
+## .meta/<project>.session and clears .new-session. A measured run changed both. So none of
+## these could be run while anybody was signed in, which in practice meant they could not be
+## run at all (enterpriseaiframework-cf5).
+##
+## `make test-browser` no longer needs an account, a cluster, or anybody signed out. It
+## hosts the portal, the shipped settings handlers, the workshop proxy and the real
+## shell-server on loopback (tests-live/portal_harness.py) and asserts HARDER than the live
+## version did, because a fixture can contain another account's spend row and a real
+## deployment's data cannot.
+##
+## What genuinely needs a real pod, a real model or a real Keycloak is marked and gated. The
+## gate is not advice: tests-live/conftest.py removes those tests at COLLECTION unless an
+## account is named, and live_identity.py refuses to hand a credential to a test that is not
+## marked. Both halves, because either alone leaves a hole.
+##
+## TO RUN THE GATED ONES you need a throwaway account — never a person's:
+##   deploy/bin/ensure-second-user.sh --throwaway eaibot
+##   deploy/bin/ensure-second-user.sh --throwaway eaibot2      # the isolation pair
+##   deploy/bin/provision-workspace.sh eaibot
+##   deploy/bin/provision-workspace.sh eaibot2
+## then EAI_LIVE_TEST_USER=eaibot EAI_LIVE_TEST_USER_2=eaibot2 make test-browser-pod
+## Those provisioning commands write to the cluster; run them in a maintenance window.
+##
+## A gated run with nothing selected exits non-zero (pytest's 5 = nothing collected). That is
+## deliberate — a suite that held everything back must not print a green line.
+## ---------------------------------------------------------------------------------------
+
+## The UIs in a real Chromium. HERMETIC: no cluster, no account, no credential, safe at any
+## hour. Asserts on the rendered DOM and fails on any console error, because a page that
+## throws on load still looks fine to curl.
 ## Screenshots land in $$BROWSER_SHOT_DIR (default /tmp/eai-shots).
-
-## The IDE surface (a browser terminal running opencode) against the live k3s cluster, with two real
-## Keycloak users. Needs the workspaces provisioned first:
-##   deploy/bin/ensure-second-user.sh student
-##   deploy/bin/provision-workspace.sh baron && deploy/bin/provision-workspace.sh student
-## Spends a fraction of a cent per run. Kept out of `make test` — it needs a cluster.
-## The whole journey in a real browser with a real account and real money: one login,
-## chat signed in, the agent typed at until it writes a file, the run gate, running it,
-## publishing, and fetching that link with NO session at all. Slow; waits on a model.
-test-e2e:
-	@.venv-test/bin/pytest tests-live/test_e2e_journey.py -v --tb=short -p no:cacheprovider
-
 test-browser:
 	@.venv-test/bin/pytest tests-live/test_browser.py -v --tb=short -p no:cacheprovider
 
+## The two browser tests that cannot be hosted: they need ttyd's own xterm.js reporting what
+## it fitted to, and a real opencode resolving a real model. Drives the throwaway account's
+## pod — see the header above.
+test-browser-pod:
+	@.venv-test/bin/pytest tests-live/test_browser.py -v --tb=short -p no:cacheprovider \
+		-m needs_real_user
+
+## The whole journey in a real browser with a real account and real money: one login,
+## chat signed in, the agent typed at until it writes a file, the run gate, running it,
+## publishing, and fetching that link with NO session at all. Slow; waits on a model.
+## Every step drives the account's pod, so the whole module is gated.
+test-e2e:
+	@.venv-test/bin/pytest tests-live/test_e2e_journey.py -v --tb=short -p no:cacheprovider
+
+## The IDE surface (a browser terminal running opencode) against the live k3s cluster, with
+## TWO throwaway Keycloak users — one proves nothing about isolation. It types into both
+## shells, runs `make test` there and lets aider rewrite a file, so both accounts must be
+## throwaway and both must be named. Spends a fraction of a cent per run.
 test-workspace:
 	@.venv-test/bin/pytest tests-live/test_workspace.py -v --tb=short -p no:cacheprovider
+
+## Only the portal may reach a workspace. The NodePort claim in here needs no account and
+## runs ungated; the pod-to-pod probes need the throwaway pair.
+test-workspace-isolation:
+	@.venv-test/bin/pytest tests-live/test_workspace_isolation.py -v --tb=short \
+		-p no:cacheprovider

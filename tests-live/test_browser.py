@@ -8,40 +8,51 @@ and both surfaces are almost entirely JavaScript. The portal renders every panel
 fetch calls; the Workshop's whole premise is a drawer that opens when a poll says
 something appeared. A syntax check and a 200 say nothing about either.
 
-So this drives a real Chromium: signs in, waits for the page to settle, and asserts on
-the DOM as rendered. It also fails on any console error or failed network request,
-because a page that throws on load can still look fine to curl.
+So this drives a real Chromium, waits for the page to settle, and asserts on the DOM as
+rendered. It also fails on any console error or failed network request, because a page that
+throws on load can still look fine to curl.
+
+WHERE IT DRIVES THAT BROWSER, AND WHY THAT CHANGED (enterpriseaiframework-cf5)
+
+It used to sign in to the live cluster, as `student`, out of secret/workspace-user-student.
+`student` is a person. Two of the tests below open the Code tab, and the Code tab drives
+that person's OWN pod: switching to it starts a session, rewrites
+`.meta/<project>.session` and clears the `.new-session` flag. A measured run changed both.
+So `make test-browser` could not be run while anybody was signed in, which in practice
+meant it could not be run — and items whose done-condition needed it were blocked on a
+maintenance window.
+
+Almost none of it needed a person. It needed A portal, A workshop, and a browser. Those are
+hosted on loopback by portal_harness.py, which serves the shipped page, the shipped
+`require_user`, the shipped settings handlers and the real `shell-server.py` over a
+throwaway projects root, and mints its own per-process token instead of reading the shared
+per-deployment one. Ten of the twelve tests here run against that and take no identity from
+anywhere; they are safe at any hour.
+
+The two that are left need a real ttyd, a real xterm.js and a real opencode resolving a
+real model through the gateway. Nothing on loopback can stand in for that without the test
+becoming a test of the stand-in. They are marked `needs_real_user`, they resolve their
+account through tests-live/live_identity.py — which refuses anything not explicitly named
+AND marked throwaway — and conftest.py deselects them unless that account is named. See
+live_identity.py for why the env var is not the whole gate.
+
+WHAT IS NOT WEAKER THAN IT WAS. Every assertion the live versions made is still made, and
+the panel and rotation tests make strictly stronger ones, because a fixture can contain a
+second account's spend row, a second account's key, and a key secret — none of which a live
+deployment's own data can be relied on to provide. "A row exists" was what the live test
+could check. "This row is right, and that row is absent" is what these check.
 """
 
-import base64
 import os
 import re
-import subprocess
 
 import pytest
 from playwright.sync_api import expect, sync_playwright
 
-NS = "enterprise-ai"
+import live_identity
+import portal_harness
+
 SHOTS = os.environ.get("BROWSER_SHOT_DIR", "/tmp/eai-shots")
-
-
-def _secret(name: str, key: str) -> str:
-    out = subprocess.run(
-        ["kubectl", "-n", NS, "get", "secret", name, "-o", f"jsonpath={{.data.{key}}}"],
-        capture_output=True, text=True, timeout=60, check=True,
-    ).stdout
-    return base64.b64decode(out).decode()
-
-
-@pytest.fixture(scope="session")
-def base_url() -> str:
-    return _secret("enterprise-ai-secrets", "PUBLIC_BASE_URL").rstrip("/")
-
-
-@pytest.fixture(scope="session")
-def account() -> tuple[str, str]:
-    return (_secret("workspace-user-student", "USERNAME"),
-            _secret("workspace-user-student", "PASSWORD"))
 
 
 @pytest.fixture(scope="session")
@@ -104,52 +115,14 @@ class Page:
         assert not problems, f"{label} did not load cleanly:\n  " + "\n  ".join(problems)
 
 
-def _signed_in_portal(browser, base_url, account) -> Page:
-    ctx = browser.new_context(ignore_https_errors=True, viewport={"width": 1440, "height": 900})
-    _CONTEXTS.append(ctx)
-    p = Page(ctx.new_page())
-    p.page.goto(f"{base_url}/portal/", wait_until="domcontentloaded", timeout=45000)
-    if p.page.locator("#username, input[name='username']").count():
-        # Keycloak's login form. Fill it the way a person does.
-        if p.page.locator("input[name='username']").count():
-            p.page.fill("input[name='username']", account[0])
-            p.page.fill("input[name='password']", account[1])
-            p.page.click("input[type='submit'], button[type='submit']")
-            p.page.wait_for_load_state("load", timeout=45000)
-    p.page.wait_for_load_state("load", timeout=45000)
-    return p
-
-
-# ---------------------------------------------------------------- portal
-
-def test_portal_renders_with_no_javascript_errors(browser, base_url, account):
-    p = _signed_in_portal(browser, base_url, account)
-    p.page.screenshot(path=f"{SHOTS}/portal.png", full_page=True)
-    p.assert_clean("portal")
-
-
-def test_portal_shows_the_signed_in_user(browser, base_url, account):
-    p = _signed_in_portal(browser, base_url, account)
-    p.page.wait_for_selector("#tab-chat", timeout=20000)
-    p.page.click("#avatar-btn")
-    p.page.wait_for_selector("#user-menu:not([hidden])", timeout=8000)
-    assert p.page.inner_text("#username").strip() == account[0]
-
-
-# ------------------------------------------- the route back to the portal, self-hosted
+# ---------------------------------------------------------------- the hosted stack
 #
-# These two do not use the cluster. The Code tab drives its user's own pod — switching to
-# it starts a session and writes that user's session bookkeeping — so a test that proved
-# this against the live deployment would be mutating a real person's state to do it. The
-# stack is hosted on loopback instead; see tests-live/portal_harness.py for exactly what
-# in it is the shipped code and what is a marker page.
+# The portal, its workshop proxy, the shipped settings handlers and a throwaway workshop,
+# all on loopback. No cluster, no credential, no pod anybody owns.
 
 
 @pytest.fixture(scope="module")
 def hosted():
-    """The portal, its workshop proxy and a throwaway workshop, on loopback."""
-    import portal_harness
-
     s = portal_harness.stack()
     yield s
     portal_harness.shutdown()
@@ -171,22 +144,218 @@ def hosted_no_workshop(hosted):
     hosted.stop_shell()
 
 
-def _hosted_portal(browser, hosted) -> tuple[Page, list[tuple[str, int]]]:
-    """The portal as the harness serves it, plus every response status the page saw.
+def _open(browser, hosted, path="/portal/", viewport=None) -> tuple[Page, list]:
+    """A page on the hosted origin, plus every response status it saw.
 
     The statuses are collected because `requestfailed` does not fire on an HTTP error
     response — it is for transport failures — so a framed surface answering 401 or 500 is
     not a "failed request" as far as Playwright is concerned. Recording the response is how
-    the test sees the status the frame actually got.
+    a test sees the status a frame actually got.
     """
-    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx = browser.new_context(viewport=viewport or {"width": 1440, "height": 900})
     _CONTEXTS.append(ctx)
     p = Page(ctx.new_page())
     seen: list[tuple[str, int]] = []
     p.page.on("response", lambda r: seen.append((r.url, r.status)))
-    p.page.goto(f"{hosted.base_url}/portal/", wait_until="domcontentloaded", timeout=45000)
+    p.page.goto(f"{hosted.base_url}{path}", wait_until="domcontentloaded", timeout=45000)
+    return p, seen
+
+
+def _hosted_portal(browser, hosted) -> tuple[Page, list]:
+    p, seen = _open(browser, hosted)
     p.page.wait_for_selector("#tab-chat", timeout=20000)
     return p, seen
+
+
+# ---------------------------------------------------------------- portal
+
+def test_portal_renders_with_no_javascript_errors(browser, hosted):
+    p, _ = _hosted_portal(browser, hosted)
+    p.page.screenshot(path=f"{SHOTS}/portal.png", full_page=True)
+    p.assert_clean("portal")
+
+
+def test_portal_shows_the_signed_in_user(browser, hosted):
+    """The name in the menu comes from the shipped `me` handler, not from the page.
+
+    Asserted against the identity the harness's oauth2-proxy hop injected, so a page that
+    rendered a hardcoded string, an empty string, or the wrong field would fail. The avatar
+    and the email are checked too: all three are set from the same payload by `loadMe`, and
+    the reason to have this test is that one of them once was not.
+
+    Deliberately NOT asserted: `document.title`. `loadMe` sets it to the username and then
+    `mountFrames` immediately overwrites it with the tab name, so the username is never in
+    the title by the time anything can look. Measured, not assumed — the assertion was
+    written, run, and failed. It is a dead line in app.js, not a defect worth an item, and
+    pinning current behaviour here would be pinning the wrong thing either way.
+    """
+    p, _ = _hosted_portal(browser, hosted)
+    p.page.click("#avatar-btn")
+    p.page.wait_for_selector("#user-menu:not([hidden])", timeout=8000)
+    assert p.page.inner_text("#username").strip() == portal_harness.USER
+    assert p.page.inner_text("#avatar").strip() == portal_harness.USER[0].upper()
+    assert p.page.inner_text("#email").strip() == f"{portal_harness.USER}@example.invalid"
+    # And not somebody else's, which is the half a presence check cannot see.
+    assert portal_harness.OTHER_USER not in p.page.inner_text("body")
+
+
+def test_settings_is_closed_until_asked_for(browser, hosted):
+    """It is a sheet over the work, not the page you land on.
+
+    Regression: .sheet sets display:flex, which beats the user-agent rule that hides a
+    closed <dialog> — so settings rendered permanently on top of the surfaces.
+    """
+    p, _ = _hosted_portal(browser, hosted)
+    assert p.page.evaluate("() => !document.getElementById('dlg-settings').open")
+    assert p.page.locator("#dlg-settings").is_hidden()
+
+
+def _open_settings(p):
+    p.page.wait_for_selector("#tab-chat", timeout=20000)
+    p.page.click("#avatar-btn")
+    p.page.wait_for_selector("#user-menu:not([hidden])", timeout=8000)
+    p.page.click("#mi-settings")
+    p.page.wait_for_function("() => document.getElementById('dlg-settings').open", timeout=8000)
+    # The three panels fetch independently. Waited on by their rendered result rather than
+    # by a sleep, so this cannot pass by having timed out into an empty table.
+    p.page.wait_for_function(
+        "() => document.getElementById('spend-total').textContent.trim() !== '—'",
+        timeout=20000)
+    p.page.wait_for_selector("#keylist li", timeout=20000)
+
+
+def test_portal_panels_actually_populate(browser, hosted):
+    """The panels are rendered by fetch. If the JS is broken they stay at their placeholders.
+
+    That was the whole of this test when it ran against the cluster: a total that is not the
+    placeholder, `rows > 0`, `keys > 0`. Those are presence checks, and a presence check
+    cannot tell a correct bill from a bill that has somebody else's spend in it — which is
+    the defect class this repo keeps producing. Against the harness the upstream data is
+    known, and it deliberately contains a second account's row and key, a chat row keyed by
+    a LibreChat ObjectId, and a key carrying a secret. So the assertions here are what the
+    numbers ARE, and what must not be among them.
+    """
+    p, _ = _hosted_portal(browser, hosted)
+    _open_settings(p)
+
+    # 1. The total. Not "not the placeholder" — the exact figure the shipped handler must
+    #    compute from the fixture rows, rendered by the shipped money().
+    total = p.page.inner_text("#spend-total").strip()
+    assert total == portal_harness.SPEND_TOTAL_RENDERED, (
+        f"spend rendered as {total!r}; the three rows belonging to this user sum to "
+        f"{portal_harness.SPEND_TOTAL_RENDERED}"
+    )
+
+    # 2. Every surface, in the order the handler sorts them, and no others. The chat row is
+    #    the one that matters: its principal in the ledger is a 24-hex ObjectId, so a
+    #    regression that filtered before translating would drop it silently — and a missing
+    #    number reads as a zero, not as an error.
+    surfaces = p.page.locator("#spend-rows tr .surface-tag").all_inner_texts()
+    assert [s.strip() for s in surfaces] == portal_harness.SPEND_SURFACES_RENDERED, (
+        f"spend rows are {surfaces}; expected {portal_harness.SPEND_SURFACES_RENDERED}"
+    )
+
+    sheet = p.page.inner_text("#dlg-settings")
+
+    # 3. The other account's row is much larger than everything here. It must be nowhere.
+    assert portal_harness.OTHER_USER not in sheet, (
+        "another account's name is rendered in this user's settings sheet"
+    )
+    assert "7.5" not in sheet and "$7.50" not in sheet, (
+        f"another account's spend leaked into this user's bill:\n{sheet}"
+    )
+    # And the untranslated chat id must not be what a person is shown.
+    assert portal_harness.CHAT_ID not in sheet, (
+        "the chat row rendered as a raw LibreChat ObjectId instead of a surface name"
+    )
+
+    # 4. The keys: this user's two, in the handler's order, and not the other account's,
+    #    and not the shared chat-surface key, which is not a person.
+    aliases = [t.strip() for t in p.page.locator("#keylist .alias").all_inner_texts()]
+    assert aliases == portal_harness.KEY_ALIASES_RENDERED, (
+        f"key list is {aliases}; expected {portal_harness.KEY_ALIASES_RENDERED}"
+    )
+    assert "chat-surface" not in sheet, "the shared chat key was listed as this user's"
+
+    # 5. No secret. One of the fixture keys carries a `token`, so the shipped projection
+    #    dropping it is a real result rather than a vacuous one.
+    assert "sk-" not in sheet, f"a key secret was rendered into the page:\n{sheet}"
+
+    # 6. Published work, from the listing the shipped handler fetched over HTTP. The file
+    #    entry in that listing must not become a project.
+    work = p.page.inner_text("#worklist")
+    assert portal_harness.PUBLISHED_PROJECT in work, f"published work did not render: {work!r}"
+    assert "index.html" not in work, "a file in the listing was rendered as a project"
+
+    # 7. This user is not an operator, so the console must not be there at all. The panel
+    #    is the unchanged path: it has nothing to do with the assertions above and would
+    #    be the first thing a broken is_admin check exposed.
+    assert p.page.locator("#panel-admin").is_hidden(), (
+        "the operator console rendered for a non-operator"
+    )
+
+    p.page.screenshot(path=f"{SHOTS}/portal-settings.png")
+    p.assert_clean("portal settings sheet")
+
+
+def test_portal_hidden_elements_are_genuinely_hidden(browser, hosted):
+    """The [hidden] display bug shipped once already; prove it as rendered, not as CSS."""
+    p, _ = _hosted_portal(browser, hosted)
+    for sel in ("#failbar", "#toast", "#user-menu"):
+        assert p.page.locator(sel).is_hidden(), f"{sel} is visible on a healthy page"
+
+
+def test_portal_key_rotation_dialog_opens_and_can_be_dismissed(browser, hosted):
+    """Exercises a native <dialog> and the confirm path, and proves nothing was rotated.
+
+    The live version of this test said "Decline. Nothing should be rotated by a test run."
+    in a comment and had no way to check it: the only evidence available was the key list,
+    which looks identical after a rotation. The harness records every call the page makes to
+    the rotate endpoint, so declining is now a claim with a check behind it.
+    """
+    p, _ = _hosted_portal(browser, hosted)
+    before = len(hosted.rotations)
+    _open_settings(p)
+
+    row = p.page.locator("#keylist li").first
+    alias = row.locator(".alias").inner_text().strip()
+    row.locator("button", has_text="Rotate").click()
+    p.page.wait_for_selector("#dlg-confirm[open]", timeout=8000)
+    assert p.page.locator("#confirm-title").is_visible()
+    # Which key it is about. A confirm dialog wired to the wrong row is a dialog that
+    # rotates somebody's working key when they say yes, and "a dialog opened" cannot see it.
+    assert alias in p.page.inner_text("#confirm-title"), (
+        f"the confirm dialog says {p.page.inner_text('#confirm-title')!r} for row {alias!r}"
+    )
+
+    # Decline. Nothing should be rotated by a test run.
+    p.page.locator("#dlg-confirm button[value='cancel']").click()
+    # Waiting on a selector would wait for VISIBILITY, and a closed <dialog> is hidden —
+    # so the obvious `#dlg-confirm:not([open])` can never match and times out on a dialog
+    # that closed correctly. Ask the element itself.
+    p.page.wait_for_function(
+        "() => !document.getElementById('dlg-confirm').open", timeout=8000)
+    # The new-key dialog is what appears when a rotation succeeds; it must not.
+    assert p.page.evaluate("() => !document.getElementById('dlg-key').open")
+    assert hosted.rotations[before:] == [], (
+        f"declining still rotated a key: {hosted.rotations[before:]}"
+    )
+    p.assert_clean("portal after dialog")
+
+
+@pytest.mark.parametrize("size", [(1280, 720), (1440, 900), (2560, 1440), (390, 844)])
+def test_portal_never_scrolls_sideways(browser, hosted, size):
+    """The Workshop shipped a header that overflowed below 560px. Check the whole range."""
+    w, h = size
+    p, _ = _open(browser, hosted, viewport={"width": w, "height": h})
+    p.page.wait_for_selector("#tab-chat", timeout=20000)
+    overflow = p.page.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
+    p.page.screenshot(path=f"{SHOTS}/portal-{w}x{h}.png", full_page=True)
+    assert overflow <= 0, f"page scrolls sideways by {overflow}px at {w}x{h}"
+
+
+# ------------------------------------------- the route back to the portal, self-hosted
 
 
 def _chrome_is_not_covered(p):
@@ -218,8 +387,6 @@ def _menu_from_the_code_tab(p, hosted):
     and the published site at the one path each that the shipped code is supposed to emit,
     so following the link is what distinguishes right from merely present.
     """
-    import portal_harness
-
     p.page.click("#avatar-btn")
     p.page.wait_for_selector("#user-menu:not([hidden])", timeout=8000)
     assert p.page.inner_text("#username").strip() == portal_harness.USER, (
@@ -259,8 +426,6 @@ def test_the_portal_is_reachable_from_inside_the_workshop_tab(browser, hosted_wo
     under test is that the portal's own chrome stays outside both of them and stays usable
     while the workshop (which itself nests a further terminal iframe) is what is on screen.
     """
-    import portal_harness
-
     p, seen = _hosted_portal(browser, hosted_workshop)
 
     # The tab that was already working, asserted too: this test must fail if the Chat
@@ -389,90 +554,85 @@ def test_the_route_back_holds_when_the_workshop_does_not(
         timeout=20000)
 
 
-def _open_settings(p):
-    p.page.wait_for_selector("#tab-chat", timeout=20000)
-    p.page.click("#avatar-btn")
-    p.page.wait_for_selector("#user-menu:not([hidden])", timeout=8000)
-    p.page.click("#mi-settings")
-    p.page.wait_for_function("() => document.getElementById('dlg-settings').open", timeout=8000)
-    p.page.wait_for_timeout(2500)   # the three panels fetch independently
+# ---------------------------------------------------------------- workshop, self-hosted
 
 
-def test_settings_is_closed_until_asked_for(browser, base_url, account):
-    """It is a sheet over the work, not the page you land on.
+def _close_drawer(page):
+    """Put the layout in a known state.
 
-    Regression: .sheet sets display:flex, which beats the user-agent rule that hides a
-    closed <dialog> — so settings rendered permanently on top of the surfaces.
+    The drawer opens by itself once the project has something to show, which is correct
+    and is the feature — but it means "at rest" depends on whether an earlier test built
+    something. These tests asserted a fixed layout and so passed alone and failed in the
+    suite: order-dependence, not a product bug.
     """
-    p = _signed_in_portal(browser, base_url, account)
-    p.page.wait_for_selector("#tab-chat", timeout=20000)
-    assert p.page.evaluate("() => !document.getElementById('dlg-settings').open")
-    assert p.page.locator("#dlg-settings").is_hidden()
+    page.evaluate("""() => {
+        const el = document.querySelector('[data-drawer]');
+        if (el && el.dataset.drawer !== 'closed') document.getElementById('btn-look')?.click();
+    }""")
+    page.wait_for_timeout(1200)
 
 
-def test_portal_panels_actually_populate(browser, base_url, account):
-    """The panels are rendered by fetch. If the JS is broken they stay at their placeholders."""
-    p = _signed_in_portal(browser, base_url, account)
-    _open_settings(p)
-
-    total = p.page.inner_text("#spend-total").strip()
-    assert total != "—", "spend never rendered — the placeholder is still there"
-    assert total.startswith("$"), f"spend rendered as {total!r}"
-
-    rows = p.page.locator("#spend-rows tr").count()
-    assert rows > 0, "spend table has no rows despite the account having spend"
-
-    keys = p.page.locator("#keylist li").count()
-    assert keys > 0, "no API keys rendered"
+def _hosted_workshop_page(browser, hosted) -> Page:
+    """The workshop on its own, through the shipped proxy, served by the real shell."""
+    p, _ = _open(browser, hosted, path="/workshop/")
+    p.page.wait_for_selector("#project-name", timeout=30000)
+    expect(p.page.locator("#project-name")).to_have_text(portal_harness.PROJECT,
+                                                        timeout=30000)
+    return p
 
 
-def test_portal_hidden_elements_are_genuinely_hidden(browser, base_url, account):
-    """The [hidden] display bug shipped once already; prove it as rendered, not as CSS."""
-    p = _signed_in_portal(browser, base_url, account)
-    p.page.wait_for_selector("#tab-chat", timeout=20000)
-    for sel in ("#failbar", "#toast", "#user-menu"):
-        assert p.page.locator(sel).is_hidden(), f"{sel} is visible on a healthy page"
+def test_workshop_renders_with_no_javascript_errors(browser, hosted_workshop):
+    p = _hosted_workshop_page(browser, hosted_workshop)
+    p.page.screenshot(path=f"{SHOTS}/workshop.png", full_page=True)
+    p.assert_clean("workshop")
 
 
-def test_portal_key_rotation_dialog_opens_and_can_be_dismissed(browser, base_url, account):
-    """Exercises a native <dialog> and the confirm path WITHOUT actually rotating a key."""
-    p = _signed_in_portal(browser, base_url, account)
-    _open_settings(p)
-    p.page.wait_for_selector("#keylist li", timeout=20000)
-    p.page.locator("#keylist li button", has_text="Rotate").first.click()
-    p.page.wait_for_selector("#dlg-confirm[open]", timeout=8000)
-    assert p.page.locator("#confirm-title").is_visible()
-    # Decline. Nothing should be rotated by a test run.
-    p.page.locator("#dlg-confirm button[value='cancel']").click()
-    # Waiting on a selector would wait for VISIBILITY, and a closed <dialog> is hidden —
-    # so the obvious `#dlg-confirm:not([open])` can never match and times out on a dialog
-    # that closed correctly. Ask the element itself.
-    p.page.wait_for_function(
-        "() => !document.getElementById('dlg-confirm').open", timeout=8000)
-    p.assert_clean("portal after dialog")
+def test_workshop_terminal_is_the_hero_with_the_drawer_shut(browser, hosted_workshop):
+    """The whole point of the rebuild: no preview squatting on half the screen at rest.
+
+    A layout claim about the shipped shell page, so what is in the terminal frame is beside
+    the point — this measures the frame's box, and the box is the same size whatever is
+    painting inside it. It used to be measured on a real person's pod, which bought it
+    nothing and cost them a session.
+    """
+    p = _hosted_workshop_page(browser, hosted_workshop)
+    _close_drawer(p.page)
+    term = p.page.locator("#terminal-frame, iframe[src*='terminal']").first
+    assert term.count(), "no terminal iframe on the page at all"
+    box = term.bounding_box()
+    width = p.page.evaluate("() => document.documentElement.clientWidth")
+    assert box and box["width"] > width * 0.75, (
+        f"terminal is only {box['width'] if box else 0}px of {width} with the drawer shut"
+    )
+    # The drawer really is shut, so the measurement above is of the state it claims to be
+    # of. Without this the test passes on a page whose drawer never opened in the first
+    # place for an unrelated reason.
+    assert p.page.evaluate(
+        "() => document.querySelector('[data-drawer]').dataset.drawer") == "closed"
 
 
-@pytest.mark.parametrize("size", [(1280, 720), (1440, 900), (2560, 1440), (390, 844)])
-def test_portal_never_scrolls_sideways(browser, base_url, account, size):
-    """The Workshop shipped a header that overflowed below 560px. Check the whole range."""
-    w, h = size
-    ctx = browser.new_context(ignore_https_errors=True, viewport={"width": w, "height": h})
-    _CONTEXTS.append(ctx)
-    p = Page(ctx.new_page())
-    p.page.goto(f"{base_url}/portal/", wait_until="domcontentloaded", timeout=45000)
-    if p.page.locator("input[name='username']").count():
-        p.page.fill("input[name='username']", account[0])
-        p.page.fill("input[name='password']", account[1])
-        p.page.click("input[type='submit'], button[type='submit']")
-    p.page.wait_for_load_state("load", timeout=45000)
-    p.page.wait_for_selector("#tab-chat", timeout=20000)
-    overflow = p.page.evaluate(
-        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
-    p.page.screenshot(path=f"{SHOTS}/portal-{w}x{h}.png", full_page=True)
-    assert overflow <= 0, f"page scrolls sideways by {overflow}px at {w}x{h}"
+# ---------------------------------------------------------------- needs a real pod
+#
+# What is below cannot be hosted. It needs ttyd's own client (xterm.js, WebGL renderer, its
+# fit-on-connect behaviour) and a real opencode resolving a real model through the gateway;
+# a stand-in for either would turn the test into a test of the stand-in, and the reason
+# these exist is that smaller tests were green on a day the terminal came up the wrong size
+# and the agent could not spend.
+#
+# So they are marked, gated and separated instead. `account` cannot reach a person: see
+# live_identity.py. conftest.py deselects everything here unless EAI_LIVE_TEST_USER names an
+# account whose Secret is marked THROWAWAY.
+
+@pytest.fixture(scope="session")
+def base_url() -> str:
+    return live_identity.public_base_url()
 
 
-# ---------------------------------------------------------------- workshop
+@pytest.fixture(scope="session")
+def account(request) -> tuple[str, str]:
+    """The throwaway account, or a loud refusal. Never a person's credential."""
+    return live_identity.account(request)
+
 
 @pytest.fixture(scope="session")
 def workshop_url(base_url) -> str:
@@ -499,41 +659,6 @@ def _signed_in_workshop(browser, workshop_url, account) -> Page:
     return p
 
 
-def test_workshop_renders_with_no_javascript_errors(browser, workshop_url, account):
-    p = _signed_in_workshop(browser, workshop_url, account)
-    p.page.screenshot(path=f"{SHOTS}/workshop.png", full_page=True)
-    p.assert_clean("workshop")
-
-
-def _close_drawer(page):
-    """Put the layout in a known state.
-
-    The drawer opens by itself once the project has something to show, which is correct
-    and is the feature — but it means "at rest" depends on whether an earlier test built
-    something. These tests asserted a fixed layout and so passed alone and failed in the
-    suite: order-dependence, not a product bug.
-    """
-    page.evaluate("""() => {
-        const el = document.querySelector('[data-drawer]');
-        if (el && el.dataset.drawer !== 'closed') document.getElementById('btn-look')?.click();
-    }""")
-    page.wait_for_timeout(1200)
-
-
-def test_workshop_terminal_is_the_hero_with_the_drawer_shut(browser, workshop_url, account):
-    """The whole point of the rebuild: no preview squatting on half the screen at rest."""
-    p = _signed_in_workshop(browser, workshop_url, account)
-    p.page.wait_for_timeout(4000)
-    _close_drawer(p.page)
-    term = p.page.locator("#terminal-frame, iframe[src*='terminal']").first
-    assert term.count(), "no terminal iframe on the page at all"
-    box = term.bounding_box()
-    width = p.page.evaluate("() => document.documentElement.clientWidth")
-    assert box and box["width"] > width * 0.75, (
-        f"terminal is only {box['width'] if box else 0}px of {width} with the drawer shut"
-    )
-
-
 def _terminal_buffer(page) -> str:
     """Read the terminal's contents.
 
@@ -558,10 +683,15 @@ def _terminal_buffer(page) -> str:
     }""")
 
 
+@pytest.mark.needs_real_user
 def test_the_agent_actually_boots_in_the_terminal(browser, workshop_url, account):
     """End to end: ttyd spawns the shell, the shell starts opencode, opencode finds its
     provider. If the model name is on screen, the whole chain from pod env through the
-    config to the gateway catalogue resolved."""
+    config to the gateway catalogue resolved.
+
+    Irreducibly a real pod: the claim is about a real agent process finding a real key and
+    a real model catalogue. Nothing on loopback has any of those.
+    """
     p = _signed_in_workshop(browser, workshop_url, account)
     buf = ""
     for _ in range(24):          # opencode paints in ~5s; allow for a cold pod
@@ -595,6 +725,7 @@ def _term_dims(page):
     return None
 
 
+@pytest.mark.needs_real_user
 def test_the_terminal_keeps_its_size_across_a_reconnect(browser, workshop_url, account):
     """ttyd fits once, from whatever the frame measured when its client started.
 
@@ -604,6 +735,10 @@ def test_the_terminal_keeps_its_size_across_a_reconnect(browser, workshop_url, a
     unchanged viewport. The agent then drew its input box below the visible area.
 
     Nothing signals it afterwards, because the WINDOW never resized — only the element did.
+
+    Irreducibly a real pod: `rows`, `cols` and the cell height are ttyd's own xterm.js
+    instance reporting what IT fitted to. There is no ttyd off-cluster (no binary on the
+    test host) and a stub cannot mis-fit itself, which is the entire subject.
     """
     p = _signed_in_workshop(browser, workshop_url, account)
     p.page.wait_for_timeout(11000)

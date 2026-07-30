@@ -2,7 +2,23 @@
 # Create a realm user, so multi-user isolation can be demonstrated rather than asserted.
 # One user proves nothing about isolation.
 #
-#   deploy/bin/ensure-second-user.sh [username] [email]
+#   deploy/bin/ensure-second-user.sh [--throwaway] [username] [email]
+#
+# --throwaway marks the account as one the live test suites may sign in as and drive. It
+# writes THROWAWAY=1 into that user's own Secret, and NOTHING ELSE grants it — see
+# tests-live/live_identity.py, which refuses any account without it.
+#
+# WHY A MARKER ON THE ACCOUNT RATHER THAN A FLAG ON THE TEST RUN
+#
+# The suites used to resolve their identity from secret/workspace-user-student. `student` is
+# a person, and the tests do not merely read: opening the Code tab starts a session in that
+# account's own pod, rewriting `.meta/<project>.session` and clearing `.new-session`. A
+# measured run changed both. The file said not to run it while anybody was signed in; that
+# warning was there and a run happened anyway (enterpriseaiframework-cf5).
+#
+# An env var alone would put the same hazard one impatient command away. Requiring a marker
+# ON THE ACCOUNT means pointing the suites at a real person takes writing to that person's
+# Secret — a decision with a name attached, not a flag.
 #
 # Each user's password is generated here and stored ONLY in that user's own Secret inside
 # the namespace, `workspace-user-<username>`. It is never written to the repo and never
@@ -17,13 +33,23 @@
 # credential — and then overwrote the USERNAME field, pointing the live tests at an
 # account whose password they no longer held. Found before it ran, not after.
 #
-# `workspace-test-user` still exists and still means "the account tests-live signs in as".
-# It is only ever (re)pointed at the user this script was asked to make when it does not
-# already name somebody else, so adding a camper cannot silently steal the test identity.
+# `workspace-test-user` USED to mean "the account tests-live signs in as", and this script
+# repointed it. That indirection is gone: nothing reads it any more, because it is what
+# quietly made a person the test identity. Which account the suites may use is now stated
+# explicitly at run time (EAI_LIVE_TEST_USER) and must be marked --throwaway here as well.
+# The Secret is still READ once, below, to keep a pre-split account's existing password
+# valid; it is never written.
 set -euo pipefail
 
 NS=enterprise-ai
 REALM="${IDP_REALM:-enterprise-ai}"
+
+THROWAWAY=""
+if [[ "${1:-}" == "--throwaway" ]]; then
+    THROWAWAY=1
+    shift
+fi
+
 USER_NAME="${1:-student}"
 EMAIL="${2:-${USER_NAME}@example.invalid}"
 
@@ -88,24 +114,28 @@ kc -X PUT "${IDP}/admin/realms/${REALM}/users/${existing}/reset-password" \
 import json, os
 print(json.dumps({"type": "password", "value": os.environ["PASS"], "temporary": False}))')" >/dev/null
 
-kubectl -n "$NS" create secret generic "$USER_SECRET" \
-    --from-literal=USERNAME="$USER_NAME" \
-    --from-literal=EMAIL="$EMAIL" \
-    --from-literal=PASSWORD="$PASS" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# THROWAWAY is written only when asked for, and an existing marker is PRESERVED when it is
+# not. Rebuilding the Secret from scratch on every run would otherwise silently un-mark a
+# throwaway account on the next plain rerun, and the failure is the wrong way round: the
+# suites would refuse to run and somebody would go looking for the reason in the tests.
+if [[ -z "$THROWAWAY" ]]; then
+    THROWAWAY=$(kubectl -n "$NS" get secret "$USER_SECRET" -o jsonpath='{.data.THROWAWAY}' 2>/dev/null | base64 -d || true)
+fi
 
-# Point the live tests at this account only if nobody else already holds that role.
-# Claiming it unconditionally is what broke: a new camper would repoint the tests at an
-# account whose password the shared Secret no longer matched.
-holder=$(kubectl -n "$NS" get secret workspace-test-user -o jsonpath='{.data.USERNAME}' 2>/dev/null | base64 -d || true)
-if [[ -z "$holder" || "$holder" == "$USER_NAME" ]]; then
-    kubectl -n "$NS" create secret generic workspace-test-user \
-        --from-literal=USERNAME="$USER_NAME" \
-        --from-literal=EMAIL="$EMAIL" \
-        --from-literal=PASSWORD="$PASS" \
-        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-    echo "${USER_NAME} <${EMAIL}> ready; password in secret/${USER_SECRET} (also the live-test account)"
+args=(--from-literal=USERNAME="$USER_NAME"
+      --from-literal=EMAIL="$EMAIL"
+      --from-literal=PASSWORD="$PASS")
+[[ -n "$THROWAWAY" ]] && args+=(--from-literal=THROWAWAY="$THROWAWAY")
+
+kubectl -n "$NS" create secret generic "$USER_SECRET" \
+    "${args[@]}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
+echo "${USER_NAME} <${EMAIL}> ready; password in secret/${USER_SECRET}"
+if [[ -n "$THROWAWAY" ]]; then
+    echo "  marked THROWAWAY — the live suites may sign in as this account and drive its pod:"
+    echo "    EAI_LIVE_TEST_USER=${USER_NAME} make test-browser-pod"
 else
-    echo "${USER_NAME} <${EMAIL}> ready; password in secret/${USER_SECRET}"
-    echo "  live tests keep signing in as '${holder}' — untouched"
+    echo "  NOT marked throwaway, so the live suites will refuse to sign in as it."
+    echo "  That is deliberate: they used to sign in as a person and mutate their session."
+    echo "  Re-run with --throwaway if this account exists for testing."
 fi

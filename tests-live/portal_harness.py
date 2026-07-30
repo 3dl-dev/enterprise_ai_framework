@@ -21,6 +21,11 @@ Real, exercised as shipped:
     an in-process hop injects the way oauth2-proxy does, over loopback.
   * `app.portal.me` — the links payload the account menu is wired from, built by the
     shipped code from the configured PUBLIC_BASE_URL and IDP_REALM.
+  * `app.portal.my_spend`, `my_keys`, `my_published`, `rotate_my_key` — the real handlers
+    behind the settings sheet, including the filter that decides which rows are yours.
+  * `app.chat_identity` — the real module, its regex and its resolve(), with only the Mongo
+    read replaced (see below). This is the path whose docstring warns that filtering before
+    translating silently drops every chat row from a user's own total.
   * `app.workshop.workshop_proxy` — the real proxy, including its token header and its one
     `<base href>` rewrite.
   * `deploy/workspace/shell-server.py` — the real workshop shell, as a subprocess, over a
@@ -37,6 +42,14 @@ Stubbed, and why:
     at the other end renders. They are served ONLY at the exact paths the shipped code is
     supposed to emit, so a link naming the wrong realm or the wrong user gets a 404 rather
     than a page.
+  * The four data sources the settings handlers read — `metering.spend_by_user_and_surface`
+    (Postgres), `gateway.list_keys` (LiteLLM's admin API), `chat_identity`'s Mongo lookup,
+    and the published volume's directory listing (an HTTP GET the real handler makes, so
+    that one is served rather than patched). They are replaced at the OUTER boundary only:
+    every line of this repo's own filtering, translating, projecting and sorting still
+    runs. The fixtures deliberately contain a second account's rows and keys, a chat row
+    keyed by a LibreChat ObjectId, and a key carrying a `token` field — so the tests can
+    assert what must NOT reach the page, which a live deployment's data cannot guarantee.
 
 No cluster, no docker, no bundle, no credential, no network.
 """
@@ -60,12 +73,71 @@ CONTROL_PLANE = ROOT / "control-plane"
 SHELL_SERVER = ROOT / "deploy" / "workspace" / "shell-server.py"
 
 USER = "harness-user"
+# A second account that exists only in the fixtures. Nothing signs in as it; it is here so
+# that "this row is mine" can be distinguished from "a row exists", which is the difference
+# between a presence check and a correctness check.
+OTHER_USER = "harness-other"
 REALM = "harness-realm"
 PROJECT = "rocket"
+# A 24-character hex ObjectId, which is what LibreChat forwards as `end_user` and what
+# chat_identity's real regex is written to recognise. The chat row below is keyed on it, so
+# a regression that filtered before translating would drop that row and the total with it.
+CHAT_ID = "6a67b18069dba4d1126fef44"
+PUBLISHED_PROJECT = "rocket"
 # Local to this process and never a cluster credential: the shared per-deployment token
 # is the same string in every pod, so a test has no business holding one, let alone
 # printing one.
 TOKEN = "harness-" + os.urandom(8).hex()
+
+# ---------------------------------------------------------------- the fixture data
+#
+# The shape `metering.spend_by_user_and_surface` returns: one row per (principal, surface),
+# where the principal is a key-alias owner for every surface except chat, whose principal is
+# LibreChat's own primary key.
+SPEND_ROWS = [
+    {"username": USER, "surface": "ide", "requests": 12, "spend": 0.004212,
+     "prompt_tokens": 8100, "completion_tokens": 2300},
+    {"username": CHAT_ID, "surface": "chat", "requests": 5, "spend": 0.000915,
+     "prompt_tokens": 1200, "completion_tokens": 640},
+    # Zero spend, non-zero requests: a surface that was used and cost nothing must still be
+    # a row. A filter written as `if not spend: continue` would drop it.
+    {"username": USER, "surface": "terminal", "requests": 2, "spend": 0.0,
+     "prompt_tokens": 40, "completion_tokens": 0},
+    # Somebody else's, and much larger, so that leaking it into the signed-in user's total
+    # is impossible to miss.
+    {"username": OTHER_USER, "surface": "ide", "requests": 99, "spend": 7.5,
+     "prompt_tokens": 500000, "completion_tokens": 90000},
+]
+
+#: The total the shipped handler must compute for USER: 0.004212 + 0.000915 + 0.0.
+SPEND_TOTAL_RENDERED = "$0.00513"
+#: In the order app.js renders them — the handler sorts by descending spend.
+SPEND_SURFACES_RENDERED = ["ide", "chat", "terminal"]
+
+#: What `gateway.list_keys` returns. `token` is present on one of them on purpose: the
+#: shipped projection is supposed to drop it, and "no secret reached the page" is only a
+#: real assertion if there was a secret available to leak.
+GATEWAY_KEYS = [
+    {"key_alias": f"{USER}::ide", "max_budget": 5.0, "spend": 0.004212,
+     "created_at": "2026-07-01T00:00:00Z", "token": "sk-harness-ide-must-not-be-served"},
+    {"key_alias": f"{USER}::chat", "max_budget": None, "spend": 0.000915,
+     "created_at": "2026-07-01T00:00:00Z"},
+    {"key_alias": f"{OTHER_USER}::ide", "max_budget": 5.0, "spend": 7.5,
+     "created_at": "2026-07-01T00:00:00Z"},
+    # A shared surface key, which is not a person and has no `owner::surface` shape at all.
+    {"key_alias": "chat-surface", "max_budget": None, "spend": 1.25,
+     "created_at": "2026-07-01T00:00:00Z"},
+]
+
+#: In the order app.js renders them — the handler sorts by surface name.
+KEY_ALIASES_RENDERED = [f"{USER}::chat", f"{USER}::ide"]
+
+#: What the published volume's listing endpoint answers for USER. The `file` entry is here
+#: because the shipped handler is supposed to keep directories only.
+PUBLISHED_LISTING = [
+    {"type": "directory", "name": PUBLISHED_PROJECT, "mtime": "2026-07-28T10:00:00Z"},
+    {"type": "file", "name": "index.html", "mtime": "2026-07-28T10:00:00Z"},
+]
 
 
 def _free_port() -> int:
@@ -89,8 +161,23 @@ class _Stack:
         os.environ["WORKSPACE_INTERNAL_TOKEN"] = TOKEN
         os.environ["WORKSPACE_SHELL_PORT"] = str(self.shell_port)
         os.environ["WORKSPACE_TTYD_PORT"] = str(self.ttyd_port)
+        # The published volume's listing service, which the shipped my_published handler
+        # fetches over HTTP. Pointed at this harness so that request really happens rather
+        # than being patched out.
+        os.environ["PUBLISHED_INTERNAL_URL"] = self.base_url
+        # No operator, so the admin panel must stay hidden and its endpoints must 404. The
+        # shipped code reads this at import; setting it explicitly rather than relying on
+        # the default keeps the expectation in one place.
+        os.environ["PORTAL_ADMINS"] = ""
+        # chat_identity would otherwise try to reach a Mongo somewhere.
+        os.environ["CHAT_MONGO_URL"] = ""
 
-        self.portal, self.workshop = _import_shipped_modules()
+        #: Every rotation the page asked for. Nothing in this suite is supposed to rotate a
+        #: key, so a test asserts this stays empty — the live version of that test could
+        #: only hope.
+        self.rotations: list[tuple[str, str]] = []
+
+        self.portal, self.workshop = _import_shipped_modules(self)
         # The one host stub. Still derived from identity: only the authenticated name maps
         # to loopback, so a request that somehow arrived as somebody else still leaves for
         # a `ws-<them>` that does not exist.
@@ -202,12 +289,24 @@ class _Stack:
         return f"{self.base_url}/live/{USER}/"
 
 
-def _import_shipped_modules():
-    """Import app.portal and app.workshop with their database siblings stubbed.
+def _import_shipped_modules(stack: "_Stack"):
+    """Import app.portal and app.workshop, with their four data sources stood in for.
 
-    Same trade as control-plane/tests/test_portal_auth.py: those siblings want a live
-    Postgres at import time, none of them is on any path this stack exercises, and a test
-    that needs a database to prove a link is a test nobody runs.
+    Same trade as control-plane/tests/test_portal_auth.py for the import itself: `app.db`
+    wants a live Postgres at import time and nothing here goes near it.
+
+    What is different from the first version of this harness is WHERE the line is drawn.
+    `app.metering` and `app.gateway` are not empty modules any more — they answer the one
+    query each that the settings sheet reaches, with the fixtures at the top of this file.
+    Everything between those answers and the browser is the shipped code: the per-user
+    filter, the chat-id translation, the aggregation, the projection that drops key
+    secrets, and both sort orders. Stubbing `my_spend` itself would have tested the page
+    and nothing else; stubbing the SQL tests the page and the handler.
+
+    `app.chat_identity` is imported for real — it has no database dependency of its own,
+    only an optional pymongo one — and its cache is seeded directly. So the regex that
+    decides what looks like a chat id, and resolve()'s fall-through for anything that does
+    not, are the shipped ones.
     """
     import types
 
@@ -215,11 +314,37 @@ def _import_shipped_modules():
         sys.path.insert(0, str(CONTROL_PLANE))
     import app  # noqa: F401  (the real package; __init__ is empty)
 
-    for name in ("app.db", "app.gateway", "app.metering", "app.issuance",
-                 "app.chat_identity"):
-        if name not in sys.modules:
-            sys.modules[name] = types.ModuleType(name)
-    sys.modules["app.gateway"].SURFACES = ("chat", "ide", "terminal")
+    # app.db is the only one that must not be imported at all: it opens a pool.
+    if "app.db" not in sys.modules:
+        sys.modules["app.db"] = types.ModuleType("app.db")
+
+    metering = sys.modules.setdefault("app.metering", types.ModuleType("app.metering"))
+    gateway = sys.modules.setdefault("app.gateway", types.ModuleType("app.gateway"))
+    issuance = sys.modules.setdefault("app.issuance", types.ModuleType("app.issuance"))
+
+    async def spend_by_user_and_surface(since: str | None = None):
+        # `since` is accepted and ignored: the page's default is no window, and a window
+        # filter belongs to the SQL this stands in for. A test that changed the selector
+        # would be testing this function, not the product.
+        return [dict(r) for r in SPEND_ROWS]
+
+    async def list_keys():
+        return [dict(k) for k in GATEWAY_KEYS]
+
+    async def issue(user: str, surface: str, actor: str | None = None):
+        stack.rotations.append((user, surface))
+        return {"key_alias": f"{user}::{surface}", "key": "sk-harness-rotated",
+                "rotated": True}
+
+    metering.spend_by_user_and_surface = spend_by_user_and_surface
+    gateway.list_keys = list_keys
+    gateway.SURFACES = ("chat", "ide", "terminal")
+    issuance.issue = issue
+
+    # The real module, with only the Mongo read stood in for.
+    from app import chat_identity
+    chat_identity._cache = {CHAT_ID: USER}
+    chat_identity._loaded = True
 
     from app import portal, workshop
     return portal, workshop
@@ -269,6 +394,14 @@ def _make_ttyd_stub():
 # ---------------------------------------------------------------- the portal front door
 
 
+def _query_one(query: str, name: str) -> str | None:
+    """One query parameter, the way FastAPI would hand it to the handler."""
+    from urllib.parse import parse_qs
+
+    values = parse_qs(query).get(name) or []
+    return values[0] if values else None
+
+
 def _page(title: str, marker_id: str, text: str) -> bytes:
     return (f"<!doctype html><meta charset=utf-8><title>{title}</title>"
             f"<body style='font:16px system-ui;padding:2rem'>"
@@ -308,6 +441,15 @@ def _make_portal_handler(stack: "_Stack"):
             if path == "/health-harness":
                 self._send(200, b"ok", "text/plain")
                 return
+            # The published volume's directory listing. Answered before require_user
+            # because this request comes from the shipped my_published handler's own httpx
+            # client, not from the browser, and carries no identity header — exactly as it
+            # does in the cluster, where `published` is a separate service.
+            if method == "GET" and path.startswith("/listing/"):
+                wanted = path[len("/listing/"):].strip("/")
+                body = json.dumps(PUBLISHED_LISTING if wanted == USER else []).encode()
+                self._send(200, body, "application/json")
+                return
             if method == "GET" and path in STUBS:
                 self._send(200, STUBS[path], "text/html; charset=utf-8")
                 return
@@ -335,6 +477,28 @@ def _make_portal_handler(stack: "_Stack"):
             elif path == "/portal/api/me":
                 self._send(200, json.dumps(await portal.me(request, user=user)).encode(),
                            "application/json")
+            elif path == "/portal/api/spend":
+                since = _query_one(query, "since")
+                self._send(200, json.dumps(await portal.my_spend(since, user=user)).encode(),
+                           "application/json")
+            elif path == "/portal/api/keys":
+                self._send(200, json.dumps(await portal.my_keys(user=user)).encode(),
+                           "application/json")
+            elif path == "/portal/api/published":
+                self._send(200, json.dumps(await portal.my_published(user=user)).encode(),
+                           "application/json")
+            elif path == "/portal/api/keys/rotate" and method == "POST":
+                body = json.loads(await request.body() or b"{}")
+                self._send(200,
+                           json.dumps(await portal.rotate_my_key(body, user=user)).encode(),
+                           "application/json")
+            elif path.startswith("/portal/api/admin/"):
+                # The shipped predicate decides. PORTAL_ADMINS is empty here, so this is
+                # the 404 a non-operator is supposed to get — and the page must not render
+                # the panel on the strength of it.
+                portal.require_admin_user(request, user=user)
+                self._send(500, b"unreachable: require_admin_user admitted a non-operator",
+                           "text/plain")
             elif path == "/workshop" or path.startswith("/workshop/"):
                 sub = path[len("/workshop/"):] if path.startswith("/workshop/") else ""
                 resp = await workshop.workshop_proxy(sub, request, user=user)

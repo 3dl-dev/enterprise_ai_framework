@@ -3,38 +3,51 @@
 Signs in through Keycloak with a real account and checks that what comes back is that
 account's own data and nobody else's. The point of the portal is that one login reaches
 every surface, so a test that skipped the login would be testing the wrong thing.
+
+WHY THIS ONE STILL NEEDS AN ACCOUNT (enterpriseaiframework-cf5)
+
+Most of test_browser.py stopped needing one: what it asserted about the page and the
+settings handlers is provable against a hosted stack (portal_harness.py), and is asserted
+harder there, because a fixture can contain another account's rows and a real deployment's
+data cannot be relied on to.
+
+This file is the other kind. Its subject is the LOGIN and the routing that hangs off it: a
+real Keycloak authorization-code exchange, oauth2-proxy's forwarded identity, and the
+reverse proxy in front of the origin — including the path-traversal and prefix-climbing
+cases, which are claims about that proxy's normalisation and are meaningless against a
+Python http.server on loopback. Two of them (`/workshop/api/state` and `/workshop/`) also
+reach the account's own pod.
+
+So the module is marked `needs_real_user` and takes its identity from live_identity.py,
+which refuses any account that is not explicitly named AND marked throwaway. It used to
+read secret/workspace-user-student directly — a person, whose pod the workshop routes then
+touched.
 """
 
-import base64
 import re
-import subprocess
 
 import httpx
 import pytest
 
-NS = "enterprise-ai"
+import live_identity
+
+# Every test in here signs in to the live deployment, and two of them reach that account's
+# own workspace pod through the portal's proxy.
+pytestmark = pytest.mark.needs_real_user
+
 _FORM = re.compile(r'<form[^>]*\baction="([^"]+)"[^>]*\bmethod="post"', re.I | re.S)
-
-
-def _secret(name: str, key: str) -> str:
-    out = subprocess.run(
-        ["kubectl", "-n", NS, "get", "secret", name, "-o", f"jsonpath={{.data.{key}}}"],
-        capture_output=True, text=True, timeout=60, check=True,
-    ).stdout
-    return base64.b64decode(out).decode()
 
 
 @pytest.fixture(scope="module")
 def base_url() -> str:
-    return _secret("enterprise-ai-secrets", "PUBLIC_BASE_URL").rstrip("/")
+    return live_identity.public_base_url()
 
 
 @pytest.fixture(scope="module")
-def creds() -> tuple[str, str]:
-    # The live-test account, not an operator. If the portal only worked for the person
-    # who built it, that would pass a test written with the wrong account.
-    return (_secret("workspace-user-student", "USERNAME"),
-            _secret("workspace-user-student", "PASSWORD"))
+def creds(request) -> tuple[str, str]:
+    # The throwaway live-test account, not an operator. If the portal only worked for the
+    # person who built it, that would pass a test written with the wrong account.
+    return live_identity.account(request)
 
 
 @pytest.fixture(scope="module")
@@ -201,9 +214,15 @@ def test_portal_static_never_serves_source(client, base_url):
 # ------------------------------------------------------------------ operator console
 
 @pytest.fixture(scope="module")
-def operator(base_url) -> httpx.Client:
-    user = _secret("enterprise-ai-secrets", "BOOTSTRAP_USER")
-    password = _secret("enterprise-ai-secrets", "BOOTSTRAP_PASSWORD")
+def operator(request, base_url) -> httpx.Client:
+    """An operator's session.
+
+    Named explicitly rather than taken. This read BOOTSTRAP_USER/BOOTSTRAP_PASSWORD out of
+    the deployment Secret, which signs a test run in as the founder without anybody having
+    asked; see live_identity.operator_account for why a throwaway cannot stand in (an
+    operator is a member of PORTAL_ADMINS, which is control-plane configuration).
+    """
+    user, password = live_identity.operator_account(request)
     c = httpx.Client(verify=False, follow_redirects=True, timeout=60.0)
     landing = c.get(f"{base_url}/portal/")
     m = _FORM.search(landing.text)

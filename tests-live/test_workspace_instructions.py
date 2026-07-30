@@ -19,6 +19,19 @@ Requires:
     lifecycle test below runs it itself)
 
 Run with:  .venv-test/bin/pytest tests-live/test_workspace_instructions.py -v --tb=short
+
+WHAT IS GATED HERE, AND WHAT IS NOT (enterpriseaiframework-cf5)
+
+The accounts this file drives — `cbftest` and `cbftest2` — are already throwaway, so it was
+never the identity hazard that item is about. Everything it creates otherwise carries a uuid
+suffix and is deleted in a fixture teardown.
+
+Two tests are the exception and are marked `mutates_live_deployment`: they DELETE
+`workspace-tenant-instructions`, the single deployment-wide ConfigMap every real workspace
+pod mounts, and run the real `provision-workspace.sh`. `prod_cm_snapshot` restores it
+faithfully — that guard is itself fault-injection-tested below — but a restore is not the
+same as never having removed it, and a person coding through that window sees their house
+rules disappear. conftest.py deselects both unless EAI_LIVE_MAINTENANCE_WINDOW is set.
 """
 
 from __future__ import annotations
@@ -540,6 +553,7 @@ def prod_cm_snapshot():
     _restore_cm_snapshot(PROD_CM, snapshot, AGENTS_MD)
 
 
+@pytest.mark.mutates_live_deployment
 def test_fresh_deployment_pod_gets_the_camp_rules_verbatim_with_no_operator_action(
     cbf_users, prod_cm_snapshot
 ):
@@ -588,6 +602,7 @@ def test_fresh_deployment_pod_gets_the_camp_rules_verbatim_with_no_operator_acti
     ]
 
 
+@pytest.mark.mutates_live_deployment
 def test_a_second_user_with_different_instructions_proves_per_deployment_not_per_user(
     cbf_users, prod_cm_snapshot
 ):
