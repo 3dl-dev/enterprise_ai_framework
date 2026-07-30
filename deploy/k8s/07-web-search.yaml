@@ -169,6 +169,14 @@ spec:
     metadata:
       labels: { app: webfetch }
     spec:
+      # Kubernetes injects legacy Docker-link env vars for every Service in the
+      # namespace: <SERVICE>_PORT=tcp://<clusterIP>:<port>. This Service is named
+      # `webfetch`, so it injects WEBFETCH_PORT — the exact name app.py reads to
+      # decide which port to listen on — and the container dies with
+      # `ValueError: invalid literal for int() with base 10: 'tcp://10.43.215.98:3002'`.
+      # Measured here, not reasoned about. Invisible in the compose bundle, which does
+      # no such injection, so this can only ever be caught by deploying.
+      enableServiceLinks: false
       containers:
         - name: webfetch
           # Substituted at apply time, matching 05-fakeprovider.yaml and 06-mcp-echo.yaml.
@@ -215,6 +223,9 @@ spec:
     metadata:
       labels: { app: rerank }
     spec:
+      # Same collision as webfetch above: the Service named `rerank` injects
+      # RERANK_PORT=tcp://<clusterIP>:3003, which app.py reads as its listen port.
+      enableServiceLinks: false
       containers:
         - name: rerank
           # Substituted at apply time, matching webfetch and mcp-echo above.
