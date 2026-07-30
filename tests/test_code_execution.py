@@ -25,17 +25,42 @@ matching SECRET|TOKEN|PASSWORD|PRIVATE_KEY — the same set api/src/secure-start
 refuses to boot the sandbox over. If the container is running and answering, that check
 already passed once at boot; this asserts it again, directly, rather than trusting that
 inference.
+
+RE-DISPATCH (adversary verdict UNRESOLVED, see rd notes): the two classes above proved
+that a real sandbox really executes code, but nothing proved WHOSE identity codeapi runs
+it under. Flipping LOCAL_MODE to true or CODEAPI_AUTH_PROVIDER to none — where userId
+comes from a caller-supplied header instead of the LibreChat-minted JWT — left all of the
+above green. Two more classes close that:
+
+3. TestCodeApiRefusesCallerAssertedIdentity (Challenge 1): probes the running codeapi
+   container directly and asserts it 401s a caller with no bearer, a caller asserting a
+   victim's identity via a `User-Id` header, and a caller with a forged bearer. This is
+   only true because bundle/docker-compose.yml sets LOCAL_MODE=false and
+   CODEAPI_AUTH_PROVIDER=librechat-jwt for the `codeapi` service — this test is what
+   makes that config claim fail loudly if it ever drifts.
+
+4. TestCrossUserSessionIsolation (Challenge 2): logs in as a SECOND real Keycloak user,
+   drives a real chat turn for each of two users, and shows their codeapi session-store
+   artifacts are namespaced by distinct canonical user ids and that one user's output
+   session is unreachable to the other through codeapi's own /download endpoint —
+   the "no path to ... another user's workspace" half of Finding 27, exercised live
+   rather than inherited from the vendored dependency's own (unrun-by-`make test`)
+   upstream tests. See enterpriseaiframework-297.
 """
 
 import hashlib
+import json
 import re
+import subprocess
+import time
 import uuid
 
+import jwt as pyjwt
 import pytest
 
 import chat_turn
 import oidc_login
-from conftest import compose
+from conftest import compose, idp_admin_token
 
 pytestmark = pytest.mark.usefixtures("stack_up")
 
@@ -178,3 +203,407 @@ class TestChatRunsRealCode:
             f"hardened-sandbox-mode boot check exists to keep out of a pod running "
             f"arbitrary user code: {offenders}"
         )
+
+    def test_pid_1s_live_environ_also_carries_no_credential(self, env):
+        """The stronger claim `docker exec ... env` cannot make: `docker exec` starts a
+        NEW process inside the container's namespaces and reports ITS OWN environment
+        (inherited from the image/compose config), not necessarily what PID 1 is actually
+        running with right now. Reading /proc/1/environ directly is what the sandboxed
+        code itself would see if it broke out of its own process namespace, so this is
+        the live artifact rather than the configured one."""
+        forbidden = re.compile(
+            r"^(CODEAPI_|REDIS_|AWS_|S3_|MINIO_)|SECRET|TOKEN|PASSWORD|PRIVATE_KEY",
+            re.IGNORECASE,
+        )
+        allowed_exceptions = {
+            "SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY",
+            "CODEAPI_HARDENED_SANDBOX_MODE",
+        }
+        result = compose("exec", "-T", "codeapi-sandbox", "cat", "/proc/1/environ", check=True)
+        names = [
+            entry.partition("=")[0]
+            for entry in result.stdout.split("\x00")
+            if entry
+        ]
+        offenders = [
+            name for name in names
+            if name not in allowed_exceptions and forbidden.search(name)
+        ]
+        assert not offenders, (
+            f"codeapi-sandbox's PID 1 live environ (not docker exec's own reported env) "
+            f"carries variables the hardened-sandbox-mode boot check exists to keep out "
+            f"of a pod running arbitrary user code: {offenders}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Re-dispatch, Challenge 1: nothing asserted that codeapi refuses a
+# caller-asserted identity. codeapi has no port published to the host
+# (bundle/docker-compose.yml), so these probes originate from inside the real
+# `chat` container over the bundle's own docker network — the same vantage
+# point LibreChat's own outgoing call has, and the same
+# `docker exec <chat_container> node -e ...` hop
+# test_chat_surface_version.py already uses to inspect the running image from
+# the inside.
+# ---------------------------------------------------------------------------
+
+_EXEC_IDENTITY_PROBE_SCRIPT = """
+(async () => {
+  const probes = [
+    ["no_auth", {}],
+    ["user_id_header", {"User-Id": "victim-0000-0000-0000"}],
+    ["forged_bearer", {"Authorization": "Bearer not-a-real.jwt.at-all"}],
+  ];
+  const out = {};
+  for (const [name, headers] of probes) {
+    const res = await fetch("http://codeapi:3112/v1/exec", {
+      method: "POST",
+      headers: Object.assign({"Content-Type": "application/json"}, headers),
+      body: JSON.stringify({lang: "python", code: "print(1)"}),
+    });
+    out[name] = {status: res.status, body: await res.text()};
+  }
+  process.stdout.write(JSON.stringify(out));
+})();
+"""
+
+
+def _node_probe_in_chat(chat_container: str, script: str, timeout: float = 30.0) -> dict:
+    """Run a small node script inside the real `chat` container and parse its one line
+    of JSON stdout. `chat` has network access to codeapi's internal DNS name; nothing
+    outside the bundle's compose network does."""
+    result = subprocess.run(
+        ["docker", "exec", chat_container, "node", "-e", script],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    assert result.returncode == 0, (
+        f"identity probe script failed inside {chat_container} (rc={result.returncode}): "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.fixture(scope="module")
+def chat_container(env) -> str:
+    """The name of THIS bundle's chat container — see
+    test_chat_surface_version.py's identical fixture for why this is derived from the
+    compose project name rather than hardcoded."""
+    project = env.get("COMPOSE_PROJECT_NAME", "enterprise-ai")
+    name = f"{project}-chat-1"
+    listed = subprocess.run(
+        ["docker", "ps", "--filter", f"name=^{name}$", "--format", "{{.Names}}"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert listed == name, (
+        f"chat container {name!r} is not running (docker ps returned {listed!r}); "
+        "these tests assert against the surface this bundle actually started"
+    )
+    return name
+
+
+@pytest.fixture(scope="module")
+def _exec_identity_probes(chat_container) -> dict:
+    return _node_probe_in_chat(chat_container, _EXEC_IDENTITY_PROBE_SCRIPT)
+
+
+class TestCodeApiRefusesCallerAssertedIdentity:
+    """Challenge 1: "codeapi appears only in test_code_execution.py [...] no test
+    asserts that codeapi refuses a caller-asserted identity." bundle/docker-compose.yml
+    sets LOCAL_MODE=false and CODEAPI_AUTH_PROVIDER=librechat-jwt for the real `codeapi`
+    service, which is what makes all three of these true; if either ever flips, these
+    probes flip with them (see the mutation check in the item's dispatch notes)."""
+
+    def test_a_request_with_no_bearer_is_refused(self, _exec_identity_probes):
+        outcome = _exec_identity_probes["no_auth"]
+        assert outcome["status"] == 401, outcome
+        assert json.loads(outcome["body"]) == {"error": "Bearer token is required"}, outcome
+
+    def test_a_caller_supplied_user_id_header_is_not_trusted(self, _exec_identity_probes):
+        """A `User-Id` header naming a victim, with no bearer token, must be refused
+        exactly like no auth at all — proving the header is never consulted for identity
+        outside CODEAPI_AUTH_PROVIDER=none + LOCAL_MODE, neither of which this deployment
+        sets (service/src/middleware/auth.ts's `apiKeyAuth`)."""
+        outcome = _exec_identity_probes["user_id_header"]
+        assert outcome["status"] == 401, (
+            f"a caller-supplied User-Id header must not let the caller assert a victim's "
+            f"identity; got {outcome}"
+        )
+        assert json.loads(outcome["body"]) == {"error": "Bearer token is required"}, outcome
+
+    def test_a_forged_bearer_is_rejected(self, _exec_identity_probes):
+        outcome = _exec_identity_probes["forged_bearer"]
+        assert outcome["status"] == 401, outcome
+        assert json.loads(outcome["body"]) == {"error": "Invalid bearer token"}, outcome
+
+
+# ---------------------------------------------------------------------------
+# Re-dispatch, Challenge 2: no test proves the cross-user clause. Log in as a
+# second real Keycloak user, drive a real chat turn for each, and show one
+# user's codeapi output session is unreachable to the other.
+# ---------------------------------------------------------------------------
+
+SECOND_USER = "codeapi-isolation-check"
+SECOND_PASSWORD = "codeapi-isolation-check-pw-1"
+
+
+def _ensure_second_realm_user(env) -> None:
+    """Create (or update) a second, real Keycloak user — same admin API
+    bundle/bin/ensure-user.sh uses, kept idempotent for the same reason: a rerun of this
+    test must not fail because the previous run already created the account."""
+    idp = f"http://localhost:{env.get('IDP_PORT', '8082')}"
+    realm = env.get("IDP_REALM", "enterprise-ai")
+    headers = {"Authorization": f"Bearer {idp_admin_token(env)}"}
+
+    import httpx
+
+    found = httpx.get(
+        f"{idp}/admin/realms/{realm}/users",
+        headers=headers, params={"username": SECOND_USER, "exact": "true"}, timeout=30,
+    ).json()
+
+    profile = {
+        "username": SECOND_USER,
+        "email": f"{SECOND_USER}@example.invalid",
+        "firstName": "Codeapi-Isolation-Check",
+        "lastName": "User",
+        "enabled": True,
+        "emailVerified": True,
+        "requiredActions": [],
+    }
+
+    if not found:
+        r = httpx.post(
+            f"{idp}/admin/realms/{realm}/users",
+            headers={**headers, "Content-Type": "application/json"}, json=profile, timeout=30,
+        )
+        assert r.status_code == 201, r.text
+        found = httpx.get(
+            f"{idp}/admin/realms/{realm}/users",
+            headers=headers, params={"username": SECOND_USER, "exact": "true"}, timeout=30,
+        ).json()
+    else:
+        r = httpx.put(
+            f"{idp}/admin/realms/{realm}/users/{found[0]['id']}",
+            headers={**headers, "Content-Type": "application/json"}, json=profile, timeout=30,
+        )
+        r.raise_for_status()
+
+    user_id = found[0]["id"]
+    r = httpx.put(
+        f"{idp}/admin/realms/{realm}/users/{user_id}/reset-password",
+        headers={**headers, "Content-Type": "application/json"},
+        json={"type": "password", "value": SECOND_PASSWORD, "temporary": False},
+        timeout=30,
+    )
+    r.raise_for_status()
+
+
+@pytest.fixture(scope="module")
+def second_chat_session(chat_url, env):
+    """A REAL second OIDC-authenticated chat session — a different Keycloak account,
+    logged in through the same authorization-code flow oidc_login.login() drives for the
+    bootstrap user, not a synthesized header or claim."""
+    _ensure_second_realm_user(env)
+    client = oidc_login.login(chat_url, SECOND_USER, SECOND_PASSWORD)
+    yield client
+    client.close()
+
+
+def _run_hashing_turn(client, chat_url, headers) -> tuple[str, str]:
+    """One real chat turn that runs sandboxed code computing the sha256 of a fresh
+    nonce. Returns (nonce, expected_hash) so the caller can assert the answer came back
+    correctly, proving this user's own execution genuinely ran."""
+    nonce = uuid.uuid4().hex
+    expected_hash = hashlib.sha256(nonce.encode()).hexdigest()
+    command = (
+        "python3 -c \"import hashlib; "
+        f"print(hashlib.sha256(b'{nonce}').hexdigest())\""
+    )
+    text = f"EXECUTE_BASH:{command}"
+    reply = chat_turn.send_turn(
+        client, chat_url, text, model=MODEL, endpoint=ENDPOINT_NAME,
+        execute_code=True, headers=headers, timeout=TIMEOUT,
+    )
+    assert reply, "no assistant message was persisted for this turn"
+    reply_text = chat_turn.reply_text(reply)
+    assert expected_hash in reply_text, (
+        f"expected the sandbox-computed sha256 of a nonce THIS turn generated "
+        f"({nonce!r} -> {expected_hash!r}) in the reply; got {reply_text!r}"
+    )
+    return nonce, expected_hash
+
+
+def _new_session_keys(env, before: set) -> dict:
+    """The session:* keys that appeared since `before` was captured, mapped to their
+    codeapi-redis VALUES (the sessionKey each one resolved to) — not merely a count, so
+    the caller can inspect which canonical user each new session belongs to."""
+    result = compose(
+        "exec", "-T", "codeapi-redis", "valkey-cli", "--no-auth-warning",
+        "-a", env["CODEAPI_REDIS_PASSWORD"], "--scan", "--pattern", "session:*",
+        check=True,
+    )
+    after = {ln for ln in result.stdout.splitlines() if ln.strip()}
+    new_keys = after - before
+    values = {}
+    for key in new_keys:
+        got = compose(
+            "exec", "-T", "codeapi-redis", "valkey-cli", "--no-auth-warning",
+            "-a", env["CODEAPI_REDIS_PASSWORD"], "GET", key, check=True,
+        )
+        values[key] = got.stdout.strip()
+    return values
+
+
+def _mint_codeapi_bearer(env, user_id: str) -> str:
+    """Mint a codeapi bearer JWT with the SAME Ed25519 signing key, claim shape, and
+    algorithm LibreChat's packages/api/src/auth/codeapi.ts uses to mint one per outgoing
+    request (buildClaims/signJwt) — read straight out of bundle/.env, the file the real
+    `codeapi`/`chat` containers are themselves configured from.
+
+    `user_id` is never invented by this test: every caller passes in a canonicalUserId
+    this test extracted from a REAL, already-persisted codeapi-redis sessionKey that a
+    genuine chat turn for a genuinely OIDC-authenticated user produced. This is
+    deliberately NOT the same thing Challenge 1 tests — Challenge 1 (above) proves
+    codeapi refuses an UNSIGNED, caller-supplied identity (a `User-Id` header, a body
+    field); this signs with the actual production private key to reach the orthogonal
+    property under test here, which is whether codeapi's session-key ISOLATION logic
+    keeps two DIFFERENT genuine principals apart. Intercepting LibreChat's own
+    per-request ephemeral mint would prove the identical thing with more moving parts and
+    no stronger a guarantee, since `auth_context_hash` is asserted to be a non-empty
+    string by codeapi's verifier (service/src/auth/librechat-jwt.ts#validateClaims) and
+    never recomputed or compared.
+    """
+    private_key_pem = env["CODEAPI_JWT_PRIVATE_KEY"].replace("\\n", "\n")
+    now = int(time.time())
+    claims = {
+        "iss": env.get("CODEAPI_JWT_ISSUER", "librechat"),
+        "aud": env.get("CODEAPI_JWT_AUDIENCE", "codeapi"),
+        "sub": user_id,
+        "iat": now,
+        "nbf": now,
+        "exp": now + 60,
+        "jti": uuid.uuid4().hex,
+        "tenant_id": "legacy",
+        "role": "USER",
+        "principal_source": "librechat_jwt",
+        "auth_context_hash": "test-minted-" + uuid.uuid4().hex,
+    }
+    return pyjwt.encode(
+        claims, private_key_pem, algorithm="EdDSA",
+        headers={"kid": env.get("CODEAPI_JWT_KID", "lc-codeapi-bundle-1")},
+    )
+
+
+_DOWNLOAD_PROBE_SCRIPT = """
+(async () => {
+  const res = await fetch("http://codeapi:3112/v1/download/%(session_id)s/probe-file?kind=user", {
+    headers: {"Authorization": "Bearer %(token)s"},
+  });
+  process.stdout.write(JSON.stringify({status: res.status, body: await res.text()}));
+})();
+"""
+
+
+def _probe_download_as(chat_container: str, session_id: str, token: str) -> dict:
+    script = _DOWNLOAD_PROBE_SCRIPT % {"session_id": session_id, "token": token}
+    result = subprocess.run(
+        ["docker", "exec", chat_container, "node", "-e", script],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"download probe script failed (rc={result.returncode}): "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    return json.loads(result.stdout)
+
+
+class TestCrossUserSessionIsolation:
+    """Challenge 2: "no test proves the cross-user clause [...] Log in as a second real
+    user and prove A's artifacts are unreachable to B." Both users below are real,
+    independently OIDC-authenticated Keycloak accounts driving real chat turns — user A
+    is the same bootstrap DOGFOOD_USER test_correct_answer_the_model_cannot_predict_
+    and_an_afterward_artifact already exercises; user B is provisioned fresh above.
+    """
+
+    def test_two_real_users_get_distinct_session_namespaces(
+        self, chat_session, second_chat_session, chat_url, env,
+    ):
+        headers_a = _chat_headers(chat_session, chat_url)
+        headers_b = _chat_headers(second_chat_session, chat_url)
+
+        before = {ln for ln in compose(
+            "exec", "-T", "codeapi-redis", "valkey-cli", "--no-auth-warning",
+            "-a", env["CODEAPI_REDIS_PASSWORD"], "--scan", "--pattern", "session:*",
+            check=True,
+        ).stdout.splitlines() if ln.strip()}
+
+        _run_hashing_turn(chat_session, chat_url, headers_a)
+        new_after_a = _new_session_keys(env, before)
+        assert new_after_a, "user A's real chat turn registered no new codeapi session"
+        session_id_a, session_key_a = next(iter(new_after_a.items()))
+
+        before_b = before | set(new_after_a)
+        _run_hashing_turn(second_chat_session, chat_url, headers_b)
+        new_after_b = _new_session_keys(env, before_b)
+        assert new_after_b, "user B's real chat turn registered no new codeapi session"
+        session_id_b, session_key_b = next(iter(new_after_b.items()))
+
+        assert session_key_a != session_key_b, (
+            f"two different real users produced the SAME codeapi sessionKey "
+            f"({session_key_a!r}) — session-key.ts's per-user namespace "
+            f"(<namespace>:user:<canonicalUserId>) is not actually separating them"
+        )
+
+        user_id_a = session_key_a.rsplit(":user:", 1)[-1]
+        user_id_b = session_key_b.rsplit(":user:", 1)[-1]
+        assert user_id_a and user_id_b and user_id_a != user_id_b, (
+            f"expected distinct canonicalUserIds embedded in the two sessionKeys; got "
+            f"{session_key_a!r} and {session_key_b!r}"
+        )
+
+    def test_users_output_session_is_unreachable_to_a_second_user(
+        self, chat_session, second_chat_session, chat_url, env, chat_container,
+    ):
+        headers_a = _chat_headers(chat_session, chat_url)
+        headers_b = _chat_headers(second_chat_session, chat_url)
+
+        before = {ln for ln in compose(
+            "exec", "-T", "codeapi-redis", "valkey-cli", "--no-auth-warning",
+            "-a", env["CODEAPI_REDIS_PASSWORD"], "--scan", "--pattern", "session:*",
+            check=True,
+        ).stdout.splitlines() if ln.strip()}
+
+        _run_hashing_turn(chat_session, chat_url, headers_a)
+        new_keys = _new_session_keys(env, before)
+        assert new_keys, "user A's real chat turn registered no new codeapi session"
+        session_id_a, session_key_a = next(iter(new_keys.items()))
+        user_id_a = session_key_a.rsplit(":user:", 1)[-1]
+
+        before_b = before | set(new_keys)
+        _run_hashing_turn(second_chat_session, chat_url, headers_b)
+        new_keys_b = _new_session_keys(env, before_b)
+        assert new_keys_b, "user B's real chat turn registered no new codeapi session"
+        _, session_key_b = next(iter(new_keys_b.items()))
+        user_id_b = session_key_b.rsplit(":user:", 1)[-1]
+
+        # Negative control: A, authenticated as A, hitting A's OWN session is not
+        # blocked by sessionAuth (a 404 — no file with that id was ever uploaded — is
+        # the expected miss; a 403 here would mean the endpoint always refuses and the
+        # real assertion below would be meaningless).
+        token_a = _mint_codeapi_bearer(env, user_id_a)
+        as_a = _probe_download_as(chat_container, session_id_a, token_a)
+        assert as_a["status"] != 403, (
+            f"user A was refused their OWN session ({as_a}); the negative control below "
+            f"is meaningless if this endpoint refuses everyone regardless of identity"
+        )
+
+        # The actual assertion: B, authenticated as B, hitting A's session must be
+        # refused by codeapi's own sessionAuth (service/src/middleware/auth.ts) — A's
+        # workspace has no path reachable to B.
+        token_b = _mint_codeapi_bearer(env, user_id_b)
+        as_b = _probe_download_as(chat_container, session_id_a, token_b)
+        assert as_b["status"] == 403, (
+            f"user B reached user A's codeapi output session ({as_b}) — Finding 27's "
+            f"'no path to ... another user's workspace' clause is violated"
+        )
+        assert json.loads(as_b["body"]) == {"error": "Unauthorized"}, as_b
