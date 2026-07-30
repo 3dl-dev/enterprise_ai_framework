@@ -23,8 +23,14 @@ mcp = FastMCP(
     port=8080,
     # The chat pod calls this service by its cluster DNS name (mcp-echo:8080), which
     # is exactly what DNS-rebinding protection exists to reject on an
-    # internet-facing server. This server is cluster-internal only, reachable from
-    # nowhere else, so that protection has no attack surface here to protect.
+    # internet-facing server. This server is cluster-internal only and has no route in
+    # from outside the cluster, so that protection has no attack surface here to protect.
+    #
+    # NOT "reachable from nowhere else", which is what this said until
+    # enterpriseaiframework-784: the workspace NetworkPolicy now names this Service in the
+    # terminal agent's egress allowlist, so a shell the user controls can call `echo`
+    # unauthenticated. Harmless for a tool that returns its own input. A tool server that
+    # carries any authority must authenticate its caller before it goes on that list.
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 

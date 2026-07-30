@@ -342,6 +342,52 @@ Service rewrites source addresses. It is only isolation if you tried it from ins
 pod, which is what `tests-live/test_workspace.py::test_workspace_cannot_reach_the_cluster`
 does.
 
+**Addendum, measured 2026-07-30 while opening the workspace's egress to the MCP servers
+(enterpriseaiframework-784).** The generalisation above was read one step too far, and the
+over-reading was about to cost a change nobody needed. Because the finding says an egress
+rule "proves nothing on its own", -784 and -471 were both written expecting the tool
+services to need *matching ingress rules naming the workspace pods* before a workspace
+could call them. They do not, and this is the measurement that says so — a raw TCP connect
+from inside `ws-student`'s ttyd container, before any policy change:
+
+```
+gateway:4000        OPEN
+mcp-echo:8080       ConnectionRefusedError
+fakeprovider:8080   ConnectionRefusedError
+control-plane:8000  ConnectionRefusedError
+identity:8080       ConnectionRefusedError
+postgres:5432       ConnectionRefusedError
+valkey:6379         ConnectionRefusedError
+```
+
+`workspace-isolation` is the **only** NetworkPolicy in the namespace, so no policy selects
+the gateway pod, mcp-echo, or any of the refused destinations. Yet the gateway — named in
+the workspace's egress and nowhere else — answers, and everything not named is refused. So
+the asymmetry is precise, and it is worth stating in one line because both readings look
+alike:
+
+- the destination **is** selected by some policy → its ingress rules can ACCEPT the packet
+  and the source's egress deny is never consulted. This is finding 22, and it is why
+  workspace→workspace needed the `from` lists.
+- the destination is selected by **no** policy → nothing ACCEPTs early, evaluation reaches
+  the source's egress chain, and an egress rule naming that destination is sufficient *and
+  necessary*.
+
+Which means adding an ingress policy to a tool server in order to "complete" the grant
+would not have completed anything. It would have converted an unrestricted pod into a
+deny-by-default one — and the pod in question is `mcp-echo`, which the chat surface
+depends on and which fails the way finding 40 describes: the surface stays healthy, logs
+`1 configured server and 0 tools`, and nothing breaks until a model tries to call the tool.
+A defensive-looking edit with a silent blast radius on the surface it was protecting.
+
+What the measurement does **not** excuse is skipping the test. Refused-is-refused was
+verified from inside the pod on a service that listens on the *same port* as the one that
+was allowed (`fakeprovider:8080`), so "we opened 8080" cannot pass for "we opened
+mcp-echo"; and the suite now asserts an allowed destination is reachable
+(`test_the_allowed_destinations_are_reachable_so_the_guard_is_not_vacuous`), because a pod
+with no network at all passes every isolation assertion ever written and reads as perfect
+security.
+
 ### 23. aider drops a completed edit when the model names a file that is not in the chat
 
 The load-bearing measurement for the coding-camp plan: can aider hold an edit format
