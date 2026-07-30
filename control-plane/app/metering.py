@@ -152,21 +152,39 @@ _CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
 # and the code below matched the comment rather than the database. Every class was then
 # re-measured on the bundle, one fresh key each, and dumped raw:
 #
-#   outcome                        status    llm_provider  spend  tokens  alias on row
-#   ------------------------------ --------- ------------- -----  ------  ------------
-#   served                         success   (no error)    real   real    yes
-#   served from cache              success   (no error)    0      real    yes
-#   upstream 500                   failure   openai        0      0       yes
-#   upstream refused the call *    failure   openai        0      0       yes
-#   no attributable principal **   failure   ''            0      0       NO
-#   rate limit the GATEWAY imposed failure   ''            0      0       yes
-#   model not on the key's list    failure   ''            0      0       NO
-#   over the key's budget          failure   ''            0      0       NO
-#   model not in the catalogue     failure   ''            0      0       yes
+#   outcome                        status   error_class            llm_provider  alias
+#   ------------------------------ -------- ---------------------- ------------- -----
+#   served                         success  (no error object)      (no error)    yes
+#   served from cache              success  (no error object)      (no error)    yes
+#   upstream 500                   failure  InternalServerError    openai        yes
+#   upstream has no such route *   failure  NotFoundError          openai        yes
+#   no attributable principal **   failure  HTTPException     403  ''            NO
+#   rate limit the GATEWAY imposed failure  RouterRateLimitError † ''            yes
+#                                  failure  HTTPException     429  ''            yes
+#   model not on the key's list    failure  ProxyException    401  ''            NO
+#   over the key's budget          failure  BudgetExceededError    ''            NO
+#   model not in the catalogue     failure  ProxyException    401  ''            yes
+#
+#   and the four typed columns beside them, which is the part that decides the predicate:
+#
+#   outcome                        model_id  model_group  custom_llm_provider  api_base
+#   ------------------------------ --------- ------------ -------------------- --------
+#   served / served from cache     set       set          set                  set
+#   BOTH provider faults           set       set          EMPTY                EMPTY
+#   RouterRateLimitError           EMPTY     set          EMPTY                EMPTY
+#   every other refusal            EMPTY     EMPTY        EMPTY                EMPTY
+#
+#   Spend and tokens are real only on `served`; every other row above carries spend 0, and
+#   `served from cache` carries real tokens at spend 0. That is why no version of this
+#   changes SUM(spend) — see NEITHER OPTION TOUCHES MONEY below.
 #
 #   *  a /v1/embeddings call the fake provider has no route for: NotFoundError, a
 #      different litellm exception class from the 500, and it populates llm_provider too.
 #   ** deploy/gateway/require_principal.py, finding 36.
+#   †  the FIRST refusal from a key with rpm_limit set comes from the router's own limiter
+#      and the rest from the proxy's, so one operator-visible class writes two different
+#      error_class values with two different typed-column shapes. Recorded because a
+#      predicate tuned to one of them would have looked right on a four-request sample.
 #
 # THE PREMISE THIS CORRECTS. It was recorded as measured that over-budget and
 # model-not-permitted refusals "never reach the ledger at all". They do. The earlier
@@ -189,19 +207,56 @@ _CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
 #                           spent by anyone. This is the layer WORKING, and counting it as
 #                           usage means the bill grows when a user is DENIED service.
 #
-# THE DISCRIMINATOR is `metadata->'error_information'->>'llm_provider'`. litellm's own
-# exception classes carry the provider they were raised for; the proxy-level refusals are
-# FastAPI `HTTPException`, `BudgetExceededError`, `ProxyException` and
-# `ProxyModelNotFoundError`, which have no such attribute, so the field serialises as the
-# empty string. Measured non-vacuously: two different provider exception classes populate
-# it (InternalServerError, NotFoundError) and four different refusal classes leave it
-# empty. Not `error_code` — a gateway rate limit and a provider rate limit are both 429.
+# THE DISCRIMINATOR IS TWO INDEPENDENT SIGNALS THAT MUST AGREE, and it is a conjunction
+# rather than a single test because each one alone has a reachable hole that the other
+# covers. A refusal has to be proven by BOTH:
 #
-# WHICH WAY IT FAILS IF THE SHAPE EVER CHANGES. A refusal must be positively proven: the
-# error object must exist AND name no provider. Anything unrecognised counts as admitted
-# and, if it failed, as a provider failure. That direction over-reports faults; the other
-# direction would delete requests from the count, which is this codebase's signature
-# defect and the thing reason 3 below is about.
+#   s.model_id = ''    NO ROUTER DEPLOYMENT WAS SELECTED. A typed first-class column, not a
+#                      JSON shape. litellm writes it from `metadata['model_info']['id']`,
+#                      which the Router stamps onto the request data at the moment it picks
+#                      a deployment — so a non-empty value means an upstream was addressed.
+#                      Measured on the bundle, whole-ledger cross-tab: set on all served
+#                      rows, on cache hits, and on BOTH provider-fault classes
+#                      (InternalServerError, NotFoundError); empty on all six refusal
+#                      classes (HTTPException 403 and 429, BudgetExceededError,
+#                      ProxyException ×2, RouterRateLimitError).
+#   error names no     litellm's own exception classes carry the provider they were raised
+#   provider           for; the proxy-level refusals are FastAPI `HTTPException`,
+#                      `BudgetExceededError`, `ProxyException`, `ProxyModelNotFoundError`
+#                      and `RouterRateLimitError`, none of which has that attribute, so
+#                      `get_error_information` falls back to `""` (vendor:
+#                      litellm_logging.py `getattr(original_exception, "llm_provider", "")`).
+#
+# Not `error_code` — a gateway rate limit and a provider rate limit are both 429. And not
+# `model_group`: measured, `RouterRateLimitError` carries a model_group, so it is set on a
+# refusal and cannot separate them.
+#
+# `api_base` AND `custom_llm_provider` LOOK LIKE THE RIGHT ANSWER AND ARE THE WRONG ONE.
+# They are first-class typed columns beside `model_id`, they are populated on every served
+# row, and they are empty on every refusal row — a cross-tab that says "use these" if the
+# only two classes you sample are served and refused. They are ALSO empty on every provider
+# fault, so requiring them to be populated in order to count a request would classify every
+# upstream failure as a refusal and delete it from `requests`: the exact defect reason 3
+# below is about, arrived at by a measurement that never sampled a fault.
+#
+# That is structural, not a sampling artifact, and it is worth stating because the columns
+# will keep inviting this. In `proxy_track_cost_callback.async_post_call_failure_hook` the
+# kwargs handed to `get_logging_payload` are the raw inbound `request_data` plus a synthetic
+# `litellm_params` holding only `proxy_server_request` and `metadata`. `get_logging_payload`
+# then reads `api_base` from `litellm_params` and `custom_llm_provider` from the top-level
+# kwargs — neither of which that synthetic dict has. So both columns are unconditionally
+# empty on EVERY failure row, refusal and fault alike, and carry no signal here at all.
+# `model_id` survives the same path only because it is read from `metadata`, which the
+# failure hook merges the request's real metadata into.
+#
+# WHICH WAY IT FAILS IF THE SHAPE EVER CHANGES. A refusal must be POSITIVELY PROVEN, on
+# both signals. Anything unrecognised counts as admitted and, if it failed, as a provider
+# fault. That direction over-reports faults; the other direction deletes requests from the
+# count, which is this codebase's signature defect and the thing reason 3 below is about.
+# The over-reporting direction is also the LOUD one: the refusal classes are pinned by
+# TestARefusalIsNotAFailedRequestAndIsNotUsage, so a predicate that drifted into admitting
+# refusals fails CI, whereas a predicate that drifted into deleting requests would pass
+# every test that only ever looks at rows it kept.
 #
 # THE RULING (enterpriseaiframework-e69, and the founder may reverse it — see finding 41).
 # `requests` counts every request the gateway ADMITTED, and each way of costing nothing
@@ -242,11 +297,31 @@ _CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
 # refusal ever did carry spend, that is money and it must appear, not be filtered out by a
 # predicate written when refusals were free.
 #
+# AND THE SECOND SIGNAL MOVES NO OPERATOR-VISIBLE NUMBER EITHER, measured rather than argued.
+# One SELECT over the 238-row ledger a full `make test` leaves behind, which holds all nine
+# classes, classifying every row under the previous single-signal predicate and under this
+# two-signal one and reporting both:
+#
+#   requests 121 / 121   failed_requests 36 / 36   refused_requests 117 / 117   cached 13
+#   SUM(spend) over admitted rows = SUM(spend) over all rows = 0.013947
+#
+# Identical on every column. That is the property this correction should have: the rows it
+# moves are shapes no class in the bundle produces, so it closes a hole without restating
+# anybody's bill — and it is also why the change cannot be justified by better numbers. The
+# rows it moves are enumerated and executed in tests/test_ledger_row_shapes.py, which is
+# where the evidence for the change lives.
+#
+# For contrast, on the same ledger, the api_base/custom_llm_provider predicate rejected
+# above: requests 121 -> 85, refused 117 -> 153, and failed_requests 36 -> ZERO. The one
+# number this whole item exists to create, reading nothing for ever, on a ledger holding 36
+# real upstream failures.
+#
 # Read against `status`, not against spend or tokens. That is not hypothetical: measured on
-# this bundle's ledger, `spend = 0` matches the cache-hit row AND all ten failure rows, so
-# deducing "failed" from the money column would report cache hits as failures and vice
-# versa depending on which way it was written. `total_tokens = 0` is no better — it would
-# sweep in anything else that ever records no tokens.
+# this bundle's ledger, `spend = 0` matches 166 rows — 13 cache hits AND all 153 failure rows
+# — so deducing "failed" from the money column would report cache hits as failures and vice
+# versa depending on which way it was written. `total_tokens = 0` matches those same 153
+# failures and cannot separate them either, and would sweep in anything else that ever
+# records no tokens.
 #
 # The observed values are exactly 'success' and 'failure'. The COALESCE is defensive rather
 # than measured: nothing here has produced a NULL status, but the sibling column cache_hit
@@ -255,29 +330,56 @@ _CACHE_HIT = "lower(COALESCE(s.cache_hit, '')) = 'true'"
 # the bill should under-claim failures rather than invent them.
 _FAILED = "lower(COALESCE(s.status, '')) = 'failure'"
 
-# The provider named on a failure, or NULL if none was. `jsonb_typeof(...) = 'object'` is
-# not decoration: without it a malformed `error_information` — a bare JSON string, say —
-# would extract as NULL and be read as "no provider named", i.e. as a refusal, which
-# subtracts a request that really happened. With it, only a well-formed error object that
-# explicitly names no provider can classify a row as refused.
 _ERROR_INFO = "s.metadata->'error_information'"
-_ERROR_PROVIDER = f"""CASE WHEN jsonb_typeof({_ERROR_INFO}) = 'object'
-    THEN NULLIF({_ERROR_INFO}->>'llm_provider', '') END"""
+
+# SIGNAL 1 — litellm's error object exists and explicitly names NO provider.
+#
+# PROVEN, NOT INFERRED FROM AN ABSENCE, and that is the whole difference between this and
+# the version it replaces. The earlier form asked "does `->>'llm_provider'` come back NULL",
+# which is TRUE for three different situations that mean three different things:
+#
+#   {"llm_provider": ""}     the measured refusal shape                  -> a refusal
+#   {"error_class": ...}     the key is absent; we know nothing about it  -> NOT a refusal
+#   {"llm_provider": null}   the key is present and explicitly null       -> NOT a refusal
+#
+# The last two were being counted as refusals, which means a request that really happened
+# was deleted from `requests` — reason 3's defect, in the code written to prevent it. Not
+# hypothetical: `llm_provider` is `Optional[str]` in litellm's own
+# `StandardLoggingPayloadErrorInformation`, and `get_error_information` fills it with
+# `getattr(original_exception, "llm_provider", "")`, which returns None — serialised as JSON
+# null — for any exception whose constructor defaults that argument to None. `ImageFetchError`
+# in litellm/exceptions.py is exactly such a class, and it is a PROVIDER fault: a request
+# the gateway admitted and forwarded. So the null shape is reachable on the one class of row
+# that must never be dropped.
+#
+# Hence three positive conditions rather than one negative one: the object must be an
+# object, the key must be present AND a JSON string, and that string must be empty. Any
+# other shape — absent key, JSON null, a nested object, a bare string where the object
+# should be — is unrecognised and therefore not a proven refusal.
+_ERROR_NAMES_NO_PROVIDER = f"""jsonb_typeof({_ERROR_INFO}) = 'object'
+    AND jsonb_typeof({_ERROR_INFO}->'llm_provider') = 'string'
+    AND {_ERROR_INFO}->>'llm_provider' = ''"""
+
+# SIGNAL 2 — the router never selected a deployment, so nothing was addressed upstream.
+# A typed column rather than a JSON shape; see the long note above for what it covers, what
+# it does not, and why its neighbours `api_base` and `custom_llm_provider` cannot be used.
+_NO_DEPLOYMENT_SELECTED = "COALESCE(s.model_id, '') = ''"
 
 # The gateway declined this request itself. No upstream was called.
 #
-# THE COALESCE IS THE WHOLE PREDICATE'S CORRECTNESS, not a tidy-up. `jsonb_typeof()` of an
-# absent key is NULL, so on a failure row with no `error_information` at all this expression
-# evaluates to NULL — and `COUNT(*) FILTER (WHERE ...)` counts only rows where the condition
-# is TRUE. Without the COALESCE such a row is excluded from `refused_requests` AND, through
-# `NOT (...)`, from `requests` as well: it vanishes off the bill entirely, which is the
-# precise defect reason 3 above is about, reintroduced by the fix for it. Found by running
-# the predicate over synthetic rows rather than by reading it. Defaulting to FALSE makes the
-# row admitted and, since it failed, a provider fault — the direction that over-reports
-# faults instead of deleting requests.
+# THE COALESCE IS THE WHOLE PREDICATE'S CORRECTNESS, not a tidy-up. Every `jsonb_typeof()`
+# above is NULL when the thing it is given does not exist, and NULL propagates through AND —
+# so on a failure row carrying no `error_information` at all this expression is NULL rather
+# than FALSE. `COUNT(*) FILTER (WHERE ...)` counts only rows where the condition is TRUE, so
+# without the COALESCE such a row falls out of `refused_requests` AND, through `NOT (...)`,
+# out of `requests` as well: it vanishes off the bill entirely. That was a real defect in an
+# earlier draft, found by running the predicate over synthetic rows rather than by reading
+# it, and tests/test_ledger_row_shapes.py now executes exactly those rows against exactly
+# this SQL so it cannot come back. Defaulting to FALSE makes the row admitted and, since it
+# failed, a provider fault — over-reporting faults instead of deleting requests.
 _REFUSED = f"""COALESCE({_FAILED}
-    AND jsonb_typeof({_ERROR_INFO}) = 'object'
-    AND {_ERROR_PROVIDER} IS NULL, false)"""
+    AND {_NO_DEPLOYMENT_SELECTED}
+    AND {_ERROR_NAMES_NO_PROVIDER}, false)"""
 
 # The gateway let this request through. Everything that is not a proven refusal, so an
 # unrecognised row is counted rather than silently dropped from the bill.
@@ -302,6 +404,29 @@ def refused_sql() -> str:
 def failed_sql() -> str:
     """`status = 'failure'`, refusals included. Pair with refused_sql() to separate them."""
     return _FAILED
+
+
+def admitted_sql() -> str:
+    """"The gateway let this request through" — what `requests` counts."""
+    return _ADMITTED
+
+
+def provider_failed_sql() -> str:
+    """"Admitted, and the provider did not answer" — what `failed_requests` counts."""
+    return _PROVIDER_FAILED
+
+
+def cache_hit_sql() -> str:
+    """"Answered without calling a provider" — what `cached_requests` counts."""
+    return _CACHE_HIT
+
+
+# The columns the four predicates above actually read. Named here so a test can build a
+# table of synthetic rows that is complete with respect to the rule rather than with respect
+# to whatever the test author happened to think of — if the predicate grows a term on a new
+# column, this list is what makes the omission visible. tests/test_ledger_row_shapes.py
+# asserts it against the SQL.
+PREDICATE_COLUMNS = ("status", "cache_hit", "model_id", "metadata")
 
 
 async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:

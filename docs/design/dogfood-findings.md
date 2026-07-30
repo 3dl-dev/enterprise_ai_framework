@@ -1254,11 +1254,12 @@ The second is the sharper one. Finding 36 exists to make `(unattributed)` **empt
 that no bill can name is the exact failure this project exists to prevent. Counting
 refusals refilled it with a phantom principal that made requests and failed every one.
 
-**The discriminator is `metadata->'error_information'->>'llm_provider'`.** litellm's own
+**The discriminator was `metadata->'error_information'->>'llm_provider'`** — litellm's own
 exception classes carry the provider they were raised for; the proxy-level refusals are
 `HTTPException`, `BudgetExceededError`, `ProxyException` and `ProxyModelNotFoundError`,
 which have no such attribute, so the field serialises as the empty string. Not `error_code`:
-a gateway rate limit and a provider rate limit are both `429`.
+a gateway rate limit and a provider rate limit are both `429`. **That single-signal form is
+superseded — see §Correction 2.**
 
 The type guard on that expression is load-bearing, not defensive style — demonstrated by
 running both variants over synthetic rows:
@@ -1328,12 +1329,135 @@ every cache assertion pass with the cache switched off. `/debug/calls` now publi
 `boot_id`, and the two tests that read a low count as evidence of caching assert it did not
 change. Demonstrated by removing the field: both fail rather than passing quietly.
 
+#### Correction 2: "the extraction came back NULL" is not "the error names no provider"
+
+§Correction replaced the *premise* and left a hole in the *predicate*. `->>'llm_provider'`
+returns SQL `NULL` for three different situations, and only one of them is a refusal:
+
+| shape of `error_information` | what it means | old verdict | correct verdict |
+|---|---|---|---|
+| `{"llm_provider": ""}` | the measured refusal shape | refused | refused |
+| `{"error_class": "…"}` — key absent | unknown | **refused** | admitted |
+| `{"llm_provider": null}` | explicitly null | **refused** | admitted |
+
+The last two were being deleted from `requests` — reason 3's defect, inside the code written
+to prevent it, and the comment above the predicate asserted the state was unreachable.
+
+**It is reachable, and on the one class of row that must never be dropped.** `llm_provider`
+is `Optional[str]` in litellm's own `StandardLoggingPayloadErrorInformation`, and
+`get_error_information` fills it with `getattr(original_exception, "llm_provider", "")` —
+which returns `None`, serialised as JSON `null`, for any exception whose constructor defaults
+that argument to `None`. `ImageFetchError` in `litellm/exceptions.py` is exactly such a class,
+and it is a **provider fault**: a request the gateway admitted and forwarded.
+
+**A second signal, from a typed column: `LiteLLM_SpendLogs.model_id`.** litellm writes it from
+`metadata['model_info']['id']`, which the Router stamps onto the request data at the moment it
+selects a deployment — so a non-empty value means an upstream was addressed. Measured on a
+whole-ledger cross-tab of all nine classes:
+
+| outcome | `model_id` | `model_group` | `custom_llm_provider` | `api_base` |
+|---|---|---|---|---|
+| served / served from cache | set | set | **set** | **set** |
+| both provider faults | **set** | set | *empty* | *empty* |
+| `RouterRateLimitError` | *empty* | set | *empty* | *empty* |
+| every other refusal | *empty* | *empty* | *empty* | *empty* |
+
+**`api_base` and `custom_llm_provider` look like the answer and are the wrong one, and this is
+the part worth reading.** They are first-class typed columns beside `model_id`, populated on
+every served row, empty on every refusal row — a cross-tab that says "use these" if the only
+two classes you sample are *served* and *refused*. They are also empty on every provider
+**fault**, so a predicate reading "all three populated means a provider was called" classifies
+every upstream failure as a refusal and deletes it from the bill. Measured over the live
+ledger, three readings of that proposal side by side:
+
+```
+                        refused, all-three-empty   refused, not-all-populated   refused, api_base alone
+served                             f                          f                          f
+InternalServerError                f                          t  <-- deleted               t  <-- deleted
+NotFoundError                      f                          t  <-- deleted               t  <-- deleted
+every refusal class                t                          t                          t
+```
+
+Only the conjunction survives, and it survives because `model_id` carries the whole load:
+the other two terms are empty on *every* failure row, so they are tautologies there and
+contribute nothing. What the middle column costs, over the 238-row ledger the full suite
+leaves behind: `requests` 121 → 85, `refused_requests` 117 → 153, and
+**`failed_requests` 36 → 0** — the one number this whole finding exists to create, reading
+zero for ever, on a ledger with 36 real upstream failures in it.
+
+That is structural rather than a sampling artifact. In litellm's
+`proxy_track_cost_callback.async_post_call_failure_hook`, the kwargs handed to
+`get_logging_payload` are the raw inbound `request_data` plus a synthetic `litellm_params`
+holding only `proxy_server_request` and `metadata`; `get_logging_payload` then reads
+`api_base` from `litellm_params` and `custom_llm_provider` from the top-level kwargs, and that
+synthetic dict has neither. `model_id` survives the same path only because it is read from
+`metadata`, which the failure hook merges the request's real metadata into.
+
+**The predicate is now a conjunction of two independent signals** — a refusal must be proven
+by both, because each alone has a reachable hole the other covers:
+
+```
+refused = status='failure'
+      AND model_id is empty                     the router selected no deployment
+      AND error_information is an object
+      AND its llm_provider is a JSON string     present, not absent, not null
+      AND that string is empty                  and it names nobody
+```
+
+`model_id` alone would misclassify a pass-through route, which reaches a provider without the
+Router stamping a deployment. The error object alone misclassifies the `ImageFetchError`
+shape above. Anything unrecognised is admitted, and if it failed, a provider fault — the
+direction that over-reports faults instead of deleting requests, and also the **loud**
+direction: the refusal classes are pinned by live tests, so a predicate that drifted into
+admitting refusals fails CI, whereas one that drifted into deleting requests passes every
+test that only looks at rows it kept.
+
+**A new observation about one operator-visible class.** A key with `rpm_limit` set produces
+*two* different refusal shapes: the first refusal comes from the router's own limiter
+(`RouterRateLimitError`, `model_group` set) and the rest from the proxy's (`HTTPException`
+`429`, `model_group` empty). A predicate tuned to either one would have looked correct on a
+four-request sample.
+
+**Nothing an operator sees moved**, measured rather than argued — one `SELECT` classifying
+every row of the 238-row ledger the full suite leaves behind, which holds all nine classes,
+under both predicates:
+
+```
+                    old predicate    new predicate
+requests                121              121
+failed_requests          36               36
+refused_requests        117              117
+cached_requests          13               13
+SUM(spend)         0.013947         0.013947     (admitted rows and all rows agree, so
+                                                  refusals carry no money either way)
+```
+
+That is the property this correction should have: the rows it moves are shapes no class in
+the bundle produces, so it closes a hole without restating anybody's bill. It is also why
+this correction cannot be justified by "the numbers got better" — they did not change, and
+the argument for it is entirely about the shapes that are reachable but unsampled.
+
+**The row shapes are now executed, not reasoned about.** `tests/test_ledger_row_shapes.py`
+builds a temp table inside the bundle's Postgres, inserts 22 row shapes — the nine measured
+classes plus thirteen hazards no class produces — and runs `metering`'s own exported SQL over
+them, asserting the exact four-way classification and that no predicate is ever `NULL`. It
+never touches `LiteLLM_SpendLogs`. Red before green by execution: against the predicate this
+branch previously shipped, five tests fail, three of them naming a row shape being deleted
+from `requests`. The live half —
+`test_the_raw_ledger_row_carries_the_shape_the_predicate_assumes` — asserts the raw rows real
+traffic writes actually have those shapes, including that `api_base` and
+`custom_llm_provider` are still empty on a fault, so the trap above is re-measured rather
+than remembered.
+
 **Still open, deliberately.** `unpriced_models` excludes refusals only incidentally, via
 `total_tokens > 0`. If a refusal or a partial-stream failure ever recorded tokens, the leak
 detector would flag its model as unpriced. Worth an item if that is ever seen; there is no
 evidence for it now. `make test-forge` — finding 9's live reconciliation against a real
 provider — was **not** run: it needs real credentials and a live upstream, and running with
-Forge credentials visible drops the fake upstreams the whole suite is built on.
+Forge credentials visible drops the fake upstreams the whole suite is built on. And the
+`model_id` signal is not proven against a **pass-through** route, because the bundle
+configures none; a pass-through failure raising a non-provider exception would be classified
+as a refusal.
 
 ### 42. `make up` failed the first time and passed on a re-run, in a clean checkout
 

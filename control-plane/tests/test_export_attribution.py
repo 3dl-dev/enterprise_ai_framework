@@ -317,28 +317,54 @@ def test_the_archive_and_the_bill_share_one_definition_of_a_refusal():
     cannot disagree about which rows were refusals.
     """
     refused = metering.refused_sql()
-    assert "llm_provider" in refused, (
-        f"the refusal rule no longer reads the provider named on the error, so it is "
-        f"deciding on something else: {refused}"
-    )
-    assert "error_information" in refused, refused
-    # A malformed error object must NOT classify as a refusal — that direction deletes a
-    # request that really happened, which is the defect this whole item is about.
-    assert "jsonb_typeof" in refused, (
-        f"without the type guard, a malformed error_information extracts as NULL and the "
-        f"row is read as 'no provider named', i.e. as a refusal, and a request that really "
-        f"happened vanishes from the count: {refused}"
-    )
     assert metering.failed_sql() in refused, (
         f"a refusal must be a failure first; this predicate could match a successful "
         f"request: {refused}"
     )
-    # And it must be TOTAL. `jsonb_typeof()` of an absent key is NULL, so without a
-    # COALESCE this predicate is NULL on a failure row carrying no error object — and
-    # `COUNT(*) FILTER (WHERE ...)` counts only TRUE, so such a row falls out of
-    # refused_requests AND, through `NOT (...)`, out of `requests` too. It vanishes off the
-    # bill. That was a real defect in the first draft of this predicate, found by running it
-    # over synthetic rows; this assertion is what stops it coming back.
+
+    # BOTH SIGNALS, because either one alone has a reachable hole the other covers, and
+    # dropping one is what silently deletes a request from the operator's count.
+    assert "s.model_id" in refused, (
+        f"the refusal rule no longer asks whether the router selected a deployment, so a "
+        f"provider fault whose exception happens to name no provider — litellm's "
+        f"llm_provider is Optional[str] and ImageFetchError leaves it None — is classified "
+        f"as a refusal and drops out of `requests`: {refused}"
+    )
+    assert "llm_provider" in refused and "error_information" in refused, (
+        f"the refusal rule no longer reads the provider named on the error, so it is "
+        f"deciding on the deployment column alone — and a pass-through route stamps no "
+        f"deployment while genuinely calling a provider: {refused}"
+    )
+
+    # THE SHAPE MUST BE PROVEN, NOT INFERRED FROM AN ABSENCE. `->>'llm_provider'` returns
+    # NULL for three different situations — the measured refusal shape (present and empty),
+    # an absent key, and an explicit JSON null — and only the first is a refusal. Asking
+    # `jsonb_typeof(... -> 'llm_provider') = 'string'` is what separates them; asking only
+    # `jsonb_typeof(error_information) = 'object'` does not, and that was the defect.
+    assert "->'llm_provider') = 'string'" in refused, (
+        f"the refusal rule is back to reading a NULL extraction as 'names no provider', "
+        f"which counts a well-formed error object with the key absent, and one with the key "
+        f"explicitly null, as refusals — deleting requests that really happened: {refused}"
+    )
+
+    # THE COLUMNS THAT MUST NOT BE READ. api_base and custom_llm_provider sit beside
+    # model_id, are populated on every served row and empty on every refusal row, and are
+    # ALSO empty on every provider fault — litellm's failure hook builds the payload from
+    # the inbound request data, which carries neither. Requiring them populated in order to
+    # count a request reclassifies every upstream failure as a refusal.
+    for forbidden in ("api_base", "custom_llm_provider"):
+        assert f"s.{forbidden}" not in refused, (
+            f"the refusal rule reads s.{forbidden}, which litellm leaves empty on EVERY "
+            f"failure row — refusal and genuine provider fault alike: {refused}"
+        )
+
+    # And it must be TOTAL. Every `jsonb_typeof()` is NULL when the thing it is given does
+    # not exist and NULL propagates through AND, so without a COALESCE this predicate is
+    # NULL on a failure row carrying no error object — and `COUNT(*) FILTER (WHERE ...)`
+    # counts only TRUE, so such a row falls out of refused_requests AND, through
+    # `NOT (...)`, out of `requests` too. It vanishes off the bill. That was a real defect
+    # in an earlier draft, found by running it over synthetic rows; this assertion and
+    # tests/test_ledger_row_shapes.py are what stop it coming back.
     assert "COALESCE" in refused and "false" in refused, (
         f"the refusal predicate can evaluate to NULL, which drops the row from BOTH the "
         f"request count and the refusal count instead of choosing one: {refused}"

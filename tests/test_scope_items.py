@@ -18,7 +18,9 @@ import httpx
 import pytest
 
 import oidc_login
-from conftest import BUNDLE, DOGFOOD_USER, compose, portal_get, set_user_enabled
+from conftest import (
+    BUNDLE, DOGFOOD_USER, _load_env, compose, portal_get, set_user_enabled,
+)
 
 
 def _chat_token(client, chat_url: str) -> str:
@@ -1991,10 +1993,25 @@ class TestARefusalIsNotAFailedRequestAndIsNotUsage:
     status='failure', and none of them is a provider fault.
 
         HTTPException 403     require_principal refused it     finding 36, no alias on row
-        HTTPException 429     the GATEWAY's own rate limiter   alias present
+        RouterRateLimitError  the ROUTER's own rate limiter    alias present
+        HTTPException 429     the PROXY's own rate limiter     alias present
         BudgetExceededError   over the key's budget            no alias on row
         ProxyException        model not on the key's list      no alias on row
-        ProxyModelNotFoundError  no such model in the catalogue  alias present
+        ProxyException 401    no such model in the catalogue   alias present
+
+    THE PREDICATE IS TWO SIGNALS, and the third pass is what made it two. `requests` counts
+    a row unless BOTH say the gateway declined before addressing anyone: `s.model_id` empty
+    (the router selected no deployment) AND litellm's error object present with
+    `llm_provider` an explicit empty JSON string. Either alone deletes a real request in a
+    reachable case — see metering._REFUSED, and tests/test_ledger_row_shapes.py, which runs
+    the four predicates over the row shapes this bundle cannot produce.
+
+    `api_base` and `custom_llm_provider` are the trap. They are typed first-class columns
+    beside model_id, populated on every served row and empty on every refusal row, and they
+    are empty on every provider FAULT too — so requiring them populated in order to count a
+    request deletes every upstream failure from the bill.
+    test_the_raw_ledger_row_carries_the_shape_the_predicate_assumes re-measures that rather
+    than trusting this paragraph.
 
     And the premise that made the first pass look safe was false. It was recorded as
     measured that over-budget and model-not-permitted refusals "never reach the ledger at
@@ -2265,6 +2282,143 @@ class TestARefusalIsNotAFailedRequestAndIsNotUsage:
         assert row["refused_requests"] == refused, row
         # The arithmetic the ruling promises, on a row that holds all three classes.
         assert row["requests"] - row["failed_requests"] == served, row
+
+    def test_the_raw_ledger_row_carries_the_shape_the_predicate_assumes(
+        self, gateway_url, master_headers, fakeprovider_url
+    ):
+        """The assertion whose absence is why the premise was wrong twice.
+
+        Every other test in this class reads the BILL. That proves the numbers agree with
+        each other; it cannot prove the predicate is reading the signal it thinks it is,
+        because a predicate keying off the wrong column would produce the same numbers as
+        long as the wrong column happened to correlate. It did correlate: `api_base` and
+        `custom_llm_provider` are populated on every served row and empty on every refusal
+        row, which reads as a clean discriminator right up until you look at a provider
+        fault, where they are empty too.
+
+        So this test looks at the RAW ROW for traffic it just made, and asserts the shape
+        that tests/test_ledger_row_shapes.py encodes as MEASURED. That file runs the real
+        predicates over synthetic rows of that shape; this one is the authority for the
+        shape being real. Neither is sufficient alone — synthetic rows prove the rule, live
+        rows prove the input, and the defect lived in the gap between them.
+
+        Read over `compose exec` because these columns reach no HTTP surface: /admin/spend
+        aggregates them away and spend.csv does not carry model_id. Being unable to see
+        them from outside is part of why nobody looked.
+        """
+        username = f"rawshape-{uuid.uuid4().hex[:8]}"
+        key = self._rate_limited_key(gateway_url, master_headers, f"{username}::chat", 2)
+
+        assert self._ask(gateway_url, key, f"raw ok {uuid.uuid4().hex}").status_code == 200
+        prompt = f"{FAKE_FAIL_MARKER} {uuid.uuid4().hex}"
+        assert self._ask(gateway_url, key, prompt).status_code >= 500
+        assert self._provider_calls(fakeprovider_url, prompt) >= 1, (
+            "the fault never reached the provider, so this is measuring a refusal"
+        )
+        refused = sum(
+            1 for _ in range(5)
+            if self._ask(gateway_url, key, f"raw refused {uuid.uuid4().hex}").status_code == 429
+        )
+        assert refused >= 2, f"only {refused} refusals; nothing to compare against"
+
+        rows = self._raw_ledger_rows(username, expect_at_least=4)
+        served_rows = [r for r in rows if r["status"] == "success"]
+        failure_rows = [r for r in rows if r["status"] == "failure"]
+        faults = [r for r in failure_rows if r["llm_provider"] not in ("", None)]
+        refusals = [r for r in failure_rows if r["llm_provider"] == ""]
+
+        assert served_rows, f"no served row reached the ledger: {rows}"
+        assert faults, f"no provider-fault row reached the ledger: {failure_rows}"
+        assert refusals, f"no refusal row reached the ledger: {failure_rows}"
+        assert len(faults) + len(refusals) == len(failure_rows), (
+            f"a failure row names a provider in neither shape the predicate recognises, so "
+            f"it is being classified by the fallback: {failure_rows}"
+        )
+
+        # SIGNAL 1 — a deployment id is present exactly when an upstream was addressed.
+        for r in served_rows + faults:
+            assert r["model_id"], (
+                f"a request that reached a provider carries no deployment id, so the bill "
+                f"classifies it as a refusal and deletes it from `requests`: {r}"
+            )
+        for r in refusals:
+            assert not r["model_id"], (
+                f"a request the gateway refused carries a deployment id, so the bill "
+                f"counts a refusal as usage and grows the bill of somebody who was "
+                f"DENIED service: {r}"
+            )
+
+        # SIGNAL 2 — the error object names the provider on a fault and is present-and-empty
+        # on a refusal. Present-and-empty, not absent: the predicate requires a JSON string,
+        # and an absent key means 'unknown' rather than 'refused'.
+        for r in faults:
+            assert r["provider_type"] == "string" and r["llm_provider"], r
+        for r in refusals:
+            assert r["provider_type"] == "string", (
+                f"a refusal's error object no longer carries llm_provider as a JSON string, "
+                f"so the predicate can no longer prove it is a refusal and will count it as "
+                f"a provider fault: {r}"
+            )
+
+        # THE TWO COLUMNS THAT CORRELATE AND MUST NOT BE TRUSTED. Asserted, not assumed:
+        # this is the observation that disproves the obvious typed-column predicate, and it
+        # has to be re-observed rather than remembered.
+        for r in faults:
+            for column in ("api_base", "custom_llm_provider"):
+                assert not r[column], (
+                    f"litellm now populates {column} on a provider fault. That reopens the "
+                    f"'all three typed columns populated means a provider was called' "
+                    f"predicate, which is currently WRONG precisely because this is empty. "
+                    f"Recheck metering._REFUSED before relaxing anything: {r}"
+                )
+        for r in served_rows:
+            for column in ("api_base", "custom_llm_provider"):
+                assert r[column], (
+                    f"{column} is empty on a SERVED row, so this test's premise about which "
+                    f"columns correlate is stale: {r}"
+                )
+
+    @staticmethod
+    def _raw_ledger_rows(username, expect_at_least, timeout=90):
+        """The gateway's own spend rows for one key alias, straight out of Postgres.
+
+        SELECT only, and only rows this test's own unique username produced. Polls because
+        the gateway batches spend writes on a 7-13s timer.
+        """
+        sql = (
+            "SELECT COALESCE(s.status,'') AS status, "
+            "COALESCE(s.model_id,'') AS model_id, "
+            "COALESCE(s.api_base,'') AS api_base, "
+            "COALESCE(s.custom_llm_provider,'') AS custom_llm_provider, "
+            "COALESCE(jsonb_typeof(s.metadata->'error_information'->'llm_provider'),"
+            "'(absent)') AS provider_type, "
+            "COALESCE(s.metadata->'error_information'->>'llm_provider','(absent)') "
+            "AS llm_provider "
+            'FROM "LiteLLM_SpendLogs" s '
+            f"WHERE s.metadata->>'user_api_key_alias' = '{username}::chat'"
+        )
+        env = _load_env()
+        columns = ("status", "model_id", "api_base", "custom_llm_provider",
+                   "provider_type", "llm_provider")
+        deadline = time.monotonic() + timeout
+        rows = []
+        while time.monotonic() < deadline:
+            out = compose(
+                "exec", "-T", "postgres", "psql", "-U", env["POSTGRES_USER"], "-d",
+                "gateway", "--no-align", "--tuples-only", "--field-separator=\t", "-c", sql,
+            )
+            rows = [
+                dict(zip(columns, line.split("\t")))
+                for line in out.stdout.splitlines() if line.count("\t") == len(columns) - 1
+            ]
+            if len(rows) >= expect_at_least:
+                break
+            time.sleep(3)
+        assert len(rows) >= expect_at_least, (
+            f"only {len(rows)} of {expect_at_least} rows reached the ledger for "
+            f"{username}::chat, so there is nothing to check the shape of: {rows}"
+        )
+        return rows
 
     def test_an_over_budget_refusal_is_a_request_nowhere_on_the_whole_ledger(
         self, gateway_url, control_plane_url, master_headers, admin_headers
