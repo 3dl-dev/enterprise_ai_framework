@@ -137,6 +137,29 @@ spec:
             - { name: OPENID_AUTO_REDIRECT, value: "true" }
             - name: OPENID_SESSION_SECRET
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_SESSION_SECRET } }
+            # enterpriseaiframework-40f: shouldUseSecureCookie() (packages/api/src/oauth/csrf.ts)
+            # marks every session/auth cookie Secure whenever DOMAIN_SERVER is a non-localhost
+            # https:// origin — true here. That's fine for the browser, which really is
+            # talking TLS to the public origin. It is NOT fine for express-session's own
+            # cookie-setting gate (node_modules/express-session/index.js: `if
+            # (cookie.secure && !issecure(req, trustProxy)) return` — i.e. it silently skips
+            # Set-Cookie entirely), because THIS pod sees the request as plain HTTP: Caddy's
+            # :8081 block on the gateway VM (the one Tailscale Funnel forwards to) is itself
+            # unencrypted — see deploy/README.md's Caddyfile excerpt — so whatever it forwards
+            # downstream reports http, not https, no matter how the browser reached Funnel.
+            # Measured: `GET /oauth/openid` carried zero Set-Cookie headers, on both the real
+            # public origin and a direct port-forward, so the OIDC state stashed before the
+            # bounce to Keycloak never came back on the callback — logged as "[OpenID OAuth]
+            # Callback authentication failed Unable to verify authorization request state".
+            # Same fix, same justification, as --cookie-secure=false on the portal's
+            # oauth2-proxy in 40-control-plane.yaml: the browser's connection to the public
+            # origin really is TLS, so a non-Secure cookie set over it is still accepted and
+            # stored; only defense-in-depth against a *plain-http* path to this same NodePort
+            # is given up, a trade-off this deployment already accepts for the portal cookie.
+            # Fixing this without giving up that defense-in-depth means Caddy's :8081 block
+            # asserting `header_up X-Forwarded-Proto https` — a gateway-VM change outside this
+            # repo and outside the cluster.
+            - { name: SESSION_COOKIE_SECURE, value: "false" }
 
             - name: CREDS_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_CREDS_KEY } }
