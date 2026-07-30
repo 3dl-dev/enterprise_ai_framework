@@ -43,6 +43,21 @@ model_list:
       input_cost_per_token: 0.000003
       output_cost_per_token: 0.000015
 
+  # File search's embedding leg (enterpriseaiframework-c7c). rag_api calls THIS model
+  # through the gateway — RAG_OPENAI_BASEURL points at the gateway, never at
+  # fakeprovider directly — so an uploaded document's embedding call is a metered,
+  # attributed gateway request like any other, not a path around it. Swap to a real
+  # embeddings model (e.g. text-embedding-3-small) by uncommenting a real entry below
+  # and pointing bundle/docker-compose.yml's EMBEDDINGS_MODEL at it — no other file
+  # changes.
+  - model_name: fake-embed
+    litellm_params:
+      model: openai/fake-embed
+      api_base: http://fakeprovider:8080/v1
+      api_key: fake-not-a-real-key
+      input_cost_per_token: 0.0000001
+      output_cost_per_token: 0
+
   # ---- upstream models, generated ------------------------------------------------
   # bin/render-gateway-config.py replaces the marker below with one entry per model
   # from Forge's live catalog, priced from that catalog. Do not hand-edit: the doc is

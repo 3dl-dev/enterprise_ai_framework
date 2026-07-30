@@ -218,6 +218,8 @@ ensure SEARXNG_SECRET              "$(hex 24)"
 # LibreChat's Meilisearch client against the self-hosted meilisearch service below;
 # it is never sent anywhere outside the bundle.
 ensure MEILI_MASTER_KEY            "ms-$(hex 24)"
+# File search (enterpriseaiframework-c7c) — rag_api's dedicated pgvector instance.
+ensure RAGVECTOR_PASSWORD          "$(hex 24)"
 
 # Bootstrap realm user, so a fresh bundle can be signed in to without manual steps.
 # The first two are not secrets, but they must exist in .env for post-up to provision

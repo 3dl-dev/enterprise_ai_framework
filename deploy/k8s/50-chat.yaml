@@ -240,6 +240,13 @@ spec:
             - { name: MEILI_HOST, value: "http://meilisearch:7700" }
             - name: MEILI_MASTER_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: MEILI_MASTER_KEY } }
+
+            # File search (enterpriseaiframework-c7c). Services in
+            # deploy/k8s/51-file-search.yaml. Unset, this is exactly the cluster's own
+            # observed symptom the item started from: "RAG API is either not running or
+            # not reachable at undefined" — file_search silently has nowhere to embed
+            # or query uploaded documents.
+            - { name: RAG_API_URL, value: "http://rag-api:8000" }
           ports: [{ containerPort: 3080 }]
           volumeMounts:
             - { name: config, mountPath: /app/librechat.yaml, subPath: librechat.yaml, readOnly: true }

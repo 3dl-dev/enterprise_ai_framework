@@ -118,6 +118,28 @@ else
     echo "    existing key is valid"
 fi
 
+echo "==> rag-api (file search, enterpriseaiframework-c7c) virtual key"
+# Same reasoning as the chat surface key above: minted against THIS gateway, not carried
+# over from the local compose bundle. Without a valid key here rag-api's embedding calls
+# 401 against the gateway and every file upload fails at the embed step.
+RAG_KEY=$(curl -sS -o /dev/null -w '%{http_code}' -G "${GW}/key/info" \
+    -H "Authorization: Bearer ${MK}" --data-urlencode "key=$(secret RAG_VIRTUAL_KEY 2>/dev/null || echo x)")
+if [[ "$RAG_KEY" != "200" ]]; then
+    curl -sS -X POST "${GW}/key/delete" -H "Authorization: Bearer ${MK}" \
+        -H "Content-Type: application/json" -d '{"key_aliases":["rag-api::file-search"]}' >/dev/null 2>&1 || true
+    NEW_RAG=$(curl -sS -X POST "${GW}/key/generate" -H "Authorization: Bearer ${MK}" \
+        -H "Content-Type: application/json" \
+        -d '{"key_alias":"rag-api::file-search","metadata":{"surface":"file-search","issuer":"post-deploy"}}' \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin)["key"])')
+    kubectl -n "$NS" patch secret enterprise-ai-secrets --type=json \
+        -p "[{\"op\":\"replace\",\"path\":\"/data/RAG_VIRTUAL_KEY\",\"value\":\"$(printf '%s' "$NEW_RAG" | base64 -w0)\"}]" >/dev/null
+    kubectl -n "$NS" rollout restart deployment/rag-api >/dev/null
+    kubectl -n "$NS" rollout status deployment/rag-api --timeout=300s >/dev/null
+    echo "    minted and rag-api restarted"
+else
+    echo "    existing key is valid"
+fi
+
 echo "==> reconciling identity into virtual keys"
 kubectl -n "$NS" port-forward svc/control-plane 18081:8000 >/dev/null 2>&1 &
 CPF=$!
