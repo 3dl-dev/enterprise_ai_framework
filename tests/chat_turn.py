@@ -41,12 +41,22 @@ BROWSER_UA = (
 )
 
 
-def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=None):
+def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=None,
+                  execute_code=False):
     """The body LibreChat's own client sends for an ephemeral-agent turn.
 
     `ephemeralAgent.mcp` is what attaches an MCP server to an otherwise plain
     custom-endpoint turn; the entries are server names from `mcpServers` in
     librechat.yaml, not tool names.
+
+    `ephemeralAgent.execute_code` (enterpriseaiframework-082) is the per-turn switch for
+    the codeapi sandbox — a real zod key (data-provider/src/models.ts's
+    tModelSpecPresetSchema has the modelSpec-level twin, `executeCode`; this is the
+    ephemeral-agent one, read in api/server/services/Endpoints/agents/added.ts:
+    `ephemeralAgent?.execute_code === true || modelSpec?.executeCode === true`). Needed
+    when a turn is sent against a bare model name (e.g. "fake-large") rather than
+    through a modelSpec, which is exactly how the hermetic suite talks to the fake
+    upstream.
     """
     body = {
         "text": text,
@@ -63,8 +73,13 @@ def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=Non
         "isTemporary": False,
         "isRegenerate": False,
     }
+    ephemeral_agent = {}
     if mcp_servers:
-        body["ephemeralAgent"] = {"mcp": list(mcp_servers)}
+        ephemeral_agent["mcp"] = list(mcp_servers)
+    if execute_code:
+        ephemeral_agent["execute_code"] = True
+    if ephemeral_agent:
+        body["ephemeralAgent"] = ephemeral_agent
     return body
 
 
@@ -183,9 +198,11 @@ def tool_calls(message):
 
 
 def send_turn(client, chat_url, text, model, endpoint, endpoint_type="custom",
-              mcp_servers=None, headers=None, timeout=180.0):
+              mcp_servers=None, execute_code=False, headers=None, timeout=180.0):
     """One turn, end to end, on either protocol. Returns the persisted assistant message."""
-    payload = build_payload(text, model, endpoint, endpoint_type, mcp_servers)
+    payload = build_payload(
+        text, model, endpoint, endpoint_type, mcp_servers, execute_code=execute_code
+    )
     conversation_id, _ = start_turn(
         client, chat_url, payload, headers=headers, timeout=timeout
     )
