@@ -2,7 +2,8 @@
 #
 # Everything here exists to make one claim true: a workspace pod runs the user's own code
 # next to a spendable virtual key, on a node that is also running live GPU training. It
-# must be able to reach the gateway and the public internet, and nothing else.
+# must be able to reach the gateway, the tool servers named one at a time below, and the
+# public internet — and nothing else.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -79,14 +80,54 @@ spec:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
 
-    # The gateway, and only the gateway, of everything we run. This is the one route out
-    # of the building for model traffic; the pod cannot reach the control plane, the
-    # identity provider's internal service, Postgres, or another workspace.
+    # The gateway. This is the one route out of the building for model traffic; the pod
+    # cannot reach the control plane, the identity provider's internal service, Postgres,
+    # or another workspace.
     - to:
         - podSelector:
             matchLabels: { app: gateway }
       ports:
         - { protocol: TCP, port: 4000 }
+
+    # ------------------------------------------------------------------ tool servers
+    # The MCP servers the chat surface uses, so the terminal agent has the same tools
+    # (enterpriseaiframework-784, unblocking -471). Before this rule, measured from
+    # inside ws-student's ttyd container: mcp-echo:8080 -> ConnectionRefused while
+    # gateway:4000 -> OPEN.
+    #
+    # ONE `podSelector` PER SERVER, MATCHING THAT SERVER'S OWN `app` LABEL, AND NOTHING
+    # BROADER. Not `namespaceSelector`, not the pod CIDR, not a shared
+    # `component: mcp-server` label. Two reasons, and the second is the load-bearing one:
+    #
+    #   1. Every rule here is an authority grant to a shell the user controls, running
+    #      code an agent wrote, holding a spendable virtual key. A future MCP server
+    #      should cost one reviewed line, not arrive by inheriting a label.
+    #   2. THE CNI. kube-router resolves a packet on the DESTINATION pod's ingress rules
+    #      without consulting the source's egress (see the ingress section above). A
+    #      destination set wide enough to cover workspace pods — the namespace, or
+    #      10.42.0.0/16 — therefore re-opens workspace-to-workspace traffic that the
+    #      ingress `from` lists exist to close. tests/test_workspace_egress_allowlist.py
+    #      fails on each of those shapes by fault injection, and
+    #      tests-live/test_workspace_isolation.py measures the result on the cluster.
+    #
+    # NO MATCHING INGRESS RULE IS NEEDED ON THESE SERVICES, and that is measured rather
+    # than assumed: `gateway` has no NetworkPolicy of its own — `workspace-isolation` is
+    # the only policy in this namespace — and workspace -> gateway:4000 is OPEN. So under
+    # this CNI an egress ACCEPT naming a destination that no policy selects is sufficient.
+    # The ingress-side requirement recorded above applies where the destination IS
+    # selected by a policy, i.e. workspace -> workspace.
+    #
+    # WHAT THIS GRANTS, STATED PLAINLY: mcp-echo authenticates nobody (mcp-echo/app.py has
+    # no auth and disables DNS-rebinding protection on the grounds of being unreachable
+    # from anywhere but chat — which stops being true here). Any workspace shell can now
+    # call its `echo` tool. Acceptable for a server whose only tool returns its own input;
+    # a real tool server carrying authority (code execution, web fetch) needs a caller
+    # identity before it is added to this list, not just a line here.
+    - to:
+        - podSelector:
+            matchLabels: { app: mcp-echo }
+      ports:
+        - { protocol: TCP, port: 8080 }
 
     # The public TLS edge, for the oauth2-proxy sidecar's OIDC backchannel. The sidecar
     # shares this network namespace with the shell, so the shell can reach it too — it is

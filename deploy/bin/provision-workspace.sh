@@ -17,8 +17,13 @@
 #      NetworkPolicy admits 7681/7682 only from the control-plane pod, and ttyd itself
 #      demands a credential that only the portal holds. The portal decides WHICH pod you
 #      reach from your authenticated name, so a request cannot name somebody else's.
-#   3. The pod cannot reach the Kubernetes API, another workspace, or anything else we
-#      run except the gateway. See the NetworkPolicy in 60-workspace-common.yaml.
+#   3. The pod cannot reach the Kubernetes API, another workspace, the control plane,
+#      Postgres or identity. Its in-cluster egress is an allowlist of NAMED services —
+#      kube-dns, the gateway, and the MCP tool servers the chat surface uses
+#      (enterpriseaiframework-784) — never the namespace and never the pod CIDR. Read the
+#      NetworkPolicy in 60-workspace-common.yaml; the list is short on purpose. Do not
+#      paraphrase it here: this line said "nothing else we run except the gateway" for one
+#      commit after the tool servers were added, which is the same defect as finding 37.
 #
 # --instructions FILE (enterpriseaiframework-cbf): the terminal agent's standing
 # instructions for THIS DEPLOYMENT, not this user. Every workspace pod in the namespace
