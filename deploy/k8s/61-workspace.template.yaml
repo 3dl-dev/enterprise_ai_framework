@@ -161,6 +161,18 @@ spec:
             # before applying this template), but the guarantee should not depend on that
             # ordering never being violated.
             - { name: tenant-instructions, mountPath: /etc/opencode/tenant, readOnly: true }
+            # THIS user's own remembered chat preferences (enterpriseaiframework-471,
+            # done-condition 3) — unlike tenant-instructions above, one ConfigMap PER
+            # __USER__, refreshed from LibreChat's Mongo by
+            # deploy/bin/lib/workspace-memory.sh via provision-workspace.sh. Same
+            # directory-not-subPath reasoning as tenant-instructions: a directory mount
+            # picks up a ConfigMap update on the kubelet's sync with no pod restart,
+            # subPath does not (tests-live/test_workspace_instructions.py measures this
+            # both ways). `optional: true`: a pod for a user nobody has ever provisioned
+            # with this script yet, or whose sync failed (Mongo unreachable, chat
+            # database not up), still starts with an empty memory directory rather than
+            # hanging in ContainerCreating.
+            - { name: workspace-memory, mountPath: /etc/opencode/memory, readOnly: true }
             # enterpriseaiframework-6ff: the SAME tenant Agent Skills corpus the chat
             # surface loads (deploy/k8s/50-chat.yaml), read here by opencode's OWN native
             # skill loader — `skills.paths` in deploy/workspace/opencode.json points at
@@ -213,6 +225,9 @@ spec:
         # true` matches the volumeMount above.
         - name: tenant-instructions
           configMap: { name: workspace-tenant-instructions, optional: true }
+        # Per-__USER__, not deployment-wide — see the volumeMount comment above.
+        - name: workspace-memory
+          configMap: { name: workspace-memory-__USER__, optional: true }
         # Seeded by deploy/bin/lib/tenant-skills.sh from bundle/skills/ — the identical
         # corpus and identical ConfigMaps the chat surface mounts above 50-chat.yaml.
         # `optional: true` for the same reason as tenant-instructions: a pod scheduled

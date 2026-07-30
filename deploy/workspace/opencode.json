@@ -28,8 +28,19 @@
   },
   "model": "enterprise-ai/glm-5.2@deepinfra",
   "theme": "system",
-  "instructions": ["/etc/opencode/PLATFORM.md", "/etc/opencode/tenant/TENANT.md"],
+  "instructions": [
+    "/etc/opencode/PLATFORM.md",
+    "/etc/opencode/tenant/TENANT.md",
+    "/etc/opencode/memory/MEMORY.md"
+  ],
   "skills": {
     "paths": ["/etc/opencode/tenant-skills"]
+  },
+  "mcp": {
+    "echo": {
+      "type": "remote",
+      "url": "http://mcp-echo:8080/mcp",
+      "enabled": true
+    }
   }
 }

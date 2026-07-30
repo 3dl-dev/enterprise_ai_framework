@@ -40,6 +40,14 @@ fi
 # complete; the browser binaries are a separate `playwright install`.
 "$VENV/bin/pip" install --quiet playwright
 
+# pymongo, pinned to the same version control-plane/requirements.txt runs, for
+# tests/test_workspace_memory_bridge.py (enterpriseaiframework-471). Unlike
+# test_portal_auth.py's stubbed-out asyncpg/pymongo above, this suite's whole point is
+# proving real query semantics (collection name, ObjectId matching, field shapes)
+# against a real, disposable mongod -- a stub of the driver would be asserting the
+# thing that is actually under test, not a nicety to skip installing.
+"$VENV/bin/pip" install --quiet pymongo==4.10.1
+
 # control-plane/tests/ is not under tests/ and pytest.ini's testpaths is overridden by any
 # explicit path given here, so it must be listed alongside tests/ or it silently never
 # runs — which is exactly how it sat green-by-never-executing before this line existed.

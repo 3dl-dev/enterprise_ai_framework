@@ -50,6 +50,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 source deploy/bin/lib/tenant-instructions.sh
+source deploy/bin/lib/workspace-memory.sh
 
 NS=enterprise-ai
 REGISTRY="${RAIL_REGISTRY:-192.168.2.43:30500}"
@@ -171,6 +172,15 @@ kubectl apply -f deploy/k8s/60-workspace-common.yaml >/dev/null
 # deploy/bin/lib/tenant-instructions.sh for the three cases this covers.
 ensure_tenant_instructions "$NS" workspace-tenant-instructions \
     deploy/workspace/AGENTS.md "$INSTRUCTIONS"
+
+# One ConfigMap PER USER (enterpriseaiframework-471, done-condition 3), also applied
+# before the pod template: a preference this user stated in chat, surfaced the same way
+# tenant instructions are — see deploy/bin/lib/workspace-memory.sh. Never fatal: a chat
+# database hiccup or a control plane that has not rolled out yet must not block
+# provisioning a workspace, only cost that user their remembered preferences until the
+# next re-run of this script.
+sync_workspace_memory "$NS" "workspace-memory-${USER_NAME}" "$USER_NAME" \
+    || echo "    memory sync skipped for ${USER_NAME} (see message above); continuing"
 
 sed -e "s|__USER__|${USER_NAME}|g" \
     -e "s|__IMAGE__|${IMAGE}|g" \
