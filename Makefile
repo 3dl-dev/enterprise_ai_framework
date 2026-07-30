@@ -98,5 +98,11 @@ test-e2e:
 test-browser:
 	@.venv-test/bin/pytest tests-live/test_browser.py -v --tb=short -p no:cacheprovider
 
+## enterpriseaiframework-40f: signs in to CHAT (not the portal) from a fresh browser context
+## against the cluster's real public origin, then reloads and asserts the session survives —
+## the cookie-policy defect is invisible to anything that only inspects response headers.
+test-chat-login:
+	@.venv-test/bin/pytest tests-live/test_chat_login.py -v --tb=short -p no:cacheprovider
+
 test-workspace:
 	@.venv-test/bin/pytest tests-live/test_workspace.py -v --tb=short -p no:cacheprovider

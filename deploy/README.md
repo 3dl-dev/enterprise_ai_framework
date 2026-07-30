@@ -39,6 +39,21 @@ is a complete uninstall.
 - **`PUBLIC_BASE_URL` must be https or nobody can log in.** The OIDC client refuses
   plaintext discovery. The stack deploys healthy either way — the failure appears only at
   login.
+- **Chat's own cookies are not Secure (enterpriseaiframework-40f), because the gateway VM's
+  Caddy `:8081` block — the one Tailscale Funnel forwards to — is itself plain HTTP**, so
+  whatever it forwards downstream reports `http`, never `https`, no matter how the browser
+  reached Funnel. LibreChat's `shouldUseSecureCookie()` marks the OIDC session cookie Secure
+  whenever `DOMAIN_SERVER` is a non-localhost https origin, and express-session's own
+  cookie-setting gate then silently drops that Set-Cookie header on a request it sees as
+  plain HTTP — the callback then has no state to check against and login fails with
+  "Unable to verify authorization request state". `SESSION_COOKIE_SECURE=false` on the
+  `chat` Deployment works around it (same trade-off already accepted for the portal's
+  oauth2-proxy cookie, `--cookie-secure=false` in `40-control-plane.yaml`): the browser's
+  connection to the public origin really is TLS, so a non-Secure cookie set over it is
+  still stored, and only defense-in-depth against a *plain-http* path to the same NodePort
+  is given up. The fix that keeps that defense-in-depth is a gateway-VM change outside this
+  repo and outside the cluster: Caddy's `:8081` block asserting
+  `header_up X-Forwarded-Proto https` so the pod sees the true scheme.
 - **Storage is `local-path`**, which lives on `k3s-worker`. That node is cattle and is
   rebuilt wholesale, which destroys the ledger and audit chain with it. A tank-backed ZFS
   dataset is requested in the mainframe note; until it exists, treat cluster data as
