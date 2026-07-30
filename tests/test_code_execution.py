@@ -496,7 +496,7 @@ def _mint_codeapi_bearer(env, user_id: str) -> str:
 
 _DOWNLOAD_PROBE_SCRIPT = """
 (async () => {
-  const res = await fetch("http://codeapi:3112/v1/download/%(session_id)s/probe-file?kind=user", {
+  const res = await fetch("http://codeapi:3112/v1/download/%(session_id)s/%(file_id)s?kind=user", {
     headers: {"Authorization": "Bearer %(token)s"},
   });
   process.stdout.write(JSON.stringify({status: res.status, body: await res.text()}));
@@ -505,7 +505,15 @@ _DOWNLOAD_PROBE_SCRIPT = """
 
 
 def _probe_download_as(chat_container: str, session_id: str, token: str) -> dict:
-    script = _DOWNLOAD_PROBE_SCRIPT % {"session_id": session_id, "token": token}
+    # fileId must satisfy isValidId (service/src/utils.ts: 21-char nanoid shape,
+    # /^[A-Za-z0-9_-]{21}$/) or sessionAuth 400s on shape before ever comparing
+    # sessionKeys — a shape failure would read as a false negative for the isolation
+    # check below, so this is a syntactically well-formed (if never-uploaded) id.
+    file_id = "probeprobeprobeprobe1"
+    assert len(file_id) == 21
+    script = _DOWNLOAD_PROBE_SCRIPT % {
+        "session_id": session_id, "file_id": file_id, "token": token,
+    }
     result = subprocess.run(
         ["docker", "exec", chat_container, "node", "-e", script],
         capture_output=True, text=True, timeout=30,
@@ -576,7 +584,13 @@ class TestCrossUserSessionIsolation:
         _run_hashing_turn(chat_session, chat_url, headers_a)
         new_keys = _new_session_keys(env, before)
         assert new_keys, "user A's real chat turn registered no new codeapi session"
-        session_id_a, session_key_a = next(iter(new_keys.items()))
+        redis_key_a, session_key_a = next(iter(new_keys.items()))
+        # `_new_session_keys` returns the full redis key (`session:<id>`); the URL path
+        # param the /download route expects is just `<id>` (router.ts's
+        # `/download/:session_id/:fileId`, looked up as `session:${session_id}` server
+        # side) — using the prefixed form here would 400 on isValidId's shape check
+        # before the isolation check under test ever runs.
+        session_id_a = redis_key_a.removeprefix("session:")
         user_id_a = session_key_a.rsplit(":user:", 1)[-1]
 
         before_b = before | set(new_keys)
