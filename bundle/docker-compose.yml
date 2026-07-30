@@ -291,9 +291,34 @@ services:
 
       # The surface never holds a provider key — only its virtual key.
       CHAT_VIRTUAL_KEY: ${CHAT_VIRTUAL_KEY:-}
+
+      # enterpriseaiframework-6ff: the tenant's Agent Skills corpus. A DIFFERENT
+      # mechanism from librechat.yaml's `skills` capability flag — this is the
+      # filesystem loader (packages/api/src/skills/deployment.ts,
+      # initializeDeploymentSkills), scanned ONCE at boot into a module-level
+      # singleton, NOT persisted as Mongo Skill documents. Two consequences worth
+      # restating here rather than only in dogfood-findings.md finding 41:
+      #   - Editing ./skills requires restarting this container; there is no
+      #     watcher. `docker compose restart chat` after any change.
+      #   - A malformed SKILL.md throws at boot and takes the whole surface down
+      #     (the awaited call in api/server/index.js is unguarded). We do not
+      #     patch LibreChat to guard that await — "integrate, do not reimplement"
+      #     forbids carrying a fork of the image. Instead this is guarded ON OUR
+      #     SIDE: tests/test_skill_corpus.py boots this exact container with this
+      #     exact ./skills directory and asserts /health before any turn is sent,
+      #     so malformed tenant content fails `make test` (a disposable bundle,
+      #     not a shared deployment) before anyone pushes it toward the cluster's
+      #     chat-skills ConfigMap (deploy/k8s/50-chat.yaml).
+      DEPLOYMENT_SKILLS_DIR: /app/skill
     volumes:
       - ./librechat/librechat.yaml:/app/librechat.yaml:ro
       - ./certs:/certs:ro
+      # Tenant content, not platform content (same principle as workspace house
+      # rules, enterpriseaiframework-cbf): a camp's skills and a law firm's
+      # skills are different directories on this one mechanism, so this lives in
+      # the bundle, never in the LibreChat image. Read-only — this deployment
+      # does not author skills through the UI.
+      - ./skills:/app/skill:ro
     ports:
       - "${CHAT_PORT:-3080}:3080"
     depends_on:

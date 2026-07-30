@@ -41,12 +41,22 @@ BROWSER_UA = (
 )
 
 
-def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=None):
+def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=None,
+                   manual_skills=None):
     """The body LibreChat's own client sends for an ephemeral-agent turn.
 
     `ephemeralAgent.mcp` is what attaches an MCP server to an otherwise plain
     custom-endpoint turn; the entries are server names from `mcpServers` in
     librechat.yaml, not tool names.
+
+    `manual_skills` is the `$`-popover's wire shape (enterpriseaiframework-6ff):
+    a top-level `manualSkills` array of skill NAMES (not `ephemeralAgent.mcp`'s
+    shape) plus `ephemeralAgent.skills: true`, the per-conversation skills-badge
+    toggle. Both are required — packages/api/src/agents/skills.ts only resolves
+    `manualSkills` against an `accessibleSkillIds` set that is empty unless the
+    toggle is on (`resolveAgentScopedSkillIds`'s ephemeral-agent branch falls
+    through to `ephemeralSkillsToggle ? ... : []`), so sending names without the
+    toggle silently primes nothing.
     """
     body = {
         "text": text,
@@ -63,8 +73,14 @@ def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=Non
         "isTemporary": False,
         "isRegenerate": False,
     }
+    ephemeral_agent = {}
     if mcp_servers:
-        body["ephemeralAgent"] = {"mcp": list(mcp_servers)}
+        ephemeral_agent["mcp"] = list(mcp_servers)
+    if manual_skills:
+        ephemeral_agent["skills"] = True
+        body["manualSkills"] = list(manual_skills)
+    if ephemeral_agent:
+        body["ephemeralAgent"] = ephemeral_agent
     return body
 
 
@@ -183,9 +199,9 @@ def tool_calls(message):
 
 
 def send_turn(client, chat_url, text, model, endpoint, endpoint_type="custom",
-              mcp_servers=None, headers=None, timeout=180.0):
+              mcp_servers=None, manual_skills=None, headers=None, timeout=180.0):
     """One turn, end to end, on either protocol. Returns the persisted assistant message."""
-    payload = build_payload(text, model, endpoint, endpoint_type, mcp_servers)
+    payload = build_payload(text, model, endpoint, endpoint_type, mcp_servers, manual_skills)
     conversation_id, _ = start_turn(
         client, chat_url, payload, headers=headers, timeout=timeout
     )

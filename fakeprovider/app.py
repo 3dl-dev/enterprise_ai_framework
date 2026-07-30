@@ -23,6 +23,40 @@ app = FastAPI(title="fake-provider")
 # so these numbers flow all the way through to the ledger and the tests assert on them.
 CHARS_PER_TOKEN = 4
 
+# --------------------------------------------------------------------------
+# Prompt capture — a test seam, not a feature. reply_text() only ever hands a
+# caller a hash of what it received, which is enough to prove two requests
+# differed but not enough to prove WHAT changed. enterpriseaiframework-6ff
+# needs the stronger claim ("this exact secret string, which lives nowhere but
+# a SKILL.md body, reached the upstream request") without guessing at
+# LibreChat's internal message-join format. So every request's fully
+# extracted prompt is kept in a bounded ring buffer, inspectable over
+# /debug/prompts by any test that knows a substring (a nonce) to search for.
+# Nothing about the deterministic reply_text()/reply-digest contract other
+# tests already rely on changes.
+# --------------------------------------------------------------------------
+_CAPTURED_PROMPTS: list[dict] = []
+_CAPTURE_LIMIT = 500
+
+
+def _capture_prompt(model: str, prompt: str) -> None:
+    _CAPTURED_PROMPTS.append({"model": model, "prompt": prompt})
+    if len(_CAPTURED_PROMPTS) > _CAPTURE_LIMIT:
+        del _CAPTURED_PROMPTS[: len(_CAPTURED_PROMPTS) - _CAPTURE_LIMIT]
+
+
+@app.get("/debug/prompts")
+async def debug_prompts(contains: str | None = None):
+    """Recent extracted prompts, optionally filtered to ones containing `contains`.
+
+    `contains` should be a nonce unique to the test's own turn — the buffer is
+    shared across every caller hitting this process, including other tests
+    running in the same suite.
+    """
+    if contains:
+        return [c for c in _CAPTURED_PROMPTS if contains in c["prompt"]]
+    return _CAPTURED_PROMPTS
+
 
 def count_tokens(text: str) -> int:
     return max(1, len(text) // CHARS_PER_TOKEN)
@@ -68,6 +102,7 @@ async def openai_chat(request: Request):
     body = await request.json()
     model = body.get("model", "fake-gpt-large")
     prompt = extract_prompt(body.get("messages", []))
+    _capture_prompt(model, prompt)
     text = reply_text(prompt, model)
     prompt_tokens = count_tokens(prompt)
     completion_tokens = count_tokens(text)
@@ -141,6 +176,7 @@ async def anthropic_messages(request: Request):
     prompt = extract_prompt(body.get("messages", []))
     if body.get("system"):
         prompt = str(body["system"]) + "\n" + prompt
+    _capture_prompt(model, prompt)
     text = reply_text(prompt, model)
     input_tokens = count_tokens(prompt)
     output_tokens = count_tokens(text)
