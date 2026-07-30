@@ -291,6 +291,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
 
   # ---------------------------------------------------------------------------------
   # meilisearch: conversation search (enterpriseaiframework-2a6). Configuration, not
