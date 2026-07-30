@@ -108,8 +108,23 @@ USER_AGENT = os.environ.get(
 
 _SKIP_TAGS = frozenset(
     {"script", "style", "noscript", "template", "svg", "nav", "header", "footer",
-     "aside", "form", "button", "iframe"}
+     "form", "button", "iframe"}
 )
+# `aside` USED TO BE IN THIS SET, treated as navigation furniture the same as `nav` and
+# `footer`. It was removed after a live grounding run for enterpriseaiframework-0be
+# measured the consequence directly: kernel.org's own front page wraps its "Latest
+# Release" table — the single most authoritative version number this service is ever
+# asked to retrieve — inside `<aside id="featured" class="body">`, and that table has no
+# JavaScript involved; it is in `rawHtml` from the first byte. With `aside` skipped, the
+# extracted text of https://www.kernel.org/ carried only the footer link list ("Git
+# Trees", "Documentation", "Mirrors", ...) and NONE of the version numbers — the model
+# then had to answer from memory or decline, even though the page had been fetched
+# successfully and the fact was sitting in the response the whole time. `<aside>` per the
+# HTML5 spec means "tangentially related", not "chrome"; some sites do use it for actual
+# sidebar noise, but silently dropping a page's primary content because of the tag it
+# happens to be wrapped in is a worse failure mode than the noise it was meant to avoid,
+# especially for a service whose entire purpose is handing real page content to a model.
+
 _BLOCK_TAGS = frozenset(
     {"p", "div", "section", "article", "main", "br", "hr", "li", "tr", "blockquote",
      "pre", "h1", "h2", "h3", "h4", "h5", "h6", "table", "ul", "ol", "dl", "dd", "dt"}

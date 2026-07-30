@@ -351,6 +351,51 @@ class TestTheFetchLegRetrievesRealPages:
             "indistinguishable from a fetch that never happened"
         )
 
+    def test_content_inside_an_aside_element_is_not_silently_dropped(self):
+        """REGRESSION (enterpriseaiframework-0be re-dispatch, live run): `_SKIP_TAGS` used
+        to include `aside`, treated the same as `nav`/`footer`/navigation chrome. A live
+        grounding run measured the consequence directly: kernel.org's OWN front page wraps
+        its "Latest Release" table — a plain, no-JavaScript, first-byte-of-rawHtml table —
+        inside `<aside id="featured" class="body">`. With `aside` skipped, the extracted
+        text of https://www.kernel.org/ carried the footer link list and NONE of the
+        version numbers, so the fact the item's live test asks about was stripped before
+        rerank/ or the model ever saw it — a real page, fetched successfully, silently
+        emptied of its one load-bearing fact.
+
+        This runs `html_to_text` inside the webfetch container directly (not over HTTP),
+        against a minimal fixture that reproduces the shape: real content inside `<aside>`
+        alongside genuine chrome inside `<nav>`/`<footer>`. Both must be told apart
+        correctly — chrome still dropped, `aside` content now kept — or this is not
+        actually testing the fix.
+        """
+        html = (
+            "<html><body>"
+            "<nav>Site nav: Home About Contact</nav>"
+            "<aside id=\"featured\"><table><tr><td>Latest Release</td>"
+            "<td>KERNELVERSIONMARKER-9.9.9</td></tr></table></aside>"
+            "<footer>Copyright chrome footer text</footer>"
+            "</body></html>"
+        )
+        script = (
+            "import json\n"
+            "from app import html_to_text\n"
+            f"text, title = html_to_text({html!r})\n"
+            "print(json.dumps({'text': text}))\n"
+        )
+        result = _compose("exec", "-T", "webfetch", "python", "-c", script, check=False)
+        assert result.returncode == 0, (
+            f"running html_to_text inside webfetch failed\n{result.stdout}\n{result.stderr}"
+        )
+        text = json.loads(result.stdout.strip().splitlines()[-1])["text"]
+        assert "KERNELVERSIONMARKER-9.9.9" in text, (
+            f"content inside <aside> was dropped from extraction: {text!r} — this is "
+            f"exactly the kernel.org failure mode this regression test exists to prevent"
+        )
+        assert "Site nav" not in text and "Copyright chrome" not in text, (
+            f"<nav>/<footer> chrome leaked into extracted text: {text!r} — those tags "
+            f"must stay skipped; only <aside> was too broad a brush"
+        )
+
     def test_the_fetch_service_refuses_every_credential_but_the_real_one(self, fetch_log):
         """An open fetcher is a worse hole than a broken one.
 

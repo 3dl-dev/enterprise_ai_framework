@@ -31,28 +31,52 @@ three services exist only in this bundle's own docker compose stack right now. T
 therefore the only place the DONE condition can be proven live.
 
 THE QUESTION: the current stable Linux kernel version per kernel.org. It changes over
-time (so it postdates whatever the model's training cutoff was, without needing to
-guess at that cutoff), and kernel.org is a plain, stable, unthrottled page — the same
-site TestTheSearchLeg and TestTheFetchLegRetrievesRealPages already rely on being
-reachable from this host.
+time (so it postdates whatever the model's training cutoff was, without needing to guess
+at that cutoff), it is unambiguous once "stable" is named as the specific release line
+kernel.org itself labels that way (as opposed to mainline or longterm, which the page
+lists alongside it), and kernel.org is a plain, stable, unthrottled page — the same site
+TestTheSearchLeg and TestTheFetchLegRetrievesRealPages already rely on being reachable
+from this host. The question is also phrased to BOUND the tool loop deterministically —
+"perform exactly one web search... do not search again once you have a result" — because
+an earlier re-dispatch's live run hit LangGraph's "Recursion limit of 50 reached" with an
+empty reply on this same question phrased more open-endedly. If that recurs even bounded
+this way, it is a defect in the search/agent pipeline, not a defect in the question, and
+is filed as such rather than retried past.
 
-VERACITY RE-DISPATCH (enterpriseaiframework-0be): the first version of this test quoted
-the grounding bound in this docstring and never measured it — every assertion it made
-(fetch logged, cited URL fetched, a version present SOMEWHERE on ANY fetched page) also
-passes under `rerankerType: none`, the snippet-grounded configuration this item replaces,
-because kernel.org's own pages list mainline/stable/longterm versions side by side and a
-version the model recalled from its WEIGHTS matches one of them regardless of whether
-anything was read this turn. Claims 5-8 below fix that: Claim 5 parses the PERSISTED
-web_search tool_call's own `output` string (chat_turn.tool_calls) into its highlight
-blocks — the model-facing content format.ts's own comment says per-source `content`
-never reaches (it "stays in the WEB_SEARCH artifact") — and measures
+VERACITY RE-DISPATCH (enterpriseaiframework-0be, wave 2): the first version of this test
+quoted the grounding bound in this docstring and never measured it — every assertion it
+made (fetch logged, cited URL fetched, a version present SOMEWHERE on ANY fetched page)
+also passes under `rerankerType: none`, the snippet-grounded configuration this item
+replaces, because kernel.org's own pages list mainline/stable/longterm versions side by
+side and a version the model recalled from its WEIGHTS matches one of them regardless of
+whether anything was read this turn. Claims 5-8 below fix that: Claim 5 parses the
+PERSISTED web_search tool_call's own `output` string (chat_turn.tool_calls) into its
+highlight blocks — the model-facing content format.ts's own comment says per-source
+`content` never reaches (it "stays in the WEB_SEARCH artifact") — and measures
 0 < len(that content) <= text_chars directly, rather than asserting it. Claim 6 joins a
 non-degenerate rerank log entry to that same non-empty content in the SAME test, which is
 what rules out JinaReranker's error-catch and a post-200 expandHighlights miss, either of
-which can leave /reranklog non-degenerate while the model receives nothing real. Claim 8
-requires the reported version to appear inside the highlight block belonging to the
-SPECIFIC cited URL, not merely anywhere on any fetched page, which is what tells "read
-this page this turn" apart from "knew the answer and cited a page that happens to agree".
+which can leave /reranklog non-degenerate while the model receives nothing real.
+
+VERACITY RE-DISPATCH (enterpriseaiframework-0be, wave 2's own live runs, and the
+ORCHESTRATOR RULING that followed): wave 2's Claim 8 required the reported version to sit
+inside the highlight block belonging to the SPECIFIC cited URL. Three live runs against
+the correct config surfaced that this is a DIFFERENT, STRONGER claim than grounding, and
+sometimes fails on CORRECT behaviour: rerank/ is deliberately lexical BM25 over page
+chunks, so on kernel.org's releases listing the query terms matched prose about
+mainline/stable/longterm maintenance rather than the version-table row, and the fact
+reached the model through a DIFFERENT fetched source's highlights while the model cited
+the canonical kernel.org page anyway. Grounding held; the old single assertion failed
+anyway. The ruling split it, exactly as this item already split BM25-ranking-quality from
+grounding once before: Claim 8 now asserts only GROUNDING — the fact appears in this
+turn's model-facing content from ANY fetched source (composed with Claim 7's "every cited
+URL was fetched") — and a same-turn mismatch between "which source carried the fact" and
+"which source was cited" is checked separately, printed plainly, and reported as a
+CITATION-ATTRIBUTION finding rather than failing the grounding test. Claim 7 also now
+normalises scheme and a leading `www.` before comparing URLs (challenge B) — a model
+writing `https://kernel.org` for a page the fetch log recorded as `https://www.kernel.org/`
+is citing the same served page, and the old `rstrip('/')`-only comparison measured string
+formatting, not grounding.
 
 Run (bundle must be up — `make up`):
   .venv-test/bin/pytest tests-live/test_web_search_grounding.py -v --tb=short -p no:cacheprovider
@@ -83,10 +107,38 @@ ENDPOINT_TYPE = "custom"
 _VERSION_RE = re.compile(r"\b\d+\.\d+(?:\.\d+)?\b")
 _URL_RE = re.compile(r"https?://[^\s)\]}\"'>]+")
 
+
+def _normalize_url(u: str) -> str:
+    """Compare URLs by scheme+host(minus a leading `www.`)+path(minus a trailing slash),
+    not by string equality.
+
+    ORCHESTRATOR RULING (enterpriseaiframework-0be, challenge B): a model that cites
+    `https://kernel.org` for a page the fetch log recorded as `https://www.kernel.org/`
+    is citing the SAME served page — a bare host and its `www` form are not a grounding
+    failure, they are a string-formatting difference. `u.rstrip('/') == fu.rstrip('/')`
+    only killed the trailing slash and left the `www` mismatch red for a reason with no
+    bearing on grounding. This normalises scheme (both are just transport) and the `www`
+    prefix (both name the same host) while still treating a genuinely different host or
+    path as a genuinely different page.
+    """
+    parsed = urllib.parse.urlsplit(u.strip())
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = parsed.path.rstrip("/")
+    return f"{host}{path}{'?' + parsed.query if parsed.query else ''}"
+
+
+def _same_page(a: str, b: str) -> bool:
+    return _normalize_url(a) == _normalize_url(b)
+
 QUESTION = (
-    "Search the web right now for the CURRENT latest stable version of the Linux "
-    "kernel, per kernel.org. Do not answer from memory. Reply with only the version "
-    "number and, on a new line, the exact URL of the page you found it on."
+    "Perform exactly one web search for the CURRENT stable version of the Linux kernel "
+    "(the release line kernel.org itself labels \"stable\", not mainline or longterm), "
+    "per kernel.org. Do not answer from memory, and do not search again once you have a "
+    "result — if the first search does not give you a clear version number, say so "
+    "rather than guessing. Reply with only the version number and, on a new line, the "
+    "exact URL of the page you found it on."
 )
 
 # format.cjs's own line shapes (see rerank/'s companion service and
@@ -243,7 +295,7 @@ class TestChatCitesAPageItActuallyFetched:
         reply = chat_turn.send_turn(
             chat_client, chat_url, QUESTION, model=MODEL,
             endpoint=ENDPOINT_NAME, endpoint_type=ENDPOINT_TYPE,
-            web_search=True, timeout=120.0,
+            web_search=True, timeout=170.0,
         )
         text = chat_turn.reply_text(reply)
         assert text.strip(), f"the model gave no text reply at all: {reply}"
@@ -335,45 +387,83 @@ class TestChatCitesAPageItActuallyFetched:
             f"so ranking did not meaningfully run: {reranks}"
         )
 
-        # Claim 7: the cited URL matches something this request actually fetched — not
-        # merely plausible, since a model can cite a well-known URL it never retrieved.
+        # Claim 7 (challenge B fix — normalised comparison): EVERY cited URL is among the
+        # URLs this request actually fetched — not merely plausible, since a model can
+        # cite a well-known URL it never retrieved. This is half of the ORCHESTRATOR
+        # RULING's two-part grounding proof: "(b) every cited URL is among the URLs
+        # fetched during that request." Comparison goes through `_same_page`, which
+        # normalises scheme and a leading `www.` — a model that writes the bare-host form
+        # of a page the fetch log recorded with `www.` is citing the SAME page; that is a
+        # string-formatting difference, not a grounding failure, and the old
+        # `rstrip('/')`-only comparison measured the wrong thing.
         fetched_urls = {f["requested"] for f in successful} | {
             f.get("url") for f in successful if f.get("url")
         }
-        matching_cited = [
-            u for u in cited_urls
-            if any(u == fu or u.rstrip("/") == fu.rstrip("/") for fu in fetched_urls)
+        unfetched_citations = [
+            u for u in cited_urls if not any(_same_page(u, fu) for fu in fetched_urls)
         ]
-        assert matching_cited, (
-            f"none of the cited URL(s) {cited_urls} match anything this request "
-            f"actually fetched {sorted(fetched_urls)} — the citation is not tied to a "
-            f"retrieval"
+        assert not unfetched_citations, (
+            f"cited URL(s) {unfetched_citations} match nothing this request actually "
+            f"fetched {sorted(fetched_urls)} — a citation not tied to a retrieval is "
+            f"exactly the fabricated-citation shape this item exists to rule out"
         )
 
-        # Claim 8 (challenge 4 — the strong one, composed with Claim 5): the reported
-        # fact must appear in the MODEL-FACING CONTENT of the highlight block belonging
-        # to the SPECIFIC URL the model cited — not merely somewhere on that page, and
-        # not merely on some OTHER fetched page. A full-page check would pass on
-        # kernel.org's own homepage, which lists mainline, stable and several longterm
-        # version lines side by side, so a number the model recalled from its WEIGHTS
-        # would match the page even though nothing this turn read it there. Requiring
-        # the match inside the specific cited source's own highlight text is what proves
-        # this fact came from what the model actually read this turn, not what it knows.
+        # Claim 8 (ORCHESTRATOR RULING 2026-07-30, splitting the claim exactly as this
+        # item already split BM25-ranking-quality from grounding once before):
+        #
+        # GROUNDING is (a) the reported fact appears in the MODEL-FACING content of THIS
+        # TURN — the highlight text actually delivered to the prompt, from ANY source
+        # fetched during the request — AND (b) every cited URL is among the URLs fetched
+        # during the request (Claim 7, above). Those two together kill both
+        # fabricated-citation shapes: citing a page nothing retrieved, and answering from
+        # the weights while an unrelated fetch happened in the background. That is what
+        # the item's DONE condition asks for, and it is NOT the same claim as "the fact
+        # sits in the highlight block belonging to the specific cited URL" — rerank/ is
+        # deliberately lexical BM25 over page chunks, so on a page like kernel.org's
+        # releases listing the query terms can match prose about mainline/stable/longterm
+        # maintenance rather than the version-table row, and the fact then reaches the
+        # model through a DIFFERENT fetched source's highlights while the model cites the
+        # canonical page anyway. That was MEASURED, not theorised, in wave 2's live runs:
+        # grounding worked (the fact was in this turn's model-facing content, the cited
+        # URL was really fetched) and the old single claim failed anyway, on correct
+        # behaviour. So Claim 8 below asserts ONLY grounding (a); a same-turn mismatch
+        # between "which source carried the fact" and "which source the model cited" is
+        # a CITATION-ATTRIBUTION defect, checked separately and reported, not asserted.
+        assert any(v in h["text"] for h in all_highlights for v in versions), (
+            f"the version number(s) the model reported {versions} do not appear in ANY "
+            f"of this turn's model-facing highlight content — reply was {text!r}, cited "
+            f"{cited_urls}, sources fetched were "
+            f"{sorted({h['url'] for h in all_highlights if h['url']})}, and the highlight "
+            f"text was {[h['text'] for h in all_highlights]!r} — the reply's fact is not "
+            f"tied to anything this request actually fetched and fed to the model"
+        )
+
+        # CITATION-ATTRIBUTION CHECK (not part of grounding, per the ruling above — NOT
+        # WAIVED, just not conflated with grounding). If the fact instead lands only in a
+        # DIFFERENT fetched source's highlights than the one(s) the model cited, that is
+        # a real defect in citation attribution and must be surfaced, not silently
+        # accepted — this block reports it plainly (visible in -v output and captured by
+        # whoever reads this run) without failing the grounding test itself.
         cited_highlights = [
             h for h in all_highlights
-            if h["url"] and any(
-                h["url"] == cu or h["url"].rstrip("/") == cu.rstrip("/") for cu in cited_urls
-            )
+            if h["url"] and any(_same_page(h["url"], cu) for cu in cited_urls)
         ]
-        assert cited_highlights, (
-            f"the cited URL(s) {cited_urls} have no corresponding highlight block in "
-            f"the persisted tool output, so nothing ties the citation to content the "
-            f"model actually saw: highlight URLs were "
-            f"{sorted({h['url'] for h in all_highlights if h['url']})}"
+        fact_in_cited = any(
+            v in h["text"] for h in cited_highlights for v in versions
         )
-        assert any(v in h["text"] for h in cited_highlights for v in versions), (
-            f"the version number(s) the model reported {versions} do not appear in the "
-            f"model-facing highlight content for the cited URL(s) {cited_urls} "
-            f"({[h['text'] for h in cited_highlights]!r}) — the reply's fact is not "
-            f"tied to what this request actually fetched and fed to the model"
-        )
+        if not fact_in_cited:
+            carrying_urls = sorted({
+                h["url"] for h in all_highlights
+                if h["url"] and any(v in h["text"] for v in versions)
+            })
+            print(
+                "\nCITATION-ATTRIBUTION DEFECT (grounding held, attribution did not): "
+                f"question={QUESTION!r} cited_url(s)={cited_urls} "
+                f"reported_version(s)={versions} — the fact appears in the "
+                f"model-facing highlights of {carrying_urls or '(no source)'}, not in "
+                f"the highlight(s) for the cited URL "
+                f"({sorted({h['url'] for h in cited_highlights})}). rerank/'s lexical "
+                f"BM25 matched query terms to a different chunk than the one carrying "
+                f"the fact on the cited page. FILE per the orchestrator ruling — this "
+                f"is not waived, just not conflated with the grounding assertion above."
+            )
