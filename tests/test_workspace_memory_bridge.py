@@ -24,6 +24,16 @@ about the tenant-instructions/skills wiring already proven elsewhere. The model 
 opencode's configured provider is tests/opencode_stub.py -- a real paid model is
 unnecessary to prove that opencode LOADS a local file and FORWARDS its content, which is
 the entire claim under test.
+
+GAP 2 (adversary finding), closed by `TestPreferenceWrittenViaChatMemoryReachesTheTerminalAgent`
+below: done-condition 3 says a preference is stored VIA CHAT MEMORY, but the `seeded`
+fixture above hand-writes `memoryentries` documents directly -- the collection name, the
+userId ObjectId-vs-string typing, and the field names are asserted by the test author,
+not produced by the system under test, so none of the tests using it would notice if
+chat_memory.py stopped being faithful to LibreChat's real schema. That class writes the
+preference through chat's own POST /api/memories against the running bundle and reads it
+back through chat_memory's own CLI wrapper, run for real inside the running control-plane
+container -- no hand-authored Mongo document anywhere in that chain.
 """
 
 from __future__ import annotations
@@ -41,10 +51,30 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "control-plane"))
 
+import oidc_login  # noqa: E402
+from conftest import DOGFOOD_USER, compose  # noqa: E402
 from opencode_stub import ChatCompletionStub, free_port, system_text  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 OPENCODE_CONFIG_PATH = REPO / "deploy/workspace/opencode.json"
+TIMEOUT = 60.0
+
+
+def _token(client, chat_url: str) -> str:
+    r = client.post(
+        f"{chat_url}/api/auth/refresh",
+        headers={"Cookie": oidc_login._cookie_header(client)},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["token"]
+
+
+def _auth(client, chat_url: str) -> dict:
+    return {
+        "Authorization": f"Bearer {_token(client, chat_url)}",
+        "Cookie": oidc_login._cookie_header(client),
+    }
 
 
 def _require(binary: str) -> None:
@@ -201,18 +231,24 @@ def test_the_cli_wrapper_prints_the_same_content_a_kubectl_exec_would_capture(se
 # ---------------------------------------------------------------- the real opencode run
 
 
-def test_the_real_terminal_agent_session_is_influenced_by_the_stored_preference(
-    seeded, tmp_path
-):
-    """The whole claim, end to end: render the real user's real memory, point the REAL
-    opencode 1.x binary's `instructions` at it (deploy/workspace/opencode.json's own
-    third instructions entry, /etc/opencode/memory/MEMORY.md, redirected here to a real
-    temp file with the real rendered content -- the cluster mount path is not reachable
-    from a bundle-side test), and read the marker back out of the actual request opencode
-    sends to the model.
+def _system_prompt_opencode_sends_with_memory_file(memory_markdown: str, tmp_path) -> str:
+    """Point the REAL opencode 1.x binary's `instructions` at a real memory file holding
+    `memory_markdown`, run it for real, and return the system prompt of the main agent
+    turn's request to the (stubbed) model.
+
+    deploy/workspace/opencode.json's own third instructions entry,
+    /etc/opencode/memory/MEMORY.md, is redirected here to a real temp file with the real
+    rendered content -- the cluster mount path is not reachable from a bundle-side test.
+    Shared by both `test_the_real_terminal_agent_session_is_influenced_by_the_stored_preference`
+    (content from a hand-seeded Mongo fixture -- proves chat_memory's rendering logic
+    given arbitrary well-formed data) and
+    `TestPreferenceWrittenViaChatMemoryReachesTheTerminalAgent` (content produced by the
+    real chat surface's own POST /api/memories, read back through the real chat_memory
+    module against the real chatdb -- proves the end-to-end claim done-condition 3 makes,
+    with no hand-authored Mongo document anywhere in the chain).
     """
     memory_md = tmp_path / "MEMORY.md"
-    memory_md.write_text(seeded["chat_memory"].render_instructions_markdown("baron"))
+    memory_md.write_text(memory_markdown)
 
     cfg = json.loads(OPENCODE_CONFIG_PATH.read_text())
     cfg.pop("skills", None)
@@ -279,10 +315,131 @@ def test_the_real_terminal_agent_session_is_influenced_by_the_stored_preference(
             "no request carried the main agent system prompt; requests seen: "
             f"{[system_text(r.get('messages', []))[:80] for r in stub.requests]}"
         )
-        prompt = system_text(main_request["messages"])
-        assert seeded["marker_a"] in prompt, (
-            f"the stored preference never reached the model's system prompt; system "
-            f"prompt was:\n{prompt[:2000]}"
-        )
+        return system_text(main_request["messages"])
     finally:
         stub.stop()
+
+
+def test_the_real_terminal_agent_session_is_influenced_by_the_stored_preference(
+    seeded, tmp_path
+):
+    """The whole claim, end to end: render the real user's real memory, point the REAL
+    opencode binary's `instructions` at it, and read the marker back out of the actual
+    request opencode sends to the model.
+
+    This proves chat_memory's rendering logic given arbitrary well-formed Mongo data;
+    it does NOT by itself prove the data came from LibreChat's own memory API, which is
+    exactly the gap `TestPreferenceWrittenViaChatMemoryReachesTheTerminalAgent` below
+    closes with a real POST /api/memories in place of `seeded`'s hand-written documents.
+    """
+    prompt = _system_prompt_opencode_sends_with_memory_file(
+        seeded["chat_memory"].render_instructions_markdown("baron"), tmp_path
+    )
+    assert seeded["marker_a"] in prompt, (
+        f"the stored preference never reached the model's system prompt; system "
+        f"prompt was:\n{prompt[:2000]}"
+    )
+
+
+# ---------------------------------------------------------------- gap 2: no hand-seeded
+# Mongo anywhere in the chain -- write through chat's own API, read back through the
+# real chat_memory module against the real chatdb.
+
+
+@pytest.mark.usefixtures("stack_up")
+class TestPreferenceWrittenViaChatMemoryReachesTheTerminalAgent:
+    """enterpriseaiframework-471, gap 2 (adversary finding): done-condition (3) says a
+    preference is stored VIA CHAT MEMORY, but every test above seeds Mongo directly --
+    the collection name, the userId ObjectId-vs-string typing, and the field names are
+    asserted by the test author rather than produced by the system under test, so none
+    of them would notice if chat_memory.py stopped being faithful to LibreChat's actual
+    schema. This class writes the preference through the real chat surface's own
+    POST /api/memories (the same real endpoint
+    tests/test_chat_surface_version.py::test_a_memory_outlives_the_session_that_wrote_it
+    already exercises against the running bundle with a real OIDC session) and reads it
+    back through chat_memory.py's own CLI wrapper (render_workspace_memory.py), run for
+    real inside the running control-plane container against the SAME chatdb Mongo the
+    bundle actually populated. No fixture hand-writes a Mongo document anywhere below.
+
+    Requires `stack_up`: unlike every other test in this file (which stands up its own
+    disposable, standalone mongod), this one needs the real running bundle -- the real
+    chat surface to write through, and the real control-plane container to read back
+    through.
+    """
+
+    def _store_and_render(self, chat_session, chat_url) -> tuple[str, str, str]:
+        """POST a fresh marker preference through the real chat API, then render it
+        back via the real control-plane container's CLI wrapper. Returns
+        (key, value, rendered_markdown); the caller is responsible for deleting `key`.
+        """
+        # Same lowercase-letters-and-underscores-only key constraint
+        # test_a_memory_outlives_the_session_that_wrote_it documents: LibreChat's
+        # MemoryEntry schema rejects anything else with a 500.
+        suffix = "".join(chr(ord("a") + b % 26) for b in uuid.uuid4().bytes[:8])
+        key = f"probe_{suffix}"
+        value = f"remembered-{uuid.uuid4().hex[:12]}"
+        headers = _auth(chat_session, chat_url)
+
+        created = chat_session.post(
+            f"{chat_url}/api/memories", headers=headers,
+            json={"key": key, "value": value}, timeout=TIMEOUT,
+        )
+        assert created.status_code in (200, 201), (
+            f"the surface would not store a memory ({created.status_code}): "
+            f"{created.text[:300]}"
+        )
+
+        rendered = compose(
+            "exec", "-T", "control-plane", "python3", "-m",
+            "app.render_workspace_memory", DOGFOOD_USER,
+        )
+        assert rendered.returncode == 0, (
+            f"render_workspace_memory.py failed inside the real control-plane "
+            f"container: {rendered.stderr}"
+        )
+        return key, value, rendered.stdout
+
+    def test_a_memory_stored_through_the_chat_api_is_read_back_by_chat_memory(
+        self, chat_session, chat_url
+    ):
+        key, value, rendered = self._store_and_render(chat_session, chat_url)
+        try:
+            assert value in rendered, (
+                f"a memory written through chat's own POST /api/memories was not read "
+                f"back by chat_memory.render_instructions_markdown, run for real inside "
+                f"the real control-plane container against the real chatdb Mongo; "
+                f"rendered content was: {rendered!r}"
+            )
+            assert key in rendered
+        finally:
+            chat_session.delete(
+                f"{chat_url}/api/memories/{key}",
+                headers=_auth(chat_session, chat_url), timeout=TIMEOUT,
+            )
+
+    def test_the_same_preference_reaches_a_real_terminal_agent_session(
+        self, chat_session, chat_url, tmp_path
+    ):
+        """The whole chain, end to end, with no hand-authored Mongo document anywhere:
+        chat's own API writes the memory; chat_memory (via the real CLI wrapper, run
+        inside the real control-plane container against the real chatdb) renders it;
+        the REAL opencode binary loads that rendered file as an instructions entry and
+        forwards its content to the model.
+        """
+        key, value, rendered = self._store_and_render(chat_session, chat_url)
+        try:
+            assert value in rendered, (
+                "the memory was not readable back before even reaching opencode -- see "
+                "test_a_memory_stored_through_the_chat_api_is_read_back_by_chat_memory "
+                "for the isolated failure"
+            )
+            prompt = _system_prompt_opencode_sends_with_memory_file(rendered, tmp_path)
+            assert value in prompt, (
+                f"a preference stored via chat's own memory API never reached the "
+                f"terminal agent's system prompt; system prompt was:\n{prompt[:2000]}"
+            )
+        finally:
+            chat_session.delete(
+                f"{chat_url}/api/memories/{key}",
+                headers=_auth(chat_session, chat_url), timeout=TIMEOUT,
+            )

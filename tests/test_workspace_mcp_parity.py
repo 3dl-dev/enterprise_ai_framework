@@ -1,27 +1,39 @@
 """enterpriseaiframework-471, done-condition 1: a tool invoked in chat is invocable in
 the terminal agent and behaves the same.
 
-WHAT "THE SAME TOOL" MEANS HERE, VERIFIED RATHER THAN ASSUMED: the chat surface's own
-proof (tests-live/test_mcp_echo.py) is that a real chat turn against the real cluster
-calls mcp-echo's `echo` tool and the reply carries `ECHO:<nonce>` — a string nothing but
-that server can produce. This file proves the SAME server, reached the SAME way
-(`type: streamable-http`/`remote`, the `/mcp` path, no auth), is invocable from
-deploy/workspace/opencode.json — the terminal agent's real config, loaded from disk and
-only patched at the two points a bundle-side test cannot reach a cluster DNS name or a
-paid model (the mcp URL's host:port, and the model/provider) — by running the REAL
-opencode 1.x binary against a REAL mcp-echo container and reading the REAL tool result
-back out of the request opencode makes to continue the conversation.
+WHAT "THE SAME TOOL" MEANS HERE, VERIFIED RATHER THAN ASSUMED: this file proves the SAME
+server, reached the SAME way (`type: streamable-http`/`remote`, the `/mcp` path, no
+auth), is invocable from deploy/workspace/opencode.json — the terminal agent's real
+config, loaded from disk and only patched at the two points a bundle-side test cannot
+reach a cluster DNS name or a paid model (the mcp URL's host:port, and the model/
+provider) — by running the REAL opencode 1.x binary against a REAL mcp-echo container
+and reading the REAL tool result back out of the request opencode makes to continue the
+conversation.
+
+THE CHAT-SIDE HALF OF THIS CLAIM (adversary finding, gap 1) used to be proven by nothing
+but a static comparison of two config files' URLs, whose own docstring outsourced the
+real proof to tests-live/test_mcp_echo.py — which by ITS OWN docstring is only valid
+against LibreChat v0.8.0 and cannot pass against the v0.8.7 this bundle and cluster pin
+(enterpriseaiframework-a70 tracks fixing that file; it is not fixed here, only stopped
+depending on). `TestChatSurfaceInvokesTheSameMCPTool` below closes that gap directly: it
+drives a REAL chat turn through the running bundle (chat surface -> gateway ->
+fakeprovider -> tool_calls -> LibreChat's agents framework -> the REAL mcp-echo container
+-> back) and asserts the persisted assistant message's tool_call carries mcp-echo's own
+`ECHO:<nonce>` output — produced against the exact version this deployment runs, not
+inferred from a config file naming the right address.
 
 WHY A NONCE, not a fixed string: this file regenerates it every run so a cached or
-invented reply cannot pass — the same reasoning tests-live/test_mcp_echo.py's own
-docstring gives for the chat-side proof.
+invented reply cannot pass.
 
 WHAT IS MOCKED AND WHY: the model behind opencode's configured provider is
 tests/opencode_stub.py, an OpenAI-compatible SSE stub — opencode's ai-sdk client
 requires `stream: true`, and a real model is unnecessary and paid. It decides only
 WHETHER to ask for a tool call; the tool itself is never mocked — the request opencode
 sends back after the fact carries mcp-echo's own real response, and the assertions below
-are on that response's exact bytes.
+are on that response's exact bytes. `TestChatSurfaceInvokesTheSameMCPTool` mocks the
+model the SAME way, for the SAME reason: fakeprovider (tests/test_fakeprovider_mcp_echo.py
+proves its marker/relay logic in isolation) decides only whether to request the
+`echo_mcp_echo` tool call, never what mcp-echo returns.
 """
 
 from __future__ import annotations
@@ -38,6 +50,8 @@ import httpx
 import pytest
 import yaml
 
+import chat_turn
+import oidc_login
 from opencode_stub import ChatCompletionStub, free_port, has_tool_result
 
 REPO = Path(__file__).resolve().parent.parent
@@ -219,3 +233,83 @@ def test_the_terminal_agent_invokes_the_real_echo_tool_and_relays_its_real_resul
 
 def _full_env() -> dict:
     return dict(os.environ)
+
+
+# ---------------------------------------------------------------- the chat-side proof
+
+
+def _token(client, chat_url: str) -> str:
+    r = client.post(
+        f"{chat_url}/api/auth/refresh",
+        headers={"Cookie": oidc_login._cookie_header(client)},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["token"]
+
+
+def _auth(client, chat_url: str) -> dict:
+    return {
+        "Authorization": f"Bearer {_token(client, chat_url)}",
+        "Cookie": oidc_login._cookie_header(client),
+    }
+
+
+@pytest.mark.usefixtures("stack_up")
+class TestChatSurfaceInvokesTheSameMCPTool:
+    """Gap 1, closed: done-condition (1)'s chat half, proven by actual invocation
+    against the running bundle rather than by two config files agreeing on a URL.
+
+    `stack_up` (tests/conftest.py) is what makes this class need the running compose
+    bundle, unlike every other test in this file -- it fails fast and clearly if the
+    bundle is not up rather than as a confusing timeout below.
+    """
+
+    def test_a_chat_turn_invokes_the_real_mcp_echo_tool_and_its_output_is_persisted(
+        self, chat_session, chat_url
+    ):
+        nonce = uuid.uuid4().hex[:12]
+        expected = f"ECHO:{nonce}"
+        headers = _auth(chat_session, chat_url)
+
+        # CALL_MCP_ECHO:<nonce> is the marker fakeprovider/app.py's find_mcp_echo_arg()
+        # turns into a real request for the echo_mcp_echo tool call -- see
+        # tests/test_fakeprovider_mcp_echo.py for that logic proven in isolation. What
+        # happens next is NOT mocked: LibreChat's real agents framework, running inside
+        # the real `chat` container, receives that tool_calls response and actually
+        # calls the real mcp-echo container over the network this bundle wires up.
+        reply = chat_turn.send_turn(
+            chat_session, chat_url, f"CALL_MCP_ECHO:{nonce}", model="fake-large",
+            endpoint="Enterprise AI", mcp_servers=["echo"], headers=headers,
+            timeout=TIMEOUT,
+        )
+        assert reply, "no assistant message was persisted for this turn"
+
+        calls = chat_turn.tool_calls(reply)
+        mcp_calls = [
+            c for c in calls
+            if "echo" in (c.get("tool_call") or {}).get("name", "")
+        ]
+        assert mcp_calls, (
+            f"no MCP echo tool_call block was persisted on the assistant message "
+            f"(expected a name containing 'echo_mcp_echo'); content blocks were: {calls}"
+        )
+
+        tool_call = mcp_calls[0]["tool_call"]
+        # The tool's own recorded output -- this is the part that proves mcp-echo
+        # itself, not just fakeprovider, actually ran. Nothing but mcp-echo's real
+        # echo() function (mcp-echo/app.py) can have produced this exact string.
+        assert expected in (tool_call.get("output") or ""), (
+            f"the persisted tool_call's recorded output does not contain {expected!r}; "
+            f"the tool call did not reach the real mcp-echo container, or it did not "
+            f"run: {tool_call}"
+        )
+
+        # And the same string must reach the assistant's visible reply -- the other
+        # half of "invocable ... and behaves the same", matched against what a user
+        # actually sees, not only what was recorded server-side.
+        text = chat_turn.reply_text(reply)
+        assert expected in text, (
+            f"the tool executed and returned {expected!r}, but that text never reached "
+            f"the persisted reply: {text!r}"
+        )

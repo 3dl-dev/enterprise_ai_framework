@@ -83,6 +83,35 @@ EXECUTE_MARKER_RE = re.compile(r"EXECUTE_BASH:(.*)", re.DOTALL)
 
 BASH_TOOL_NAME = "bash_tool"
 
+# --------------------------------------------------------------------------
+# MCP tool calling (enterpriseaiframework-471, gap 1)
+#
+# The adversary's finding: done-condition (1) ("a tool invoked in chat is invocable in
+# the terminal agent and behaves the same") was proven on the terminal side by actually
+# running opencode against a real mcp-echo container, but on the chat side by nothing
+# more than two config files naming the same URL — a passing test that would not notice
+# a broken LibreChat MCP client, a namespacing regression, or a routing break between
+# the chat pod and mcp-echo.
+#
+# Same inversion as EXECUTE_BASH/bash_tool above, for the same reason: fakeprovider
+# cannot itself be mcp-echo (a real MCP server, reached over streamable-http, is a
+# separate process this stub does not speak the protocol of), so it only ever decides
+# WHETHER to ask the agents framework to call mcp-echo's `echo` tool — never what that
+# tool returns. LibreChat's agents framework does the real MCP round trip and hands the
+# real result back as a `role: tool` message, which the find_tool_result()/relay branch
+# below already forwards verbatim, unmodified by which tool produced it.
+#
+# `echo_mcp_echo` is not invented here: it is LibreChat's own namespacing of an MCP
+# tool (`<tool>_mcp_<server>`), reverse-engineered and recorded in
+# tests-live/test_mcp_echo.py (kept only as a live cluster reference now that its
+# `_send_message` is dead against the pinned v0.8.7 wire protocol — see
+# enterpriseaiframework-a70).
+# --------------------------------------------------------------------------
+
+MCP_ECHO_MARKER_RE = re.compile(r"CALL_MCP_ECHO:(.*)", re.DOTALL)
+
+MCP_ECHO_TOOL_NAME = "echo_mcp_echo"
+
 
 def _message_text(message: dict) -> str:
     content = message.get("content", "")
@@ -112,6 +141,18 @@ def find_exec_command(messages: list) -> str | None:
         if m.get("role") != "user":
             continue
         match = EXECUTE_MARKER_RE.search(_message_text(m))
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def find_mcp_echo_arg(messages: list) -> str | None:
+    """The text argument from a user-authored `CALL_MCP_ECHO:<text>` marker, most recent
+    user message first. None if no message carries one."""
+    for m in reversed(messages or []):
+        if m.get("role") != "user":
+            continue
+        match = MCP_ECHO_MARKER_RE.search(_message_text(m))
         if match:
             return match.group(1).strip()
     return None
@@ -156,9 +197,16 @@ async def openai_models():
     }
 
 
-def _tool_call_completion(cid: str, model: str, created: int, command: str) -> dict:
-    call_id = tool_call_id(command)
-    arguments = json.dumps({"command": command})
+def _tool_call_completion(
+    cid: str, model: str, created: int, tool_name: str, tool_args: dict
+) -> dict:
+    """A single non-streamed tool-call completion requesting `tool_name(**tool_args)`.
+    Generic over the tool identity — used for both `bash_tool` (enterpriseaiframework-082)
+    and `echo_mcp_echo` (enterpriseaiframework-471, gap 1); fakeprovider never computes
+    either tool's answer, only decides to ask for the call.
+    """
+    call_id = tool_call_id(tool_name + json.dumps(tool_args, sort_keys=True))
+    arguments = json.dumps(tool_args)
     return {
         "id": cid,
         "object": "chat.completion",
@@ -174,7 +222,7 @@ def _tool_call_completion(cid: str, model: str, created: int, command: str) -> d
                         {
                             "id": call_id,
                             "type": "function",
-                            "function": {"name": BASH_TOOL_NAME, "arguments": arguments},
+                            "function": {"name": tool_name, "arguments": arguments},
                         }
                     ],
                 },
@@ -182,16 +230,21 @@ def _tool_call_completion(cid: str, model: str, created: int, command: str) -> d
             }
         ],
         "usage": {
-            "prompt_tokens": count_tokens(command),
+            "prompt_tokens": count_tokens(json.dumps(tool_args)),
             "completion_tokens": count_tokens(arguments),
-            "total_tokens": count_tokens(command) + count_tokens(arguments),
+            "total_tokens": count_tokens(json.dumps(tool_args)) + count_tokens(arguments),
         },
     }
 
 
-def _tool_call_stream(cid: str, model: str, created: int, command: str):
-    call_id = tool_call_id(command)
-    arguments = json.dumps({"command": command})
+def _tool_call_stream(cid: str, model: str, created: int, tool_name: str, tool_args: dict):
+    """The streamed twin of `_tool_call_completion` — opencode's ai-sdk client and
+    LibreChat's SSE upstream parsing both require `stream: true`, so the non-streamed
+    shape above is never actually reachable in this deployment; kept for callers/tests
+    that post `stream: false` directly."""
+    call_id = tool_call_id(tool_name + json.dumps(tool_args, sort_keys=True))
+    arguments = json.dumps(tool_args)
+    prompt_str = json.dumps(tool_args)
 
     def chunk(delta: dict, finish=None) -> str:
         payload = {
@@ -212,7 +265,7 @@ def _tool_call_stream(cid: str, model: str, created: int, command: str):
                         "index": 0,
                         "id": call_id,
                         "type": "function",
-                        "function": {"name": BASH_TOOL_NAME, "arguments": ""},
+                        "function": {"name": tool_name, "arguments": ""},
                     }
                 ]
             }
@@ -227,9 +280,9 @@ def _tool_call_stream(cid: str, model: str, created: int, command: str):
             "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
             "usage": {
-                "prompt_tokens": count_tokens(command),
+                "prompt_tokens": count_tokens(prompt_str),
                 "completion_tokens": count_tokens(arguments),
-                "total_tokens": count_tokens(command) + count_tokens(arguments),
+                "total_tokens": count_tokens(prompt_str) + count_tokens(arguments),
             },
         }
         yield f"data: {json.dumps(final)}\n\n"
@@ -316,8 +369,15 @@ async def openai_chat(request: Request):
     if exec_command is not None:
         cid = "fakecmpl-" + hashlib.sha256(exec_command.encode()).hexdigest()[:16]
         if not body.get("stream"):
-            return _tool_call_completion(cid, model, created, exec_command)
-        return _tool_call_stream(cid, model, created, exec_command)
+            return _tool_call_completion(cid, model, created, BASH_TOOL_NAME, {"command": exec_command})
+        return _tool_call_stream(cid, model, created, BASH_TOOL_NAME, {"command": exec_command})
+
+    mcp_echo_arg = find_mcp_echo_arg(messages)
+    if mcp_echo_arg is not None:
+        cid = "fakecmpl-" + hashlib.sha256(("mcp-echo:" + mcp_echo_arg).encode()).hexdigest()[:16]
+        if not body.get("stream"):
+            return _tool_call_completion(cid, model, created, MCP_ECHO_TOOL_NAME, {"text": mcp_echo_arg})
+        return _tool_call_stream(cid, model, created, MCP_ECHO_TOOL_NAME, {"text": mcp_echo_arg})
 
     prompt = extract_prompt(messages)
     text = reply_text(prompt, model)
