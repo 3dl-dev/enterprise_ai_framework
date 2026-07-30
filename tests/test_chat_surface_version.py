@@ -332,8 +332,10 @@ class TestTheConfigIsStillHonoured:
             "a placeholder rather than what mcp-echo actually returned"
         )
 
-    def test_every_model_spec_still_renders_artifacts(self, startup_config):
-        """Artifacts, asserted where they are actually switched on.
+    def test_the_default_model_spec_does_not_render_artifacts_but_another_still_does(
+        self, startup_config
+    ):
+        """Artifacts, asserted where they are actually switched on -- and OFF.
 
         NOT via `interface.artifacts`. That key is in bundle/librechat/librechat.yaml and
         has never done anything: it is absent from librechat-data-provider's
@@ -341,14 +343,39 @@ class TestTheConfigIsStillHonoured:
         packages/data-schemas/src/app/interface.ts never reads it. What turns artifacts on
         is `preset.artifacts` on each model spec, which is what this asserts. Checked
         against the served config, so it stays true only while the surface agrees.
+
+        Until enterpriseaiframework-52a every spec set `preset.artifacts: "default"`. Real-
+        model measurement showed the default model (glm-5.2) wraps plain prose in an HTML
+        artifact 2/5-4/5 of the time regardless of prompt content (Finding 41), so the
+        default model now ships with NO `artifacts` key at all -- `build.js` only injects
+        the artifact system prompt when `typeof artifacts === 'string'`. At least one
+        non-default model must keep `artifacts: "default"`, or done-condition 2 of that
+        item (a genuine build request still renders as an artifact somewhere in the
+        bundle) is unproven by construction.
         """
         specs = (startup_config.get("modelSpecs") or {}).get("list") or []
         assert specs, "no model specs served"
-        for spec in specs:
-            assert spec.get("preset", {}).get("artifacts") == "default", (
-                f"model spec {spec.get('name')!r} does not enable artifacts: "
-                f"{spec.get('preset')}"
-            )
+
+        defaults = [s for s in specs if s.get("default")]
+        assert len(defaults) == 1, f"expected one default spec, got {defaults}"
+        default_preset = defaults[0].get("preset", {})
+        assert "artifacts" not in default_preset, (
+            f"default model spec {defaults[0].get('name')!r} still serves "
+            f"preset.artifacts={default_preset.get('artifacts')!r} -- the default model "
+            "must not render artifacts (enterpriseaiframework-52a, Finding 41)"
+        )
+
+        others = [s for s in specs if not s.get("default")]
+        assert others, "no non-default model spec served to carry artifacts: \"default\""
+        still_enabled = [
+            s["name"] for s in others
+            if s.get("preset", {}).get("artifacts") == "default"
+        ]
+        assert still_enabled, (
+            "no non-default model spec serves preset.artifacts: \"default\" -- with the "
+            "default model's artifacts off, a genuine build request could never render "
+            "as an artifact anywhere in the bundle"
+        )
 
     def test_the_interface_artifacts_key_is_inert(self, startup_config, librechat_config):
         """Locks in the finding above so nobody 'fixes' artifacts by trusting that key.

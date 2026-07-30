@@ -1045,3 +1045,91 @@ One incidental correction while there: `interface.artifacts: true` in
 from the served `/api/config`. What actually turns artifacts on is `preset.artifacts` on
 each model spec. The key is left in place with a corrected comment and a test that fails
 if a future release starts honouring it.
+
+### 41. GLM-5.2 wraps plain prose in an HTML artifact at a measured, uncomfortable rate — artifacts turned off for the default model rather than chased with prompting
+
+Follow-on to Finding 40's `preset.artifacts` correction and `enterpriseaiframework-8b5`
+(the removed `promptPrefix`, `enterpriseaiframework-52a` (this decision).
+
+**FOUND IN USE.** A user asked chat for a short story, got a long one, and replied with a
+typo — "make it a lot sorter" for "a lot shorter". The model built and rendered an HTML
+**car lot sorter**. Nobody asked for a program at any point in the conversation.
+
+**8b5's theory, tested and not confirmed.** `glm-5-2`'s `preset.promptPrefix` was ~10
+lines of standing per-turn context, every line about emitting runnable HTML, ending in a
+worked `<!DOCTYPE html>` example, and provably redundant (LibreChat's own stock
+`artifactsPrompt`, injected whenever `preset.artifacts` is a string, already states when
+to use one and when not to; `deploy/gateway/strip_reasoning.py`'s `_OPEN_FENCE` regex
+already normalises the fence format deterministically at the gateway, model-agnostically).
+Removing it was correct and shipped. It did NOT fix the reported behaviour.
+
+**MEASURED, real model, real (small) spend.** Called `glm-5.2@deepinfra` directly via
+Forge — bypassing the gateway container, so the hermetic suite's fake catalogue was never
+touched — reconstructing LibreChat's exact system prompt for both the prompt-present
+config and the prompt-removed fix. Natural two-turn trials, n=5 per condition: a fresh
+"write me a short story about a lighthouse keeper...", then the literal reported typo
+"make it a lot sorter".
+
+| condition                                  | turn 1 (fresh story) fenced as HTML | turn 2 (the typo) fenced |
+|---------------------------------------------|:---:|:---:|
+| promptPrefix present (pre-8b5 production)   | 2/5 | 0/5 |
+| promptPrefix removed (8b5's fix, now shipped) | 4/5 | 3/5 |
+
+Fisher's exact on both comparisons: p=0.52 and p=0.17 — neither direction is significant
+at n=5. The robust finding, independent of which config: **glm-5.2 wraps a plain "write
+me a short story" request in an HTML artifact somewhere between 2/5 and 4/5 of the time**,
+driven by LibreChat's own stock `artifactsPrompt` ("Content intended for eventual use
+outside the conversation (e.g., reports, emails, presentations)" reads, to this model, as
+license to style a short story as a webpage) interacting with glm-5.2's own tendency — not
+by our custom prompt in either direction. A separate fixed-history control (n=6 each, a
+hand-written non-code story fed as turn-1 history instead of asking the model to write it)
+got 0/6 fenced follow-ups under both configs, pinning the effect to whether **turn 1
+itself** gets wrapped in HTML, not to the follow-up's ambiguous phrasing.
+
+**DECISION (orchestrator ruling, founder-approved, not a config tweak anyone made
+unilaterally).** `preset.artifacts` removed from `glm-5-2` (the default model) in
+`bundle/librechat/librechat.yaml`; `glm-4-7` keeps `artifacts: "default"`. The two
+candidates not taken:
+
+- **Counter-prompting** ("do not wrap ordinary prose in an artifact") was rejected. It is
+  new standing per-turn context in the opposite direction from what 8b5 just removed, and
+  8b5's own A/B is the evidence that prompting glm-5.2 on this axis does not hold —
+  spending more real-model trials on a mechanism already shown not to work was not judged
+  worth the cost.
+- **Accepting the rate and doing nothing** was rejected on the asymmetry between the two
+  failure modes: a **missing** artifact costs a user one re-ask ("actually, can you make
+  that a runnable page?"); a **wrong** one is the reported incident — a user asks for a
+  shorter story and gets a rendered HTML car lot sorter. For the tenant that exists, the
+  first is cheap and the second is the defect that got reported.
+
+**WHAT THIS GIVES UP**, on the record rather than hidden: a genuine build request on
+glm-5.2 no longer renders as a one-click artifact panel — the model still writes the code,
+as an ordinary fenced code block, but the user has to copy it out by hand instead of
+seeing it run. `glm-4-7` is left with artifacts on specifically so at least one bundled
+model still demonstrates the gateway's fence-rewrite carrying a genuine build request
+through to a rendered artifact on its own, unaffected by this ruling.
+
+**RESIDUAL RATE, written down so a later revisit works from a number.** With artifacts
+off for `glm-5-2`, a plain prose request cannot be wrapped in an HTML artifact panel at
+all — `endpoints/custom/build.js` only calls `generateArtifactsPrompt` when
+`typeof artifacts === 'string'`, and the key is now absent — so the false-positive
+mechanism measured above (2/5–4/5 on fresh prose) is structurally closed for the default
+model. `glm-4-7`, with artifacts still on, is presumed to carry the same underlying
+per-model tendency (not separately measured — the n=5/n=5 trials above were run against
+glm-5.2 specifically); if `glm-4-7` becomes more heavily used, or if a different model is
+chosen as default, this residual should be re-measured against whichever model is
+actually serving artifacts-on traffic, not assumed to transfer.
+
+**WHAT COULD NOT BE PROVEN HERE, and why.** Everything above is HTTP-level, direct against
+the real model via Forge. Whether the artifact **panel** actually renders (or, with this
+change, correctly does NOT render) in the chat UI is a separate, unproven layer — it needs
+a signed-in browser session against a chat container, which for this project exists only
+against the k3s cluster (`tests-live/test_browser.py`, `test_e2e_journey.py`), both
+cluster-only by their own docstrings (Finding 33). The cluster was read-only, with a real
+user mid-conversation on it, for the entirety of this work. The prerequisite to close that
+gap without the cluster is a compose-bundle browser harness — OIDC login plus Playwright
+pointed at the bundle's own chat container — which does not exist today. What this item
+proves instead: the **configuration** ships as decided (`tests/test_chat_model_prompts.py`
+asserts `glm-5-2` has no `preset.artifacts` and `glm-4-7` still does), and the underlying
+model behaviour that motivated the config change is the real-model measurement above, not
+a UI observation.

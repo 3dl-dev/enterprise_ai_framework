@@ -98,7 +98,38 @@ modelSpecs:
       preset:
         endpoint: "Enterprise AI"
         model: "glm-5.2@deepinfra"
-        artifacts: "default"
+        # NO artifacts key (enterpriseaiframework-52a). This model previously carried
+        # `artifacts: "default"`, same as glm-4-7 below. Real-model measurement (see the
+        # item's audit trail) showed glm-5.2 wraps a plain prose request -- "write me a
+        # short story", no code intent anywhere in the conversation -- in an HTML artifact
+        # 2/5 to 4/5 of the time, driven by LibreChat's OWN stock artifact system prompt
+        # (generateArtifactsPrompt, injected whenever `artifacts` is a string) interacting
+        # with this model's own tendency, NOT by anything in our (already-removed, see
+        # enterpriseaiframework-8b5) promptPrefix. Counter-prompting ("do not wrap prose in
+        # an artifact") was rejected: it reintroduces the standing per-turn context 8b5 just
+        # removed, and 8b5's own A/B is the evidence that prompting on this axis does not
+        # hold for this model. ORCHESTRATOR RULING, founder-approved: the asymmetry between
+        # the two failure modes decides it. A MISSING artifact costs a user one re-ask; a
+        # WRONG one is the reported incident -- a child asks for a shorter story and gets a
+        # rendered HTML car lot sorter. For the tenant that exists today, the first is cheap
+        # and the second is not. So: artifacts OFF for the default model.
+        #   endpoints/custom/build.js only calls generateArtifactsPrompt when
+        #   `typeof artifacts === 'string'` -- omitting the key entirely (not `artifacts:
+        #   false`, which risks a zod-schema mismatch on a `z.string().optional()` field)
+        #   is the deterministic off switch. See tests/test_chat_model_prompts.py.
+        # WHAT THIS GIVES UP: a user who genuinely asks glm-5.2 to build something no
+        # longer gets a rendered artifact panel -- they get the code as a normal fenced
+        # code block instead, and have to copy it out by hand. glm-4-7 below keeps
+        # `artifacts: "default"`, which is done-condition (2): it exists precisely to prove
+        # the gateway's fence rewrite (strip_reasoning.py, unaffected by this change) still
+        # carries a genuine build request through to a rendered artifact on a model where
+        # artifacts remain on.
+        # RESIDUAL RATE, WRITTEN DOWN rather than chased with more prompting: see
+        # docs/design/dogfood-findings.md -- 2/5 to 4/5 false-positive artifact rate on
+        # glm-5.2 plain prose, n=5 per condition, neither difference significant (Fisher's
+        # exact p=0.52, p=0.17). This is a documented limitation, not a resolved one; if a
+        # different default model is chosen, or if a larger sample changes the number,
+        # revisit this ruling with a number, not an argument.
         # Matches the provider: 200k context, and the full output budget. These models
         # spend part of the output budget reasoning, so a short cap truncates the answer
         # after the thinking rather than producing a smaller answer.
@@ -133,6 +164,11 @@ modelSpecs:
       preset:
         endpoint: "Enterprise AI"
         model: "glm-4.7@deepinfra"
+        # artifacts KEPT ON, unlike glm-5-2 above (enterpriseaiframework-52a). Not an
+        # oversight: this is done-condition (2) of that item -- at least one model must
+        # still render a genuinely requested artifact, proving the gateway's fence rewrite
+        # (strip_reasoning.py) carries a real build request through on its own, independent
+        # of glm-5-2's prose-vs-artifact ruling above.
         artifacts: "default"
         maxContextTokens: 128000
         maxOutputTokens: 32768
