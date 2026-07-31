@@ -1314,10 +1314,16 @@ class TestSubagentAttribution:
 
     WHAT WAS MEASURED, on this running bundle, reading `LiteLLM_SpendLogs` directly
     rather than trusting a rendering of it: a single subagent-delegating turn writes
-    MULTIPLE distinct completion rows under the model `fake-gpt-large` — the parent's
-    own decision call, the child subagent's own completion (a genuinely separate
-    request, provably distinct because its prompt is the subagent's own task text, not
-    the parent's), and the parent's post-relay completion — and EVERY one of them
+    THREE distinct completion rows under the model `fake-gpt-large` — the parent's own
+    decision call, the child subagent's own completion (a genuinely separate HTTP
+    request the child graph makes on its own), and the parent's post-relay completion.
+    `LiteLLM_SpendLogs.messages` is `{}` on every row this bundle writes (verified by
+    psql against this exact table), so the child's row cannot be identified by reading
+    its prompt text back off the ledger — that claim is NOT made here. What IS measured
+    and asserted is the row count itself: fewer than three rows means no distinct child
+    completion happened, only the ordinary parent-call/relay-call pair an ordinary tool
+    turn already produces (see the negative control below, which reproduces exactly that
+    two-row shape when no subagent tool is bound at all). EVERY one of the three rows
     carries the SAME `end_user` (LibreChat's own Mongo _id for the signed-in user) and
     the SAME `metadata.user_api_key_alias` (the shared `chat-surface::chat` key every
     chat turn authenticates with) as an ordinary, non-delegating turn. Translated through
@@ -1325,6 +1331,28 @@ class TestSubagentAttribution:
     every constituent call therefore lands on `/admin/spend` under the requesting
     person's own name and the `chat` surface — not a synthetic agent principal, not the
     agent's own id, and not `(unattributed)`.
+
+    THE NEGATIVE CONTROL BELOW IS WHAT MAKES THIS MORE THAN AN ARGUMENT. An earlier
+    version of this class asserted only `minimum=2` constituent rows, `tool_calls(reply)`
+    non-empty, and nothing about the reply's content. Run against an agent with NO
+    `subagents` config bound (so LibreChat has no `subagent` tool at all), the identical
+    marker turn persists a tool_call block named `subagent` whose own output is
+    `Error processing tool: Tool "subagent" not found.`, the visible reply is the string
+    `Error: Tool "subagent" not found. Please fix your mistakes.`, and the ledger shows
+    FEWER THAN THREE `fake-gpt-large` rows — measured directly against this bundle
+    (three separate runs, one an 80-second patient poll with no early exit) as a
+    reproducible, steady-state ONE row, the parent's own decision call; LibreChat
+    synthesizes the tool-not-found error locally rather than round-tripping the model a
+    second time. (The rework item that produced this class quotes an earlier adversary
+    run of the same scenario at two rows — this measurement disagrees with that number
+    and is the one this test is built on; flagged rather than silently overwritten,
+    see the item's own trail.) Either way, that shape satisfied every assertion the old
+    test made. The assertions below — `minimum=3`, the tool_call's output must not be
+    an error, the reply text must not be an error — are written so that same
+    negative-control turn, exercised as an actual test method
+    (`test_a_turn_with_no_subagents_configured_gets_an_error_the_assertions_reject`),
+    fails them. That test asserts `pytest.raises(AssertionError)` around the shared
+    helper, so the discrimination is measured, not claimed.
 
     BOTH SHAPES SubagentConfig SUPPORTS ARE MEASURED, because the mechanism differs
     enough between them that proving one would not have proven the other:
@@ -1484,6 +1512,77 @@ class TestSubagentAttribution:
             f"{bill.get('by_user_and_surface')}"
         )
 
+    # A tool-not-found error is what a `subagent` tool_call looks like when no
+    # delegation happened at all — this is the exact string LibreChat's tool-call
+    # relay writes when the model asks for a tool the agent has no binding for.
+    # Measured on this bundle against an agent with no `subagents` config.
+    _NOT_FOUND_MARKERS = ("not found", "please fix your mistakes")
+
+    def _assert_genuine_delegation(self, reply: dict, rows: list[dict], oid: str,
+                                    minimum: int) -> None:
+        """The shared assertion set both real-delegation tests apply to a passing turn,
+        and the negative-control test below applies to a turn that never delegated —
+        proving, by actually raising on that second input, that these assertions
+        discriminate rather than merely accepting the good case.
+
+        Checks, in order: (1) a tool_call literally named `subagent` was persisted —
+        not just SOME tool_call, closing the gap where an ordinary tool-relay turn with
+        no delegation at all could satisfy a bare `tool_calls(reply)` check; (2) that
+        tool_call's own output is not the tool-not-found error string, i.e. a subagent
+        actually ran rather than failing to bind; (3) the visible reply text is not the
+        matching error string either — the 'coherent decomposed result' half of the
+        done-condition, which the prior version of this class never checked at all;
+        (4) at least `minimum` distinct completion rows landed on the ledger — the real,
+        successful case always produces three (parent decision, child's own call, parent
+        relay); a subagents-disabled turn produces fewer (measured steady-state on this
+        bundle: exactly one, the parent's own decision call), which is why the negative
+        control below calls this with `minimum=3` and expects it to raise;
+        (5) every one of those rows is attributed to the requesting user's own identity
+        on the shared chat credential — unchanged from the original assertion, kept
+        because it was never in question.
+        """
+        calls = chat_turn.tool_calls(reply)
+        subagent_calls = [
+            c for c in calls if (c.get("tool_call") or {}).get("name") == "subagent"
+        ]
+        assert subagent_calls, (
+            f"no tool_call named 'subagent' was persisted on the reply — a generic "
+            f"tool_calls(reply) check would not have caught this: {calls}"
+        )
+        tool_call = subagent_calls[0]["tool_call"]
+        output = (tool_call.get("output") or "").lower()
+        assert not any(marker in output for marker in self._NOT_FOUND_MARKERS), (
+            f"the subagent tool_call's own output is an error, not a delegation "
+            f"result: {tool_call}"
+        )
+
+        text = chat_turn.reply_text(reply).lower()
+        assert not any(marker in text for marker in self._NOT_FOUND_MARKERS), (
+            f"the assistant's visible reply is an error string, not a coherent "
+            f"decomposed result: {chat_turn.reply_text(reply)!r}"
+        )
+
+        assert len(rows) >= minimum, (
+            f"expected >= {minimum} constituent completions (parent decision call, "
+            f"the child subagent's own completion, and the parent's post-relay call) "
+            f"on the ledger, found {len(rows)}: {rows}"
+        )
+        distinct_prompt_token_counts = {r["prompt_tokens"] for r in rows}
+        assert len(distinct_prompt_token_counts) > 1, (
+            f"every constituent row shares the same prompt_tokens count — that is the "
+            f"signature of the same completion counted twice, not {minimum} genuinely "
+            f"separate requests with different context depths: {rows}"
+        )
+        for row in rows:
+            assert row["alias"] == self.SHARED_CHAT_ALIAS, (
+                f"a subagent constituent call authenticated with an unexpected "
+                f"credential: {row}"
+            )
+            assert row["end_user"] == oid, (
+                f"a subagent constituent call was not attributed to the requesting "
+                f"user's own identity ({oid}): {row}"
+            )
+
     # ---------------------------------------------------------------- the tests
 
     def test_a_self_spawned_subagent_calls_own_completion_is_billed_to_the_requesting_user(
@@ -1504,27 +1603,16 @@ class TestSubagentAttribution:
             reply = self._send_subagent_turn(
                 chat_session, chat_url, agent_id, f"CALL_SUBAGENT:self:self task {nonce}"
             )
-            assert chat_turn.tool_calls(reply), (
-                "no subagent tool_call was persisted on the reply — the marker never "
-                f"reached the subagent tool: {reply}"
-            )
 
-            # At least two: the parent's own decision-to-delegate call, and the child
-            # subagent's OWN completion (a third, the parent's post-relay call, usually
-            # also lands — asserted as >= 2 rather than == 3 so a future LibreChat
-            # version that collapses the relay into the streaming response does not
-            # break this test over a detail it does not claim).
-            rows = self._await_constituent_rows(env, since, minimum=2)
-
-            for row in rows:
-                assert row["alias"] == self.SHARED_CHAT_ALIAS, (
-                    f"a subagent constituent call authenticated with an unexpected "
-                    f"credential: {row}"
-                )
-                assert row["end_user"] == oid, (
-                    f"a subagent constituent call was not attributed to the requesting "
-                    f"user's own identity ({oid}): {row}"
-                )
+            # Three: the parent's own decision-to-delegate call, the child subagent's
+            # OWN completion, and the parent's post-relay call — the exact shape
+            # measured on this bundle. `_assert_genuine_delegation` also checks the
+            # tool_call is actually named `subagent`, that neither its output nor the
+            # visible reply is the tool-not-found error, and that the rows are not all
+            # the same completion counted twice — see the negative control test below
+            # for proof this rejects a turn where no delegation happened.
+            rows = self._await_constituent_rows(env, since, minimum=3)
+            self._assert_genuine_delegation(reply, rows, oid, minimum=3)
 
             bill_row = self._await_bill_row(control_plane_url, admin_headers, username)
             assert bill_row["requests"] >= len(rows), (
@@ -1577,18 +1665,9 @@ class TestSubagentAttribution:
                 chat_session, chat_url, parent_id,
                 f"CALL_SUBAGENT:{child_id}:explicit child task {nonce}",
             )
-            assert chat_turn.tool_calls(reply), (
-                f"no subagent tool_call was persisted on the reply: {reply}"
-            )
 
-            rows = self._await_constituent_rows(env, since, minimum=2)
-            for row in rows:
-                assert row["alias"] == self.SHARED_CHAT_ALIAS, row
-                assert row["end_user"] == oid, (
-                    f"the explicit child agent's own completion was not attributed to "
-                    f"the requesting user ({oid}), the person who actually asked for "
-                    f"it — not the child agent's author, not the agent itself: {row}"
-                )
+            rows = self._await_constituent_rows(env, since, minimum=3)
+            self._assert_genuine_delegation(reply, rows, oid, minimum=3)
 
             bill_row = self._await_bill_row(control_plane_url, admin_headers, username)
             assert bill_row["requests"] >= len(rows)
@@ -1603,6 +1682,86 @@ class TestSubagentAttribution:
         finally:
             self._delete_agent(chat_session, chat_url, parent_id)
             self._delete_agent(chat_session, chat_url, child_id)
+
+    def test_a_turn_with_no_subagents_configured_gets_an_error_the_assertions_reject(
+        self, chat_session, chat_url, env
+    ):
+        """Negative control (enterpriseaiframework-00d rework, adversary CHALLENGE 1).
+
+        An agent with NO `subagents` config bound at all has no `subagent` tool for the
+        model to call. The `CALL_SUBAGENT:...` marker is identical to the two tests
+        above; only the agent's config differs. Two things are proven here, both by
+        measurement rather than restated as fact:
+
+        1. What actually happens without the feature: a tool_call named `subagent` IS
+           persisted (fakeprovider still asks for it — that part doesn't depend on the
+           agent's config), but its own recorded output is LibreChat's tool-not-found
+           error, the visible reply is the matching error string, and FEWER THAN THREE
+           `fake-gpt-large` rows land on the ledger — not the three-row delegated shape.
+           Measured directly against this running bundle (three separate runs, including
+           an 80-second patient poll with no early exit): the steady-state count is
+           exactly ONE row — the parent's own decision call. LibreChat's tool-not-found
+           error is synthesized locally once the bound-tool lookup fails; it does not
+           make a second model round-trip the way a genuine tool-result relay does. The
+           assertion below is written as `< 3` rather than pinned to `== 1` so it states
+           the invariant that actually matters (this is not the three-row delegated
+           shape) without being brittle to an incidental extra row.
+
+        2. That `_assert_genuine_delegation` — the exact helper the two real-delegation
+           tests above rely on — REJECTS this turn. `pytest.raises` around the call is
+           not decorative: this is the same assertion set run over data it must fail on,
+           which is the only way "the assertions can see the delegation they claim to
+           prove" is something other than an unverified claim.
+        """
+        oid, username = self._chat_identity(chat_session, chat_url)
+        agent_id = self._create_agent(
+            chat_session, chat_url, name=f"subagent-none-{uuid.uuid4().hex[:8]}",
+        )
+        try:
+            since = self._ledger_now(env)
+            nonce = uuid.uuid4().hex
+            reply = self._send_subagent_turn(
+                chat_session, chat_url, agent_id, f"CALL_SUBAGENT:self:self task {nonce}"
+            )
+
+            calls = chat_turn.tool_calls(reply)
+            subagent_calls = [
+                c for c in calls if (c.get("tool_call") or {}).get("name") == "subagent"
+            ]
+            assert subagent_calls, (
+                f"expected a tool_call named 'subagent' even without delegation "
+                f"(fakeprovider still asks for it): {calls}"
+            )
+            output = (subagent_calls[0]["tool_call"].get("output") or "").lower()
+            assert any(marker in output for marker in self._NOT_FOUND_MARKERS), (
+                f"expected the tool-not-found error on the tool_call's own output, "
+                f"measured on this bundle without a subagents config: {subagent_calls[0]}"
+            )
+            text = chat_turn.reply_text(reply)
+            assert any(marker in text.lower() for marker in self._NOT_FOUND_MARKERS), (
+                f"expected the visible reply to be the tool-not-found error string: "
+                f"{text!r}"
+            )
+
+            rows = self._await_constituent_rows(env, since, minimum=1)
+            assert len(rows) < 3, (
+                f"expected fewer than the 3-row delegated shape without a subagent "
+                f"actually running (measured steady-state on this bundle: exactly 1 "
+                f"row, the parent's own decision call — no second model round-trip): "
+                f"{rows}"
+            )
+            for row in rows:
+                assert row["end_user"] == oid, (
+                    "even a rejected tool call must still be attributed to the "
+                    f"requesting user, not left unattributed: {row}"
+                )
+
+            # The actual discrimination proof: the SAME helper the real-delegation
+            # tests trust must refuse to call this a genuine delegation.
+            with pytest.raises(AssertionError):
+                self._assert_genuine_delegation(reply, rows, oid, minimum=3)
+        finally:
+            self._delete_agent(chat_session, chat_url, agent_id)
 
 
 class TestPricingIntegrity:
