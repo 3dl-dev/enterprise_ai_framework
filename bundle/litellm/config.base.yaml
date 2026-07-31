@@ -80,6 +80,14 @@ model_list:
       api_key: fake-not-a-real-key
       input_cost_per_token: 0.00000015
       output_cost_per_token: 0.0000006
+    # Declared to LiteLLM (and, through it, to the surface) rather than left implicit in
+    # the model_name — a name is not a capability. fakeprovider itself backs this: an
+    # `image_url` content block reaches it as a short deterministic marker derived from
+    # the image rather than being silently dropped (fakeprovider/app.py's
+    # `_message_text`/`_image_marker`), so a turn that actually sends an image is
+    # observably different from one that does not, over GET /debug/prompts.
+    model_info:
+      supports_vision: true
 
   # ---- upstream models, generated ------------------------------------------------
   # bin/render-gateway-config.py replaces the marker below with one entry per model
@@ -112,11 +120,19 @@ litellm_settings:
   # bundle as one 200-response, 19 tokens, no ledger row, ever. Source and full reasoning:
   # deploy/gateway/flush_spend_on_shutdown.py
   #
+  # allow_reasoning_effort (enterpriseaiframework-282) keeps `reasoning_effort` alive past
+  # `drop_params` below. Every model in this catalogue is reached as `openai/<id>` (Forge
+  # is OpenAI-wire-compatible), and LiteLLM only treats `reasoning_effort` as a supported
+  # param for a model whose STRING matches a literal OpenAI o-series/gpt-5 name — nothing
+  # ours ever will. Measured directly against this gateway before this hook existed: a
+  # request carrying `reasoning_effort: "low"` reached fakeprovider with the field silently
+  # gone. Source and full reasoning: deploy/gateway/allow_reasoning_effort.py
+  #
   # KEEP THIS LIST IN INLINE FLOW STYLE. tests/test_gateway_callbacks.py parses it with a
   # regex on `callbacks: [ ... ]` to derive the modules every deployment must ship; block
   # style makes that parse return nothing, which skips the whole drift trap instead of
   # failing it.
-  callbacks: ["strip_reasoning.handler", "require_principal.handler", "flush_spend_on_shutdown.handler"]
+  callbacks: ["strip_reasoning.handler", "require_principal.handler", "flush_spend_on_shutdown.handler", "allow_reasoning_effort.handler"]
   # Every request gets a spend row. This is the ledger the control plane reads for
   # the one bill (scope item 4) — without it, spend-by-user-and-surface returns nothing.
   success_callback: ["postgres"]

@@ -43,7 +43,7 @@ import yaml
 
 import chat_turn
 import oidc_login
-from conftest import BUNDLE, DOGFOOD_USER, DOGFOOD_PASSWORD
+from conftest import BUNDLE, DOGFOOD_USER, DOGFOOD_PASSWORD, compose
 
 pytestmark = pytest.mark.usefixtures("stack_up")
 
@@ -501,6 +501,152 @@ class TestTheConfigIsStillHonoured:
                 headers=_auth(chat_session, chat_url), timeout=TIMEOUT,
             )
             second.close()
+
+
+# ---------------------------------------------------------------------------
+# The model picker, driven through a real rendered DOM (enterpriseaiframework-282 rework)
+# ---------------------------------------------------------------------------
+
+class TestTheModelPickerActuallyRenders:
+    """enterpriseaiframework-282, the half of the claim `test_the_model_picker_and_...
+    _panel_are_actually_switched_on` above conceded it could not cover: a served
+    `/api/config` with `modelSelect: true` is a claim about JSON, not about a rendered
+    dropdown — "a regression back to `modelSelect: false` would NOT be caught by driving
+    the API directly" (that test's own docstring). Nothing established that the React
+    client actually renders a picker given that flag, which is exactly the defect this
+    item found and fixed.
+
+    This drives a real Chromium through the real sign-in flow this bundle runs
+    (OPENID_AUTO_REDIRECT is off locally, so it lands on `/login` and clicks through —
+    the cluster skips that page only because it sets the flag; the underlying Keycloak
+    exchange is identical, reproduced from tests-live/test_chat_login.py's
+    `_sign_in_to_chat`), opens the model-spec button, searches the catalogue for a model
+    that is NOT one of the two pinned modelSpecs, clicks it, sends a turn through the
+    real composer (not the API client `chat_turn.py` posts with), and reads the same
+    `LiteLLM_SpendLogs` table `tests/test_scope_items.py` reads to prove the picked
+    model is the one that got billed.
+
+    WITHOUT `modelSelect: true` this whole class fails at the search step: the dialog
+    that opens carries only the two configured modelSpecs (`GLM 5.2`, `GLM 4.7`) and
+    nothing that searching for a bare model_name like `fake-small` matches — measured
+    directly against this exact surface with `interface.modelSelect` unset (`false`
+    on the served config) before this item's fix. `modelSelect: true` is what makes an
+    `Enterprise AI` (the raw endpoint, i.e. its full fetched model_list) option appear
+    in the same dialog, which is what a search across the whole catalogue then matches
+    against.
+    """
+
+    @pytest.fixture(scope="class")
+    def browser(self):
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            b = p.chromium.launch()
+            yield b
+            b.close()
+
+    def _spend_row_since(self, env, model_group: str, since: float, timeout: float = 90.0):
+        """Poll `LiteLLM_SpendLogs` for a row under `model_group` no older than `since`.
+
+        Same query shape as
+        tests/test_scope_items.py::TestModelPickerAndReasoningEffort._spend_row_since —
+        duplicated rather than imported because that class's version takes an ISO
+        timestamp string and this one a `time.time()` float (matching what a browser
+        test naturally has on hand), and because a shared helper split across two test
+        modules for one query is not worth the indirection.
+        """
+        since_iso = time.strftime("%Y-%m-%dT%H:%M:%S+00", time.gmtime(since))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = compose(
+                "exec", "-T", "postgres", "psql", "-U", env.get("POSTGRES_USER", "eai"),
+                "-d", "gateway", "-tA", "-F", "|", "-c",
+                "SELECT spend, prompt_tokens, completion_tokens FROM "
+                f"\"LiteLLM_SpendLogs\" WHERE model_group = '{model_group}' "
+                f"AND \"startTime\" >= '{since_iso}'::text::timestamptz "
+                "ORDER BY \"startTime\" DESC LIMIT 1",
+                check=False,
+            )
+            assert result.returncode == 0, f"psql failed\n{result.stdout}\n{result.stderr}"
+            line = result.stdout.strip()
+            if line:
+                spend_s, prompt_s, completion_s = line.split("|")
+                return float(spend_s), int(prompt_s), int(completion_s)
+            time.sleep(3)
+        pytest.fail(
+            f"no LiteLLM_SpendLogs row landed under model_group={model_group!r} since "
+            f"{since_iso} — the browser-driven turn was either never sent under that "
+            "model, or the picker silently sent something else"
+        )
+
+    def test_switching_the_model_from_the_rendered_dropdown_bills_the_ledger_under_it(
+        self, browser, chat_url, env
+    ):
+        ctx = browser.new_context(viewport={"width": 1440, "height": 900},
+                                   ignore_https_errors=True)
+        page = ctx.new_page()
+        console_errors = []
+        page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
+        try:
+            page.goto(chat_url + "/", wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(1500)
+            if "/login" in page.url:
+                # OPENID_AUTO_REDIRECT is off on the local bundle (the cluster sets it),
+                # so a person lands on our own /login page first and clicks through to
+                # Keycloak — reproduced here rather than deep-linking to /oauth/openid,
+                # so this exercises the button a real user actually clicks.
+                page.click("text=Sign in with Enterprise AI")
+            page.wait_for_selector("input[name='username']", timeout=20000)
+            page.fill("input[name='username']", DOGFOOD_USER)
+            page.fill("input[name='password']", DOGFOOD_PASSWORD)
+            page.click("input[type='submit'], button[type='submit']")
+            page.wait_for_load_state("domcontentloaded", timeout=20000)
+            page.wait_for_selector("#prompt-textarea", timeout=20000)
+
+            # 1. Open the picker and search for a catalogue model that is NOT either of
+            #    the two pinned modelSpecs — proves the FULL catalogue is reachable, not
+            #    only the two names librechat.yaml's modelSpecs.list happens to know.
+            page.locator("button", has_text="GLM").first.click(timeout=10000)
+            search = page.locator("#model-search")
+            search.wait_for(state="visible", timeout=10000)
+            search.fill("fake-small")
+            option = page.locator("[role=option]", has_text="fake-small")
+            option.first.wait_for(state="visible", timeout=10000)
+            option.first.click()
+
+            # 2. The picker button itself now names the picked model — the rendered
+            #    proof that the click actually changed the active selection, not just
+            #    that an option existed to click.
+            page.wait_for_timeout(500)
+            assert page.locator("button", has_text="fake-small").count() > 0, (
+                "clicking the fake-small option did not change what the picker button "
+                "displays — the click may have landed on the wrong element"
+            )
+
+            # 3. Send a real turn through the actual composer, not chat_turn.py's direct
+            #    POST — this is the wire shape ONLY the rendered UI can produce.
+            nonce = uuid.uuid4().hex
+            since = time.time()
+            page.fill("#prompt-textarea", f"browser-driven model switch {nonce}")
+            page.click("#send-button")
+
+            # 4. Ground truth: the same ledger table the API-driven test reads, proving
+            #    the model this rendered dropdown displayed is the model that got billed.
+            spend, prompt_tokens, completion_tokens = self._spend_row_since(
+                env, "fake-small", since
+            )
+            assert prompt_tokens > 0 and completion_tokens > 0, (
+                "the browser-driven turn recorded no tokens under fake-small — it did "
+                "not actually reach that model"
+            )
+            assert spend > 0, (
+                "fake-small metered at $0 for a turn sent through the rendered picker"
+            )
+            assert not console_errors, (
+                f"the chat surface logged console errors during this flow: {console_errors}"
+            )
+        finally:
+            ctx.close()
 
 
 # ---------------------------------------------------------------------------

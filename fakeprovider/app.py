@@ -40,8 +40,16 @@ _CAPTURED_PROMPTS: list[dict] = []
 _CAPTURE_LIMIT = 500
 
 
-def _capture_prompt(model: str, prompt: str) -> None:
-    _CAPTURED_PROMPTS.append({"model": model, "prompt": prompt})
+def _capture_prompt(model: str, prompt: str, reasoning_effort=None) -> None:
+    """`reasoning_effort` (enterpriseaiframework-282) is the ground truth for whether the
+    Parameters panel's setting actually left the surface: strip_reasoning.py removes
+    reasoning CONTENT from the upstream's reply but must never make the request-side
+    field unobservable, or a test asserting "the surface sets reasoning effort" has
+    nothing but nonzero tokens to check — which passes identically whether the field
+    reached here or was silently dropped somewhere upstream of fakeprovider."""
+    _CAPTURED_PROMPTS.append(
+        {"model": model, "prompt": prompt, "reasoning_effort": reasoning_effort}
+    )
     if len(_CAPTURED_PROMPTS) > _CAPTURE_LIMIT:
         del _CAPTURED_PROMPTS[: len(_CAPTURED_PROMPTS) - _CAPTURE_LIMIT]
 
@@ -145,15 +153,43 @@ def find_file_search_query(messages: list) -> str | None:
     return None
 
 
+def _image_marker(block: dict) -> str:
+    """A short, deterministic stand-in for an `image_url` content block.
+
+    Never the raw data URI: those run to hundreds of KB and would dominate the ring
+    buffer and every prompt-derived hash. A digest of the URL/data is enough to prove
+    two different images differ and the same image repeats identically, which is all
+    enterpriseaiframework-282's vision leg needs — fakeprovider cannot actually SEE an
+    image, only prove that one reached it.
+    """
+    url = ""
+    if isinstance(block.get("image_url"), dict):
+        url = block["image_url"].get("url", "")
+    elif isinstance(block.get("source"), dict):
+        # Anthropic-style content block: {"type": "image", "source": {"data": ...}}.
+        url = block["source"].get("data", "") or block["source"].get("url", "")
+    digest = hashlib.sha256(str(url).encode()).hexdigest()[:12]
+    return f"[image:{digest}]"
+
+
 def _message_text(message: dict) -> str:
     content = message.get("content", "")
     if isinstance(content, list):
-        # OpenAI/Anthropic content-block shape.
-        content = "".join(
-            b.get("text", "")
-            for b in content
-            if isinstance(b, dict) and b.get("type", "text") == "text"
-        )
+        # OpenAI/Anthropic content-block shape. Image blocks used to be dropped
+        # outright here, which meant a "vision-capable" model never actually saw an
+        # image — see the enterpriseaiframework-282 rework. A marker derived from the
+        # image is kept in the extracted text instead, so a test can prove an image
+        # reached this far without fakeprovider needing to understand image bytes.
+        parts = []
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            btype = b.get("type", "text")
+            if btype == "text":
+                parts.append(b.get("text", ""))
+            elif btype in ("image_url", "image"):
+                parts.append(_image_marker(b))
+        content = "".join(parts)
     return str(content)
 
 
@@ -205,8 +241,14 @@ def extract_prompt(messages: list) -> str:
     for m in messages or []:
         content = m.get("content", "")
         if isinstance(content, list):
-            # Anthropic-style content blocks
-            content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+            # OpenAI/Anthropic-style content blocks. `b.get("text", "")` alone silently
+            # erased image blocks (they carry no "text" key) — see _message_text's
+            # docstring above for why that made "vision-capable" prove nothing.
+            content = "".join(
+                b.get("text", "") if b.get("type", "text") == "text" else _image_marker(b)
+                for b in content
+                if isinstance(b, dict)
+            )
         parts.append(str(content))
     return "\n".join(parts)
 
@@ -384,7 +426,7 @@ async def openai_chat(request: Request):
 
     # Capture before any early return, so a tool-call or relay turn is recorded too
     # (enterpriseaiframework-6ff's skill tests read this to see what LibreChat sent).
-    _capture_prompt(model, extract_prompt(messages))
+    _capture_prompt(model, extract_prompt(messages), reasoning_effort=body.get("reasoning_effort"))
 
     # Code-execution tool calling takes priority over the deterministic-ack default
     # (enterpriseaiframework-082). Two states, mutually exclusive: either this turn

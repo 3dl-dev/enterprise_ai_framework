@@ -19,6 +19,7 @@ import httpx
 import pytest
 
 import chat_turn
+import file_upload
 import oidc_login
 from conftest import BUNDLE, DOGFOOD_USER, compose, set_user_enabled
 
@@ -1352,6 +1353,24 @@ class TestModelPickerAndReasoningEffort:
             "Cookie": oidc_login._cookie_header(client),
         }
 
+    @staticmethod
+    def _fakeprovider_url(env: dict) -> str:
+        return f"http://localhost:{env.get('FAKEPROVIDER_PORT', '8090')}"
+
+    def _prompts_containing(self, env: dict, nonce: str) -> list[dict]:
+        """The raw captured-request entries fakeprovider kept for a nonce.
+
+        Ground truth for "did the surface actually send X", not just "did a turn
+        happen" — see fakeprovider/app.py's `_capture_prompt`/`/debug/prompts`, the same
+        seam tests/test_skill_corpus.py already relies on for the identical reason.
+        """
+        r = httpx.get(
+            f"{self._fakeprovider_url(env)}/debug/prompts",
+            params={"contains": nonce}, timeout=TIMEOUT,
+        )
+        assert r.status_code == 200, r.text
+        return r.json()
+
     def _since(self) -> str:
         """An explicit UTC-offset timestamp taken immediately before a turn.
 
@@ -1439,6 +1458,26 @@ class TestModelPickerAndReasoningEffort:
         selectable by picking it explicitly, and priced above zero once picked —
         enterpriseaiframework-020 (pasting a screenshot / uploading a PDF) is blocked on
         this being true.
+
+        THE VISION CLAIM ITSELF (enterpriseaiframework-282 rework). Offered+priced+
+        selectable alone proves a text echo, not vision — "vision-capable" was
+        previously a substring of a model_name and nothing else: fakeprovider dropped
+        every `image_url` content block before it ever computed the fake reply, and no
+        request in this test sent one. Fixed on both sides:
+          - bundle/litellm/config.base.yaml now sets `model_info.supports_vision: true`
+            on this entry, so LiteLLM (and, through `/v1/models`, the surface) is told
+            this model is vision-capable, not just named as though it were.
+          - fakeprovider/app.py's `_message_text`/`extract_prompt` (see
+            `_image_marker`) now turn an `image_url` block into a short deterministic
+            marker instead of silently erasing it, so an image that reaches fakeprovider
+            is observable rather than invisible.
+        This test now actually uploads a real image the way LibreChat's own client does
+        (`file_upload.upload_image` — reproduced from the running v0.8.7 image's
+        `useFileHandling.ts`, a materially different upload path than the file_search
+        document upload every other test in this suite uses) and attaches it to the
+        turn, then reads fakeprovider's own `/debug/prompts` capture to prove the image
+        actually reached the model's request — not merely that a turn against this
+        model_name billed successfully, which a text-only turn would also do.
         """
         headers = self._chat_headers(chat_session, chat_url)
         token = _chat_token(chat_session, chat_url)
@@ -1454,11 +1493,22 @@ class TestModelPickerAndReasoningEffort:
             f"the vision-capable stand-in is not in the offered catalogue: {offered}"
         )
 
+        image_record = file_upload.upload_image(
+            chat_session, chat_url, headers, "probe.png",
+        )
+        assert image_record.get("file_id"), (
+            f"image upload carried no file_id: {image_record}"
+        )
+        assert str(image_record.get("type", "")).startswith("image/"), (
+            f"the uploaded file was not stored as an image, so it would never be routed "
+            f"to addImageURLs: {image_record}"
+        )
+
         nonce = uuid.uuid4().hex
         since = self._since()
         chat_turn.send_turn(
             chat_session, chat_url, f"pick the vision model {nonce}", "fake-vision-large",
-            "Enterprise AI", headers=headers, timeout=TIMEOUT,
+            "Enterprise AI", files=[image_record], headers=headers, timeout=TIMEOUT,
         )
         spend, prompt_tokens, completion_tokens = self._spend_row_since(
             env, "fake-vision-large", since
@@ -1468,6 +1518,17 @@ class TestModelPickerAndReasoningEffort:
             "the vision-capable model metered at $0 — an unpriced model meters at $0, "
             "so budgets never trip and the bill under-reports (the exact failure "
             "/admin/unpriced exists to catch)"
+        )
+
+        captured = self._prompts_containing(env, nonce)
+        assert captured, (
+            f"fakeprovider never saw a request carrying nonce {nonce!r} — the turn did "
+            "not actually reach it"
+        )
+        assert "[image:" in captured[-1]["prompt"], (
+            f"fakeprovider's own capture of the request it received has no image marker "
+            f"in it: {captured[-1]['prompt']!r} — the uploaded image never reached the "
+            "model's request, so 'vision-capable' is still unproven"
         )
 
     def test_reasoning_effort_does_not_undo_token_accounting(
@@ -1482,6 +1543,17 @@ class TestModelPickerAndReasoningEffort:
         the running v0.8.7 image's data-provider bundle) that a `custom`-endpoint turn
         forwards straight through to `litellm_params`, so this sends it exactly as the
         Parameters panel would rather than as a synthetic shape.
+
+        WHY THIS ALSO CHECKS fakeprovider'S RING BUFFER, NOT JUST TOKENS
+        (enterpriseaiframework-282 rework). Nonzero tokens/spend are insensitive to the
+        feature under test: they pass identically whether `reasoning_effort` actually
+        left the surface or was silently dropped anywhere between the Parameters panel
+        and the upstream request — a plain turn with no `reasoning_effort` at all would
+        satisfy the same two assertions. `GET /debug/prompts` is fakeprovider's own
+        record of what it actually received on the wire (the same seam
+        tests/test_skill_corpus.py already uses to prove an exact string reached the
+        upstream), so asserting on the captured `reasoning_effort` is ground truth for
+        "the value left the surface", not an inference from a side effect of it.
         """
         nonce = uuid.uuid4().hex
         since = self._since()
@@ -1498,6 +1570,18 @@ class TestModelPickerAndReasoningEffort:
             "control must not undo strip_reasoning's token accounting"
         )
         assert spend > 0
+
+        captured = self._prompts_containing(env, nonce)
+        assert captured, (
+            f"fakeprovider never saw a request carrying nonce {nonce!r} — the turn did "
+            "not actually reach it"
+        )
+        assert captured[-1]["reasoning_effort"] == "low", (
+            f"fakeprovider's own capture of the request it received shows "
+            f"reasoning_effort={captured[-1]['reasoning_effort']!r}, not 'low' — the "
+            "Parameters panel's setting did not reach the upstream request, even though "
+            "the turn still billed and recorded tokens normally"
+        )
 
 
 # ---------------------------------------------------------------------------

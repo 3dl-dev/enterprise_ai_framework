@@ -67,6 +67,7 @@ spec:
             - { name: config, mountPath: /app/strip_reasoning.py, subPath: strip_reasoning.py, readOnly: true }
             - { name: config, mountPath: /app/require_principal.py, subPath: require_principal.py, readOnly: true }
             - { name: config, mountPath: /app/flush_spend_on_shutdown.py, subPath: flush_spend_on_shutdown.py, readOnly: true }
+            - { name: config, mountPath: /app/allow_reasoning_effort.py, subPath: allow_reasoning_effort.py, readOnly: true }
           readinessProbe:
             httpGet: { path: /health/liveliness, port: 4000 }
             initialDelaySeconds: 20
