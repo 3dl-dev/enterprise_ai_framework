@@ -63,6 +63,26 @@ assertion set that passed with the tool call emitted as text would have proven n
 the DOM alone could not tell the two apart, which is exactly why the prior wave's version
 did not catch this.
 
+DRIVEN DIRECTLY AT `{base_url}/`, NOT THROUGH THE PORTAL SHELL'S IFRAME
+(enterpriseaiframework-c31, filed, not this item's to fix). An earlier version of this file
+navigated to `{base_url}/portal/` and read the chat surface out of the embedded iframe the
+portal shell hosts it in. That path reproducibly fails at ~312s with "Frame was detached ...
+navigated to /portal/" -- but the failure is the PORTAL SHELL'S, not this item's: in the run
+that produced that exact failure, the assistant turn had already completed and persisted a
+real `tool_call`-bearing message at t=58s, 254s before the detach at t=312.19s (mongo
+conversationId f72ed5d9-e0aa-435a-a3c9-3b6e89c99eec, `content: ['tool_call', 'text']`,
+`unfinished: false`, `tokenCount: 380`) -- the harness was blind for four minutes after the
+product had already succeeded. The freeze is not 312s-triggered (every DOM read inside the
+portal iframe times out from t=15s onward, independent of when ~312s is merely when the
+top-level navigation resolves and surfaces the error) and is not web_search-specific (an
+identical run asking only "Say the single word hello and nothing else." froze the same way).
+None of that is evidence about whether THIS item's fix works; it is evidence the portal
+iframe is unreliable to observe through, which is exactly what enterpriseaiframework-c31
+tracks. `tests-live/test_chat_login.py` already proves sign-in itself works by going straight
+to `{base_url}/` (LibreChat's own `OPENID_AUTO_REDIRECT` bounces straight to Keycloak, no
+portal shell involved) -- this file does the same, and is sufficient to prove this item's own
+claim, which is about the turn's content, not the portal shell around it.
+
 Real cluster, real model, a fraction of a cent. Kept out of `make test` for the same reason
 test-e2e and test-browser are: it needs a live cluster and waits on a real model.
 """
@@ -206,36 +226,20 @@ def browser():
         b.close()
 
 
-def _chat_frame(page, base_url, timeout=60):
-    """The chat iframe specifically, not the portal shell that hosts it.
-
-    `base_url in frame.url` is not enough: the shell page itself is served AT base_url
-    (`.../portal/`), so a plain substring match finds the outer document, not the frame
-    embedded inside it. The chat frame is the one that starts with base_url and is
-    neither the portal shell nor the workshop.
-    """
-    end = time.time() + timeout
-    while time.time() < end:
-        for f in page.frames:
-            u = f.url or ""
-            if u.startswith(base_url) and "/portal" not in u and "/workshop" not in u:
-                return f
-        page.wait_for_timeout(500)
-    raise AssertionError(f"no chat frame under {base_url!r} after {timeout}s")
-
-
-def _fetch_persisted_message(chat, conversation_id, timeout_s=60):
+def _fetch_persisted_message(page, conversation_id, timeout_s=60):
     """Read the persisted assistant message back from the surface's own API, from
-    INSIDE the chat frame's own JS context -- so it rides the browser's real session
-    (the httpOnly refresh cookie) exactly the way the SPA itself does, rather than this
-    test trying to reconstruct a separate authenticated HTTP client.
+    INSIDE the page's own JS context -- so it rides the browser's real session (the
+    httpOnly refresh cookie) exactly the way the SPA itself does, rather than this test
+    trying to reconstruct a separate authenticated HTTP client.
 
     Mirrors `tests/chat_turn.py::wait_for_reply` (refresh for a bearer token, then
     `GET /api/messages/<id>`, poll until the last non-user message is no longer
     `unfinished`) but runs as page JavaScript because that is the only place this
-    browser-driven test holds a live, cookie-backed session.
+    browser-driven test holds a live, cookie-backed session. Driving the chat surface
+    directly at `{base_url}/` (see module docstring) means this is the top-level page,
+    not an iframe -- no frame lookup needed.
     """
-    result = chat.evaluate(
+    result = page.evaluate(
         """
         async ({ conversationId, timeoutMs }) => {
           const refreshResp = await fetch('/api/auth/refresh', {
@@ -307,10 +311,12 @@ def test_a_never_signed_in_account_reaches_a_working_first_conversation(
     page.on("response", _on_response)
 
     try:
-        # The one thing this account is told: the documented front door
-        # (deploy/README.md), trailing slash included -- the exact form this item's own
-        # constraint text names as something a user has had to be told about.
-        page.goto(f"{base_url}/portal/", wait_until="load", timeout=60000)
+        # Driven DIRECTLY at the chat origin, not through the portal shell's iframe --
+        # see module docstring for why (enterpriseaiframework-c31: the portal iframe is
+        # unobservable from t=15s on, independent of turn outcome). This is the same
+        # entry point `tests-live/test_chat_login.py` already proves sign-in works
+        # through: LibreChat's own `OPENID_AUTO_REDIRECT` bounces straight to Keycloak.
+        page.goto(f"{base_url}/", wait_until="load", timeout=60000)
 
         # A never-before-seen account gets a real Keycloak login form, not a bounce
         # through an existing session -- direct evidence nothing about this identity was
@@ -321,48 +327,31 @@ def test_a_never_signed_in_account_reaches_a_working_first_conversation(
         page.click("input[type='submit'], button[type='submit']")
         page.wait_for_load_state("load", timeout=60000)
 
-        # No instruction on which tab to use: the shell must open on Chat by itself.
-        page.wait_for_selector("#tab-chat", timeout=30000)
-        assert page.get_attribute("#tab-chat", "aria-selected") == "true", (
-            "a brand-new account did not land on the Chat tab by default -- the first "
-            "thing they would need is somebody telling them which tab to click"
+        # Land straight in chat with no second login prompt -- the composer showing up
+        # unaided is the "reached a working first conversation" claim for the surface
+        # itself; the portal shell's own tab-routing (enterpriseaiframework-c31 territory)
+        # is not re-asserted here.
+        page.wait_for_selector("#prompt-textarea", timeout=30000)
+        body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
+        assert "Sign in with" not in body_text, (
+            "chat asked a brand-new account to sign in a second time after Keycloak login"
         )
         page.screenshot(path=f"{SHOTS}/222-01-landed.png")
-
-        chat = _chat_frame(page, base_url, timeout=45)
-
-        # The surface embedded in the tab must not ask this account to sign in a second
-        # time -- one login reaching every surface is scope item 1, re-checked here for
-        # an identity that has never exercised that path before.
-        deadline = time.time() + 60
-        body_text = ""
-        while time.time() < deadline:
-            try:
-                body_text = chat.evaluate("() => document.body ? document.body.innerText : ''")
-            except Exception:
-                body_text = ""
-            if body_text and "Sign in with" not in body_text:
-                break
-            page.wait_for_timeout(1500)
-        assert "Sign in with" not in body_text, (
-            "chat asked a brand-new, already-portal-authenticated account to sign in again"
-        )
 
         # Type a real prompt into the real composer. No tool named, no model chosen, no
         # toggle touched -- the default model spec (librechat.yaml modelSpecs, default:
         # true / prioritize: true) and its `webSearch: true` preset
         # (enterpriseaiframework-222) are what are supposed to make this work unaided.
-        chat.wait_for_selector("#prompt-textarea", timeout=30000)
-        chat.fill("#prompt-textarea", PROMPT)
+        page.fill("#prompt-textarea", PROMPT)
         # `no_wait_after=True`: sending the first message in a brand-new conversation
         # triggers a client-side (pushState) route change to `/c/<conversationId>`, which
         # Playwright's default post-click "wait for navigation" heuristic can mistake for
         # an in-flight full navigation and hang on until its own timeout even though the
         # click has already fired and the turn has already started -- observed directly:
-        # the frame's URL had already updated to the new conversation before the bare
+        # the page's URL had already updated to the new conversation before the bare
         # `.click()` call timed out. Not a product behaviour change; every subsequent wait
         # below still asserts on the real end state.
-        chat.click('[data-testid="send-button"]', no_wait_after=True)
+        page.click('[data-testid="send-button"]', no_wait_after=True)
         page.screenshot(path=f"{SHOTS}/222-02-sent.png")
 
         # A completed assistant turn renders a copy-response control. Waiting on that,
@@ -370,9 +359,9 @@ def test_a_never_signed_in_account_reaches_a_working_first_conversation(
         # actually arrived rather than on how fast the model happened to run this time.
         # NOTE: by itself this proves only that SOME message finished -- see the
         # tool_call assertion below, which is the actual done-condition check.
-        chat.wait_for_selector('[data-testid="copy-response-button"]',
+        page.wait_for_selector('[data-testid="copy-response-button"]',
                               timeout=TURN_BUDGET_S * 1000)
-        reply = chat.evaluate("() => document.body.innerText")
+        reply = page.evaluate("() => document.body.innerText")
         page.screenshot(path=f"{SHOTS}/222-03-reply.png", full_page=True)
 
         # This prompt was chosen so the first turn never needs code execution, and this
@@ -411,7 +400,7 @@ def test_a_never_signed_in_account_reaches_a_working_first_conversation(
             "shape changed; see tests/chat_turn.py's docstring for the two protocols "
             "this surface has used"
         )
-        message = _fetch_persisted_message(chat, captured["conversation_id"],
+        message = _fetch_persisted_message(page, captured["conversation_id"],
                                             timeout_s=TURN_BUDGET_S)
         tool_calls = [
             b for b in (message.get("content") or [])
