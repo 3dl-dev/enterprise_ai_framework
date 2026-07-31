@@ -241,6 +241,15 @@ spec:
             - name: MEILI_MASTER_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: MEILI_MASTER_KEY } }
 
+            # Conversation sharing (enterpriseaiframework-bd2): LibreChat's own native
+            # /api/share routes. The default USER role already grants
+            # SHARED_LINKS.SHARE_PUBLIC, but @librechat/api's
+            # createSharedLinkAccessMiddleware additionally requires this env var before
+            # an UNAUTHENTICATED caller is let through a public link — unset, every
+            # unauthenticated fetch 401s regardless of the role grant. See the matching
+            # comment in bundle/docker-compose.yml, where this was found and proven.
+            - { name: ALLOW_SHARED_LINKS_PUBLIC, value: "true" }
+
             # File search (enterpriseaiframework-c7c). Services in
             # deploy/k8s/51-file-search.yaml. Unset, this is exactly the cluster's own
             # observed symptom the item started from: "RAG API is either not running or
