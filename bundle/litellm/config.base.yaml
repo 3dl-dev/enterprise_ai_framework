@@ -58,6 +58,29 @@ model_list:
       input_cost_per_token: 0.0000001
       output_cost_per_token: 0
 
+  # Vision-capable stand-in (enterpriseaiframework-282). Forge serves a whole
+  # vision-language family behind the same catalogue the moment a real key is
+  # configured — qwen3-vl-30b-a3b@deepinfra, qwen3-vl-235b(-a22b), pixtral-large,
+  # nemotron-nano-12b-vl, palmyra-vision-7b — every one of them priced by Forge's own
+  # /v1/pricing/effective (measured against the live catalogue 2026-07-31: the cheapest,
+  # qwen3-vl-30b-a3b@deepinfra, at $0.15/$0.60 per Mtok) and pulled in automatically by
+  # bin/render-gateway-config.py, same as every other model — nothing about vision is
+  # hand-picked into a pinned list.
+  #
+  # This entry exists only so the no-provider-account bundle (scope item 8) has ONE
+  # vision-capable, PRICED, selectable model to prove the picker against in `make test`,
+  # which never has a live Forge key. Priced like the real cheapest vision model above
+  # rather than at $0, so it also proves the unpriced-model detector
+  # (/admin/unpriced) has nothing to say about it — an unpriced model metering at $0
+  # is exactly the failure this bundle exists to rule out.
+  - model_name: fake-vision-large
+    litellm_params:
+      model: openai/fake-gpt-vision
+      api_base: http://fakeprovider:8080/v1
+      api_key: fake-not-a-real-key
+      input_cost_per_token: 0.00000015
+      output_cost_per_token: 0.0000006
+
   # ---- upstream models, generated ------------------------------------------------
   # bin/render-gateway-config.py replaces the marker below with one entry per model
   # from Forge's live catalog, priced from that catalog. Do not hand-edit: the doc is

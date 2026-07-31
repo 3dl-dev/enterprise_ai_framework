@@ -44,7 +44,7 @@ BROWSER_UA = (
 def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=None,
                   manual_skills=None, execute_code=False, web_search=False,
                   skills_catalog=False, prompt_prefix=None, file_search=False,
-                  files=None):
+                  files=None, reasoning_effort=None):
     """The body LibreChat's own client sends for an ephemeral-agent turn.
 
     `ephemeralAgent.mcp` is what attaches an MCP server to an otherwise plain
@@ -107,6 +107,18 @@ def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=Non
     modelSpec?.fileSearch === true`. Without it the turn gets no file_search tool even
     if `files` below names real, previously-uploaded, embedded files.
 
+    `reasoning_effort` (enterpriseaiframework-282) sets the top-level `reasoning_effort`
+    field of the request body — a real key of librechat-data-provider's
+    `tConversationSchema` (peer of `temperature`/`top_p`, not nested under anything), so
+    this exercises the exact same field the Parameters panel writes rather than a
+    synthetic shape. `@librechat/api`'s `getOpenAILLMConfig`/`applyReasoningConfig` reads
+    it off `modelOptions` and, for a `custom` (OpenAI-shaped) endpoint with no Responses
+    API, sets `llmConfig.reasoning_effort` directly on the outbound request — the same
+    field deploy/gateway/strip_reasoning.py's docstring names as one GLM ignores for
+    disabling reasoning. `drop_params: true` in litellm_settings means an upstream that
+    does not recognise the field drops it rather than erroring, so this is safe to send
+    against the bundle's fakes too.
+
     `files` is the wire shape LibreChat's own upload response already comes in
     (`[{file_id, filename, type, ...}, ...]` from `POST /api/files`) — passed straight
     through as the message's top-level `files` field, `api/server/controllers/
@@ -151,6 +163,8 @@ def build_payload(text, model, endpoint, endpoint_type="custom", mcp_servers=Non
         body["ephemeralAgent"] = ephemeral_agent
     if prompt_prefix is not None:
         body["promptPrefix"] = prompt_prefix
+    if reasoning_effort is not None:
+        body["reasoning_effort"] = reasoning_effort
     if files:
         body["files"] = list(files)
     return body
@@ -273,13 +287,15 @@ def tool_calls(message):
 def send_turn(client, chat_url, text, model, endpoint, endpoint_type="custom",
               mcp_servers=None, manual_skills=None, execute_code=False,
               web_search=False, skills_catalog=False, prompt_prefix=None,
-              file_search=False, files=None, headers=None, timeout=180.0):
+              file_search=False, files=None, reasoning_effort=None, headers=None,
+              timeout=180.0):
     """One turn, end to end, on either protocol. Returns the persisted assistant message."""
     payload = build_payload(
         text, model, endpoint, endpoint_type, mcp_servers,
         manual_skills=manual_skills, execute_code=execute_code,
         web_search=web_search, skills_catalog=skills_catalog,
         prompt_prefix=prompt_prefix, file_search=file_search, files=files,
+        reasoning_effort=reasoning_effort,
     )
     conversation_id, _ = start_turn(
         client, chat_url, payload, headers=headers, timeout=timeout

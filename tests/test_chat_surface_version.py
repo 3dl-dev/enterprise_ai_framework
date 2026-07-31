@@ -398,6 +398,39 @@ class TestTheConfigIsStillHonoured:
             f"exactly one spec must open by default; got {defaults}"
         )
 
+    def test_the_model_picker_and_parameters_panel_are_actually_switched_on(
+        self, startup_config
+    ):
+        """enterpriseaiframework-282, the config half of the claim.
+
+        The OPPOSITE trap from `interface.artifacts` above: `modelSelect` and
+        `parameters` ARE real, honoured keys of data-provider's `interfaceSchema` — but
+        that schema's `.default({modelSelect:true, parameters:true, ...})` fires only
+        when the whole `interface:` key is absent from librechat.yaml, and this file has
+        always set one (for privacyPolicy/termsOfService/artifacts/memories). Every key
+        under `interface:` that this file does not also list therefore comes back
+        `undefined` from zod, which `/api/config` serves as `false` — not as "defaulted
+        to true". Measured on this exact file before `modelSelect`/`parameters` were
+        added to it: both `false` in a live `/api/config` response, with the gateway
+        catalogue and modelSpecs both otherwise fully configured and reachable by a raw
+        API call (see tests/test_scope_items.py::TestModelPickerAndReasoningEffort,
+        which drives turns directly and is unaffected by this key either way).
+        `modelSelect: false` hides the model dropdown — nobody can reach the fetched
+        catalogue no matter how large it is. `parameters: false` hides the Parameters
+        panel, the only place `reasoning_effort` is exposed to a user. Checked against
+        the served config, not the file, so this stays true only while the surface
+        agrees.
+        """
+        interface = startup_config.get("interface") or {}
+        assert interface.get("modelSelect") is True, (
+            f"interface.modelSelect is {interface.get('modelSelect')!r}, not True — the "
+            "model picker is not rendered regardless of what the gateway catalogue offers"
+        )
+        assert interface.get("parameters") is True, (
+            f"interface.parameters is {interface.get('parameters')!r}, not True — the "
+            "Parameters panel (reasoning_effort's only home) is not rendered"
+        )
+
     def test_automatic_memory_extraction_is_explicitly_enabled(self, librechat_config):
         """Fails on the config this item started from.
 

@@ -1319,6 +1319,188 @@ class TestPricingIntegrity:
 
 
 # ---------------------------------------------------------------------------
+# enterpriseaiframework-282 — a model picker, reasoning effort, a priced vision model
+# ---------------------------------------------------------------------------
+
+class TestModelPickerAndReasoningEffort:
+    """The surface offers the gateway's catalogue: a model picker, reasoning-effort
+    control, and at least one vision-capable model priced and selectable.
+
+    DONE-CONDITION IS BEHAVIOURAL, not config: switch model in the UI, send a turn, and
+    assert the ledger row names the model picked. A config assertion cannot see a surface
+    that ignores the setting — which is exactly what this bundle was doing before this
+    item: `interface.modelSelect` and `interface.parameters` were silently `false` in the
+    served `/api/config` (zod's `.default({modelSelect:true,...})` only fires when the
+    whole `interface:` key is absent, and librechat.yaml has always set one for
+    privacyPolicy/artifacts/memories), so the model dropdown and the Parameters panel
+    that carries `reasoning_effort` were both hidden regardless of what the gateway
+    catalogue or the modelSpecs offered. Fixed in librechat.yaml alongside this test.
+
+    Every turn below is driven through the real `/api/agents/chat` route with an
+    explicit `model=`, exactly the wire shape LibreChat's own model dropdown sends when a
+    user picks a catalogue entry that is not the modelSpec default — so a regression back
+    to `modelSelect: false` (which does not change what a raw API call can request, only
+    what the UI renders) would NOT be caught by driving the API directly. That half of
+    the claim — the picker is actually rendered — is covered separately in
+    tests/test_chat_surface_version.py against the served `/api/config`. This file covers
+    the other half: a model a user picks is the model that gets billed.
+    """
+
+    def _chat_headers(self, client, chat_url: str) -> dict:
+        return {
+            "Authorization": f"Bearer {_chat_token(client, chat_url)}",
+            "Cookie": oidc_login._cookie_header(client),
+        }
+
+    def _since(self) -> str:
+        """An explicit UTC-offset timestamp taken immediately before a turn.
+
+        Not "the newest row for this model_group": the fakes are shared upstreams that
+        every test in this class (and TestPricingIntegrity before it) sends traffic
+        through, so a row that already existed before THIS turn was sent — e.g. an
+        earlier $0 cache hit — would satisfy a plain "latest row" query without this
+        turn's own row ever having landed yet, and the assertion would be reading
+        somebody else's history. `startTime` is a `timestamptz`, so a naive string here
+        would be read in the server's zone; the explicit `+00` is required, not cosmetic
+        (same reasoning as TestPricingIntegrity.test_configured_models_record_nonzero_spend
+        above).
+        """
+        return time.strftime("%Y-%m-%dT%H:%M:%S+00", time.gmtime(time.time() - 2))
+
+    def _spend_row_since(self, env, model_group: str, since: str, timeout: float = 90.0):
+        """Poll `LiteLLM_SpendLogs` for a row under `model_group` no older than `since`.
+
+        `model_group` carries the ALIAS a caller requested (litellm's `model_name` in
+        the gateway config), not the upstream id `litellm_params.model` resolves to — the
+        two diverge for the bundle's fake upstreams by design (`fake-vision-large` maps
+        to `openai/fake-gpt-vision`, matching every other fake entry in
+        bundle/litellm/config.base.yaml), so `model_group` is the only column that
+        answers "which catalogue entry did the picker actually send" — the literal
+        DONE-CONDITION — rather than "which upstream served it". For a real Forge model
+        the two are the same string, so this holds there too.
+
+        Polls rather than reads once: the gateway batches spend rows for 7-13s
+        (flush_spend_on_shutdown.handler's own comment) before they land in postgres.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = compose(
+                "exec", "-T", "postgres", "psql", "-U", env.get("POSTGRES_USER", "eai"),
+                "-d", "gateway", "-tA", "-F", "|", "-c",
+                "SELECT spend, prompt_tokens, completion_tokens FROM "
+                f"\"LiteLLM_SpendLogs\" WHERE model_group = '{model_group}' "
+                f"AND \"startTime\" >= '{since}'::text::timestamptz "
+                "ORDER BY \"startTime\" DESC LIMIT 1",
+                check=False,
+            )
+            assert result.returncode == 0, f"psql failed\n{result.stdout}\n{result.stderr}"
+            line = result.stdout.strip()
+            if line:
+                spend_s, prompt_s, completion_s = line.split("|")
+                return float(spend_s), int(prompt_s), int(completion_s)
+            time.sleep(3)
+        pytest.fail(
+            f"no LiteLLM_SpendLogs row landed under model_group={model_group!r} since "
+            f"{since} — the turn was either never sent under that model, or the picker "
+            "silently sent something else"
+        )
+
+    def test_switching_the_model_in_a_turn_bills_the_ledger_under_that_model(
+        self, chat_session, chat_url, env
+    ):
+        """Switch to a catalogue model that is NOT the modelSpec default; the ledger
+        must name it. `glm-5-2` is the `default: true` spec — always picking it would
+        prove nothing about the picker, only that the pinned default still works."""
+        nonce = uuid.uuid4().hex
+        since = self._since()
+        headers = self._chat_headers(chat_session, chat_url)
+        chat_turn.send_turn(
+            chat_session, chat_url, f"switch model {nonce}", "fake-small",
+            "Enterprise AI", headers=headers, timeout=TIMEOUT,
+        )
+        spend, prompt_tokens, completion_tokens = self._spend_row_since(
+            env, "fake-small", since
+        )
+        assert prompt_tokens > 0 and completion_tokens > 0, (
+            "the picked model recorded no tokens — the turn did not actually reach it"
+        )
+        assert spend > 0, (
+            "fake-small metered at $0 — an unpriced model would let this same test pass "
+            "while the bill silently under-reported"
+        )
+
+    def test_the_vision_capable_model_is_offered_priced_and_selectable(
+        self, chat_session, chat_url, env
+    ):
+        """`fake-vision-large` (bundle/litellm/config.base.yaml) is the no-account
+        stand-in for the vision-language family Forge prices automatically the moment a
+        real key is configured (qwen3-vl-30b-a3b@deepinfra and friends — see the entry's
+        own comment). Proven here exactly like any other catalogue model: offered,
+        selectable by picking it explicitly, and priced above zero once picked —
+        enterpriseaiframework-020 (pasting a screenshot / uploading a PDF) is blocked on
+        this being true.
+        """
+        headers = self._chat_headers(chat_session, chat_url)
+        token = _chat_token(chat_session, chat_url)
+        offered = chat_session.get(
+            f"{chat_url}/api/models",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Cookie": oidc_login._cookie_header(chat_session),
+            },
+            timeout=TIMEOUT,
+        ).json().get("Enterprise AI", [])
+        assert "fake-vision-large" in offered, (
+            f"the vision-capable stand-in is not in the offered catalogue: {offered}"
+        )
+
+        nonce = uuid.uuid4().hex
+        since = self._since()
+        chat_turn.send_turn(
+            chat_session, chat_url, f"pick the vision model {nonce}", "fake-vision-large",
+            "Enterprise AI", headers=headers, timeout=TIMEOUT,
+        )
+        spend, prompt_tokens, completion_tokens = self._spend_row_since(
+            env, "fake-vision-large", since
+        )
+        assert prompt_tokens > 0 and completion_tokens > 0
+        assert spend > 0, (
+            "the vision-capable model metered at $0 — an unpriced model meters at $0, "
+            "so budgets never trip and the bill under-reports (the exact failure "
+            "/admin/unpriced exists to catch)"
+        )
+
+    def test_reasoning_effort_does_not_undo_token_accounting(
+        self, chat_session, chat_url, env
+    ):
+        """The regression this item's CONSTRAINTS section warns against by name:
+        deploy/gateway/strip_reasoning.py strips reasoning CONTENT from the response but
+        deliberately leaves token counts alone, and a reasoning-effort control must not
+        undo that — a turn sent with `reasoning_effort` set must still record real,
+        nonzero prompt/completion tokens and nonzero spend, exactly like one sent without
+        it. `reasoning_effort` is a genuine `tConversationSchema` field (verified against
+        the running v0.8.7 image's data-provider bundle) that a `custom`-endpoint turn
+        forwards straight through to `litellm_params`, so this sends it exactly as the
+        Parameters panel would rather than as a synthetic shape.
+        """
+        nonce = uuid.uuid4().hex
+        since = self._since()
+        headers = self._chat_headers(chat_session, chat_url)
+        chat_turn.send_turn(
+            chat_session, chat_url, f"reasoning effort {nonce}", "fake-large",
+            "Enterprise AI", reasoning_effort="low", headers=headers, timeout=TIMEOUT,
+        )
+        spend, prompt_tokens, completion_tokens = self._spend_row_since(
+            env, "fake-large", since
+        )
+        assert prompt_tokens > 0 and completion_tokens > 0, (
+            "a turn sent with reasoning_effort recorded no tokens — a reasoning-effort "
+            "control must not undo strip_reasoning's token accounting"
+        )
+        assert spend > 0
+
+
+# ---------------------------------------------------------------------------
 # Item 5 — one audit trail, survives a restart
 # ---------------------------------------------------------------------------
 

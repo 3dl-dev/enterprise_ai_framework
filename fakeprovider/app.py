@@ -224,7 +224,7 @@ async def openai_models():
         "object": "list",
         "data": [
             {"id": m, "object": "model", "owned_by": "fake-provider"}
-            for m in ("fake-gpt-large", "fake-gpt-small", "fake-embed")
+            for m in ("fake-gpt-large", "fake-gpt-small", "fake-embed", "fake-gpt-vision")
         ],
     }
 
