@@ -107,3 +107,10 @@ test-chat-login:
 
 test-workspace:
 	@.venv-test/bin/pytest tests-live/test_workspace.py -v --tb=short -p no:cacheprovider
+
+## enterpriseaiframework-03f / -222: a never-signed-in Keycloak account, the documented
+## front door, and nothing else — a real assistant reply grounded in a REAL tool call
+## (not the tool call leaked as text), read back from the persisted message, not just the
+## DOM. Mints and deletes its own account against the cluster's identity provider.
+test-first-conversation:
+	@.venv-test/bin/pytest tests-live/test_first_conversation.py -v --tb=short -p no:cacheprovider
