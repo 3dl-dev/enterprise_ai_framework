@@ -858,6 +858,20 @@ services:
       MEILI_HOST: http://meilisearch:7700
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?set MEILI_MASTER_KEY in .env}
       MEILI_NO_SYNC: "false"
+      # ---- conversation sharing (enterpriseaiframework-bd2) ------------------------
+      # LibreChat's own native feature (api/server/routes/share.js). ALLOW_SHARED_LINKS
+      # (unset here, defaults true) turns the /api/share routes on at all; this is a
+      # SECOND, separate gate. The default USER role already carries
+      # SHARED_LINKS.SHARE_PUBLIC: true (librechat-data-provider's roleDefaults), which
+      # grants a per-link public ACL entry at creation time — but
+      # `@librechat/api`'s createSharedLinkAccessMiddleware ALSO requires
+      # `isEnabled(process.env.ALLOW_SHARED_LINKS_PUBLIC)` before it will let an
+      # unauthenticated caller through; unset, it falls through to
+      # `if (!user) 401 "Authentication required"` even though the link's own ACL says
+      # public. Without this, "a second person opens it without an account" is
+      # unreachable regardless of role permissions — confirmed live before this line
+      # existed: a real share, fetched with no cookie and no bearer token, returned 401.
+      ALLOW_SHARED_LINKS_PUBLIC: "true"
       # File search (enterpriseaiframework-c7c). Unset, this is exactly the
       # "RAG API is either not running or not reachable at undefined" warning the item
       # started from — LibreChat's file_search tool silently has nowhere to embed or
