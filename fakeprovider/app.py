@@ -140,6 +140,45 @@ FILE_SEARCH_MARKER_RE = re.compile(r"SEARCH_FILES:(.*)", re.DOTALL)
 
 FILE_SEARCH_TOOL_NAME = "file_search"
 
+# --------------------------------------------------------------------------
+# Subagent tool calling (enterpriseaiframework-00d)
+#
+# Same inversion as the markers above, for the same reason: this bundle has no
+# tool-calling model, so nothing could otherwise force LibreChat's own `subagent` tool
+# (Constants.SUBAGENT in @librechat/agents, name literally "subagent") to fire — and
+# without a real delegation actually happening, the attribution question this item
+# exists to answer ("does a subagent's OWN completion call still bill to the
+# REQUESTING user, not to nobody and not to a synthetic agent principal") cannot be
+# measured, only guessed at from reading @librechat/agents' source.
+#
+# `CALL_SUBAGENT:<type>:<task>` asks for exactly one delegation, to `<type>`
+# (SubagentToolSchema.subagent_type — "self" reuses the parent's own AgentInputs, which
+# is the only subagent target this bundle's tests configure, per SubagentConfig.self in
+# @librechat/agents' src/types/graph.ts). fakeprovider never decides what the subagent
+# DOES once spawned — LibreChat's SubagentExecutor really constructs a child graph and
+# really invokes a model for it (which, for `self`, is fakeprovider again, on ITS OWN
+# HTTP request — a second, distinct call this stub cannot avoid making real, which is
+# the whole point: two real completions, two real opportunities for the gateway to
+# attribute or fail to). The child's reply is whatever fakeprovider's own
+# deterministic-ack default produces for the task text, same as any other turn.
+# --------------------------------------------------------------------------
+
+SUBAGENT_MARKER_RE = re.compile(r"CALL_SUBAGENT:([^:]+):(.*)", re.DOTALL)
+
+SUBAGENT_TOOL_NAME = "subagent"
+
+
+def find_subagent_request(messages: list) -> tuple[str, str] | None:
+    """(subagent_type, task) from a user-authored `CALL_SUBAGENT:<type>:<task>` marker,
+    most recent user message first. None if no message carries one."""
+    for m in reversed(messages or []):
+        if m.get("role") != "user":
+            continue
+        match = SUBAGENT_MARKER_RE.search(_message_text(m))
+        if match:
+            return match.group(1).strip(), match.group(2).strip()
+    return None
+
 
 def find_file_search_query(messages: list) -> str | None:
     """The query from a user-authored `SEARCH_FILES:<query>` marker, most recent user
@@ -511,6 +550,15 @@ async def openai_chat(request: Request):
         if not body.get("stream"):
             return _tool_call_completion(cid, model, created, FILE_SEARCH_TOOL_NAME, {"query": file_search_query})
         return _tool_call_stream(cid, model, created, FILE_SEARCH_TOOL_NAME, {"query": file_search_query})
+
+    subagent_request = find_subagent_request(messages)
+    if subagent_request is not None:
+        subagent_type, task = subagent_request
+        tool_args = {"description": task, "subagent_type": subagent_type}
+        cid = "fakecmpl-" + hashlib.sha256(("subagent:" + subagent_type + ":" + task).encode()).hexdigest()[:16]
+        if not body.get("stream"):
+            return _tool_call_completion(cid, model, created, SUBAGENT_TOOL_NAME, tool_args)
+        return _tool_call_stream(cid, model, created, SUBAGENT_TOOL_NAME, tool_args)
 
     prompt = extract_prompt(messages)
     text = reply_text(prompt, model)
