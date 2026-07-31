@@ -1283,6 +1283,328 @@ class TestChatPrincipalOnTheOneBill:
             )
 
 
+class TestSubagentAttribution:
+    """enterpriseaiframework-00d: a request the model decomposes into subagents runs as
+    subagents, and every constituent call is attributed and billed to the REQUESTING
+    user — not to a synthetic agent principal and not unattributed.
+
+    WHY THIS HAD TO BE MEASURED, NOT REASONED ABOUT. LibreChat v0.8.7 advertises
+    `subagents` in its agents-endpoint capability list (asserted already in
+    test_chat_surface_version.py) but nothing in this bundle configured or exercised
+    the mechanism, and enterpriseaiframework-f50's own investigation could not settle
+    the billing question: "an actual subagent delegation was not exercised because the
+    bundle has no tool-calling model." enterpriseaiframework-d98 is the reason this
+    matters rather than being a curiosity — the gateway's own root credential was once a
+    valid, unbudgeted, unattributable inference credential, and a subagent fan-out that
+    bills to nobody (or to the agent's own id, or to the surface as a whole) would be the
+    identical hole with a friendlier name.
+
+    HOW A DELEGATION IS FORCED WITHOUT A REAL TOOL-CALLING MODEL. Same inversion this
+    bundle already uses for bash_tool (082), MCP tools (471) and file_search (c7c):
+    fakeprovider recognizes a `CALL_SUBAGENT:<type>:<task>` marker in the user's own
+    message and turns it into a real `subagent` tool call (Constants.SUBAGENT in
+    @librechat/agents) with the exact argument shape SubagentToolSchema requires. From
+    there LibreChat's own SubagentExecutor does the real work: it spawns a genuine child
+    graph, which makes its OWN, SEPARATE completion request back to fakeprovider (a
+    second, distinct HTTP call this stub cannot avoid making real), and the child's
+    reply is relayed back to the parent verbatim by the SAME generic tool-result relay
+    branch bash_tool/MCP/file_search already rely on (`find_tool_result` only checks
+    `role == "tool"`, never the tool's name). See tests/test_fakeprovider_subagent.py for
+    the marker/relay logic proven in isolation.
+
+    WHAT WAS MEASURED, on this running bundle, reading `LiteLLM_SpendLogs` directly
+    rather than trusting a rendering of it: a single subagent-delegating turn writes
+    MULTIPLE distinct completion rows under the model `fake-gpt-large` — the parent's
+    own decision call, the child subagent's own completion (a genuinely separate
+    request, provably distinct because its prompt is the subagent's own task text, not
+    the parent's), and the parent's post-relay completion — and EVERY one of them
+    carries the SAME `end_user` (LibreChat's own Mongo _id for the signed-in user) and
+    the SAME `metadata.user_api_key_alias` (the shared `chat-surface::chat` key every
+    chat turn authenticates with) as an ordinary, non-delegating turn. Translated through
+    the SAME `chat_identity` mechanism TestChatPrincipalOnTheOneBill already proves,
+    every constituent call therefore lands on `/admin/spend` under the requesting
+    person's own name and the `chat` surface — not a synthetic agent principal, not the
+    agent's own id, and not `(unattributed)`.
+
+    BOTH SHAPES SubagentConfig SUPPORTS ARE MEASURED, because the mechanism differs
+    enough between them that proving one would not have proven the other:
+    `self: true` reuses the PARENT's own AgentInputs (its `clientOptions` — where the
+    requesting user's identity is threaded in — never gets rebuilt), while an explicit
+    `agent_ids` entry names a WHOLLY SEPARATE, independently persisted Agent document
+    (a different author, potentially a different model). If attribution held only
+    because a self-spawned child was never really a new AgentInputs, the explicit case
+    would have been the one that leaked.
+    """
+
+    BROWSER_UA = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    )
+
+    # The only alias whose end_user the bill trusts — see TestChatPrincipalOnTheOneBill.
+    SHARED_CHAT_ALIAS = "chat-surface::chat"
+
+    # The model fakeprovider's CALL_SUBAGENT marker (and every completion it triggers,
+    # parent and child alike) always answers as. Filtering the ledger to this exact
+    # model excludes the zero-token real-provider rows LibreChat's own title/routing
+    # logic writes on every agents-endpoint turn against `glm-*@deepinfra` (unreachable
+    # in this hermetic bundle) — noise this test does not exist to characterize.
+    SUBAGENT_MODEL = "fake-gpt-large"
+
+    # ---------------------------------------------------------------- helpers
+
+    def _chat_headers(self, client, chat_url: str) -> dict:
+        return {
+            "Authorization": f"Bearer {_chat_token(client, chat_url)}",
+            "Cookie": oidc_login._cookie_header(client),
+            "User-Agent": self.BROWSER_UA,
+        }
+
+    def _chat_identity(self, client, chat_url: str) -> tuple[str, str]:
+        """(LibreChat's ObjectId for the signed-in user, their username)."""
+        me = oidc_login.whoami(client, chat_url)
+        user = me.get("user", me)
+        oid = str(user.get("_id") or user.get("id") or "")
+        assert re.fullmatch(r"[0-9a-f]{24}", oid), user
+        return oid, user["username"]
+
+    def _create_agent(self, client, chat_url: str, **fields) -> str:
+        r = client.post(
+            f"{chat_url}/api/agents",
+            json={"provider": "Enterprise AI", "model": "fake-large", **fields},
+            headers=self._chat_headers(client, chat_url), timeout=TIMEOUT,
+        )
+        assert r.status_code in (200, 201), r.text
+        return r.json()["id"]
+
+    def _delete_agent(self, client, chat_url: str, agent_id: str) -> None:
+        client.delete(
+            f"{chat_url}/api/agents/{agent_id}",
+            headers=self._chat_headers(client, chat_url), timeout=TIMEOUT,
+        )
+
+    def _send_subagent_turn(self, client, chat_url: str, agent_id: str, marker: str) -> dict:
+        """One real turn against a persisted Agent, driving `marker` as the user's own
+        message. Returns the persisted assistant message."""
+        payload = {
+            "text": marker,
+            "endpoint": "agents",
+            "endpointType": "agents",
+            "agent_id": agent_id,
+            "sender": "User",
+            "isCreatedByUser": True,
+            "messageId": str(uuid.uuid4()),
+            "parentMessageId": chat_turn.NO_PARENT,
+            "conversationId": None,
+            "error": False,
+            "isContinued": False,
+            "isTemporary": False,
+            "isRegenerate": False,
+        }
+        headers = self._chat_headers(client, chat_url)
+        conversation_id, _ = chat_turn.start_turn(
+            client, chat_url, payload, headers=headers, timeout=TIMEOUT * 3
+        )
+        return chat_turn.wait_for_reply(
+            client, chat_url, conversation_id, headers=headers, timeout=TIMEOUT * 3
+        )
+
+    def _gateway_sql(self, env, sql: str) -> str:
+        r = compose("exec", "-T", "postgres", "psql", "-U", env.get("POSTGRES_USER", "eai"),
+                    "-d", "gateway", "-tA", "-c", sql, check=False)
+        assert r.returncode == 0, f"psql failed: {sql}\n{r.stdout}\n{r.stderr}"
+        return r.stdout.strip()
+
+    def _ledger_now(self, env) -> str:
+        return self._gateway_sql(env, "SELECT now()")
+
+    def _spend_rows_since(self, env, since: str) -> list[dict]:
+        """Every `LiteLLM_SpendLogs` row the shared chat key wrote for the fakeprovider
+        subagent model since `since` — request id, end_user, alias, and token counts, so
+        a caller can both count constituent calls and check every one's attribution."""
+        out = self._gateway_sql(env, (
+            "SELECT s.request_id || '|' || COALESCE(s.end_user, '') || '|' || "
+            "COALESCE(s.metadata->>'user_api_key_alias', '') || '|' || "
+            "s.prompt_tokens || '|' || s.completion_tokens "
+            'FROM "LiteLLM_SpendLogs" s '
+            f"WHERE s.model = '{self.SUBAGENT_MODEL}' "
+            f"AND s.\"startTime\" >= '{since}'::timestamptz "
+            'ORDER BY s."startTime"'
+        ))
+        rows = []
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            request_id, end_user, alias, prompt_tokens, completion_tokens = line.split("|")
+            rows.append({
+                "request_id": request_id,
+                "end_user": end_user,
+                "alias": alias,
+                "prompt_tokens": int(prompt_tokens),
+                "completion_tokens": int(completion_tokens),
+            })
+        return rows
+
+    def _await_constituent_rows(self, env, since: str, minimum: int) -> list[dict]:
+        """Poll rather than sleep-and-hope: the gateway flushes spend rows on a batch
+        interval, so reading once risks seeing the parent's call but not the child's
+        yet, and reporting an attribution gap that is really just a race."""
+        deadline = time.monotonic() + 60
+        rows: list[dict] = []
+        while time.monotonic() < deadline:
+            rows = [
+                r for r in self._spend_rows_since(env, since)
+                if r["prompt_tokens"] + r["completion_tokens"] > 0
+            ]
+            if len(rows) >= minimum:
+                return rows
+            time.sleep(2)
+        raise AssertionError(
+            f"expected at least {minimum} constituent completion(s) on the ledger, "
+            f"found {len(rows)}: {rows}"
+        )
+
+    def _await_bill_row(self, control_plane_url, admin_headers, username: str) -> dict:
+        deadline = time.monotonic() + 60
+        bill: dict = {}
+        while time.monotonic() < deadline:
+            bill = httpx.get(
+                f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+            ).json()
+            row = next(
+                (r for r in bill["by_user_and_surface"]
+                 if r["username"] == username and r["surface"] == "chat"),
+                None,
+            )
+            if row:
+                return row
+            time.sleep(2)
+        raise AssertionError(
+            f"no chat spend ever appeared for {username}: "
+            f"{bill.get('by_user_and_surface')}"
+        )
+
+    # ---------------------------------------------------------------- the tests
+
+    def test_a_self_spawned_subagent_calls_own_completion_is_billed_to_the_requesting_user(
+        self, chat_session, chat_url, env, control_plane_url, admin_headers
+    ):
+        """`self: true` — the subagent reuses the parent's own AgentInputs in an
+        isolated child graph. The child's completion request is still a wholly separate
+        HTTP call to the model; this proves it is not a separate PRINCIPAL."""
+        oid, username = self._chat_identity(chat_session, chat_url)
+        agent_id = self._create_agent(
+            chat_session, chat_url,
+            name=f"subagent-self-{uuid.uuid4().hex[:8]}",
+            subagents={"enabled": True, "allowSelf": True},
+        )
+        try:
+            since = self._ledger_now(env)
+            nonce = uuid.uuid4().hex
+            reply = self._send_subagent_turn(
+                chat_session, chat_url, agent_id, f"CALL_SUBAGENT:self:self task {nonce}"
+            )
+            assert chat_turn.tool_calls(reply), (
+                "no subagent tool_call was persisted on the reply — the marker never "
+                f"reached the subagent tool: {reply}"
+            )
+
+            # At least two: the parent's own decision-to-delegate call, and the child
+            # subagent's OWN completion (a third, the parent's post-relay call, usually
+            # also lands — asserted as >= 2 rather than == 3 so a future LibreChat
+            # version that collapses the relay into the streaming response does not
+            # break this test over a detail it does not claim).
+            rows = self._await_constituent_rows(env, since, minimum=2)
+
+            for row in rows:
+                assert row["alias"] == self.SHARED_CHAT_ALIAS, (
+                    f"a subagent constituent call authenticated with an unexpected "
+                    f"credential: {row}"
+                )
+                assert row["end_user"] == oid, (
+                    f"a subagent constituent call was not attributed to the requesting "
+                    f"user's own identity ({oid}): {row}"
+                )
+
+            bill_row = self._await_bill_row(control_plane_url, admin_headers, username)
+            assert bill_row["requests"] >= len(rows), (
+                f"the bill undercounts the subagent's constituent calls: {bill_row} vs "
+                f"{len(rows)} rows on the raw ledger"
+            )
+
+            bill = httpx.get(
+                f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+            ).json()
+            principals = [r["username"] for r in bill["by_user_and_surface"]]
+            assert agent_id not in principals, (
+                f"a subagent call billed to the agent's own id, a synthetic principal "
+                f"the requesting user never held: {principals}"
+            )
+            assert not any(
+                r["username"] == "(unattributed)" and r["spend"] > 0
+                for r in bill["by_user_and_surface"]
+            ), (
+                "money from this turn's subagent landed on the bill with no principal "
+                f"at all: {bill['by_user_and_surface']}"
+            )
+        finally:
+            self._delete_agent(chat_session, chat_url, agent_id)
+
+    def test_an_explicit_subagent_on_a_separate_agent_document_is_also_billed_to_the_requesting_user(
+        self, chat_session, chat_url, env, control_plane_url, admin_headers
+    ):
+        """`agent_ids: [...]` — the subagent is a wholly separate, independently
+        persisted Agent document, not a reuse of the parent's own config. Proven
+        distinctly from the self-spawn case above: if attribution only held because
+        `self` never really built a new `AgentInputs`, this is the case that would leak
+        — a subagent config resolved from a different Agent, potentially a different
+        author, must still carry the REQUESTING user's identity through to its own
+        completion call, not the child agent's author's.
+        """
+        oid, username = self._chat_identity(chat_session, chat_url)
+        child_id = self._create_agent(
+            chat_session, chat_url, name=f"subagent-child-{uuid.uuid4().hex[:8]}",
+        )
+        parent_id = self._create_agent(
+            chat_session, chat_url,
+            name=f"subagent-parent-{uuid.uuid4().hex[:8]}",
+            subagents={"enabled": True, "allowSelf": False, "agent_ids": [child_id]},
+        )
+        try:
+            since = self._ledger_now(env)
+            nonce = uuid.uuid4().hex
+            reply = self._send_subagent_turn(
+                chat_session, chat_url, parent_id,
+                f"CALL_SUBAGENT:{child_id}:explicit child task {nonce}",
+            )
+            assert chat_turn.tool_calls(reply), (
+                f"no subagent tool_call was persisted on the reply: {reply}"
+            )
+
+            rows = self._await_constituent_rows(env, since, minimum=2)
+            for row in rows:
+                assert row["alias"] == self.SHARED_CHAT_ALIAS, row
+                assert row["end_user"] == oid, (
+                    f"the explicit child agent's own completion was not attributed to "
+                    f"the requesting user ({oid}), the person who actually asked for "
+                    f"it — not the child agent's author, not the agent itself: {row}"
+                )
+
+            bill_row = self._await_bill_row(control_plane_url, admin_headers, username)
+            assert bill_row["requests"] >= len(rows)
+
+            bill = httpx.get(
+                f"{control_plane_url}/admin/spend", headers=admin_headers, timeout=TIMEOUT
+            ).json()
+            principals = [r["username"] for r in bill["by_user_and_surface"]]
+            assert child_id not in principals and parent_id not in principals, (
+                f"a subagent call billed to an agent id rather than a person: {principals}"
+            )
+        finally:
+            self._delete_agent(chat_session, chat_url, parent_id)
+            self._delete_agent(chat_session, chat_url, child_id)
+
+
 class TestPricingIntegrity:
     """Regression guard for a silent-money defect found while building this row.
 
