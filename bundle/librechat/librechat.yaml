@@ -38,6 +38,25 @@ interface:
   # Surfaces the memories panel in Settings so a user can see/edit what was stored.
   # Purely a UI toggle — does not gate whether memory is extracted (see `memory` below).
   memories: true
+  # THE OPPOSITE TRAP FROM `artifacts` ABOVE (enterpriseaiframework-282): these two keys
+  # ARE real, honoured zod fields (interfaceSchema in data-provider) — and BOTH default to
+  # `true` only in the schema's own `.default({...})`, which zod applies solely when the
+  # whole `interface:` key is missing from the parsed YAML. The moment this file sets
+  # `interface:` at all (it has to, for privacyPolicy/termsOfService/artifacts/memories
+  # above), every key we do NOT also list here comes back `undefined` from zod — which
+  # `/api/config` then serves as `false`, not as "defaulted to true". Measured against the
+  # running v0.8.7 surface before this line existed: `interface.modelSelect: false` and
+  # `interface.parameters: false` in the live `/api/config` response, with this exact
+  # librechat.yaml otherwise unchanged. `modelSelect: false` hides the model dropdown —
+  # the picker can offer the full gateway catalogue all it wants
+  # (endpoints.custom[].models.fetch below) and nobody can reach it. `parameters: false`
+  # hides the Parameters panel, which is the ONLY place `reasoning_effort` (a real
+  # tConversationSchema field, sent straight through to the model on `custom` endpoints —
+  # see @librechat/api's getOpenAILLMConfig) is exposed to a user. Both are therefore
+  # load-bearing for this item's done-condition and are set explicitly rather than relied
+  # on as defaults that silently were not being applied.
+  modelSelect: true
+  parameters: true
 
 # LibreChat's native memory (api/server/routes/memories.js + the `memory` Mongo
 # collection in data-schemas) — CONFIGURED, not built. A durable per-user preference

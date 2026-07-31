@@ -58,6 +58,37 @@ model_list:
       input_cost_per_token: 0.0000001
       output_cost_per_token: 0
 
+  # Vision-capable stand-in (enterpriseaiframework-282). Forge serves a whole
+  # vision-language family behind the same catalogue the moment a real key is
+  # configured — qwen3-vl-30b-a3b@deepinfra, qwen3-vl-235b(-a22b), pixtral-large,
+  # nemotron-nano-12b-vl, palmyra-vision-7b — every one of them priced by Forge's own
+  # /v1/pricing/effective (measured against the live catalogue 2026-07-31: the cheapest,
+  # qwen3-vl-30b-a3b@deepinfra, at $0.15/$0.60 per Mtok) and pulled in automatically by
+  # bin/render-gateway-config.py, same as every other model — nothing about vision is
+  # hand-picked into a pinned list.
+  #
+  # This entry exists only so the no-provider-account bundle (scope item 8) has ONE
+  # vision-capable, PRICED, selectable model to prove the picker against in `make test`,
+  # which never has a live Forge key. Priced like the real cheapest vision model above
+  # rather than at $0, so it also proves the unpriced-model detector
+  # (/admin/unpriced) has nothing to say about it — an unpriced model metering at $0
+  # is exactly the failure this bundle exists to rule out.
+  - model_name: fake-vision-large
+    litellm_params:
+      model: openai/fake-gpt-vision
+      api_base: http://fakeprovider:8080/v1
+      api_key: fake-not-a-real-key
+      input_cost_per_token: 0.00000015
+      output_cost_per_token: 0.0000006
+    # Declared to LiteLLM (and, through it, to the surface) rather than left implicit in
+    # the model_name — a name is not a capability. fakeprovider itself backs this: an
+    # `image_url` content block reaches it as a short deterministic marker derived from
+    # the image rather than being silently dropped (fakeprovider/app.py's
+    # `_message_text`/`_image_marker`), so a turn that actually sends an image is
+    # observably different from one that does not, over GET /debug/prompts.
+    model_info:
+      supports_vision: true
+
   # ---- upstream models, generated ------------------------------------------------
   # bin/render-gateway-config.py replaces the marker below with one entry per model
   # from Forge's live catalog, priced from that catalog. Do not hand-edit: the doc is
@@ -89,11 +120,19 @@ litellm_settings:
   # bundle as one 200-response, 19 tokens, no ledger row, ever. Source and full reasoning:
   # deploy/gateway/flush_spend_on_shutdown.py
   #
+  # allow_reasoning_effort (enterpriseaiframework-282) keeps `reasoning_effort` alive past
+  # `drop_params` below. Every model in this catalogue is reached as `openai/<id>` (Forge
+  # is OpenAI-wire-compatible), and LiteLLM only treats `reasoning_effort` as a supported
+  # param for a model whose STRING matches a literal OpenAI o-series/gpt-5 name — nothing
+  # ours ever will. Measured directly against this gateway before this hook existed: a
+  # request carrying `reasoning_effort: "low"` reached fakeprovider with the field silently
+  # gone. Source and full reasoning: deploy/gateway/allow_reasoning_effort.py
+  #
   # KEEP THIS LIST IN INLINE FLOW STYLE. tests/test_gateway_callbacks.py parses it with a
   # regex on `callbacks: [ ... ]` to derive the modules every deployment must ship; block
   # style makes that parse return nothing, which skips the whole drift trap instead of
   # failing it.
-  callbacks: ["strip_reasoning.handler", "require_principal.handler", "flush_spend_on_shutdown.handler"]
+  callbacks: ["strip_reasoning.handler", "require_principal.handler", "flush_spend_on_shutdown.handler", "allow_reasoning_effort.handler"]
   # Every request gets a spend row. This is the ledger the control plane reads for
   # the one bill (scope item 4) — without it, spend-by-user-and-surface returns nothing.
   success_callback: ["postgres"]
