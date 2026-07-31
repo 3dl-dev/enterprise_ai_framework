@@ -95,6 +95,47 @@ modelSpecs:
       label: "GLM 5.2"
       default: true
       description: "Open weights. $0.93/$3.00 per Mtok — about a third of Sonnet 5, a ninth of Opus."
+      # webSearch (enterpriseaiframework-222) — A TOP-LEVEL MODELSPEC FIELD, SIBLING OF
+      # `preset:` BELOW, NOT NESTED INSIDE IT. Getting this placement wrong is silent
+      # twice over, and both wrong shapes were tried and measured against the live
+      # cluster before this one:
+      #
+      #   1. `preset.webSearch: true` (camelCase, nested under preset) — parses fine,
+      #      reaches nothing. The client's `applyModelSpecEphemeralAgent`
+      #      (bundled as `dk()` in this pinned v0.8.7 image, confirmed by reading the
+      #      RUNNING container's own `client/dist/assets/hooks.*.js`) computes a new
+      #      conversation's `ephemeralAgent.web_search` from `modelSpec.webSearch`,
+      #      i.e. the TOP-LEVEL property of the modelSpec object — never from
+      #      `modelSpec.preset.webSearch`. Nesting it under `preset:` (where
+      #      `executeCode` already lived, copied without checking) means the client
+      #      never sees it, tool or no tool.
+      #   2. `preset.web_search: true` (snake_case, nested under preset) — DOES survive
+      #      the server's config-parsing schema and DOES appear in the authenticated
+      #      `/api/config` response (confirmed by reading it back), but at
+      #      `modelSpecs[].preset.web_search`, which is still the wrong path for the
+      #      same client function above — it reads `.webSearch` (camelCase) off the
+      #      modelSpec object directly, not off `.preset` at all, so this shape also
+      #      reached the browser but still never reached `ephemeralAgent`.
+      #
+      # Without a real `ephemeralAgent.web_search` in the request body, a first turn
+      # gets no web_search tool attached at all — even though the promptPrefix below
+      # unconditionally instructs the model to "Search the web when...". LibreChat never
+      # executes text shaped like a tool call, so a model told to use a tool it was
+      # never given fabricated one as prose instead: measured on the live cluster
+      # 2026-07-31 across three never-signed-in accounts, one of which leaked exactly
+      # that shape (`:::tool\n{"name": "web_search", ...}`), with `unfinished:false,
+      # error:false` so nothing downstream knew the turn had failed; reproduced again,
+      # differently, under fix attempt 2 above (a truncated `:::search` fabrication and
+      # a bare "I'll check the current stable version of Python for you." with no
+      # answer — the same failure shapes the original bug report showed, because the
+      # tool was, in every one of these attempts, still not actually attached).
+      #
+      # `mcpServers`, `fileSearch` and `artifacts` on a modelSpec are top-level for the
+      # identical reason — `dk()` reads all four (`t.mcpServers`, `t.webSearch`,
+      # `t.fileSearch`, `t.artifacts`) off the same object. `executeCode` is excepted:
+      # it stays where it was (`preset.executeCode`) because moving it is a distinct,
+      # pre-existing defect this item does not touch — see dogfood-findings.md.
+      webSearch: true
       preset:
         endpoint: "Enterprise AI"
         model: "glm-5.2@deepinfra"
@@ -106,32 +147,14 @@ modelSpecs:
         # Gated together with `endpoints.agents.capabilities`, which defaults to
         # including `execute_code` (data-provider's defaultAgentCapabilities) and is not
         # overridden anywhere in this file.
-        executeCode: true
-        # web_search (enterpriseaiframework-222), SNAKE_CASE — deliberately, and this is
-        # not a style choice. Without this, a brand-new conversation's
-        # ephemeralAgent.web_search was never set to true even though the promptPrefix
-        # below unconditionally instructs the model to "Search the web when...". LibreChat
-        # never executes text shaped like a tool call, so a model told to use a tool it
-        # was never given fabricated one as prose instead — measured on the live cluster
-        # 2026-07-31 across three never-signed-in accounts, one of which leaked exactly
-        # that shape (`:::tool\n{"name": "web_search", ...}`), with `unfinished:false,
-        # error:false` so nothing downstream knew the turn had failed.
         #
-        # THE FIRST FIX ATTEMPT USED `webSearch` (camelCase, matching `executeCode`
-        # above and matching a NEWER LibreChat checkout's tModelSpecPresetSchema) AND WAS
-        # SILENTLY A NO-OP on this pinned image. Verified directly against the RUNNING
-        # v0.8.7 container (commit 9e74cc0e, not a newer checkout): the server's own
-        # bundled schema, `/app/packages/data-provider/dist/index.js`, defines the
-        # model-spec preset's web-search pick list with the key `web_search`
-        # (snake_case) — `executeCode`/`webSearch` (camelCase) do not appear anywhere in
-        # that schema at all on this pinned build. zod strips unrecognized object keys by
-        # default, so `webSearch: true` parsed without error and vanished before
-        # `sanitizeModelSpecs` ever ran — confirmed by reading back the authenticated
-        # `/api/config` response, whose modelSpecs[].preset carried neither `webSearch`
-        # nor `executeCode`. `web_search` (this key) DOES survive that parse and DOES
-        # reach the client — confirmed the same way. See dogfood-findings.md for the
-        # `executeCode` implication this measurement leaves open (out of scope here).
-        web_search: true
+        # NOT VERIFIED WORKING on the pinned v0.8.7 image — see the `webSearch` comment
+        # above this preset block. The same client function that ignores a nested
+        # `preset.webSearch` also ignores a nested `preset.executeCode`, by the same
+        # mechanism, and this line has sat here unverified since enterpriseaiframework-082.
+        # Left exactly as it was: fixing it is out of scope for enterpriseaiframework-222
+        # and is flagged in that item's return rather than silently changed here.
+        executeCode: true
         # Matches the provider: 200k context, and the full output budget. These models
         # spend part of the output budget reasoning, so a short cap truncates the answer
         # after the thinking rather than producing a smaller answer.
@@ -179,18 +202,16 @@ modelSpecs:
     - name: glm-4-7
       label: "GLM 4.7 (cheapest)"
       description: "Open weights. $0.40/$1.75 per Mtok — the cheapest priced model in the catalogue."
+      # webSearch (enterpriseaiframework-222) — top-level, sibling of `preset:`, same
+      # placement and same reasoning as the glm-5-2 spec above (see its comment for the
+      # two wrong shapes measured against the live cluster before this one).
+      webSearch: true
       preset:
         endpoint: "Enterprise AI"
         model: "glm-4.7@deepinfra"
         artifacts: "default"
         maxContextTokens: 128000
         maxOutputTokens: 32768
-        # web_search (enterpriseaiframework-222), snake_case — same reasoning and same
-        # pinned-schema measurement as the glm-5-2 spec above: without it a brand-new
-        # conversation on this spec never attaches the web_search tool even though the
-        # shared promptPrefix below tells the model to search the web unconditionally,
-        # and the camelCase `webSearch` spelling is a silent no-op on this image.
-        web_search: true
         # TOOL SELECTION (enterpriseaiframework-e6f) — same paragraph as the glm-5-2
         # spec above; kept identical rather than DRY'd out because librechat.yaml has
         # no include mechanism and a divergence between the two would be silent.
