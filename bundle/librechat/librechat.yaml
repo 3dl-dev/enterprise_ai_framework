@@ -107,6 +107,24 @@ modelSpecs:
         # including `execute_code` (data-provider's defaultAgentCapabilities) and is not
         # overridden anywhere in this file.
         executeCode: true
+        # webSearch (enterpriseaiframework-222). Without this, a brand-new conversation's
+        # ephemeralAgent.web_search is `modelSpec.webSearch ?? false` — see
+        # client/src/utils/endpoints.ts#applyModelSpecEphemeralAgent — so the web_search
+        # TOOL WAS NEVER ATTACHED to a first turn even though the promptPrefix below
+        # unconditionally instructs the model to "Search the web when...". For a genuinely
+        # new conversation (`convoId === Constants.NEW_CONVO`) there is no per-conversation
+        # localStorage override to layer on top, so this was 100% reproducible, not
+        # stochastic: told to search with no tool to call, the model fabricated a
+        # tool-call-shaped block in plain text instead — imitating the ":::artifact" fence
+        # convention taught two paragraphs below in the same prompt (":::tool\n{"name":
+        # "web_search", ...}") rather than the API's native tool-calling path. LibreChat
+        # never executes text shaped like a tool call, so the turn ended with no grounded
+        # answer and no error (unfinished:false, error:false) — measured on the live
+        # cluster 2026-07-31 across three never-signed-in accounts, one of which leaked
+        # exactly that text. Setting it here, like executeCode above, makes the tool
+        # genuinely available on the very first turn, matching what the prompt already
+        # promises.
+        webSearch: true
         # Matches the provider: 200k context, and the full output budget. These models
         # spend part of the output budget reasoning, so a short cap truncates the answer
         # after the thinking rather than producing a smaller answer.
@@ -160,6 +178,11 @@ modelSpecs:
         artifacts: "default"
         maxContextTokens: 128000
         maxOutputTokens: 32768
+        # webSearch (enterpriseaiframework-222) — same reasoning as the glm-5-2 spec
+        # above: without it a brand-new conversation on this spec never attaches the
+        # web_search tool even though the shared promptPrefix below tells the model to
+        # search the web unconditionally.
+        webSearch: true
         # TOOL SELECTION (enterpriseaiframework-e6f) — same paragraph as the glm-5-2
         # spec above; kept identical rather than DRY'd out because librechat.yaml has
         # no include mechanism and a divergence between the two would be silent.
