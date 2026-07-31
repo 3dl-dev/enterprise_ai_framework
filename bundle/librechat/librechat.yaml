@@ -107,24 +107,31 @@ modelSpecs:
         # including `execute_code` (data-provider's defaultAgentCapabilities) and is not
         # overridden anywhere in this file.
         executeCode: true
-        # webSearch (enterpriseaiframework-222). Without this, a brand-new conversation's
-        # ephemeralAgent.web_search is `modelSpec.webSearch ?? false` — see
-        # client/src/utils/endpoints.ts#applyModelSpecEphemeralAgent — so the web_search
-        # TOOL WAS NEVER ATTACHED to a first turn even though the promptPrefix below
-        # unconditionally instructs the model to "Search the web when...". For a genuinely
-        # new conversation (`convoId === Constants.NEW_CONVO`) there is no per-conversation
-        # localStorage override to layer on top, so this was 100% reproducible, not
-        # stochastic: told to search with no tool to call, the model fabricated a
-        # tool-call-shaped block in plain text instead — imitating the ":::artifact" fence
-        # convention taught two paragraphs below in the same prompt (":::tool\n{"name":
-        # "web_search", ...}") rather than the API's native tool-calling path. LibreChat
-        # never executes text shaped like a tool call, so the turn ended with no grounded
-        # answer and no error (unfinished:false, error:false) — measured on the live
-        # cluster 2026-07-31 across three never-signed-in accounts, one of which leaked
-        # exactly that text. Setting it here, like executeCode above, makes the tool
-        # genuinely available on the very first turn, matching what the prompt already
-        # promises.
-        webSearch: true
+        # web_search (enterpriseaiframework-222), SNAKE_CASE — deliberately, and this is
+        # not a style choice. Without this, a brand-new conversation's
+        # ephemeralAgent.web_search was never set to true even though the promptPrefix
+        # below unconditionally instructs the model to "Search the web when...". LibreChat
+        # never executes text shaped like a tool call, so a model told to use a tool it
+        # was never given fabricated one as prose instead — measured on the live cluster
+        # 2026-07-31 across three never-signed-in accounts, one of which leaked exactly
+        # that shape (`:::tool\n{"name": "web_search", ...}`), with `unfinished:false,
+        # error:false` so nothing downstream knew the turn had failed.
+        #
+        # THE FIRST FIX ATTEMPT USED `webSearch` (camelCase, matching `executeCode`
+        # above and matching a NEWER LibreChat checkout's tModelSpecPresetSchema) AND WAS
+        # SILENTLY A NO-OP on this pinned image. Verified directly against the RUNNING
+        # v0.8.7 container (commit 9e74cc0e, not a newer checkout): the server's own
+        # bundled schema, `/app/packages/data-provider/dist/index.js`, defines the
+        # model-spec preset's web-search pick list with the key `web_search`
+        # (snake_case) — `executeCode`/`webSearch` (camelCase) do not appear anywhere in
+        # that schema at all on this pinned build. zod strips unrecognized object keys by
+        # default, so `webSearch: true` parsed without error and vanished before
+        # `sanitizeModelSpecs` ever ran — confirmed by reading back the authenticated
+        # `/api/config` response, whose modelSpecs[].preset carried neither `webSearch`
+        # nor `executeCode`. `web_search` (this key) DOES survive that parse and DOES
+        # reach the client — confirmed the same way. See dogfood-findings.md for the
+        # `executeCode` implication this measurement leaves open (out of scope here).
+        web_search: true
         # Matches the provider: 200k context, and the full output budget. These models
         # spend part of the output budget reasoning, so a short cap truncates the answer
         # after the thinking rather than producing a smaller answer.
@@ -178,11 +185,12 @@ modelSpecs:
         artifacts: "default"
         maxContextTokens: 128000
         maxOutputTokens: 32768
-        # webSearch (enterpriseaiframework-222) — same reasoning as the glm-5-2 spec
-        # above: without it a brand-new conversation on this spec never attaches the
-        # web_search tool even though the shared promptPrefix below tells the model to
-        # search the web unconditionally.
-        webSearch: true
+        # web_search (enterpriseaiframework-222), snake_case — same reasoning and same
+        # pinned-schema measurement as the glm-5-2 spec above: without it a brand-new
+        # conversation on this spec never attaches the web_search tool even though the
+        # shared promptPrefix below tells the model to search the web unconditionally,
+        # and the camelCase `webSearch` spelling is a silent no-op on this image.
+        web_search: true
         # TOOL SELECTION (enterpriseaiframework-e6f) — same paragraph as the glm-5-2
         # spec above; kept identical rather than DRY'd out because librechat.yaml has
         # no include mechanism and a divergence between the two would be silent.
