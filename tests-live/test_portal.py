@@ -11,6 +11,8 @@ import subprocess
 
 import httpx
 import pytest
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 NS = "enterprise-ai"
 _FORM = re.compile(r'<form[^>]*\baction="([^"]+)"[^>]*\bmethod="post"', re.I | re.S)
@@ -61,6 +63,74 @@ def client(base_url, creds) -> httpx.Client:
         "still on a login form after submitting credentials — the login did not take"
     )
     return c
+
+
+def test_bare_portal_path_reaches_a_working_front_door(base_url, creds):
+    """enterpriseaiframework-03f (REMAINING 1): a person who types the address without the
+    trailing-slash convention must not be handed a dead end. DRIVEN, not read from source.
+
+    `control-plane/app/portal.py:77` issues a 307 from `/portal` to `/portal/` -- but that
+    code can only run if the request for the bare path ever REACHES the control-plane pod.
+    Measured against the live public origin it does not. The gateway VM's Caddy `:8081`
+    block (`mainframe` repo, `cloud-init/gateway-vendor.yaml`, hand-extended beyond what
+    that file has checked in -- its own tracked copy has no `/portal` route at all) routes
+    with a `handle_path /portal/*`-shaped matcher: Caddy's path glob requires the LITERAL
+    trailing slash to match, so a request for the bare path falls through to the catch-all
+    `handle { reverse_proxy ... 30380 }` block -- CHAT's NodePort, not the control plane's.
+    `portal.py`'s redirect never executes; this is exactly the "redirect swallowed by a
+    proxy" scenario this item's own remaining findings named.
+
+    Measured live 2026-07-31 with curl (`follow_redirects` off), for both surfaces the
+    portal fronts:
+        GET /portal    -> 200, LibreChat's OWN index.html (not a 307, no Location header)
+        GET /portal/   -> 302, to Keycloak (the correct, intended shape)
+        GET /workshop  -> 200, LibreChat's OWN index.html (identical bug, identical shape)
+        GET /workshop/ -> 302, to Keycloak (control-plane's own route -- correct)
+
+    curl alone cannot catch the actual user-facing failure, though: LibreChat's router is
+    entirely client-side, so the HTTP layer really does answer 200 with valid HTML either
+    way -- indistinguishable from a working SPA boot to anything that only reads status
+    codes. What a human's browser does with that HTML once it boots at the URL `/portal`
+    is render LibreChat's OWN unrecognised-route error boundary: "Oops! Something
+    Unexpected Occurred ... Status:: 404 Not Found" -- no login form, no chat composer, no
+    path forward except "Contact the Admin". Only a real, JS-executing browser observes
+    this, so this test drives one instead of an HTTP client.
+    """
+    user, password = creds
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        ctx = b.new_context(ignore_https_errors=True, viewport={"width": 1440, "height": 900})
+        page = ctx.new_page()
+        try:
+            page.goto(f"{base_url}/portal", wait_until="load", timeout=45000)
+
+            try:
+                page.wait_for_selector("input[name='username']", timeout=15000)
+            except PlaywrightTimeoutError:
+                body = page.evaluate(
+                    "() => document.body ? document.body.innerText.slice(0, 500) : ''"
+                )
+                pytest.fail(
+                    "bare /portal (no trailing slash) never presented a login form -- "
+                    f"landed on {page.url!r} with body starting: {body!r}\n"
+                    "See this test's docstring: the gateway VM's Caddy /portal/* matcher "
+                    "requires the literal trailing slash and falls through to chat for "
+                    "the bare path, so the app's own 307 in portal.py:77 never runs."
+                )
+
+            page.fill("input[name='username']", user)
+            page.fill("input[name='password']", password)
+            page.click("input[type='submit'], button[type='submit']")
+            page.wait_for_load_state("load", timeout=45000)
+
+            page.wait_for_selector("#tab-chat", timeout=20000)
+            assert page.locator("#tab-chat").is_visible(), (
+                "signed in after starting at bare /portal but never reached the tabbed "
+                f"shell -- landed on {page.url!r} instead"
+            )
+        finally:
+            ctx.close()
+            b.close()
 
 
 def test_the_page_loads_after_one_login(client, base_url):
