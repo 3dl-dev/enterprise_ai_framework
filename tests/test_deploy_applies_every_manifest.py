@@ -116,6 +116,70 @@ def test_the_two_manifests_that_were_silently_missing_are_deployed_now():
         )
 
 
+def test_the_control_plane_image_is_substituted_into_exactly_one_manifest():
+    """`image: REPLACED_BY_DEPLOY` is seven different images sharing one spelling.
+
+    05-fakeprovider, 06-mcp-echo, 07-web-search (x2) and 70-codeapi (x6) all use it, each
+    meaning their own image from kaniko-build.sh. Only 40-control-plane's is the image
+    deploy.sh builds.
+
+    Substituting $IMAGE into all of them is not hypothetical — it was done on 2026-08-01 and
+    put the control-plane image into fakeprovider, mcp-echo, rerank and webfetch, three of
+    which had been healthy for four days. They crash-looped on
+    `KeyError: CONTROL_PLANE_DATABASE_URL` until they were rolled back.
+    """
+    body = DEPLOY_SH.read_text()
+    subs = re.findall(r"s\|image: REPLACED_BY_DEPLOY\|image: \$\{IMAGE\}\|", body)
+    assert len(subs) == 1, (
+        f"the control-plane image substitution appears {len(subs)} times in deploy.sh. It "
+        "must appear once, guarded to 40-control-plane.yaml — every other manifest using "
+        "that same placeholder means a different image entirely."
+    )
+    guard = body[: body.index("s|image: REPLACED_BY_DEPLOY|image: ${IMAGE}|")]
+    assert '"$f" == 40-control-plane.yaml' in guard, (
+        "the image substitution is no longer guarded to 40-control-plane.yaml, so it can "
+        "reach manifests whose image it is not"
+    )
+
+
+def test_manifests_whose_image_is_not_built_are_held_not_applied():
+    """Applying them would replace a working workload with the wrong image."""
+    body = DEPLOY_SH.read_text()
+    assert "needs_built_image()" in body, (
+        "deploy.sh no longer detects manifests carrying an unresolved image placeholder, so "
+        "it can apply one with whatever substitution happens to be in scope"
+    )
+    held = body[body.index("elif needs_built_image") :]
+    assert "continue" in held.split("\n", 4)[0] or "continue" in held[:200], (
+        "a manifest with an unbuilt image is not skipped — it falls through to kubectl apply"
+    )
+    # And the operator has to be told, or a held manifest is just a silent omission again.
+    assert "held back" in body and "kaniko-build.sh" in body, (
+        "nothing tells the operator which manifests were held or how to build their images; "
+        "a silent hold is the same defect as the silent omission this file exists to prevent"
+    )
+
+
+def test_the_manifests_currently_held_are_the_ones_we_expect():
+    """If this list shrinks, a feature just became deployable — update it deliberately."""
+    needing_build = {
+        p.name
+        for p in K8S_DIR.glob("*.yaml")
+        if re.search(r"^\s*image: REPLACED_BY_DEPLOY", p.read_text(), re.M)
+    }
+    assert needing_build == {
+        "05-fakeprovider.yaml",
+        "06-mcp-echo.yaml",
+        "07-web-search.yaml",
+        "40-control-plane.yaml",
+        "70-codeapi.yaml",
+    }, (
+        f"the set of manifests needing a built image changed: {sorted(needing_build)}. "
+        "deploy.sh builds only the control plane's; the rest are held back and are why "
+        "code execution is not on the cluster (enterpriseaiframework-d5f)."
+    )
+
+
 def test_a_failed_rollout_fails_the_deploy():
     """`|| true` on rollout status let a deploy exit 0 over a pod that never came up."""
     body = DEPLOY_SH.read_text()

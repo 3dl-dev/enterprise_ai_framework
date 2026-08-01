@@ -157,9 +157,20 @@ echo "==> apply"
 # directory, and anything that must NOT be applied is excluded BY NAME below, with a reason.
 # An exclusion is a decision; an omission was an accident.
 #
-# Both substitutions run on every file, image first: the CFG_SUM pattern is a prefix of the
-# image pattern, so the reverse order would rewrite `image: REPLACED_BY_DEPLOY` to a config
-# hash and deploy a nonexistent image.
+# `image: REPLACED_BY_DEPLOY` is NOT one placeholder — it is the same spelling used by seven
+# manifests for seven DIFFERENT images (mcp-echo, fakeprovider, the two web-search services,
+# and six codeapi images), each built separately by deploy/bin/kaniko-build.sh. Only
+# 40-control-plane.yaml's is the image this script builds.
+#
+# Substituting $IMAGE into all of them is not a hypothetical: it was done here on 2026-08-01
+# and it put the control-plane image into fakeprovider, mcp-echo, rerank and webfetch, which
+# then crash-looped on `KeyError: CONTROL_PLANE_DATABASE_URL` — three of them had been
+# healthy for four days. So the substitution is scoped to the one manifest it belongs to, and
+# any OTHER manifest still carrying an unresolved `image:` placeholder is a hard error: its
+# image was never built and pushed, and applying it would replace a working workload with a
+# wrong one. Refusing is the whole point — a deploy that cannot deploy something must say so
+# rather than deploy something else.
+needs_built_image() { grep -q '^\s*image: REPLACED_BY_DEPLOY' "$1"; }
 skip_manifest() {
     case "$1" in
         # Applied above, before the Secrets that everything else depends on.
@@ -174,16 +185,42 @@ skip_manifest() {
     esac
 }
 
+unbuilt=()
 for path in deploy/k8s/*.yaml; do
     f="$(basename "$path")"
     if skip_manifest "$f"; then
         echo "    skip $f"
         continue
     fi
+    if [[ "$f" == 40-control-plane.yaml ]]; then
+        # The one image this script builds and pushes, a few lines above.
+        rendered=$(sed -e "s|image: REPLACED_BY_DEPLOY|image: ${IMAGE}|" \
+                       -e "s|REPLACED_BY_DEPLOY|${CFG_SUM}|" "$path")
+    elif needs_built_image "$path"; then
+        unbuilt+=("$f")
+        echo "    HOLD  $f — image not built"
+        continue
+    else
+        rendered=$(sed "s|REPLACED_BY_DEPLOY|${CFG_SUM}|" "$path")
+    fi
     echo "    apply $f"
-    sed -e "s|image: REPLACED_BY_DEPLOY|image: ${IMAGE}|" \
-        -e "s|REPLACED_BY_DEPLOY|${CFG_SUM}|" "$path" | kubectl apply -f -
+    printf '%s\n' "$rendered" | kubectl apply -f -
 done
+
+if (( ${#unbuilt[@]} )); then
+    echo >&2
+    echo "warning: held back ${#unbuilt[@]} manifest(s) whose images this script does not build:" >&2
+    printf '           %s\n' "${unbuilt[@]}" >&2
+    echo "         Their images come from deploy/bin/kaniko-build.sh and are substituted by" >&2
+    echo "         hand today, so this script has no tag to put in. Holding them is" >&2
+    echo "         deliberate: 05/06/07 are already running the right images, and applying" >&2
+    echo "         them blind would replace working workloads with the wrong one." >&2
+    echo "         70-codeapi.yaml has never been deployed, which is why chat advertises" >&2
+    echo "         code execution against a service that is not there (enterpriseaiframework-c8b)." >&2
+    echo "         Closing this properly means deploy.sh builds and pushes every image it" >&2
+    echo "         deploys, the way it already does for the control plane:" >&2
+    echo "         enterpriseaiframework-d5f." >&2
+fi
 
 echo
 echo "==> waiting for rollout"
