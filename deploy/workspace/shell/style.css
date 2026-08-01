@@ -209,6 +209,18 @@ h2, h3 { font-weight: 600; }
 .mark { font-size: 1.1rem; }
 @media (max-width: 720px) { .brand-word { display: none; } }
 
+/* enterpriseaiframework-eb7: measured directly on a real iPhone 13 viewport (390px) with
+   a real provisioned pod -- with .brand-word already hidden, the project chip plus
+   "Settings" still leave less room than "Show someone" needs, and the header scrolled
+   sideways by 56px. Same technique as .brand-word above: the chip already ellipsizes
+   (#project-name), so capping it further loses no function, only how much of a long
+   project name is visible before the tap target. */
+@media (max-width: 480px) {
+  .chip { max-width: 5.5rem; padding-left: var(--sp-2); padding-right: var(--sp-2); }
+  #bar { gap: var(--sp-1); padding: 0 var(--sp-2); }
+  #btn-settings, #btn-share { padding-left: var(--sp-2); padding-right: var(--sp-2); }
+}
+
 /* ------------------------------------------------------------------ project chip */
 
 .project-switch { position: relative; }

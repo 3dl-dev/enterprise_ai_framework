@@ -14,6 +14,7 @@ because a page that throws on load can still look fine to curl.
 """
 
 import base64
+import json
 import os
 import re
 import secrets
@@ -168,6 +169,139 @@ def fresh_account():
             pf.wait(timeout=10)
         except subprocess.TimeoutExpired:
             pf.kill()
+
+
+@pytest.fixture()
+def fresh_workspace(fresh_account):
+    """Provisions `fresh_account`'s OWN workspace pod on the live cluster --
+    `deploy/bin/provision-workspace.sh`, the exact script an operator runs to stand up a
+    real user's Code tab, not a substitute for it.
+
+    enterpriseaiframework-eb7 Challenge 3: control-plane commit de2f021 already ruled that
+    nothing on loopback can stand in for "a real ttyd, a real xterm.js and a real opencode
+    resolving a real model through the gateway" -- portal_harness's ttyd stub proves only
+    that a keystroke's ROUTE survives two nested iframes and the real proxy. This is the
+    route that gets the real thing without touching a real person's own pod: verified
+    directly in this session (kubectl apply, a real rollout, and a real opencode painting
+    "Ask anything" / "GLM 5.2 Enterprise AI" into the terminal buffer at an iPhone 13
+    device profile, torn down cleanly afterward). If provisioning ever fails here, this
+    fixture fails loudly with the command and its exit code rather than falling back to a
+    stub -- that failure IS the proof of inability the item asks for, not a reason to
+    quietly re-stub.
+
+    WORKSPACE_TAG is read from `ws-student`'s own already-running image rather than
+    guessed: `provision-workspace.sh`'s own default (`git rev-parse --short HEAD`) is not
+    necessarily what has actually been pushed to the rail registry at any given moment,
+    and this worktree's HEAD commonly is not.
+    """
+    username, _ = fresh_account
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tag = subprocess.run(
+        ["kubectl", "-n", NS, "get", "deploy", "ws-student",
+         "-o", "jsonpath={.spec.template.spec.containers[0].image}"],
+        capture_output=True, text=True, timeout=30,
+    ).stdout.rsplit(":", 1)[-1]
+    if not tag:
+        pytest.fail(
+            "could not read ws-student's image tag from the live cluster (kubectl -n "
+            f"{NS} get deploy ws-student ...) -- no known-good WORKSPACE_TAG to provision "
+            "with, and guessing one is worse than failing loudly"
+        )
+    proc = subprocess.run(
+        ["bash", os.path.join(root, "deploy", "bin", "provision-workspace.sh"), username],
+        cwd=root, env={**os.environ, "WORKSPACE_TAG": tag},
+        capture_output=True, text=True, timeout=300,
+    )
+    if proc.returncode != 0:
+        pytest.fail(
+            f"provisioning a workspace for the throwaway account {username!r} failed "
+            f"(deploy/bin/provision-workspace.sh, exit {proc.returncode}) -- this is a "
+            f"proven inability, not grounds to fall back to a stub:\n"
+            f"stdout: {proc.stdout[-2000:]}\nstderr: {proc.stderr[-2000:]}"
+        )
+    try:
+        yield username
+    finally:
+        for args in (
+            ["delete", "deployment,svc,pvc", "-l", f"workspace.enterprise-ai/user={username}",
+             "--wait=false"],
+            ["delete", "secret", f"ws-{username}-key", "--ignore-not-found"],
+            ["delete", "configmap", f"workspace-memory-{username}", "--ignore-not-found"],
+        ):
+            subprocess.run(["kubectl", "-n", NS, *args],
+                            capture_output=True, text=True, timeout=30)
+
+
+# ------------------------------------------------------------------ raw CDP, mobile only
+#
+# enterpriseaiframework-c31 (wave 6): submitting a login form in a MOBILE Playwright
+# context, when the destination does a client-side (pushState) route change afterward --
+# as LibreChat's chat surface does, landing on /c/<conversationId> -- leaves Playwright's
+# OWN navigation-lifecycle tracking confused: `page.url` stays pinned at the Keycloak auth
+# URL forever, and every navigation-gated Playwright API (`wait_for_selector`,
+# `page.evaluate`, `page.screenshot`) then waits on a navigation that, as far as Playwright
+# is concerned, never finished. MEASURED: test_mobile_sign_in_and_a_real_conversation
+# failed 3/3 at the #prompt-textarea wait before this existed, while a scratch probe
+# reading the SAME page over raw CDP at the same moment found the real document already at
+# /c/new with #prompt-textarea present and zero console errors -- the product is fine;
+# only Playwright's own binding lost the thread. The fix, proven by that probe and now the
+# house pattern for this file: reach the same facts through
+# `browser_context.new_cdp_session(page)` + `Runtime.evaluate` instead of Playwright's
+# locator/evaluate/screenshot APIs, which never routes through whatever broke.
+#
+# NOT needed for the workshop/Code surface (see fresh_workspace's own test below): that
+# route is a plain server-rendered redirect chain with no client-side route push, and this
+# item's own scratch probe measured ordinary Playwright waits working correctly against it
+# in a mobile context, end to end, including reading the real terminal's buffer.
+
+
+def _cdp_eval(session, expression: str):
+    result = session.send("Runtime.evaluate", {
+        "expression": expression, "returnByValue": True, "awaitPromise": True,
+    })
+    exc = result.get("exceptionDetails")
+    if exc:
+        raise RuntimeError(f"CDP Runtime.evaluate raised: {json.dumps(exc)[:500]}")
+    return result["result"].get("value")
+
+
+def _cdp_wait_for(session, expression: str, timeout_s: float, what: str, poll_s: float = 1.0):
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while time.monotonic() < deadline:
+        last = _cdp_eval(session, expression)
+        if last:
+            return last
+        time.sleep(poll_s)
+    raise AssertionError(
+        f"timed out after {timeout_s}s waiting for {what} over raw CDP (not a Playwright "
+        f"navigation-gated wait -- see this file's CDP-helper comment); last observed "
+        f"value: {last!r}"
+    )
+
+
+def _cdp_wait_for_selector(session, selector: str, timeout_s: float, what: str | None = None):
+    return _cdp_wait_for(session, f"!!document.querySelector({selector!r})", timeout_s,
+                          what or f"selector {selector!r} to appear")
+
+
+def _cdp_type(session, selector: str, text: str):
+    """Focus SELECTOR and insert TEXT through CDP's own input pipeline
+    (`Input.insertText`) -- the same browser-level mechanism a real keyboard uses, proven
+    by enterpriseaiframework-c31's own probe to register with LibreChat's React-controlled
+    composer (typed text appeared in the composer and the send button became enabled)."""
+    _cdp_eval(session, f"document.querySelector({selector!r}).focus()")
+    session.send("Input.insertText", {"text": text})
+
+
+def _cdp_click(session, selector: str):
+    _cdp_eval(session, f"document.querySelector({selector!r}).click()")
+
+
+def _cdp_screenshot(session, path: str):
+    result = session.send("Page.captureScreenshot", {"format": "png"})
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(result["data"]))
 
 
 # Every context opened by a test, closed after it.
@@ -823,12 +957,8 @@ def test_mobile_sign_in_and_a_real_conversation(fresh_browser, pw, base_url, fre
     """SURFACES 1 and 2 of enterpriseaiframework-eb7's four: sign-in and holding a
     conversation, on the live cluster, on a real mobile device profile.
 
-    Driven directly at `{base_url}/`, not through the portal shell's iframe --
-    enterpriseaiframework-c31 measured that iframe as unobservable to Playwright's
-    main-frame plumbing from ~15s on, independent of product behaviour, and settled that a
-    human (raw CDP input injection kept working throughout) is not affected -- but this
-    test's own tool is Playwright, so it is driven the way test_chat_login.py and
-    test_first_conversation.py already prove works: straight at the chat origin.
+    Driven directly at `{base_url}/`, not through the portal shell's iframe -- the same
+    entry point test_chat_login.py and test_first_conversation.py already prove works:
     OPENID_AUTO_REDIRECT bounces there to Keycloak with no button to tap.
 
     Uses `fresh_account`, not `account` (workspace-user-student): mints and deletes its
@@ -836,11 +966,21 @@ def test_mobile_sign_in_and_a_real_conversation(fresh_browser, pw, base_url, fre
     (enterpriseaiframework-cf5's hazard). It never opens the Code tab or `/workshop/`, so
     it drives no workspace pod at all -- the identity only has to exist in Keycloak for
     chat's OIDC login and LibreChat's own auto-provisioned account row.
+
+    enterpriseaiframework-eb7 Challenge 1: everything from the login submit onward is read
+    over raw CDP, not Playwright's own navigation-gated APIs -- see this file's CDP-helper
+    comment above for why (measured: this test failed 3/3 at a plain
+    `wait_for_selector("#prompt-textarea")` while the real document had already landed
+    cleanly, zero console errors, confirmed by a scratch probe reading the same page over
+    CDP at the same moment). The sign-in step itself (finding the login form, filling it,
+    tapping submit) is unaffected and stays ordinary Playwright -- the hang starts only
+    after LibreChat's post-login client-side route push.
     """
     username, password = fresh_account
     ctx = fresh_browser.new_context(**pw.devices["iPhone 13"], ignore_https_errors=True)
     _CONTEXTS.append(ctx)
     p = Page(ctx.new_page())
+    cdp = ctx.new_cdp_session(p.page)
 
     p.page.goto(f"{base_url}/", wait_until="load", timeout=60000)
 
@@ -849,31 +989,32 @@ def test_mobile_sign_in_and_a_real_conversation(fresh_browser, pw, base_url, fre
     p.page.wait_for_selector("input[name='username']", timeout=30000)
     p.page.fill("input[name='username']", username)
     p.page.fill("input[name='password']", password)
-    p.page.locator("input[type='submit'], button[type='submit']").first.tap()
-    p.page.wait_for_load_state("load", timeout=60000)
+    p.page.locator("input[type='submit'], button[type='submit']").first.tap(
+        timeout=10000, no_wait_after=True)
 
-    # SURFACE 2: the composer accepts input and a reply comes back.
-    p.page.wait_for_selector("#prompt-textarea", timeout=30000)
-    body_text = p.page.evaluate("() => document.body.innerText")
+    # SURFACE 2: the composer accepts input and a reply comes back. Polled over raw CDP
+    # from here on (see this file's CDP-helper comment).
+    _cdp_wait_for_selector(cdp, "#prompt-textarea", 60,
+                            "the chat composer to appear after mobile sign-in")
+    body_text = _cdp_eval(cdp, "document.body.innerText")
     assert "Sign in with" not in body_text, (
         "chat asked a brand-new mobile sign-in for a second login"
     )
-    overflow = p.page.evaluate(
-        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
+    overflow = _cdp_eval(
+        cdp, "document.documentElement.scrollWidth - document.documentElement.clientWidth")
     assert overflow <= 0, f"chat scrolls sideways by {overflow}px on a real iPhone 13 viewport"
-    p.page.screenshot(path=f"{SHOTS}/mobile-chat-landed.png")
+    _cdp_screenshot(cdp, f"{SHOTS}/mobile-chat-landed.png")
 
-    p.page.fill("#prompt-textarea", "Say the single word hello and nothing else.")
-    # no_wait_after: sending the first message in a brand-new conversation triggers a
-    # client-side route change Playwright's default post-tap wait can mistake for a full
-    # navigation and hang on -- same reasoning as test_first_conversation.py's send tap.
-    p.page.locator('[data-testid="send-button"]').tap(timeout=10000, no_wait_after=True)
-    p.page.screenshot(path=f"{SHOTS}/mobile-chat-sent.png")
+    # Typed through CDP's own input pipeline (Input.insertText), not page.fill -- the same
+    # mechanism the c31 probe proved React's controlled composer actually picks up.
+    _cdp_type(cdp, "#prompt-textarea", "Say the single word hello and nothing else.")
+    _cdp_click(cdp, '[data-testid="send-button"]')
+    _cdp_screenshot(cdp, f"{SHOTS}/mobile-chat-sent.png")
 
-    p.page.wait_for_selector('[data-testid="copy-response-button"]',
-                              timeout=MOBILE_TURN_BUDGET_S * 1000)
-    reply = p.page.evaluate("() => document.body.innerText")
-    p.page.screenshot(path=f"{SHOTS}/mobile-chat-reply.png", full_page=True)
+    _cdp_wait_for_selector(cdp, '[data-testid="copy-response-button"]',
+                            MOBILE_TURN_BUDGET_S, "a finished assistant reply")
+    reply = _cdp_eval(cdp, "document.body.innerText")
+    _cdp_screenshot(cdp, f"{SHOTS}/mobile-chat-reply.png")
 
     lower = reply.lower()
     for bad in ("something went wrong", "an error occurred"):
@@ -884,23 +1025,23 @@ def test_mobile_sign_in_and_a_real_conversation(fresh_browser, pw, base_url, fre
 
 def test_mobile_code_tab_renders_and_accepts_a_keystroke_with_chrome_intact(
         fresh_browser, pw, hosted_workshop):
-    """SURFACE 3: Code. The item calls this the case 'most likely to be broken and
-    hardest to see' -- the workshop is an iframe inside the portal, itself nesting a
-    terminal iframe. Proving it against the live cluster's real pods would mean either a
-    real person's workspace session (enterpriseaiframework-cf5's hazard) or provisioning a
-    fresh one on a host at 8.3GB free -- so this drives the same hosted, loopback stack
+    """SURFACE 3: Code, the chrome and iframe-routing half. The item calls this the case
+    'most likely to be broken and hardest to see' -- the workshop is an iframe inside the
+    portal, itself nesting a terminal iframe. This drives the same hosted, loopback stack
     `test_the_portal_is_reachable_from_inside_the_workshop_tab` already proves the desktop
     case against: portal.require_user, portal.me, workshop.workshop_proxy and a real
     shell-server subprocess, all real and shipped, with a real mobile device profile
     instead of a desktop one.
 
     'Renders' is the same content assertions as the desktop test (project name, share
-    button, embedded class). 'Accepts a keystroke' is new: a tap-to-focus plus a real
-    typed string, checked against the stub's own echo of its `input` event -- see
-    portal_harness._make_ttyd_stub for exactly what that does and does not prove (it
-    proves the keystroke's ROUTE through two nested iframes and the real proxy; it does
-    not re-prove the real agent, which needs a real pod and is already covered,
-    non-hermetically, by test_the_agent_actually_boots_in_the_terminal above).
+    button, embedded class). 'Accepts a keystroke' is a route proof, not an agent proof: a
+    tap-to-focus plus a real typed string, checked against the stub's own echo of its
+    `input` event -- see portal_harness._make_ttyd_stub for exactly what that does and
+    does not prove (it proves the keystroke's ROUTE through two nested iframes and the
+    real proxy; it does NOT prove a real agent responds -- that is
+    test_mobile_code_tab_boots_the_real_agent_in_a_provisioned_pod below, against a real
+    pod, per enterpriseaiframework-eb7 Challenge 3 and cf5's ruling that nothing on
+    loopback can stand in for that).
     """
     import portal_harness
 
@@ -943,14 +1084,97 @@ def test_mobile_code_tab_renders_and_accepts_a_keystroke_with_chrome_intact(
     p.page.screenshot(path=f"{SHOTS}/mobile-code-tab.png")
     p.assert_clean("the mobile portal with the workshop showing")
 
+    # enterpriseaiframework-eb7 Challenge 2's negative control (wave 6 adversary):
+    # overriding devices['iPhone 13'] to a full desktop viewport+UA with only has_touch
+    # left every assertion above passing unchanged -- has_touch is orthogonal to viewport
+    # and UA, so .tap() alone blocks nothing. This is the control SHIPPED AS a test, not
+    # assumed: a genuine, pre-existing responsive rule
+    # (`@media (max-width: 760px) { .brandname { display: none } }`,
+    # control-plane/app/portal_static/style.css) that this 390px context crosses and a
+    # 1440px one does not -- measured on the SAME hosted stack, with the Code tab showing.
+    desktop_p, _ = _hosted_portal(fresh_browser, hosted_workshop,
+                                   context_kwargs={"viewport": {"width": 1440, "height": 900}})
+    desktop_p.page.locator("#tab-code").click()
+    expect(desktop_p.page.frame_locator("#frame-code").locator("#project-name")).to_have_text(
+        portal_harness.PROJECT, timeout=30000)
+    assert p.page.locator(".brandname").is_hidden(), (
+        "the mobile viewport (390px) should trip the <=760px rule that hides .brandname"
+    )
+    assert desktop_p.page.locator(".brandname").is_visible(), (
+        "the desktop viewport (1440px) should NOT trip that rule -- if it does not show "
+        "the brand name either, this control is not discriminating on width at all"
+    )
 
-def test_mobile_reads_published_work(fresh_browser, pw, hosted):
+
+def test_mobile_code_tab_boots_the_real_agent_in_a_provisioned_pod(
+        fresh_browser, pw, workshop_url, fresh_account, fresh_workspace):
+    """SURFACE 3, the real-agent half: enterpriseaiframework-eb7 Challenge 3.
+
+    control-plane commit de2f021 already ruled that nothing on loopback can stand in for
+    "a real ttyd, a real xterm.js and a real opencode resolving a real model through the
+    gateway" -- portal_harness._make_ttyd_stub proves only that a keystroke's ROUTE
+    survives two nested iframes and the real proxy, which is exactly why the test above
+    says so rather than claiming more. This test drives the REAL terminal instead, in
+    `fresh_workspace`'s own freshly provisioned pod (belonging to `fresh_account`'s
+    throwaway identity, never a real person's -- enterpriseaiframework-cf5's hazard), at a
+    real iPhone 13 device profile -- mirroring the desktop proof
+    (`test_the_agent_actually_boots_in_the_terminal`) exactly, model included.
+
+    Driven at `workshop_url` directly, not through the portal's `#frame-code` -- this is
+    the SAME shell page either way (workshop.workshop_proxy serves it at both), and going
+    straight there is what the existing desktop live-cluster test already does. Not
+    wrapped in raw CDP: unlike the chat surface (Challenge 1), the workshop route is a
+    plain server-rendered redirect chain with no client-side route push, and this item's
+    own scratch probe measured ordinary Playwright waits working correctly against it in a
+    mobile context -- verified directly: goto, form fill, tap-submit and a polled
+    `_terminal_buffer` read all completed normally, painting "Ask anything" and "GLM 5.2
+    Enterprise AI" into a real xterm.js buffer inside two nested iframes.
+    """
+    username, password = fresh_account
+    assert fresh_workspace == username
+
+    ctx = fresh_browser.new_context(**pw.devices["iPhone 13"], ignore_https_errors=True)
+    _CONTEXTS.append(ctx)
+    p = Page(ctx.new_page())
+
+    p.page.goto(f"{workshop_url}/", wait_until="load", timeout=60000)
+    if p.page.locator("input[name='username']").count():
+        p.page.fill("input[name='username']", username)
+        p.page.fill("input[name='password']", password)
+        p.page.locator("input[type='submit'], button[type='submit']").first.tap(
+            timeout=10000, no_wait_after=True)
+        p.page.wait_for_load_state("load", timeout=60000)
+
+    buf = ""
+    for _ in range(24):          # opencode paints in ~5s; allow for a cold pod
+        p.page.wait_for_timeout(2500)
+        buf = _terminal_buffer(p.page)
+        if "Ask anything" in buf or "GLM" in buf:
+            break
+    assert buf.strip(), "the terminal never painted anything at all on a real iPhone 13 viewport"
+    assert ("Ask anything" in buf) or ("ctrl+p commands" in buf), (
+        f"opencode never reached a usable prompt on mobile. Buffer:\n{buf[:600]}")
+    assert "GLM" in buf, (
+        "the agent started on mobile but shows no model -- its provider config did not "
+        f"resolve. Buffer:\n{buf[:600]}"
+    )
+
+    overflow = p.page.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
+    assert overflow <= 0, f"the workshop scrolls sideways by {overflow}px at iPhone 13 width"
+
+    p.page.screenshot(path=f"{SHOTS}/mobile-real-terminal.png")
+    p.assert_clean("the real terminal, in a real provisioned pod, on a real iPhone 13 viewport")
+
+
+def test_mobile_reads_published_work(fresh_browser, pw, hosted, base_url, account):
     """SURFACE 4: published work. Opens the account menu with a tap and follows 'Your
     shared work' exactly the way a person would on a phone -- the menu, the link's target
     and the page it lands on are all real, shipped code (portal.me's links payload, the
-    shipped index.html/app.js); only what is AT that URL is the harness's marker stub (see
-    portal_harness.py's own module docstring for why: what is under test is whether the
-    portal's link reaches the right URL, not the static-file server behind it).
+    shipped index.html/app.js); only what is AT that URL, in this first leg, is the
+    harness's marker stub (see portal_harness.py's own module docstring for why: what is
+    under test in THIS leg is whether the portal's link reaches the right URL, not the
+    static-file server behind it -- the second leg below reaches the real one).
     """
     import portal_harness
 
@@ -972,6 +1196,67 @@ def test_mobile_reads_published_work(fresh_browser, pw, hosted):
     # a person actually sees.
     expect(opened.locator("#published-stub")).to_be_visible(timeout=10000)
     assert portal_harness.USER in opened.locator("#published-stub").inner_text()
+    opened.close()
+
+    # enterpriseaiframework-eb7 Challenge 2's negative control (wave 6 adversary): the
+    # assertions above are IDENTICAL to what test_the_portal_is_reachable_from_inside_the_
+    # workshop_tab's own _menu_from_the_code_tab already proves on desktop, so by
+    # themselves they add no mobile evidence, and the adversary's negative control
+    # (devices['iPhone 13'] overridden to a desktop viewport+UA with only has_touch
+    # enabled) passed them unchanged. This does not: a genuine, pre-existing CSS
+    # breakpoint the 390px context crosses and a 1440px one does not
+    # (control-plane/app/portal_static/style.css).
+    desktop_p, _ = _hosted_portal(fresh_browser, hosted,
+                                   context_kwargs={"viewport": {"width": 1440, "height": 900}})
+    assert p.page.locator(".brandname").is_hidden(), (
+        "the mobile viewport (390px) should trip the <=760px rule that hides .brandname"
+    )
+    assert desktop_p.page.locator(".brandname").is_visible(), (
+        "the desktop viewport (1440px) should NOT trip that rule -- if it does not show "
+        "the brand name either, this control is not discriminating on width at all"
+    )
+
+    p.assert_clean("the mobile portal after reading published work")
+
+    # enterpriseaiframework-eb7 Challenge 4: what is AT the URL in the leg above is the
+    # harness's own marker stub, by design -- it proves the LINK, not what a phone
+    # actually renders once it lands. The real thing is live and reachable with no
+    # account, no pod and no disk (curl -sk https://gateway.tailcb6ef9.ts.net:8443/
+    # live/<user>/ returns 200 with a real listing); this leg hits it directly, on the
+    # LIVE cluster (base_url, not the harness), with a real iPhone 13 device profile, and
+    # measures how it actually renders at 390px rather than asserting a stub.
+    #
+    # Uses `account` (workspace-user-student), not a fresh mint: reading a public,
+    # unauthenticated static listing touches no pod and mutates nothing, so
+    # enterpriseaiframework-cf5's hazard (which is specifically about the Code tab driving
+    # a real person's pod) does not apply -- this is the same fixture the desktop tests in
+    # this file already use for non-Code-tab portal reads.
+    username = account[0]
+    live_url = f"{base_url}/live/{username}/"
+    precheck = httpx.get(live_url, verify=False, timeout=15)
+    assert precheck.status_code == 200, (
+        f"the live published listing for {username!r} answered {precheck.status_code}, "
+        f"not 200, at {live_url!r} -- this leg needs something already published for this "
+        "account (see test_e2e_journey.py / the Code tab's publish flow for how "
+        "workspace-user-student acquires its published project)"
+    )
+
+    live_ctx = fresh_browser.new_context(**pw.devices["iPhone 13"], ignore_https_errors=True)
+    _CONTEXTS.append(live_ctx)
+    live_page = live_ctx.new_page()
+    live_page.goto(live_url, wait_until="load", timeout=30000)
+    assert live_url.rstrip("/") in live_page.url.rstrip("/"), (
+        f"landed on {live_page.url!r} instead of the real published listing"
+    )
+    body = live_page.evaluate("() => document.body.innerText")
+    assert body.strip(), "the real published listing rendered no content at all on a phone"
+    overflow = live_page.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
+    assert overflow <= 0, (
+        f"the real published site scrolls sideways by {overflow}px on a real iPhone 13 "
+        "viewport (390px) -- measured against the LIVE site, not a stub"
+    )
+    live_page.screenshot(path=f"{SHOTS}/mobile-published-live.png", full_page=True)
     opened.close()
 
     p.assert_clean("the mobile portal after reading published work")
