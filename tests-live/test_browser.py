@@ -16,13 +16,18 @@ because a page that throws on load can still look fine to curl.
 import base64
 import os
 import re
+import secrets
 import subprocess
+import time
 
+import httpx
 import pytest
 from playwright.sync_api import expect, sync_playwright
 
 NS = "enterprise-ai"
+REALM = "enterprise-ai"
 SHOTS = os.environ.get("BROWSER_SHOT_DIR", "/tmp/eai-shots")
+MOBILE_TURN_BUDGET_S = 400
 
 
 def _secret(name: str, key: str) -> str:
@@ -45,12 +50,124 @@ def account() -> tuple[str, str]:
 
 
 @pytest.fixture(scope="session")
-def browser():
-    os.makedirs(SHOTS, exist_ok=True)
+def pw():
+    """The live Playwright driver object, kept around for `pw.devices[...]` —
+    enterpriseaiframework-eb7's mobile tests need real device descriptors (UA, viewport,
+    device scale factor, touch), not a hand-rolled viewport dict. See
+    `test_mobile_context_is_not_a_resized_desktop_window` for why that distinction is
+    load-bearing and tested rather than asserted in a docstring."""
     with sync_playwright() as p:
-        b = p.chromium.launch()
-        yield b
-        b.close()
+        yield p
+
+
+@pytest.fixture(scope="session")
+def browser(pw):
+    os.makedirs(SHOTS, exist_ok=True)
+    b = pw.chromium.launch()
+    yield b
+    b.close()
+
+
+@pytest.fixture()
+def fresh_browser(pw):
+    """A Chromium instance of its own, launched and closed around exactly one test.
+
+    The mobile tests below found `browser` (session-scoped, shared by every test in this
+    file) unreliable when a test ran after others had already opened and closed several
+    contexts in it: Playwright's own Runtime-mediated calls (`evaluate`, `screenshot`, and
+    -- observed directly -- `wait_for_selector` blocking on "waiting for navigation to
+    finish") would hang on a plain, un-iframed top-level page, the same SYMPTOM
+    enterpriseaiframework-c31 describes for the portal iframe but reproduced here with no
+    iframe involved at all. Isolating each mobile test in its own freshly launched browser
+    removed it across repeated runs; sharing `browser` did not, even at generous timeouts
+    (measured up to 90s, still hung). Filed as enterpriseaiframework note in this test's
+    own findings -- this fixture works around it rather than explaining it.
+    """
+    b = pw.chromium.launch()
+    yield b
+    b.close()
+
+
+@pytest.fixture(scope="module")
+def fresh_account():
+    """A Keycloak account this test creates and destroys itself, for the mobile tests
+    that need a REAL sign-in against the live cluster.
+
+    Mirrors `tests-live/test_first_conversation.py::fresh_account` exactly (same admin
+    REST flow, same cleanup) rather than importing it: that module is not a fixture
+    library, and enterpriseaiframework-eb7's own dispatch scopes this file as the one to
+    change. Not `account` (workspace-user-student) above, and deliberately never used for
+    anything that opens the Code tab — see enterpriseaiframework-cf5: that fixture is a
+    real person's account and the Code tab drives that person's own pod. This identity
+    only ever talks to chat directly (`{base_url}/`, never the portal iframe, never
+    `/workshop/`), which touches no pod at all.
+    """
+    pf = subprocess.Popen(
+        ["kubectl", "-n", NS, "port-forward", "svc/identity", "0:8080"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    user_id = None
+    idp = None
+    headers = None
+    try:
+        line = pf.stdout.readline()
+        m = re.search(r":(\d+)\s*->", line)
+        if not m:
+            pytest.fail(f"could not read the forwarded port from kubectl's output: {line!r}")
+        idp = f"http://localhost:{m.group(1)}"
+
+        for _ in range(40):
+            try:
+                if httpx.get(f"{idp}/realms/{REALM}", timeout=2).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            time.sleep(1)
+        else:
+            pytest.fail("identity provider never answered on the port-forward")
+
+        admin_user = _secret("enterprise-ai-secrets", "IDP_ADMIN_USER")
+        admin_password = _secret("enterprise-ai-secrets", "IDP_ADMIN_PASSWORD")
+        token_resp = httpx.post(
+            f"{idp}/realms/master/protocol/openid-connect/token",
+            data={"grant_type": "password", "client_id": "admin-cli",
+                  "username": admin_user, "password": admin_password},
+            timeout=30,
+        )
+        token_resp.raise_for_status()
+        token = token_resp.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        username = f"mobile-{secrets.token_hex(3)}"
+        password = secrets.token_urlsafe(24)
+
+        created = httpx.post(
+            f"{idp}/admin/realms/{REALM}/users", headers=headers,
+            json={"username": username, "email": f"{username}@example.invalid",
+                  "firstName": "Mobile", "lastName": "Tester",
+                  "enabled": True, "emailVerified": True, "requiredActions": []},
+            timeout=30,
+        )
+        assert created.status_code == 201, (
+            f"could not create {username}: {created.status_code} {created.text[:300]}"
+        )
+        user_id = created.headers["Location"].rsplit("/", 1)[-1]
+
+        httpx.put(
+            f"{idp}/admin/realms/{REALM}/users/{user_id}/reset-password", headers=headers,
+            json={"type": "password", "value": password, "temporary": False}, timeout=30,
+        ).raise_for_status()
+
+        yield username, password
+    finally:
+        if user_id and idp and headers:
+            httpx.delete(f"{idp}/admin/realms/{REALM}/users/{user_id}",
+                        headers=headers, timeout=30)
+        pf.terminate()
+        try:
+            pf.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pf.kill()
 
 
 # Every context opened by a test, closed after it.
@@ -171,15 +288,21 @@ def hosted_no_workshop(hosted):
     hosted.stop_shell()
 
 
-def _hosted_portal(browser, hosted) -> tuple[Page, list[tuple[str, int]]]:
+def _hosted_portal(browser, hosted, context_kwargs=None) -> tuple[Page, list[tuple[str, int]]]:
     """The portal as the harness serves it, plus every response status the page saw.
 
     The statuses are collected because `requestfailed` does not fire on an HTTP error
     response — it is for transport failures — so a framed surface answering 401 or 500 is
     not a "failed request" as far as Playwright is concerned. Recording the response is how
     the test sees the status the frame actually got.
+
+    `context_kwargs`: defaults to the desktop viewport every existing caller here relies
+    on. The mobile tests pass `pw.devices["iPhone 13"]` instead — a real device
+    descriptor (UA, viewport, device scale factor, `has_touch`), not a resized desktop
+    window; see `test_mobile_context_is_not_a_resized_desktop_window` for why that
+    distinction is enforced rather than assumed.
     """
-    ctx = browser.new_context(viewport={"width": 1440, "height": 900})
+    ctx = browser.new_context(**(context_kwargs or {"viewport": {"width": 1440, "height": 900}}))
     _CONTEXTS.append(ctx)
     p = Page(ctx.new_page())
     seen: list[tuple[str, int]] = []
@@ -629,3 +752,226 @@ def test_the_terminal_keeps_its_size_across_a_reconnect(browser, workshop_url, a
             f"{again['rows']} rows of {again['cellH']}px = {used}px overflows a "
             f"{again['paneH']}px pane — the prompt is drawn off screen"
         )
+
+
+# ---------------------------------------------------------------- mobile
+#
+# enterpriseaiframework-eb7: the whole product usable on a phone -- chat, Code, portal,
+# published work -- ALL FOUR, on a real viewport, not a desktop window resized. Every test
+# below uses `pw.devices["iPhone 13"]` (real UA, real viewport, real device scale factor,
+# `has_touch`) and taps rather than clicks for at least its primary interaction: `.tap()`
+# is a touch-only Playwright API that raises outright on a context that was not created
+# with `has_touch=True`, so a test written this way cannot silently pass unchanged in a
+# desktop context -- it would blow up before making a single assertion. The control below
+# proves that refusal is real rather than assuming it, because it is exactly the check
+# named in this item's own dispatch as what an adversary reaches for first.
+
+
+def test_mobile_context_is_not_a_resized_desktop_window(fresh_browser, pw, hosted):
+    """THE control an adversary reaches for first on a mobile item: run the same
+    assertions in a desktop context and see whether they still pass.
+
+    Three independent signals, all real and none inferred from a viewport number alone:
+      1. `navigator.userAgent` -- what the PAGE itself sees, which is what a real phone's
+         site would see and a merely-resized desktop window would not.
+      2. `.tap()` -- Playwright's own touch-only API, which raises on a context that was
+         not created with `has_touch=True`. This is not a property of the page; it is
+         Playwright refusing to fake a touch it cannot produce.
+      3. `.brandname`'s CSS visibility -- a genuine, pre-existing responsive rule
+         (`@media (max-width: 760px) { .brandname { display: none } }`,
+         control-plane/app/portal_static/style.css) that a 390px-wide mobile viewport
+         crosses and a 1440px desktop one does not.
+    """
+    mobile = fresh_browser.new_context(**pw.devices["iPhone 13"])
+    _CONTEXTS.append(mobile)
+    desktop = fresh_browser.new_context(viewport={"width": 1440, "height": 900})
+    _CONTEXTS.append(desktop)
+
+    mobile_page = mobile.new_page()
+    mobile_page.goto(f"{hosted.base_url}/portal/", wait_until="domcontentloaded", timeout=45000)
+    mobile_page.wait_for_selector("#tab-chat", timeout=20000)
+
+    desktop_page = desktop.new_page()
+    desktop_page.goto(f"{hosted.base_url}/portal/", wait_until="domcontentloaded", timeout=45000)
+    desktop_page.wait_for_selector("#tab-chat", timeout=20000)
+
+    # 1. What the page itself observes.
+    assert mobile_page.evaluate("() => /Mobi|iPhone/.test(navigator.userAgent)"), (
+        "the mobile context's own UA string does not read as mobile"
+    )
+    assert not desktop_page.evaluate("() => /Mobi|iPhone/.test(navigator.userAgent)"), (
+        "a plain desktop context should not carry a mobile UA -- if it does, this control "
+        "proves nothing"
+    )
+
+    # 2. Playwright's own touch gate: succeeds on mobile, raises on desktop.
+    mobile_page.locator("#tab-code").tap()
+    with pytest.raises(Exception, match="hasTouch"):
+        desktop_page.locator("#tab-code").tap(timeout=2000)
+
+    # 3. A genuine CSS divergence the two widths actually produce.
+    assert mobile_page.locator(".brandname").is_hidden(), (
+        "the mobile viewport (390px) should trip the <=760px rule that hides .brandname"
+    )
+    assert desktop_page.locator(".brandname").is_visible(), (
+        "the desktop viewport (1440px) should NOT trip that rule -- if it does not show "
+        "the brand name either, this control is not discriminating on width at all"
+    )
+
+
+def test_mobile_sign_in_and_a_real_conversation(fresh_browser, pw, base_url, fresh_account):
+    """SURFACES 1 and 2 of enterpriseaiframework-eb7's four: sign-in and holding a
+    conversation, on the live cluster, on a real mobile device profile.
+
+    Driven directly at `{base_url}/`, not through the portal shell's iframe --
+    enterpriseaiframework-c31 measured that iframe as unobservable to Playwright's
+    main-frame plumbing from ~15s on, independent of product behaviour, and settled that a
+    human (raw CDP input injection kept working throughout) is not affected -- but this
+    test's own tool is Playwright, so it is driven the way test_chat_login.py and
+    test_first_conversation.py already prove works: straight at the chat origin.
+    OPENID_AUTO_REDIRECT bounces there to Keycloak with no button to tap.
+
+    Uses `fresh_account`, not `account` (workspace-user-student): mints and deletes its
+    own throwaway Keycloak identity so no real person's session is touched
+    (enterpriseaiframework-cf5's hazard). It never opens the Code tab or `/workshop/`, so
+    it drives no workspace pod at all -- the identity only has to exist in Keycloak for
+    chat's OIDC login and LibreChat's own auto-provisioned account row.
+    """
+    username, password = fresh_account
+    ctx = fresh_browser.new_context(**pw.devices["iPhone 13"], ignore_https_errors=True)
+    _CONTEXTS.append(ctx)
+    p = Page(ctx.new_page())
+
+    p.page.goto(f"{base_url}/", wait_until="load", timeout=60000)
+
+    # SURFACE 1: sign-in. A real Keycloak login form, rendered at a real mobile
+    # viewport/UA, reached and SUBMITTED with a touch tap -- not merely present.
+    p.page.wait_for_selector("input[name='username']", timeout=30000)
+    p.page.fill("input[name='username']", username)
+    p.page.fill("input[name='password']", password)
+    p.page.locator("input[type='submit'], button[type='submit']").first.tap()
+    p.page.wait_for_load_state("load", timeout=60000)
+
+    # SURFACE 2: the composer accepts input and a reply comes back.
+    p.page.wait_for_selector("#prompt-textarea", timeout=30000)
+    body_text = p.page.evaluate("() => document.body.innerText")
+    assert "Sign in with" not in body_text, (
+        "chat asked a brand-new mobile sign-in for a second login"
+    )
+    overflow = p.page.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
+    assert overflow <= 0, f"chat scrolls sideways by {overflow}px on a real iPhone 13 viewport"
+    p.page.screenshot(path=f"{SHOTS}/mobile-chat-landed.png")
+
+    p.page.fill("#prompt-textarea", "Say the single word hello and nothing else.")
+    # no_wait_after: sending the first message in a brand-new conversation triggers a
+    # client-side route change Playwright's default post-tap wait can mistake for a full
+    # navigation and hang on -- same reasoning as test_first_conversation.py's send tap.
+    p.page.locator('[data-testid="send-button"]').tap(timeout=10000, no_wait_after=True)
+    p.page.screenshot(path=f"{SHOTS}/mobile-chat-sent.png")
+
+    p.page.wait_for_selector('[data-testid="copy-response-button"]',
+                              timeout=MOBILE_TURN_BUDGET_S * 1000)
+    reply = p.page.evaluate("() => document.body.innerText")
+    p.page.screenshot(path=f"{SHOTS}/mobile-chat-reply.png", full_page=True)
+
+    lower = reply.lower()
+    for bad in ("something went wrong", "an error occurred"):
+        assert bad not in lower, f"the mobile turn surfaced an error signature: {bad!r}"
+
+    assert not p.console_errors, f"console errors during the mobile turn: {p.console_errors}"
+
+
+def test_mobile_code_tab_renders_and_accepts_a_keystroke_with_chrome_intact(
+        fresh_browser, pw, hosted_workshop):
+    """SURFACE 3: Code. The item calls this the case 'most likely to be broken and
+    hardest to see' -- the workshop is an iframe inside the portal, itself nesting a
+    terminal iframe. Proving it against the live cluster's real pods would mean either a
+    real person's workspace session (enterpriseaiframework-cf5's hazard) or provisioning a
+    fresh one on a host at 8.3GB free -- so this drives the same hosted, loopback stack
+    `test_the_portal_is_reachable_from_inside_the_workshop_tab` already proves the desktop
+    case against: portal.require_user, portal.me, workshop.workshop_proxy and a real
+    shell-server subprocess, all real and shipped, with a real mobile device profile
+    instead of a desktop one.
+
+    'Renders' is the same content assertions as the desktop test (project name, share
+    button, embedded class). 'Accepts a keystroke' is new: a tap-to-focus plus a real
+    typed string, checked against the stub's own echo of its `input` event -- see
+    portal_harness._make_ttyd_stub for exactly what that does and does not prove (it
+    proves the keystroke's ROUTE through two nested iframes and the real proxy; it does
+    not re-prove the real agent, which needs a real pod and is already covered,
+    non-hermetically, by test_the_agent_actually_boots_in_the_terminal above).
+    """
+    import portal_harness
+
+    p, seen = _hosted_portal(fresh_browser, hosted_workshop, context_kwargs=pw.devices["iPhone 13"])
+
+    expect(p.page.frame_locator("#frame-chat").locator("#chat-stub")).to_be_visible(
+        timeout=20000)
+
+    p.page.locator("#tab-code").tap()
+    code = p.page.frame_locator("#frame-code")
+    expect(code.locator("#project-name")).to_have_text(portal_harness.PROJECT, timeout=30000)
+    expect(code.locator("#btn-share")).to_have_text("Show someone")
+    expect(code.locator("body")).to_have_class(re.compile(r"\bembedded\b"))
+
+    # A real, shipped first-run overlay (deploy/workspace/shell/app.js, K_CURTAIN) covers
+    # the whole shell until dismissed -- a genuinely fresh browser context (no prior
+    # localStorage) sees it every time, on a phone exactly as on a desktop. Dismissed the
+    # way a person would: tapping its own "OK, I'm ready" button.
+    curtain_go = code.locator("#curtain-go")
+    if curtain_go.is_visible():
+        curtain_go.tap()
+
+    # The nested terminal iframe -- one level deeper than #frame-code, reached the same
+    # way a real ttyd would be: workshop_proxy routes "terminal/*" sub-paths to the ttyd
+    # port rather than the shell port.
+    terminal = code.frame_locator("#terminal-frame")
+    stub_input = terminal.locator("#ttyd-input")
+    stub_input.tap()
+    stub_input.press_sequentially("hello from a phone")
+    expect(terminal.locator("#ttyd-echo")).to_have_text("hello from a phone", timeout=10000)
+
+    # The claim the item names explicitly: the header stays above the frame, on a
+    # viewport with far less vertical room than the desktop version of this test has.
+    _chrome_is_not_covered(p)
+
+    overflow = p.page.evaluate(
+        "() => document.documentElement.scrollWidth - document.documentElement.clientWidth")
+    assert overflow <= 0, f"the portal scrolls sideways by {overflow}px with Code showing"
+
+    p.page.screenshot(path=f"{SHOTS}/mobile-code-tab.png")
+    p.assert_clean("the mobile portal with the workshop showing")
+
+
+def test_mobile_reads_published_work(fresh_browser, pw, hosted):
+    """SURFACE 4: published work. Opens the account menu with a tap and follows 'Your
+    shared work' exactly the way a person would on a phone -- the menu, the link's target
+    and the page it lands on are all real, shipped code (portal.me's links payload, the
+    shipped index.html/app.js); only what is AT that URL is the harness's marker stub (see
+    portal_harness.py's own module docstring for why: what is under test is whether the
+    portal's link reaches the right URL, not the static-file server behind it).
+    """
+    import portal_harness
+
+    p, seen = _hosted_portal(fresh_browser, hosted, context_kwargs=pw.devices["iPhone 13"])
+
+    p.page.locator("#avatar-btn").tap()
+    p.page.wait_for_selector("#user-menu:not([hidden])", timeout=8000)
+    assert p.page.inner_text("#username").strip() == portal_harness.USER
+
+    with p.page.context.expect_page() as popup:
+        p.page.locator("#mi-published").tap()
+    opened = popup.value
+    opened.wait_for_load_state("load", timeout=20000)
+    assert opened.url == hosted.published_url, (
+        f"'Your shared work' reached {opened.url!r} on mobile, expected "
+        f"{hosted.published_url!r}"
+    )
+    # Read as rendered DOM, not merely "the request succeeded" -- the marker text is what
+    # a person actually sees.
+    expect(opened.locator("#published-stub")).to_be_visible(timeout=10000)
+    assert portal_harness.USER in opened.locator("#published-stub").inner_text()
+    opened.close()
+
+    p.assert_clean("the mobile portal after reading published work")

@@ -30,8 +30,10 @@ Stubbed, and why:
   * `_host()` — off-cluster there is no `ws-<user>` DNS name to resolve. It is redirected
     to loopback FOR THE EXPECTED USER ONLY, so "the upstream comes from the authenticated
     name" is still live: any other name still resolves to `ws-<name>` and fails.
-  * ttyd — a page that serves one static document on the ttyd port. ttyd is not what this
-    stack is for, and the shell nests it in a further iframe.
+  * ttyd — a page on the ttyd port with one real input element on it (see
+    `_make_ttyd_stub`). ttyd itself is not what this stack is for, and the shell nests it
+    in a further iframe; the stub exists so a keystroke's ROUTE through both iframes and
+    the real proxy can be proven without ttyd's own binary.
   * chat, the account console, and the published site — three marker pages, because what
     is under test is whether the portal's links arrive at the right URL, not what the thing
     at the other end renders. They are served ONLY at the exact paths the shipped code is
@@ -248,9 +250,31 @@ def _wait_for(url: str, what: str, headers: dict | None = None,
 
 
 def _make_ttyd_stub():
+    """A stand-in for ttyd's own page.
+
+    ttyd is not installed in this harness (see the module docstring), so this cannot
+    prove a real terminal or a real agent -- `tests-live/test_browser.py`'s
+    `test_the_agent_actually_boots_in_the_terminal` already covers that, against the real
+    thing, and is explicitly not converted here (enterpriseaiframework-cf5).
+
+    What this stub CAN prove, and is extended here to prove
+    (enterpriseaiframework-eb7's mobile Code-tab leg): that a real keystroke, dispatched
+    by a touch-enabled mobile-UA'd context that tapped to focus first, survives the trip
+    through two nested same-origin iframes and the real `workshop_proxy` route (portal ->
+    #frame-code -> #terminal-frame -> here) and reaches this document's own input
+    handling. `#ttyd-echo` only ever contains what THIS page's own `input` listener
+    wrote, so its content is evidence the keystroke arrived, not an assumption that it did.
+    """
     body = (b"<!doctype html><meta charset=utf-8><title>terminal (stub)</title>"
             b"<body style='background:#12141a;color:#ddd;font:14px monospace'>"
-            b"<div id='ttyd-stub'>terminal stub</div>")
+            b"<div id='ttyd-stub'>terminal stub</div>"
+            b"<input id='ttyd-input' aria-label='terminal input (stub)'>"
+            b"<div id='ttyd-echo'></div>"
+            b"<script>"
+            b"document.getElementById('ttyd-input').addEventListener('input', function (e) {"
+            b"  document.getElementById('ttyd-echo').textContent = e.target.value;"
+            b"});"
+            b"</script>")
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
