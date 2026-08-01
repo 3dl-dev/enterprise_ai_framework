@@ -189,26 +189,29 @@ def fresh_workspace(fresh_account):
     stub -- that failure IS the proof of inability the item asks for, not a reason to
     quietly re-stub.
 
-    WORKSPACE_TAG prefers an image already pushed for THIS worktree's exact HEAD (the
-    normal `deploy/bin/kaniko-build.sh deploy/workspace <registry>/enterprise-ai-workspace:
-    $(git rev-parse --short HEAD)` an operator runs per deploy/README.md -- checked
-    against the registry's own tag list, not assumed) so this test proves whatever this
-    branch's commits actually changed; falling back to `ws-student`'s own already-running
-    image if no build exists yet at HEAD, so the fixture still works before that build
-    step has been run.
+    WORKSPACE_TAG prefers an image already pushed for the most recent commit that touched
+    `deploy/workspace/` (the normal `deploy/bin/kaniko-build.sh deploy/workspace
+    <registry>/enterprise-ai-workspace:$(git rev-parse --short HEAD)` an operator runs per
+    deploy/README.md, checked against the registry's own tag list, not assumed) -- NOT the
+    repo's overall HEAD, which changes on every commit including ones (like this file)
+    that never touch the image at all and would otherwise make this fixture flap onto a
+    stale, unbuilt tag every time an unrelated commit landed. Falls back to `ws-student`'s
+    own already-running image if no build exists yet for that path's latest commit.
     """
     username, _ = fresh_account
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    head = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
-                           capture_output=True, text=True, timeout=15).stdout.strip()
+    image_commit = subprocess.run(
+        ["git", "-C", root, "log", "-1", "--format=%h", "--", "deploy/workspace"],
+        capture_output=True, text=True, timeout=15,
+    ).stdout.strip()
     tag = None
-    if head:
+    if image_commit:
         try:
             listing = httpx.get(
                 "http://192.168.2.43:30500/v2/enterprise-ai-workspace/tags/list", timeout=10
             ).json()
-            if head in (listing.get("tags") or []):
-                tag = head
+            if image_commit in (listing.get("tags") or []):
+                tag = image_commit
         except Exception:
             pass  # registry unreachable or unexpected shape -- fall back below
     if not tag:
