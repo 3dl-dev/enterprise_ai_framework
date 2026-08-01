@@ -1,0 +1,13 @@
+[Unit]
+Description=Enterprise AI: deploy origin/main to the cluster when the suite is green
+Documentation=https://github.com/3dl-dev/enterprise_ai_framework
+# Not After=network-online.target on purpose: the script's own preconditions decide whether
+# it is safe to run, and a missed window costs nothing — the next tick picks the same commit up.
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/enterprise_ai_framework
+ExecStart=%h/projects/enterprise_ai_framework/deploy/bin/watch-and-deploy.sh
+# The suite plus a deploy is a long pass; a stuck one must not wedge the timer forever.
+TimeoutStartSec=45min
+Nice=5

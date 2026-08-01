@@ -204,3 +204,45 @@ def test_the_deploy_runs_post_deploy():
         "is what stands between a green deploy and a surface that 401s on the first prompt — "
         "which is how this was found, in production, by the founder."
     )
+
+
+def test_the_deploy_ends_by_serving_a_prompt():
+    """Pod health is not product health — 0e97 shipped Running pods and a 401 first prompt."""
+    body = DEPLOY_SH.read_text()
+    smoke = REPO / "deploy" / "bin" / "smoke.sh"
+    assert smoke.exists() and smoke.stat().st_mode & 0o111, "deploy/bin/smoke.sh is missing or not executable"
+    assert re.search(r"^(?!\s*#).*deploy/bin/smoke\.sh", body, re.M), (
+        "deploy.sh does not run deploy/bin/smoke.sh, so a deploy can still report success "
+        "over a surface that cannot serve a prompt"
+    )
+    order = body.index("post-deploy.sh"), body.rindex("deploy/bin/smoke.sh")
+    assert order[0] < order[1], (
+        "smoke runs before post-deploy.sh, so it would test the key state post-deploy is "
+        "there to repair and fail every first deploy"
+    )
+
+
+def test_the_smoke_test_allows_for_stripped_reasoning():
+    """A tiny max_tokens makes a healthy reasoning model look like an empty reply.
+
+    strip_reasoning.py removes the reasoning trace before it reaches any surface. Measured
+    against the live cluster: max_tokens=16 returned empty content on glm-5.2@deepinfra;
+    max_tokens=256 returned 'ready' in 115 completion tokens. A gate that fails healthy
+    clusters gets switched off, which is worse than not having one.
+    """
+    smoke = (REPO / "deploy" / "bin" / "smoke.sh").read_text()
+    m = re.search(r'"max_tokens":(\d+)', smoke)
+    assert m, "smoke.sh no longer sets max_tokens explicitly"
+    assert int(m.group(1)) >= 128, (
+        f"smoke.sh sends max_tokens={m.group(1)}; a reasoning model spends that on reasoning "
+        "that strip_reasoning then removes, and the smoke test fails a healthy deployment"
+    )
+
+
+def test_the_smoke_test_reads_the_model_from_the_deployed_config():
+    """Asserting against a hardcoded model proves nothing about what users are given."""
+    smoke = (REPO / "deploy" / "bin" / "smoke.sh").read_text()
+    assert "configmap chat-config" in smoke, (
+        "smoke.sh no longer derives the model from the deployed chat-config, so it can pass "
+        "against a model no user is ever offered"
+    )
