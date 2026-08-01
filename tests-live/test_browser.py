@@ -227,34 +227,28 @@ def fresh_workspace(fresh_account):
             "deploy ws-student ...) -- no known-good WORKSPACE_TAG to provision with, and "
             "guessing one is worse than failing loudly"
         )
-    # provision-workspace.sh forwards Keycloak admin and control-plane traffic over
-    # hardcoded local ports (18080/18081) and does not fail loudly if that tunnel loses
-    # the race at startup. MEASURED directly in this session, isolated with `ss -ltnp`
-    # (no port conflict) and a standalone re-run of just this test (passes cleanly,
-    # repeatedly): it reproduces specifically when `fresh_account`'s OWN long-lived
-    # port-forward to svc/identity (module-scoped, still open from the earlier sign-in
-    # test in this same file) is concurrently active -- real contention between two
-    # fixtures' kubectl processes in this same test module, not a defect in the pod this
-    # fixture provisions. The script calls itself "Repeatable and idempotent: run it twice
-    # and you get the same workspace" -- retried a bounded number of times with a short
-    # gap for that contention to clear, which is that documented guarantee used
-    # deliberately, not a timeout widened to paper over a real failure.
-    proc = None
-    for attempt in range(3):
-        if attempt:
-            time.sleep(3)
-        proc = subprocess.run(
-            ["bash", os.path.join(root, "deploy", "bin", "provision-workspace.sh"), username],
-            cwd=root, env={**os.environ, "WORKSPACE_TAG": tag},
-            capture_output=True, text=True, timeout=300,
-        )
-        if proc.returncode == 0:
-            break
+    # provision-workspace.sh reads IDP_REALM from the environment, defaulting to
+    # "enterprise-ai" only if unset -- and portal_harness.py's own _Stack.__init__ sets
+    # `os.environ["IDP_REALM"] = "harness-realm"` PROCESS-WIDE with no restoration, for its
+    # own (legitimate) reason of configuring the shipped app.portal/app.workshop modules it
+    # imports. Any test in this file that uses `hosted` (portal_harness.stack()) BEFORE
+    # this fixture runs -- which, in a full-file run, the very first mobile test does --
+    # leaves that poisoned for the rest of the pytest process. MEASURED via `bash -x`: the
+    # user lookup was querying `/admin/realms/harness-realm/users`, not
+    # `/admin/realms/enterprise-ai/users`, and got back an auth-realm-not-found response
+    # that a KeyError then surfaced as. Not a port race, not flaky contention -- fixed at
+    # the actual cause by overriding IDP_REALM back to the real cluster's realm rather than
+    # inheriting whatever the environment happens to hold.
+    proc = subprocess.run(
+        ["bash", os.path.join(root, "deploy", "bin", "provision-workspace.sh"), username],
+        cwd=root, env={**os.environ, "WORKSPACE_TAG": tag, "IDP_REALM": REALM},
+        capture_output=True, text=True, timeout=300,
+    )
     if proc.returncode != 0:
         pytest.fail(
-            f"provisioning a workspace for the throwaway account {username!r} failed 3 "
-            f"times in a row (deploy/bin/provision-workspace.sh, exit {proc.returncode}) "
-            f"-- this is a proven inability, not grounds to fall back to a stub:\n"
+            f"provisioning a workspace for the throwaway account {username!r} failed "
+            f"(deploy/bin/provision-workspace.sh, exit {proc.returncode}) -- this is a "
+            f"proven inability, not grounds to fall back to a stub:\n"
             f"stdout: {proc.stdout[-2000:]}\nstderr: {proc.stderr[-2000:]}"
         )
     try:

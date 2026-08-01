@@ -86,6 +86,16 @@ class _Stack:
         self.ttyd_port = _free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
 
+        # Saved so stop() can put them back. Without this, setting these process-wide
+        # (unavoidable -- the imported modules read them at import time, see the class
+        # docstring) leaks past this stack's own lifetime: enterpriseaiframework-eb7 found
+        # `IDP_REALM` still reading "harness-realm" in a LIVE-CLUSTER subprocess launched
+        # later in the same pytest process, because nothing had ever restored it.
+        self._env_backup = {
+            k: os.environ.get(k) for k in
+            ("PUBLIC_BASE_URL", "IDP_REALM", "WORKSPACE_INTERNAL_TOKEN",
+             "WORKSPACE_SHELL_PORT", "WORKSPACE_TTYD_PORT")
+        }
         os.environ["PUBLIC_BASE_URL"] = self.base_url
         os.environ["IDP_REALM"] = REALM
         os.environ["WORKSPACE_INTERNAL_TOKEN"] = TOKEN
@@ -121,6 +131,11 @@ class _Stack:
             srv.shutdown()
             srv.server_close()
         self._servers.clear()
+        for k, v in self._env_backup.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
     # ------------------------------------------------------------------ the workshop
 
