@@ -148,20 +148,119 @@ docker build -q -t "$IMAGE" ./control-plane
 docker push -q "$IMAGE"
 
 echo "==> apply"
-for f in 10-postgres 11-data 20-identity 30-gateway 50-chat; do
-    sed "s|REPLACED_BY_DEPLOY|${CFG_SUM}|" "deploy/k8s/${f}.yaml" | kubectl apply -f -
+# Every manifest in deploy/k8s/, in the lexical order the NN- prefixes already encode.
+#
+# This used to be a hand-written list of five files, and it silently fell behind the
+# directory: 51-file-search.yaml (rag-api) and 70-codeapi.yaml were merged, tested and
+# closed, and then never deployed, because nobody thought to add them here. A feature that
+# ships a manifest must not also have to ship an edit to this loop — so the loop reads the
+# directory, and anything that must NOT be applied is excluded BY NAME below, with a reason.
+# An exclusion is a decision; an omission was an accident.
+#
+# `image: REPLACED_BY_DEPLOY` is NOT one placeholder — it is the same spelling used by seven
+# manifests for seven DIFFERENT images (mcp-echo, fakeprovider, the two web-search services,
+# and six codeapi images), each built separately by deploy/bin/kaniko-build.sh. Only
+# 40-control-plane.yaml's is the image this script builds.
+#
+# Substituting $IMAGE into all of them is not a hypothetical: it was done here on 2026-08-01
+# and it put the control-plane image into fakeprovider, mcp-echo, rerank and webfetch, which
+# then crash-looped on `KeyError: CONTROL_PLANE_DATABASE_URL` — three of them had been
+# healthy for four days. So the substitution is scoped to the one manifest it belongs to, and
+# any OTHER manifest still carrying an unresolved `image:` placeholder is a hard error: its
+# image was never built and pushed, and applying it would replace a working workload with a
+# wrong one. Refusing is the whole point — a deploy that cannot deploy something must say so
+# rather than deploy something else.
+needs_built_image() { grep -q '^\s*image: REPLACED_BY_DEPLOY' "$1"; }
+skip_manifest() {
+    case "$1" in
+        # Applied above, before the Secrets that everything else depends on.
+        00-namespace.yaml) return 0 ;;
+        # Gated on the worker reboot window (enterpriseaiframework-feb). Applying these
+        # before the virtiofs device is live binds PVCs to a path that is not there yet.
+        01-tank-pvs.yaml) return 0 ;;
+        # A template, not a manifest: carries per-user placeholders and is rendered one pod
+        # at a time by deploy/bin/provision-workspace.sh.
+        61-workspace.template.yaml) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+unbuilt=()
+for path in deploy/k8s/*.yaml; do
+    f="$(basename "$path")"
+    if skip_manifest "$f"; then
+        echo "    skip $f"
+        continue
+    fi
+    if [[ "$f" == 40-control-plane.yaml ]]; then
+        # The one image this script builds and pushes, a few lines above.
+        rendered=$(sed -e "s|image: REPLACED_BY_DEPLOY|image: ${IMAGE}|" \
+                       -e "s|REPLACED_BY_DEPLOY|${CFG_SUM}|" "$path")
+    elif needs_built_image "$path"; then
+        unbuilt+=("$f")
+        echo "    HOLD  $f — image not built"
+        continue
+    else
+        rendered=$(sed "s|REPLACED_BY_DEPLOY|${CFG_SUM}|" "$path")
+    fi
+    echo "    apply $f"
+    printf '%s\n' "$rendered" | kubectl apply -f -
 done
-sed "s|image: REPLACED_BY_DEPLOY|image: ${IMAGE}|" deploy/k8s/40-control-plane.yaml | kubectl apply -f -
+
+if (( ${#unbuilt[@]} )); then
+    echo >&2
+    echo "warning: held back ${#unbuilt[@]} manifest(s) whose images this script does not build:" >&2
+    printf '           %s\n' "${unbuilt[@]}" >&2
+    echo "         Their images come from deploy/bin/kaniko-build.sh and are substituted by" >&2
+    echo "         hand today, so this script has no tag to put in. Holding them is" >&2
+    echo "         deliberate: 05/06/07 are already running the right images, and applying" >&2
+    echo "         them blind would replace working workloads with the wrong one." >&2
+    echo "         70-codeapi.yaml has never been deployed, which is why chat advertises" >&2
+    echo "         code execution against a service that is not there (enterpriseaiframework-c8b)." >&2
+    echo "         Closing this properly means deploy.sh builds and pushes every image it" >&2
+    echo "         deploys, the way it already does for the control plane:" >&2
+    echo "         enterpriseaiframework-d5f." >&2
+fi
 
 echo
 echo "==> waiting for rollout"
-for d in postgres chatdb; do kubectl -n "$NS" rollout status statefulset/"$d" --timeout=300s; done
-for d in valkey identity gateway control-plane chat; do
-    kubectl -n "$NS" rollout status deployment/"$d" --timeout=600s || true
+# Derived from the namespace rather than hand-listed, for the same reason the apply loop is.
+# ws-* are per-user workspace pods provisioned by provision-workspace.sh on demand; one
+# user's broken pod is not a reason to fail a platform deploy.
+#
+# No `|| true` here. It used to swallow failed rollouts, so a deploy whose chat pod never
+# came up still exited 0 — the same "every signal says success over a broken product"
+# failure that enterpriseaiframework-0e97 and -00c are both instances of.
+rollout_failed=0
+for kind in statefulset deployment; do
+    for name in $(kubectl -n "$NS" get "$kind" -o name | sed 's|.*/||' | grep -v '^ws-' | sort); do
+        if ! kubectl -n "$NS" rollout status "$kind/$name" --timeout=600s; then
+            echo "ERROR: $kind/$name did not roll out" >&2
+            rollout_failed=1
+        fi
+    done
 done
+if (( rollout_failed )); then
+    echo >&2
+    echo "error: at least one workload failed to roll out; the deploy is NOT complete." >&2
+    kubectl -n "$NS" get pods -o wide >&2
+    exit 1
+fi
 
 echo
 kubectl -n "$NS" get pods -o wide
+
+echo
+echo "==> post-deploy reconciliation"
+# enterpriseaiframework-0e97: this was never called, and the founder hit the consequence in
+# production — login succeeded, the first prompt returned 401, because the chat surface held
+# a virtual key the gateway had no record of. post-deploy.sh already contained the guard
+# that detects and repairs exactly that (probe CHAT_VIRTUAL_KEY against /key/info, and on
+# anything but 200 delete the stale alias, mint a fresh key, patch the Secret, restart chat).
+# A deploy that cannot serve a prompt should not exit 0, so this is part of deploying, not
+# an optional follow-up somebody has to remember.
+PUBLIC_BASE_URL="$PUBLIC_BASE_URL" deploy/bin/post-deploy.sh
+
 cat <<EOF
 
   Chat (NodePort)      http://<k3s-worker>:30380     -> front with Caddy at ${PUBLIC_BASE_URL}
