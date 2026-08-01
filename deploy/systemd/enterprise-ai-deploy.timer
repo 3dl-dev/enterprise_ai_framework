@@ -1,0 +1,14 @@
+[Unit]
+Description=Check origin/main for a green commit to deploy
+
+[Timer]
+# Every 20 minutes, with jitter so a run never lands at a predictable moment against the
+# shared host. Persistent so a commit that landed while the machine was off is still picked
+# up rather than skipped.
+OnBootSec=10min
+OnUnitActiveSec=20min
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
