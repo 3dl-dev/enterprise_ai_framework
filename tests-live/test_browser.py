@@ -224,16 +224,28 @@ def fresh_workspace(fresh_account):
             "deploy ws-student ...) -- no known-good WORKSPACE_TAG to provision with, and "
             "guessing one is worse than failing loudly"
         )
-    proc = subprocess.run(
-        ["bash", os.path.join(root, "deploy", "bin", "provision-workspace.sh"), username],
-        cwd=root, env={**os.environ, "WORKSPACE_TAG": tag},
-        capture_output=True, text=True, timeout=300,
-    )
+    # provision-workspace.sh forwards Keycloak admin and control-plane traffic over
+    # hardcoded local ports (18080/18081) and does not fail loudly if that tunnel loses
+    # the race at startup -- MEASURED directly in this session: one run in five got a
+    # "curl: (7) Failed to connect to localhost port 18080" and a KeyError from the admin
+    # user lookup parsing an auth-failure body as a list; the immediate next run (same
+    # command, same machine) succeeded cleanly. The script calls itself "Repeatable and
+    # idempotent: run it twice and you get the same workspace" -- this is that guarantee
+    # used deliberately, not a timeout widened to paper over a real failure.
+    proc = None
+    for attempt in range(2):
+        proc = subprocess.run(
+            ["bash", os.path.join(root, "deploy", "bin", "provision-workspace.sh"), username],
+            cwd=root, env={**os.environ, "WORKSPACE_TAG": tag},
+            capture_output=True, text=True, timeout=300,
+        )
+        if proc.returncode == 0:
+            break
     if proc.returncode != 0:
         pytest.fail(
             f"provisioning a workspace for the throwaway account {username!r} failed "
-            f"(deploy/bin/provision-workspace.sh, exit {proc.returncode}) -- this is a "
-            f"proven inability, not grounds to fall back to a stub:\n"
+            f"twice in a row (deploy/bin/provision-workspace.sh, exit {proc.returncode}) "
+            f"-- this is a proven inability, not grounds to fall back to a stub:\n"
             f"stdout: {proc.stdout[-2000:]}\nstderr: {proc.stderr[-2000:]}"
         )
     try:
