@@ -148,20 +148,82 @@ docker build -q -t "$IMAGE" ./control-plane
 docker push -q "$IMAGE"
 
 echo "==> apply"
-for f in 10-postgres 11-data 20-identity 30-gateway 50-chat; do
-    sed "s|REPLACED_BY_DEPLOY|${CFG_SUM}|" "deploy/k8s/${f}.yaml" | kubectl apply -f -
+# Every manifest in deploy/k8s/, in the lexical order the NN- prefixes already encode.
+#
+# This used to be a hand-written list of five files, and it silently fell behind the
+# directory: 51-file-search.yaml (rag-api) and 70-codeapi.yaml were merged, tested and
+# closed, and then never deployed, because nobody thought to add them here. A feature that
+# ships a manifest must not also have to ship an edit to this loop — so the loop reads the
+# directory, and anything that must NOT be applied is excluded BY NAME below, with a reason.
+# An exclusion is a decision; an omission was an accident.
+#
+# Both substitutions run on every file, image first: the CFG_SUM pattern is a prefix of the
+# image pattern, so the reverse order would rewrite `image: REPLACED_BY_DEPLOY` to a config
+# hash and deploy a nonexistent image.
+skip_manifest() {
+    case "$1" in
+        # Applied above, before the Secrets that everything else depends on.
+        00-namespace.yaml) return 0 ;;
+        # Gated on the worker reboot window (enterpriseaiframework-feb). Applying these
+        # before the virtiofs device is live binds PVCs to a path that is not there yet.
+        01-tank-pvs.yaml) return 0 ;;
+        # A template, not a manifest: carries per-user placeholders and is rendered one pod
+        # at a time by deploy/bin/provision-workspace.sh.
+        61-workspace.template.yaml) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+for path in deploy/k8s/*.yaml; do
+    f="$(basename "$path")"
+    if skip_manifest "$f"; then
+        echo "    skip $f"
+        continue
+    fi
+    echo "    apply $f"
+    sed -e "s|image: REPLACED_BY_DEPLOY|image: ${IMAGE}|" \
+        -e "s|REPLACED_BY_DEPLOY|${CFG_SUM}|" "$path" | kubectl apply -f -
 done
-sed "s|image: REPLACED_BY_DEPLOY|image: ${IMAGE}|" deploy/k8s/40-control-plane.yaml | kubectl apply -f -
 
 echo
 echo "==> waiting for rollout"
-for d in postgres chatdb; do kubectl -n "$NS" rollout status statefulset/"$d" --timeout=300s; done
-for d in valkey identity gateway control-plane chat; do
-    kubectl -n "$NS" rollout status deployment/"$d" --timeout=600s || true
+# Derived from the namespace rather than hand-listed, for the same reason the apply loop is.
+# ws-* are per-user workspace pods provisioned by provision-workspace.sh on demand; one
+# user's broken pod is not a reason to fail a platform deploy.
+#
+# No `|| true` here. It used to swallow failed rollouts, so a deploy whose chat pod never
+# came up still exited 0 — the same "every signal says success over a broken product"
+# failure that enterpriseaiframework-0e97 and -00c are both instances of.
+rollout_failed=0
+for kind in statefulset deployment; do
+    for name in $(kubectl -n "$NS" get "$kind" -o name | sed 's|.*/||' | grep -v '^ws-' | sort); do
+        if ! kubectl -n "$NS" rollout status "$kind/$name" --timeout=600s; then
+            echo "ERROR: $kind/$name did not roll out" >&2
+            rollout_failed=1
+        fi
+    done
 done
+if (( rollout_failed )); then
+    echo >&2
+    echo "error: at least one workload failed to roll out; the deploy is NOT complete." >&2
+    kubectl -n "$NS" get pods -o wide >&2
+    exit 1
+fi
 
 echo
 kubectl -n "$NS" get pods -o wide
+
+echo
+echo "==> post-deploy reconciliation"
+# enterpriseaiframework-0e97: this was never called, and the founder hit the consequence in
+# production — login succeeded, the first prompt returned 401, because the chat surface held
+# a virtual key the gateway had no record of. post-deploy.sh already contained the guard
+# that detects and repairs exactly that (probe CHAT_VIRTUAL_KEY against /key/info, and on
+# anything but 200 delete the stale alias, mint a fresh key, patch the Secret, restart chat).
+# A deploy that cannot serve a prompt should not exit 0, so this is part of deploying, not
+# an optional follow-up somebody has to remember.
+PUBLIC_BASE_URL="$PUBLIC_BASE_URL" deploy/bin/post-deploy.sh
+
 cat <<EOF
 
   Chat (NodePort)      http://<k3s-worker>:30380     -> front with Caddy at ${PUBLIC_BASE_URL}
