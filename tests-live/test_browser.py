@@ -189,23 +189,40 @@ def fresh_workspace(fresh_account):
     stub -- that failure IS the proof of inability the item asks for, not a reason to
     quietly re-stub.
 
-    WORKSPACE_TAG is read from `ws-student`'s own already-running image rather than
-    guessed: `provision-workspace.sh`'s own default (`git rev-parse --short HEAD`) is not
-    necessarily what has actually been pushed to the rail registry at any given moment,
-    and this worktree's HEAD commonly is not.
+    WORKSPACE_TAG prefers an image already pushed for THIS worktree's exact HEAD (the
+    normal `deploy/bin/kaniko-build.sh deploy/workspace <registry>/enterprise-ai-workspace:
+    $(git rev-parse --short HEAD)` an operator runs per deploy/README.md -- checked
+    against the registry's own tag list, not assumed) so this test proves whatever this
+    branch's commits actually changed; falling back to `ws-student`'s own already-running
+    image if no build exists yet at HEAD, so the fixture still works before that build
+    step has been run.
     """
     username, _ = fresh_account
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    tag = subprocess.run(
-        ["kubectl", "-n", NS, "get", "deploy", "ws-student",
-         "-o", "jsonpath={.spec.template.spec.containers[0].image}"],
-        capture_output=True, text=True, timeout=30,
-    ).stdout.rsplit(":", 1)[-1]
+    head = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=15).stdout.strip()
+    tag = None
+    if head:
+        try:
+            listing = httpx.get(
+                "http://192.168.2.43:30500/v2/enterprise-ai-workspace/tags/list", timeout=10
+            ).json()
+            if head in (listing.get("tags") or []):
+                tag = head
+        except Exception:
+            pass  # registry unreachable or unexpected shape -- fall back below
+    if not tag:
+        tag = subprocess.run(
+            ["kubectl", "-n", NS, "get", "deploy", "ws-student",
+             "-o", "jsonpath={.spec.template.spec.containers[0].image}"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.rsplit(":", 1)[-1]
     if not tag:
         pytest.fail(
-            "could not read ws-student's image tag from the live cluster (kubectl -n "
-            f"{NS} get deploy ws-student ...) -- no known-good WORKSPACE_TAG to provision "
-            "with, and guessing one is worse than failing loudly"
+            "no image tagged with this worktree's HEAD in the rail registry, AND could "
+            f"not read ws-student's image tag from the live cluster (kubectl -n {NS} get "
+            "deploy ws-student ...) -- no known-good WORKSPACE_TAG to provision with, and "
+            "guessing one is worse than failing loudly"
         )
     proc = subprocess.run(
         ["bash", os.path.join(root, "deploy", "bin", "provision-workspace.sh"), username],
