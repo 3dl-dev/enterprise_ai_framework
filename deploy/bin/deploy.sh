@@ -261,6 +261,12 @@ echo "==> post-deploy reconciliation"
 # an optional follow-up somebody has to remember.
 PUBLIC_BASE_URL="$PUBLIC_BASE_URL" deploy/bin/post-deploy.sh
 
+echo
+echo "==> smoke"
+# The deploy's own definition of success. Pod health is not product health: 0e97 shipped a
+# cluster where every pod was Running and the first prompt returned 401. This sends one.
+deploy/bin/smoke.sh
+
 cat <<EOF
 
   Chat (NodePort)      http://<k3s-worker>:30380     -> front with Caddy at ${PUBLIC_BASE_URL}
