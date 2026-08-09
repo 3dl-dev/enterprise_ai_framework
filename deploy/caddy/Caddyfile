@@ -1,0 +1,125 @@
+:8080 {
+    handle_path /v1/audio/speech* {
+        reverse_proxy inference-a.stealth.baron.local:8880
+    }
+    handle_path /v1/audio/transcriptions* {
+        reverse_proxy inference-a.stealth.baron.local:8200
+    }
+    handle /v1/chat/completions* {
+        reverse_proxy inference-a.stealth.baron.local:8000
+    }
+    handle /v1/models* {
+        reverse_proxy inference-a.stealth.baron.local:8000
+    }
+    handle /v1/images/generations* {
+        reverse_proxy inference-b.stealth.baron.local:8188
+    }
+    respond 404
+}
+
+# enterprise-ai-framework chat surface (k3s NodePort on k3s-worker).
+# Plain HTTP here: Tailscale Funnel terminates TLS in front with the node cert.
+:8081 {
+    # Identity and the chat surface must share one public origin, or the OIDC issuer
+    # check fails. Keycloak owns these paths; the chat surface owns everything else.
+    handle /realms/* {
+        reverse_proxy 192.168.2.44:30382
+    }
+    handle /resources/* {
+        reverse_proxy 192.168.2.44:30382
+    }
+    # Published work. Deliberately NOT behind any auth: the audience is parents, who have
+    # no account. Static files only, served by a plain web server with no interpreter and
+    # no workspace volume mounted, so a published page cannot reach back into anyone work.
+    handle /live/* {
+        reverse_proxy 192.168.2.44:30450
+    }
+    # The portal — the signed-in front door that ties the surfaces together. Same
+    # origin as chat and identity on purpose: the OIDC issuer must be byte-identical
+    # between browser and backchannel, and a second origin would need a second cert the
+    # funnel cannot present. oauth2-proxy inside that pod owns /portal/oauth2/*.
+    handle /portal/* {
+        reverse_proxy 192.168.2.44:30460
+    }
+    # The workshop, proxied by the portal so it is a tab on this origin rather than a
+    # separate site on a LAN address. Same upstream as /portal/* — the control plane
+    # serves both, and its oauth2-proxy authenticates this path too.
+    handle /workshop/* {
+        reverse_proxy 192.168.2.44:30460
+    }
+    # The bare landing page is the portal wrapper (Chat/Code tabs, spend, keys, published
+    # work), never raw LibreChat. enterpriseaiframework-6c9 follow-up. Only a top-level
+    # browser navigation is redirected: the portal embeds chat in an iframe whose src is
+    # this same origin root (control-plane/app/portal_static/app.js), and that request —
+    # like LibreChat's own post-login redirect back to `/` inside that frame — carries
+    # `Sec-Fetch-Dest: iframe` and must fall through to chat, or the wrapper would nest
+    # itself. Matches the root path ONLY: chat's /api, /assets, /oauth, /c/... are
+    # unaffected because they are not exactly `/`.
+    handle / {
+        @not_iframe not header Sec-Fetch-Dest iframe
+        redir @not_iframe /portal/ 302
+        reverse_proxy 192.168.2.44:30380
+    }
+    handle {
+        reverse_proxy 192.168.2.44:30380
+    }
+}
+
+# LAN-side TLS for the same hostname the public funnel serves.
+#
+# Required because the chat surface completes its OIDC token exchange from INSIDE the
+# cluster, and the cluster is not on the tailnet: it resolves the funnel host to the
+# public ingress and the connection is reset. Pods reach this listener directly over the
+# LAN instead (via hostAliases), using the same hostname and port so the OIDC issuer still
+# matches. tailscaled binds 8443 only on the tailnet addresses, so the LAN IP is free.
+https://gateway.tailcb6ef9.ts.net:8443 {
+    bind 192.168.2.42
+    tls /etc/caddy/certs/ts.crt /etc/caddy/certs/ts.key
+    handle /realms/* {
+        reverse_proxy 192.168.2.44:30382
+    }
+    handle /resources/* {
+        reverse_proxy 192.168.2.44:30382
+    }
+    # Published work. Deliberately NOT behind any auth: the audience is parents, who have
+    # no account. Static files only, served by a plain web server with no interpreter and
+    # no workspace volume mounted, so a published page cannot reach back into anyone work.
+    handle /live/* {
+        reverse_proxy 192.168.2.44:30450
+    }
+    # The portal — the signed-in front door that ties the surfaces together. Same
+    # origin as chat and identity on purpose: the OIDC issuer must be byte-identical
+    # between browser and backchannel, and a second origin would need a second cert the
+    # funnel cannot present. oauth2-proxy inside that pod owns /portal/oauth2/*.
+    handle /portal/* {
+        reverse_proxy 192.168.2.44:30460
+    }
+    # The workshop, proxied by the portal so it is a tab on this origin rather than a
+    # separate site on a LAN address. Same upstream as /portal/* — the control plane
+    # serves both, and its oauth2-proxy authenticates this path too.
+    handle /workshop/* {
+        reverse_proxy 192.168.2.44:30460
+    }
+    # The bare landing page is the portal wrapper (Chat/Code tabs, spend, keys, published
+    # work), never raw LibreChat. enterpriseaiframework-6c9 follow-up. Only a top-level
+    # browser navigation is redirected: the portal embeds chat in an iframe whose src is
+    # this same origin root (control-plane/app/portal_static/app.js), and that request —
+    # like LibreChat's own post-login redirect back to `/` inside that frame — carries
+    # `Sec-Fetch-Dest: iframe` and must fall through to chat, or the wrapper would nest
+    # itself. Matches the root path ONLY: chat's /api, /assets, /oauth, /c/... are
+    # unaffected because they are not exactly `/`.
+    handle / {
+        @not_iframe not header Sec-Fetch-Dest iframe
+        redir @not_iframe /portal/ 302
+        reverse_proxy 192.168.2.44:30380
+    }
+    handle {
+        reverse_proxy 192.168.2.44:30380
+    }
+}
+
+# enterprise-ai Coder workspace (ws-baron). Funnel-exposed on :10000 because the
+# workspace NodePorts live on 192.168.2.x and the operator is on another subnet.
+:8083 {
+    reverse_proxy 192.168.2.44:30440
+}

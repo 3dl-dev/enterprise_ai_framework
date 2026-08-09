@@ -46,6 +46,27 @@ for svc in meilisearch rag-api; do
         || echo "    WARNING: $svc is not Running; the capability chat advertises is absent" >&2
 done
 
+echo "==> smoke: the chat surface's OpenID login strategy is actually registered"
+# enterpriseaiframework-6c9: LibreChat registers its OpenID passport strategy exactly once, at
+# boot, and never retries. A boot before Keycloak/Caddy were serving the issuer left it
+# unregistered, so /oauth/openid 500'd ("Unknown authentication strategy openid") and login
+# was dead for four days while /health stayed 200 and every pod was Running. "The login page
+# loaded" is a different claim from "login works" — this sends the request that actually broke.
+# 302 -> registered (it redirects to Keycloak); 500 -> not. The wait-for-oidc initContainer in
+# deploy/k8s/50-chat.yaml is what should keep this green; this proves it did.
+kubectl -n "$NS" port-forward svc/chat 13080:3080 >/dev/null 2>&1 &
+CPF=$!
+for _ in $(seq 1 20); do
+    curl -sf -o /dev/null "http://localhost:13080/health" && break
+    sleep 1
+done
+login_code=$(curl -sS -o /dev/null -w '%{http_code}' "http://localhost:13080/oauth/openid" || echo 000)
+kill $CPF 2>/dev/null || true
+if [[ "$login_code" != "302" ]]; then
+    fail "the chat surface's OpenID login strategy is not registered (/oauth/openid -> HTTP $login_code, expected 302). This is enterpriseaiframework-6c9: chat booted before the issuer was reachable and never retried. Restart chat once Keycloak+Caddy are serving the public issuer."
+fi
+echo "    /oauth/openid -> 302: OpenID strategy registered, login will work"
+
 echo "==> smoke: a real completion using the key the chat surface holds"
 kubectl -n "$NS" port-forward svc/gateway 14100:4000 >/dev/null 2>&1 &
 PF=$!

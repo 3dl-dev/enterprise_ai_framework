@@ -68,6 +68,43 @@ spec:
       # files. Copy-on-boot also means a skill change needs a pod restart, which is
       # already true of DEPLOYMENT_SKILLS_DIR (scanned once into a module singleton).
       initContainers:
+        # WHY THIS EXISTS — enterpriseaiframework-6c9, a login outage measured on this
+        # cluster on 2026-08-09. LibreChat registers its OpenID passport strategy exactly
+        # ONCE, at boot, by fetching the issuer's discovery document; if that fetch fails it
+        # logs "OpenID Connect configuration failed - strategy not registered." and NEVER
+        # retries. On 2026-08-05 the cluster rebooted and chat started before Keycloak+Caddy
+        # were serving the public issuer, so the strategy never registered and every visit
+        # thereafter 500'd on /oauth/openid ("Unknown authentication strategy openid") — with
+        # OPENID_AUTO_REDIRECT the bare landing page bounced straight into that 500. Every pod
+        # showed Running/Ready throughout: this failure is invisible to k8s health.
+        #
+        # The compose bundle never hit this because `depends_on: identity: condition:
+        # service_healthy` orders its start (bundle/docker-compose.yml). k8s has no such
+        # ordering, so THIS initContainer is that ordering. It blocks until the same public
+        # discovery URL the app is about to fetch returns 200, reached through the same
+        # hostAliases as the app (so it exercises the real network path, not just Keycloak's
+        # ClusterIP), so the app container only starts once the fetch it will make at boot is
+        # known to succeed. If Keycloak never comes up the pod sits in Init — the correct,
+        # visible state, not a green pod behind a dead login.
+        #
+        # A plain curl image, NOT the librechat image: the cluster's issuer is fronted by a
+        # public Let's Encrypt (ts.net) cert that any standard CA bundle trusts, so no special
+        # trust store is needed here — and reusing the librechat image would add a second
+        # `ghcr.io/danny-avila/librechat:` line that tests/test_chat_surface_version.py reads
+        # as a compose/cluster version mismatch.
+        - name: wait-for-oidc
+          image: curlimages/curl:8.11.0
+          command: ["sh", "-c"]
+          args:
+            - |
+              url="$OPENID_ISSUER/.well-known/openid-configuration"
+              until curl -sf -o /dev/null --max-time 5 "$url"; do
+                echo "oidc discovery not ready at $url, retrying"; sleep 3
+              done
+              echo "oidc discovery ready: $url"
+          env:
+            - name: OPENID_ISSUER
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: OPENID_ISSUER } }
         - name: materialise-skills
           image: busybox:1.36
           command: ["sh", "-c"]
@@ -268,6 +305,19 @@ spec:
             # pair here — see deploy/bin/lib/tenant-skills.sh for that tradeoff.
             # The materialised copy, NOT the ConfigMap mounts — see the initContainer.
             - { name: skills, mountPath: /app/skill, readOnly: true }
+          # enterpriseaiframework-6c9 defense-in-depth. The initContainer above prevents the
+          # boot race; this catches any OTHER reason the OpenID strategy fails to register at
+          # boot. /oauth/openid returns 302 once the strategy is registered and 500 while it
+          # is not — the exact signature of the outage. A pod that comes up without a
+          # registered strategy therefore fails startup and is restarted, instead of serving a
+          # broken login behind a green /health (which is what happened for four days).
+          # Measured on this cluster: /oauth/openid is NOT login-rate-limited (12 rapid hits
+          # all 302), so probing it is safe. 30 x 5s = 150s of boot grace; once it first
+          # succeeds the readinessProbe takes over and this path is not hit again.
+          startupProbe:
+            httpGet: { path: /oauth/openid, port: 3080 }
+            periodSeconds: 5
+            failureThreshold: 30
           readinessProbe:
             httpGet: { path: /health, port: 3080 }
             initialDelaySeconds: 30
