@@ -22,11 +22,16 @@ here; it is tests-live/test_agent_model_api.py against the real cluster.
 
 import base64
 import os
+import re
 import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "deploy/bin/provision-agent.sh"
+# The turnkey one-shot (enterpriseaiframework-e5ca), which COMPOSES the script above rather
+# than duplicating any of it. Driven through the same recorders, so the composition itself
+# — the argv it hands the provisioner, and what it does afterwards — is the subject.
+HERMES = REPO / "deploy/bin/hermes-up.sh"
 
 # What the fake control plane hands back when asked to issue a key, and what the fake
 # cluster holds in enterprise-ai-secrets. Values are distinctive so their appearance
@@ -64,15 +69,52 @@ apply)
     ;;
 get)
     # `get secret <name> -o jsonpath={.data.<field>}` — answered from $STUB_DIR/state.
-    name=""; field=""
+    #
+    # Deployments and pods are answered the same way. They are dispatched on the JSONPATH
+    # THE SCRIPT ACTUALLY SENT rather than on a reimplementation of jsonpath: this is a
+    # recorder, and a second, approximate kubectl would be a thing to get wrong that the
+    # real cluster would then disagree with. What is asserted downstream is the script's
+    # reaction to the value, and the value is seeded by the test.
+    name=""; jp=""
     for ((i=0; i<${#args[@]}; i++)); do
         case "${args[$i]}" in
             secret) name="${args[$((i+1))]:-}" ;;
-            jsonpath=*) field="${args[$i]#jsonpath=\{.data.}"; field="${field%\}}" ;;
+            jsonpath=*) jp="${args[$i]#jsonpath=}" ;;
         esac
     done
-    f="$STUB_DIR/state/${name}.${field}"
-    [[ -f "$f" ]] && base64 -w0 < "$f"
+    case "$jp" in
+        '{.data.'*)
+            field="${jp#\{.data.}"; field="${field%\}}"
+            f="$STUB_DIR/state/${name}.${field}"
+            [[ -f "$f" ]] && base64 -w0 < "$f"
+            ;;
+        *'type=="Available"'*)
+            cat "$STUB_DIR/state/deployment-available" 2>/dev/null || printf 'True' ;;
+        *'items[0].metadata.name'*)
+            cat "$STUB_DIR/state/pod-name" 2>/dev/null || printf 'stub-pod' ;;
+        *'.status.phase'*)
+            cat "$STUB_DIR/state/pod-phase" 2>/dev/null || printf 'Running' ;;
+    esac
+    ;;
+exec)
+    # `exec <pod> -c agent -- bash -c '<script>'`. The script is the LAST argument and is
+    # the real one hermes-up.sh sends; the branch is chosen by what that script does, so a
+    # rewritten check that no longer probes the gateway stops matching and the test that
+    # depends on it fails rather than silently passing on a stale answer.
+    script="${args[$(( ${#args[@]} - 1 ))]}"
+    rc=0
+    case "$script" in
+        *"agent-slack config"*|*"agent-discord config"*)
+            cat "$STUB_DIR/state/chat-config" 2>/dev/null || echo '{}'
+            rc=$(cat "$STUB_DIR/state/chat-config-rc" 2>/dev/null || echo 0) ;;
+        *opencode.json*)
+            cat "$STUB_DIR/state/doc-state" 2>/dev/null || echo DOC_WIRED ;;
+        *chat/completions*)
+            cat "$STUB_DIR/state/gateway-out" 2>/dev/null || echo "200 http://gateway:4000/v1 m"
+            rc=$(cat "$STUB_DIR/state/gateway-rc" 2>/dev/null || echo 0) ;;
+        *)  echo "stub kubectl exec: unrecognised in-pod script" >&2; rc=127 ;;
+    esac
+    exit "$rc"
     ;;
 create)
     # `create ... --dry-run=client -o yaml` renders a manifest on stdout; the caller pipes
@@ -242,6 +284,123 @@ class Run:
         return None
 
 
+def _install_stubs(tmp_path: Path, obj: str, *, existing_key: str | None = None,
+                   existing_email_sum: str | None = None,
+                   existing_slack_sum: str | None = None,
+                   existing_discord_sum: str | None = None,
+                   cluster: dict | None = None) -> Path:
+    """Write the recording kubectl/curl and seed what the cluster already holds.
+
+    `cluster` seeds the plain-text answers for everything that is not a Secret: the
+    Deployment's Available condition, the pod's name and phase, and what each in-pod check
+    replies. Those are the inputs a validating turnkey script REACTS to, so they are also
+    where a failure has to be injectable — a validator that cannot be shown refusing is a
+    validator nobody has evidence works.
+    """
+    stub_dir = tmp_path / "stubs"
+    (stub_dir / "bin").mkdir(parents=True, exist_ok=True)
+    (stub_dir / "state").mkdir(parents=True, exist_ok=True)
+
+    (stub_dir / "state" / "enterprise-ai-secrets.CONTROL_PLANE_ADMIN_TOKEN").write_text(ADMIN_TOKEN)
+    (stub_dir / "state" / "enterprise-ai-secrets.GATEWAY_MASTER_KEY").write_text(MASTER_KEY)
+    if existing_key is not None:
+        (stub_dir / "state" / f"{obj}-key.OPENAI_API_KEY").write_text(existing_key)
+    for label, value in (("email", existing_email_sum), ("slack", existing_slack_sum),
+                         ("discord", existing_discord_sum)):
+        if value is not None:
+            (stub_dir / "state"
+             / f"{obj}-{label}.AGENT_{label.upper()}_CONFIG_SUM").write_text(value)
+    for name, value in (cluster or {}).items():
+        if value is not None:
+            (stub_dir / "state" / name).write_text(value)
+
+    kubectl = stub_dir / "bin" / "kubectl"
+    kubectl.write_text(_KUBECTL)
+    kubectl.chmod(0o755)
+    curl = stub_dir / "bin" / "curl"
+    curl.write_text(_CURL.replace("ISSUED_KEY_PLACEHOLDER", ISSUED_KEY))
+    curl.chmod(0o755)
+    return stub_dir
+
+
+def _run(script: Path, stub_dir: Path, args, env: dict | None) -> Run:
+    environ = dict(os.environ)
+    environ.update({
+        "PATH": f"{stub_dir / 'bin'}:{environ['PATH']}",
+        "STUB_DIR": str(stub_dir),
+        "STUB_LOG": str(stub_dir / "calls.log"),
+        "AGENT_IMAGE": "registry.invalid/enterprise-ai-workspace:test",
+    })
+    # A BYO base exported into the developer's own shell would change what the scripts
+    # under test do. Cleared rather than inherited.
+    for leak in ("AGENT_BYO_API_KEY", "AGENT_BYO_API_BASE", "AGENT_OPENAI_API_KEY",
+                 "AGENT_SLACK_CONFIG_FILE", "AGENT_DISCORD_CONFIG_FILE",
+                 "AGENT_EMAIL_CONFIG_FILE"):
+        environ.pop(leak, None)
+    environ.update(env or {})
+
+    proc = subprocess.run(
+        ["bash", str(script), *args],
+        capture_output=True, text=True, timeout=300, env=environ, cwd=str(REPO),
+    )
+    return Run(proc, stub_dir)
+
+
+def _integrated_gateway_base() -> str:
+    """The base an integrated agent's pod actually reports, per the script that sets it.
+
+    Read out of provision-agent.sh rather than written down again here. hermes-up.sh
+    REFUSES a base that is not our gateway (a BYO agent answers 200 too and produces no
+    ledger row), so if this were a second copy of the literal, changing the provisioner's
+    GATEWAY_BASE would leave the healthy fixture agreeing with the stale value and every
+    test green while the real command refused every real agent.
+    """
+    text = (REPO / "deploy/bin/provision-agent.sh").read_text()
+    match = re.search(r'^GATEWAY_BASE="([^"]+)"', text, re.M)
+    assert match, "provision-agent.sh no longer defines GATEWAY_BASE"
+    return match.group(1)
+
+
+# What a healthy cluster answers. Every hermes_up() test starts from these and overrides
+# exactly the one that is the subject, so an injected failure is visible as a one-line diff
+# from "everything is fine".
+HEALTHY = {
+    "deployment-available": "True",
+    "pod-phase": "Running",
+    "chat-config": '{"bot_token_set": true, "app_token_set": true, '
+                   '"default_channel": "C0123ABCD"}',
+    "doc-state": "DOC_WIRED",
+    "gateway-out": f"200 {_integrated_gateway_base()} glm-5.2@deepinfra",
+    "gateway-rc": "0",
+}
+
+
+def hermes_up(tmp_path: Path, *args: str, existing_key: str | None = None,
+              existing_slack_sum: str | None = None,
+              existing_discord_sum: str | None = None,
+              public_base_url: str = "https://gateway.example.ts.net:8443",
+              cluster: dict | None = None, env: dict | None = None) -> Run:
+    """Run the REAL deploy/bin/hermes-up.sh, which runs the REAL provision-agent.sh.
+
+    Nothing about the composition is modelled: hermes-up.sh invokes the provisioner as a
+    subprocess exactly as it does on a cluster, and both are observed through the same
+    recorders. What the test asserts is what an operator would see — the argv the
+    provisioner was handed, the checks that were run inside the pod, and whether the word
+    READY was printed.
+    """
+    obj = f"agent-{args[0]}-{args[1]}"
+    state = dict(HEALTHY)
+    state.setdefault("pod-name", f"{obj}-6d7c9f5b84-mn2kq")
+    state.update(cluster or {})
+    stub_dir = _install_stubs(
+        tmp_path, obj, existing_key=existing_key,
+        existing_slack_sum=existing_slack_sum, existing_discord_sum=existing_discord_sum,
+        cluster=state,
+    )
+    (stub_dir / "state" / "enterprise-ai-secrets.PUBLIC_BASE_URL").write_text(public_base_url)
+    return _run(HERMES, stub_dir, args, env)
+
+
 def provision(tmp_path: Path, *args: str, existing_key: str | None = None,
               existing_email_sum: str | None = None,
               existing_slack_sum: str | None = None,
@@ -261,40 +420,10 @@ def provision(tmp_path: Path, *args: str, existing_key: str | None = None,
     `existing_slack_sum` / `existing_discord_sum` are the same input for the chat
     connectors (enterpriseaiframework-783), which are provisioned by the same code path.
     """
-    stub_dir = tmp_path / "stubs"
-    (stub_dir / "bin").mkdir(parents=True, exist_ok=True)
-    (stub_dir / "state").mkdir(parents=True, exist_ok=True)
-
-    (stub_dir / "state" / "enterprise-ai-secrets.CONTROL_PLANE_ADMIN_TOKEN").write_text(ADMIN_TOKEN)
-    (stub_dir / "state" / "enterprise-ai-secrets.GATEWAY_MASTER_KEY").write_text(MASTER_KEY)
     # args[0]/args[1] are <user> <name>; the object family is agent-<user>-<name>.
     obj = f"agent-{args[0]}-{args[1]}"
-    if existing_key is not None:
-        (stub_dir / "state" / f"{obj}-key.OPENAI_API_KEY").write_text(existing_key)
-    for label, value in (("email", existing_email_sum), ("slack", existing_slack_sum),
-                         ("discord", existing_discord_sum)):
-        if value is not None:
-            (stub_dir / "state"
-             / f"{obj}-{label}.AGENT_{label.upper()}_CONFIG_SUM").write_text(value)
-
-    kubectl = stub_dir / "bin" / "kubectl"
-    kubectl.write_text(_KUBECTL)
-    kubectl.chmod(0o755)
-    curl = stub_dir / "bin" / "curl"
-    curl.write_text(_CURL.replace("ISSUED_KEY_PLACEHOLDER", ISSUED_KEY))
-    curl.chmod(0o755)
-
-    environ = dict(os.environ)
-    environ.update({
-        "PATH": f"{stub_dir / 'bin'}:{environ['PATH']}",
-        "STUB_DIR": str(stub_dir),
-        "STUB_LOG": str(stub_dir / "calls.log"),
-        "AGENT_IMAGE": "registry.invalid/enterprise-ai-workspace:test",
-    })
-    environ.update(env or {})
-
-    proc = subprocess.run(
-        ["bash", str(SCRIPT), *args],
-        capture_output=True, text=True, timeout=300, env=environ, cwd=str(REPO),
+    stub_dir = _install_stubs(
+        tmp_path, obj, existing_key=existing_key, existing_email_sum=existing_email_sum,
+        existing_slack_sum=existing_slack_sum, existing_discord_sum=existing_discord_sum,
     )
-    return Run(proc, stub_dir)
+    return _run(SCRIPT, stub_dir, args, env)
