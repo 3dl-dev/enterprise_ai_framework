@@ -777,6 +777,20 @@ function openStuck(reason) {
   $("dlg-stuck").showModal();
 }
 $("terminal-frame").addEventListener("load", refitTerminal);
+
+// The load + drawer-transition nudges above miss the case that actually bites a fresh
+// visit: the pane settles its FINAL size a beat after load — fonts, the preview drawer
+// arriving, the portal's own iframe laying out — and by then ttyd has already measured the
+// wrong row count and will only re-fit on a real window resize. That is the
+// maximize/unmaximize dance users discover. A ResizeObserver on the terminal's own box
+// catches every one of those late settles and re-fits, so the terminal is right on first
+// paint without anyone resizing anything. Dispatching the synthetic 'resize' does not
+// change the iframe element's size, so this cannot feed back into itself.
+if (window.ResizeObserver) {
+  const tf = $("terminal-frame");
+  if (tf) new ResizeObserver(() => refitTerminal()).observe(tf);
+}
+
 $("btn-new-session").addEventListener("click", async () => {
   if (!await confirmDialog({
     title: "Start a fresh chat?",
