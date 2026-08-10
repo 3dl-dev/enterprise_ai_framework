@@ -739,3 +739,148 @@ def test_an_unknown_model_is_refused_and_changes_nothing(shell):
     r = shell.post("/api/model", {"model": "definitely-not-a-model"})
     assert r.status_code == 400
     assert shell.get("/api/state").json()["model"] == before
+
+
+# ------------------------------------------------------------------ booting state
+#
+# These drive the REAL page in a real browser rather than asserting on the source, because
+# what broke was timing, not text: every function involved already existed and every one of
+# them ran. Clicking "Start something new" assigned the terminal iframe's .src and fired a
+# toast in the same tick, and .src does not wait for load — so the only feedback the user
+# got was a message that appeared and expired over a black rectangle while ttyd respawned
+# the shell and the agent cold-booted inside it. A source-level test cannot tell that apart
+# from the fixed version.
+#
+# The iframe itself 404s here (ttyd is a separate process and is not running), which is
+# fine and is not what is under test: the assertion is about what the workshop paints over
+# the terminal while the terminal is not yet there.
+
+BOOT_SETTLE_MS = 2000       # must match app.js
+PAGE_TIMEOUT = 15000
+
+
+@pytest.fixture
+def page(shell):
+    pw = pytest.importorskip("playwright.sync_api")
+    with pw.sync_playwright() as p:
+        browser = p.chromium.launch()
+        ctx = browser.new_context(extra_http_headers={"X-Workspace-Token": TEST_TOKEN})
+        pg = ctx.new_page()
+        pg.goto(shell.base + "/", timeout=PAGE_TIMEOUT)
+        # The menu is rendered by load(), which is async — wait for the real thing rather
+        # than for a bare DOM ready that would race it.
+        pg.wait_for_selector("#project-menu button.new", state="attached", timeout=PAGE_TIMEOUT)
+        yield pg
+        ctx.close()
+        browser.close()
+
+
+def _make_project(page, name: str) -> None:
+    page.click("#project-button")
+    page.click("#project-menu button.new")
+    page.fill("#new-name", name)
+    page.click("#new-go")
+
+
+def test_starting_something_new_paints_a_booting_state(page):
+    """The reported bug, inverted into an assertion.
+
+    Before the fix there was nothing at all between the dialog closing and the agent's
+    first paint. `#booting` must be up essentially immediately — not after a round trip,
+    because the round trip is part of what the user is waiting through.
+    """
+    assert page.is_hidden("#booting")
+    _make_project(page, "space cats")
+    page.wait_for_selector("#booting", state="visible", timeout=PAGE_TIMEOUT)
+
+    # The overlay outlives the request that raised it and goes on to narrate the reload,
+    # so the name has to survive that handover. It did not at first: the second phase
+    # reset the text to a generic "Starting the agent…", which is the least useful moment
+    # to stop saying what is being started.
+    page.wait_for_function(
+        """() => {
+             const t = document.getElementById('booting-text').textContent;
+             return t.includes('space cats') && t.includes('agent');
+           }""",
+        timeout=PAGE_TIMEOUT,
+    )
+
+
+def test_the_booting_state_does_not_clear_while_no_agent_exists(page, shell):
+    """`busy: null` means "no agent process visible", and that is the whole signal.
+
+    The failure this rules out is an overlay cleared by a timer or by the iframe's own load
+    event: ttyd's page loads long before the agent inside it does, so clearing on load
+    would reproduce the original bug with an extra frame of ceremony. No agent is running
+    in this fixture, so the correct behaviour is to keep waiting.
+    """
+    foreign = _foreign_agents()
+    if foreign:
+        pytest.skip("an agent is running on this host, so 'no agent' cannot be asserted:\n  "
+                    + "\n  ".join(foreign))
+    _make_project(page, "quiet project")
+    page.wait_for_selector("#booting", state="visible", timeout=PAGE_TIMEOUT)
+    # Comfortably past the settle window and several client poll cycles.
+    page.wait_for_timeout(BOOT_SETTLE_MS + 2500)
+    assert page.is_visible("#booting"), (
+        "the booting overlay cleared while /api/pulse still reported busy=null — nothing "
+        "had started, so something other than the agent signal cleared it"
+    )
+
+
+def test_the_booting_state_clears_once_an_agent_is_actually_running(page, tmp_path):
+    """The other half: a real process named `opencode` makes pulse report non-null busy.
+
+    Same fake-agent mechanism as test_busy_latches_through_all_three_states — a copy of the
+    interpreter renamed, so the server's /proc scan sees a genuine agent name rather than a
+    stub the test taught it to recognise.
+    """
+    _make_project(page, "loud project")
+    page.wait_for_selector("#booting", state="visible", timeout=PAGE_TIMEOUT)
+
+    fake = tmp_path / "opencode"
+    fake.write_bytes(Path(sys.executable).read_bytes())
+    fake.chmod(0o755)
+    proc = subprocess.Popen([str(fake), "-c", "import time; time.sleep(60)"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        page.wait_for_selector("#booting", state="hidden", timeout=PAGE_TIMEOUT)
+    finally:
+        proc.kill()
+        proc.wait(timeout=TIMEOUT)
+
+
+def test_a_rejected_name_puts_the_terminal_back(page, shell):
+    """A 400 must not strand the user under a spinner for a project that was never made.
+
+    'alpha' already exists in the fixture root, so /api/projects refuses it.
+    """
+    _make_project(page, "alpha")
+    # Wait on the REFUSAL, not on the overlay: `#booting` is hidden before the click is
+    # processed as well as after the failure is handled, so waiting for hidden first
+    # passes instantly and proves nothing.
+    page.wait_for_selector("#toast", state="visible", timeout=PAGE_TIMEOUT)
+    assert "alpha" in page.text_content("#toast")
+    assert page.is_hidden("#booting"), (
+        "a refused name left the booting overlay up — the user is watching a spinner for "
+        "a project that was never created"
+    )
+
+
+def test_losing_contact_retracts_the_booting_claim(page):
+    """"Starting the agent…" is a claim, and it stops being true when contact is lost.
+
+    The failure bar is the statement that matters once the workshop is unreachable, and it
+    is the only one the user can act on. A spinner still asserting progress on top of it
+    would be this surface's cardinal sin — narrating something nobody can observe.
+
+    WHAT THIS DOES AND DOES NOT PROVE: the failure bar is revealed directly rather than by
+    severing the server, because the client waits 40 s before showing it and a 40 s test
+    would be paid for on every run forever. So this exercises the real syncBooting through
+    the real 500 ms ticker against the real DOM, but it does not prove the bar itself
+    appears — test_the_ribbon_degrades_when_pulse_dies and the failbar tests own that half.
+    """
+    _make_project(page, "doomed project")
+    page.wait_for_selector("#booting", state="visible", timeout=PAGE_TIMEOUT)
+    page.eval_on_selector("#bar-lost", "el => el.hidden = false")
+    page.wait_for_selector("#booting", state="hidden", timeout=PAGE_TIMEOUT)

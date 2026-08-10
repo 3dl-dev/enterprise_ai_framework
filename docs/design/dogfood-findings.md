@@ -1417,6 +1417,56 @@ setting SearXNG answers 403 and the search leg reports "no results" rather than 
 misconfiguration — which is why the container's healthcheck runs a real JSON query instead of
 a liveness probe.
 
+### 43. The coding surface reloaded the terminal instantly and told the user nothing, so a working boot read as a dead product
+
+Found by using it, and reported in the shape every silent-latency bug is reported in: "it did
+nothing, and apparently didn't work — but things got slow." The user's own words are still in
+the pod, in opencode's `prompt-history.jsonl`, because they typed the bug report *into the
+agent they thought was broken*: `its just all black once i click in. nothign`.
+
+Nothing was broken. Every function ran, in order, successfully.
+
+**The mechanism is that the fast half is the visible half.** Clicking "Start something new"
+POSTs `/api/projects`, which is `mkdir` plus `git init` — milliseconds
+(`deploy/workspace/shell-server.py`). Then `reloadPanes()` assigns the terminal iframe's
+`.src`, and `.src` does not wait for load. So the surface fired its success toast, and the
+work the user was actually waiting on had not started yet: ttyd kills the old shell, spawns a
+fresh one per websocket, and `opencode` cold-boots inside it — measured on the live
+`ws-baron` pod at 55% CPU and 712 MB RSS, in a pod capped at 1 CPU
+(`deploy/k8s/61-workspace.template.yaml`). The toast then expired on its 6-second timer,
+mid-boot. What remained on screen was a black rectangle.
+
+Every ingredient of "the product is broken" was present and none of "the product is working"
+was: no pending state on any control, the project menu closing as the sole acknowledgement of
+the click, a message about a project appearing and vanishing, and then a long black pane.
+
+**Why this is a product defect and not a polish item.** The same surface already refuses to
+narrate what it cannot observe — `/api/pulse` reports `busy: null` rather than guessing when
+no agent process is visible, on the stated grounds that a fabricated "still working" is the
+exact failure this product exists to avoid. The inverse was never covered: the surface was
+equally willing to say *nothing at all* during a state it could describe precisely. Silence
+is not the safe default. It is indistinguishable from failure, and a user cannot file a bug
+against a black rectangle.
+
+**The fix, and the two rules it is built on.** Every terminal reload now goes through one
+`reloadTerminal()` that raises a persistent booting state, and that state is retracted by
+ground truth rather than by a timer: the first `/api/pulse` sample taken *after* the reload
+that reports a non-null `busy` is the agent genuinely running. A settle window guards against
+believing a sample that is still describing the outgoing agent. Two fallbacks exist so a
+stuck overlay can never outlive what it describes — a hard ceiling, and immediate retraction
+the moment the "lost contact" bar appears, because a spinner asserting progress on top of a
+connection failure is the fabricated-status bug wearing the fix's clothes. The overlay sits
+*below* the failure bars in z-order for the same reason.
+
+Proven the way this repo prefers: the four browser tests added to
+`tests/test_workspace_shell.py` were run against the pre-fix page, where three of them fail
+by timing out waiting for a booting state that never appears. The fourth passes before and
+after — it guards the refusal path of the fix itself (a rejected name must not strand the
+user under a spinner), not the original defect.
+
+**Not fixed here, and separately tracked.** The 1-CPU pod running one agent per terminal
+connection is `enterpriseaiframework-3fe`; nothing in this finding raises the resource
+envelope or bounds the agent count.
 ### 46. The resident meter under-reports a pod that lives and dies between two samples
 
 `enterpriseaiframework-914` meters an agent's resident time by sampling `status.startTime`

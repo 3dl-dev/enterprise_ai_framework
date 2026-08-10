@@ -69,6 +69,22 @@
       <button class="btn small" id="btn-restart-term">Restart the terminal</button>
     </div>
 
+    <!-- Shown whenever the terminal frame is being replaced. ttyd spawns a fresh shell per
+         websocket and the agent cold-boots inside it, so between the reload and the agent's
+         first paint the pane is legitimately black — the frame has painted, the agent has
+         not. On a 1-CPU workspace pod that is seconds, not milliseconds. Before this
+         existed the only feedback was a toast fired the instant the iframe's .src was
+         assigned (which does not wait for load) and expired after 6 s, so the common
+         experience of "Start something new" was a message about a project appearing and
+         vanishing over a black rectangle. Not a <dialog>: it must not trap focus, because
+         the thing behind it is where the user is about to type. -->
+    <div id="booting" hidden role="status">
+      <div class="booting-card">
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="booting-text">Starting the agent…</span>
+      </div>
+    </div>
+
     <!-- Not a <dialog>: its whole message is "click the dark box behind me and type",
          and a focus trap makes that impossible. -->
     <div id="curtain" hidden role="dialog" aria-modal="false" aria-labelledby="curtain-h">
