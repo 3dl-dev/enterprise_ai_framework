@@ -12,11 +12,16 @@
 <header class="bar">
   <div class="brand"><span class="mark">◆</span><span class="brandname">Enterprise AI</span></div>
 
-  <!-- Two surfaces, one page. Closest thing to claude.ai: you do not get bounced to
-       another app, and the tab you were last on is where you come back. -->
+  <!-- Three surfaces, one page. Closest thing to claude.ai: you do not get bounced to
+       another app, and the tab you were last on is where you come back.
+
+       Chat and Code are surfaces you are GIVEN. Agents is the one you MAKE — each row is
+       a real Deployment with its own volume, its own key and its own bill, created and
+       destroyed from here (enterpriseaiframework-627). -->
   <nav class="tabs" role="tablist" aria-label="Surfaces">
     <button class="tab" id="tab-chat" role="tab" aria-selected="true" aria-controls="view-chat">Chat</button>
     <button class="tab" id="tab-code" role="tab" aria-selected="false" aria-controls="view-code">Code</button>
+    <button class="tab" id="tab-agents" role="tab" aria-selected="false" aria-controls="view-agents">Agents</button>
   </nav>
 
   <div class="spacer"></div>
@@ -52,6 +57,37 @@
       <h3>Your workshop is not running</h3>
       <p>It may still be starting up. If this does not clear, tell whoever set this up.</p>
       <button class="btn" id="code-retry">Try again</button>
+    </div>
+  </section>
+
+  <!-- Not an iframe. Chat and Code embed something that already exists; this view IS the
+       surface — a list of the caller's own agents and the four controls that drive
+       Contract 2's transitions. Every row shows both metering dimensions side by side:
+       inference SPEND in dollars, and resident-time / compute USAGE as quantities. They
+       are never added together, because the second one has no price. -->
+  <section class="view scroll" id="view-agents" role="tabpanel" aria-labelledby="tab-agents" hidden>
+    <div class="agents-wrap">
+      <div class="agents-head">
+        <div>
+          <h2>Your agents</h2>
+          <p class="note top">An agent keeps working while you are away — it is a resident
+            process with its own disk, not a window you have to leave open. Stopping one
+            keeps its work and costs nothing; deleting one destroys its disk for good.</p>
+        </div>
+        <form class="agents-new" id="agent-new">
+          <input id="agent-name" name="name" placeholder="new agent name"
+                 aria-label="New agent name" autocomplete="off"
+                 pattern="[a-z0-9][a-z0-9-]{0,38}" required>
+          <select id="agent-model" aria-label="Model"></select>
+          <button class="btn primary" id="agent-create" type="submit">Create</button>
+        </form>
+      </div>
+
+      <p class="warn" id="agents-error" hidden></p>
+      <ul class="agentlist" id="agentlist"></ul>
+      <p class="empty" id="agents-empty" hidden>
+        No agents yet. Name one above and it starts running in about a minute.
+      </p>
     </div>
   </section>
 </div>

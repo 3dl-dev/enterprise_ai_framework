@@ -129,6 +129,20 @@ spec:
             - name: AGENT_USAGE_SAMPLE_SECONDS
               value: "60"
           ports: [{ containerPort: 8000 }]
+          volumeMounts:
+            # The agent object set and the resident entrypoint, so the portal's Agents tab
+            # can render a real agent (enterpriseaiframework-627). They live under
+            # deploy/, and this image is built from control-plane/ alone, so a ConfigMap
+            # is how they arrive — exactly the way provision-agent.sh already delivers the
+            # entrypoint to an agent pod. Mounting THE SAME FILES the operator script
+            # renders is the point: a Python copy of the Deployment shape would drift from
+            # deploy/k8s/64-agent.template.yaml and the drift would be invisible until an
+            # agent came up different from a hand-provisioned one.
+            #
+            # `optional: true` so a control plane deployed before the ConfigMap exists
+            # still starts and serves chat, code, spend and keys; only agent CREATION
+            # fails, and app/agents.py names this ConfigMap in the error when it does.
+            - { name: agent-assets, mountPath: /etc/agent-assets, readOnly: true }
           readinessProbe:
             httpGet: { path: /health, port: 8000 }
             initialDelaySeconds: 10
@@ -195,3 +209,9 @@ spec:
           resources:
             requests: { cpu: "25m", memory: "32Mi" }
             limits:   { cpu: "200m", memory: "128Mi" }
+      volumes:
+        # Built from the repository by deploy/bin/deploy.sh, not hand-written here: a
+        # 265-line template pasted into a ConfigMap manifest is a second copy that nobody
+        # would notice going stale.
+        - name: agent-assets
+          configMap: { name: agent-assets, optional: true }
