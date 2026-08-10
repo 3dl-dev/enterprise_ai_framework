@@ -107,9 +107,9 @@ spec:
     #   10.42.0.0/16    every other pod, including other agents and every workspace
     #   169.254.0.0/16  link-local, i.e. any metadata service
     #
-    # Note what is NOT copied from the workspace policy: its egress to 192.168.2.42:8443
-    # exists for the per-pod oauth2-proxy sidecar's OIDC backchannel. An agent pod has no
-    # sidecar and no OIDC flow of its own, so it does not get that rule.
+    # Note what is NOT copied from the workspace policy: its egress to 192.168.2.42:443
+    # exists for the OIDC backchannel to the public TLS edge. An agent pod has no OIDC flow
+    # of its own, so it does not get that rule.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0

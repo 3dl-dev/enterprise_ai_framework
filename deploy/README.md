@@ -7,12 +7,12 @@ one-command uninstall.
 ```bash
 op signin                                   # credentials come from 1Password via direnv
 direnv reload
-export PUBLIC_BASE_URL=https://gateway.tailcb6ef9.ts.net:8443
+export PUBLIC_BASE_URL=https://gateway.tailcb6ef9.ts.net
 deploy/bin/deploy.sh
 deploy/bin/post-deploy.sh                   # realm redirect URIs, bootstrap user, key sync
 ```
 
-**Live at <https://gateway.tailcb6ef9.ts.net:8443>** — real Let's Encrypt cert, OIDC login
+**Live at <https://gateway.tailcb6ef9.ts.net>** — real Let's Encrypt cert, OIDC login
 verified end to end.
 
 Everything lives in the `enterprise-ai` namespace. `kubectl delete namespace enterprise-ai`
@@ -24,7 +24,7 @@ is a complete uninstall.
 |---|---|---|
 | **Portal** | NodePort 30460 | `/portal/*` on the same origin. The signed-in front door: links to every surface, your spend, your keys, your published work, and the account console. oauth2-proxy sidecar on the control-plane pod authenticates first |
 | Workshop | *(no port)* | `/workshop/*` on the same origin, proxied by the portal to the signed-in user's own pod. It has no URL of its own — see below |
-| Chat | NodePort 30380 | Gateway VM Caddy `:8081`, behind Tailscale Funnel on `:8443` |
+| Chat | NodePort 30380 | Gateway VM Caddy `:8081`, behind Tailscale Funnel on `:443` |
 | Identity | NodePort 30382 | Same origin as chat — Caddy routes `/realms/*` and `/resources/*` here. They **must** share an origin or the OIDC issuer check fails |
 | Gateway | NodePort 30400 | LAN/tailnet only — not published to the internet |
 | Control plane | ClusterIP only | Its **admin** API is a shared static token (finding 11) and stays unpublished; reach it with `kubectl -n enterprise-ai port-forward svc/control-plane 8081:8000`. Only `/portal/*` is routed publicly, and signing in there confers no operator capability |

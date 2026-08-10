@@ -1562,3 +1562,53 @@ the concatenation the way the shell does, `deploy/bin/deploy.sh` puts all of the
 `tests/test_agent_assets.py` parses all three lists and fails on drift. The third list is
 the trap: the control-plane image is built from `control-plane/` alone, so a file the
 deploy does not hand it is one it cannot ship even when it means to.
+
+### 51. The portal was published on port 8443, which venue wifi blocks, so an off-tailnet laptop got a connection timeout
+
+A user could not reach the portal from a laptop that was not on the tailnet: every load
+ended in a connection *timeout*. The portal itself was fine — from a tailnet host
+`https://gateway.tailcb6ef9.ts.net:8443/portal/` returned its 302 to login instantly, Caddy
+was up, and Tailscale Funnel was on. The tell was the shape of the failure. A dead service
+*refuses* a connection, fast; a filtered port yields *no answer at all*, which is a timeout.
+
+The portal's public origin was `https://gateway.tailcb6ef9.ts.net:8443` — a nonstandard
+port, and one that camp/school/venue networks routinely block outbound while allowing 443
+and 80. So a device off the tailnet, on exactly the kind of network this product is used on,
+could not open the port at all. Confirmed in one move: the same laptop got a 404 (i.e. a
+real HTTP answer) from the bare `:443` origin while `:8443` timed out — 443 reachable, 8443
+filtered.
+
+Why the portal was on 8443 at all: Tailscale Funnel exposes only ports 443, 8443 and 10000,
+and `:443` was already taken by a co-tenant local-inference edge (`/v1/*` → the inference
+hosts). The portal, chat and identity must share one origin — the OIDC issuer has to be
+byte-identical between the browser and the in-cluster backchannel — so the whole surface sat
+on the one remaining low port, 8443.
+
+**Fixed** in `enterpriseaiframework-e32` by moving the whole enterprise-ai origin to the
+standard `:443` and pushing inference to `:8443` (nothing depended on public inference). The
+move is a coordinated origin change, because the issuer must stay consistent end to end:
+
+- `PUBLIC_BASE_URL` and `OPENID_ISSUER` (the `enterprise-ai-secrets` Secret) dropped the
+  `:8443`; Keycloak's `KC_HOSTNAME`, oauth2-proxy's issuer URL and LibreChat's OIDC config
+  all derive from that one value.
+- Keycloak restarted to serve the port-less issuer, then `post-deploy.sh` + `setup-portal.sh`
+  repointed the `librechat` and `portal` client redirect URIs at the bare origin.
+- On the gateway VM, Tailscale Funnel was repointed (`:443` → the portal Caddy block `:8081`,
+  Funnel on; `:8443` → inference, tailnet-only), and the LAN-side OIDC listener that pods
+  reach via `hostAliases` was given a `:443` address (same `ts.crt`; `:443` was free on the
+  LAN interface, since Funnel binds only the tailnet address).
+- Chat and control-plane restarted to re-read the issuer at boot; the three workspace pods
+  had `WS_PUBLISH_URL` (the parent-share base) corrected off `:8443` so share links keep
+  working.
+
+Verified against the running cluster: `smoke.sh` passes (OIDC strategy registered, a real
+completion served), and the full public flow on `:443` returns the right redirects at the
+bare origin — portal → oauth2 → Keycloak → callback, all port-less. The config defaults that
+would have silently reverted the move on the next deploy (`watch-and-deploy.sh`,
+`provision-workspace.sh`, the Caddyfile, the READMEs, the workspace egress port) were moved
+to `:443` in the same change, so config-as-code matches the live cluster.
+
+The general lesson is the one AGENTS.md rule 1 already states for a different reason: **the
+venue's network is hostile to anything nonstandard.** A nonstandard *port* fails the same way
+a remote CDN reference does — fine on the builder's network, dead at the venue — and the fix
+is the same shape: use the boring, universally-allowed thing (`:443`).

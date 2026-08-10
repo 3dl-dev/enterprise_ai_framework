@@ -43,7 +43,7 @@ STATE="$STATE_DIR/last-deployed-sha"
 LOCK="$STATE_DIR/watch-and-deploy.lock"
 LOG="$STATE_DIR/watch-and-deploy.log"
 MIN_FREE_GB="${MIN_FREE_GB:-8}"
-PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://gateway.tailcb6ef9.ts.net:8443}"
+PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://gateway.tailcb6ef9.ts.net}"
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 

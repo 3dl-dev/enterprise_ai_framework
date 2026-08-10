@@ -80,8 +80,11 @@
 # cluster, and the cluster is not on the tailnet: it resolves the funnel host to the
 # public ingress and the connection is reset. Pods reach this listener directly over the
 # LAN instead (via hostAliases), using the same hostname and port so the OIDC issuer still
-# matches. tailscaled binds 8443 only on the tailnet addresses, so the LAN IP is free.
-https://gateway.tailcb6ef9.ts.net:8443 {
+# matches. The public origin moved to :443 (venue wifi blocks the nonstandard :8443 —
+# enterpriseaiframework-e32), so the issuer is now port-less and this listener serves :443.
+# :8443 is kept as a second address for a transition window and is harmless. tailscaled
+# binds the funnel ports only on the tailnet addresses, so the LAN IP is free for both.
+https://gateway.tailcb6ef9.ts.net:443, https://gateway.tailcb6ef9.ts.net:8443 {
     bind 192.168.2.42
     tls /etc/caddy/certs/ts.crt /etc/caddy/certs/ts.key
     handle /realms/* {
