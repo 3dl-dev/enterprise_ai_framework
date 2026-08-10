@@ -47,6 +47,15 @@
     handle /workshop/* {
         reverse_proxy 192.168.2.44:30460
     }
+    # An agent's console, attached by the portal at /agents/<name>/. Same upstream again,
+    # and it must be listed: without this rule the path falls through to `handle` below
+    # and lands on LibreChat, which answers its own 404 — a console that "does not exist"
+    # rather than one that is not routed. The owner is NEVER in this path (Contract 1 of
+    # docs/design/records/agents-surface.md); the control plane resolves it from the
+    # identity oauth2-proxy established, so there is nothing here to scope per user.
+    handle /agents/* {
+        reverse_proxy 192.168.2.44:30460
+    }
     # The bare landing page is the portal wrapper (Chat/Code tabs, spend, keys, published
     # work), never raw LibreChat. enterpriseaiframework-6c9 follow-up. Only a top-level
     # browser navigation is redirected: the portal embeds chat in an iframe whose src is
@@ -98,6 +107,15 @@ https://gateway.tailcb6ef9.ts.net:8443 {
     # separate site on a LAN address. Same upstream as /portal/* — the control plane
     # serves both, and its oauth2-proxy authenticates this path too.
     handle /workshop/* {
+        reverse_proxy 192.168.2.44:30460
+    }
+    # An agent's console, attached by the portal at /agents/<name>/. Same upstream again,
+    # and it must be listed: without this rule the path falls through to `handle` below
+    # and lands on LibreChat, which answers its own 404 — a console that "does not exist"
+    # rather than one that is not routed. The owner is NEVER in this path (Contract 1 of
+    # docs/design/records/agents-surface.md); the control plane resolves it from the
+    # identity oauth2-proxy established, so there is nothing here to scope per user.
+    handle /agents/* {
         reverse_proxy 192.168.2.44:30460
     }
     # The bare landing page is the portal wrapper (Chat/Code tabs, spend, keys, published

@@ -17,6 +17,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from . import (
+    agent_console,
     agent_usage,
     chat_identity,
     db,
@@ -73,6 +74,12 @@ app.include_router(portal.router)
 # The workshop, proxied so it can be a tab on this origin instead of a LAN address that
 # hangs from any other network. See workshop.py for what replaced the per-pod proxy.
 app.include_router(workshop.router)
+# An agent's console, ATTACHED — never spawned — at /agents/<name>/ on this same origin.
+# A separate module from workshop.py rather than an edit to it: Contract 6 of
+# docs/design/records/agents-surface.md freezes the Code surface, the residency semantics
+# are the opposite of ttyd's spawn-per-websocket, and the agent port has no NodePort at
+# all, so this proxy is the only door to it. See agent_console.py.
+app.include_router(agent_console.router)
 
 
 # ---------------------------------------------------------------- health

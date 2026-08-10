@@ -30,6 +30,18 @@ fi
 # Deliberately NOT control-plane/requirements.txt wholesale: that also pulls asyncpg and
 # pymongo for a live database the auth test stubs out rather than starts.
 "$VENV/bin/pip" install --quiet fastapi==0.118.0
+# websockets, pinned to the version control-plane/requirements.txt runs, for
+# control-plane/tests/test_agent_console.py. The agent console's terminal panel is a
+# websocket and app/agent_console.py bridges it with this library; the test stands a real
+# websocket server up on loopback and drives the bridge through it, so a stub would be
+# mocking the transport that is under test.
+"$VENV/bin/pip" install --quiet websockets==13.1
+# uvicorn, pinned the same way, because two of that file's claims cannot be made through
+# TestClient: its ASGI transport collects a whole response body before returning it (so a
+# proxy that buffered an event stream would look streamed) and an in-process call has no
+# socket to close (so a "disconnect" would not be one). Those tests run the app behind a
+# real server on loopback instead.
+"$VENV/bin/pip" install --quiet uvicorn==0.37.0
 # PyJWT[crypto] (pulls in `cryptography`) for tests/test_code_execution.py's cross-user
 # isolation probe: it mints its own EdDSA codeapi bearer JWTs with the SAME signing key
 # and claim shape LibreChat's packages/api/src/auth/codeapi.ts uses, so it can drive
