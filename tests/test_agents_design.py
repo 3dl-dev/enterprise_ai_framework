@@ -105,3 +105,29 @@ def test_reserved_rulings_are_marked_not_silently_chosen(record_text):
     assert record_text.count("RESERVED") >= 2, "the two reserved rulings are not marked"
     assert "Maddy" in record_text, "email recommendation missing"
     assert "core-hour" in record_text, "resident-time cost-basis recommendation missing"
+
+
+def test_the_resident_metering_ruling_is_recorded_as_usage_not_cost(record_text, design_section):
+    """Baron ruled Contract 3(b): meter USAGE, not cost. Both artifacts must say so.
+
+    Recorded as a test rather than only as prose because the record still contains the
+    RECOMMENDATION it overruled — a resident-hour plus core-hour rate, with the dollar
+    figures reserved — and a reader who finds that paragraph without the ruling builds the
+    rate. This is the mechanical form of "the ruling travels with the recommendation".
+
+    It is deliberately checked in BOTH files. design.md §12 is the summary an operator
+    reads and the record is the detail; the two disagreeing about whether this dimension
+    has a price is precisely the drift the source-of-truth ordering exists to prevent.
+    """
+    for name, text in (("the agents-surface record", record_text),
+                       ("design.md §12", design_section)):
+        lowered = text.lower()
+        assert "meter usage, not cost" in lowered, (
+            f"{name} does not record Baron's ruling on the resident meter. It is normative: "
+            "owned hardware is sunk cost, only inference has a real upstream bill, and the "
+            "second dimension is quantities (hours, CPU-core-hours, MB) with no rate."
+        )
+    assert "FUTURE item" in record_text, (
+        "the record does not say where a cost basis would go if commodity cloud compute is "
+        "ever added — without that, the ruling reads as an omission rather than a decision"
+    )

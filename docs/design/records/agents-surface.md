@@ -1,7 +1,9 @@
 # Design record — the resident "Agents" surface
 
 **Status:** design record for epic `enterpriseaiframework-da7`. Normative for the six
-contracts below; two rulings inside them are RESERVED to Baron and marked as such.
+contracts below; two rulings inside them were RESERVED to Baron and marked as such — the
+email default (Contract 5) is still open, and the resident-metering cost basis (Contract 3b)
+was RULED in `-914`: **meter usage, not cost. Do not reintroduce a rate.**
 **Referenced by:** `docs/design/design.md` §12 (the source-of-truth section that points
 here and states the binding contracts).
 **Consumed by:** `enterpriseaiframework-055` (resident pod + parallel provisioner), `-627`
@@ -188,7 +190,7 @@ The Deployment uses `strategy: Recreate` and a ReadWriteOnce PVC, for the same r
 workspace does: two replicas of one stateful agent is never what anyone wanted, and a
 rolling update would try to start a second.
 
-| State | k8s reality | Cost |
+| State | k8s reality | Meter (usage, not cost — see 3b) |
 |---|---|---|
 | **created** | PVC + Service + BYO Secret applied; Deployment applied at `replicas: 1`; pod scheduling. | begins accruing once the pod is Running |
 | **running** | `replicas: 1`, pod Ready, `opencode serve` up. | accrues resident-time + compute (Contract 3) |
@@ -210,7 +212,7 @@ Transitions, each a concrete k8s action `-627` drives:
   `deleted`, so a half-deleted agent cannot leave a spendable BYO Secret or a resident PVC
   behind.
 
-**"Stopped accrues no resident cost" is expressible exactly because stopped means
+**"Stopped accrues no resident usage" is expressible exactly because stopped means
 `replicas: 0`.** There is no pod, so there is no `status.startTime` advancing and no cAdvisor
 counter incrementing (Contract 3). The cost is *literally* zero, not "billed at a stopped
 rate" — the meter has no pod to read, which is the cleanest possible form of the claim and
@@ -224,7 +226,7 @@ still-running pod.
 
 ## Contract 3 — two metering dimensions
 
-An Agent costs money two ways, and the platform must show both. Conflating them, or letting
+An Agent consumes two things, and the platform must show both. Conflating them, or letting
 either perturb the existing operator bill, is the failure this contract forecloses.
 
 ### (a) Inference tokens — the existing path, unchanged
@@ -264,14 +266,19 @@ named and chosen:
   because compute is consumed by the *pod*, not by an inference call, and a stopped agent
   with no inference still had a PVC reserved while it ran.
 
-- **Cost basis — RECOMMENDED, but RESERVED to Baron.** A **per-hour resident rate** (charged
-  only while `running`; zero while `stopped`, by Contract 2) that covers the reserved PVC
-  and the baseline footprint, **plus a CPU-core-hour rate** applied to the cAdvisor
-  core-hours. The *shape* (resident-hour + core-hour) is the engineering recommendation; the
-  **dollar figures are a pricing decision, not an engineering one**, exactly like the email
-  default — see *Reserved rulings*. `-914` builds the collector and the ledger against the
-  recommended shape and reads the actual rates from config, so Baron's number is a value, not
-  a code change.
+- **Cost basis — RULED by Baron: there is none. Meter USAGE, not cost.** The recommendation
+  below was a per-hour resident rate plus a CPU-core-hour rate, with the dollar figures
+  RESERVED as a pricing decision. Baron ruled against the whole frame: **the hardware is
+  owned, so its cost is sunk; inference already tracks a real Forge cost and compute does
+  not.** So the second dimension is a set of **quantities per agent — resident hours,
+  CPU-core-hours, peak megabytes — with no dollar basis, no rate configuration and no
+  pricing anywhere in it.** The *shape* survives (resident-hours and core-hours are exactly
+  what the recommendation would have multiplied); the multiplier does not exist. If
+  commodity cloud compute is ever added, cost-wiring is a **FUTURE item**: the seam is these
+  quantities, and building the multiplier before there is a real bill behind it would be
+  inventing a number nobody owes. `-914` landed the collector and the ledger under this
+  ruling — `control-plane/app/agent_usage.py`, table `agent_usage`, `/admin/agents/usage`
+  and the `by_agent` sibling on `/portal/api/spend`.
 
 ### How it surfaces beside inference spend without perturbing the operator bill
 
@@ -282,12 +289,15 @@ operator without a browser has) is untouched. The two numbers are composed **in 
 layer**, not in SQL: `/portal/api/spend` already merges keys and spend after the database
 answers, and gains a sibling `resident` section from the new ledger, summed alongside the
 `by_surface` inference rows — the same additive pattern the portal already uses, never a
-fold of resident cost into a token-spend row. `-914` adds the sibling; it does not edit the
-inference query. This keeps finding 34's rule intact: one query names inference spend, and
+fold of resident usage into a token-spend row. `-914` adds the sibling (`by_agent` on
+`/portal/api/spend`, `agent_usage` on `/portal/api/admin/overview`, and `/admin/agents/usage`
+for the browserless operator); it does not edit the inference query — `metering.py` is
+byte-identical to the commit this epic began at, and
+`control-plane/tests/test_agent_usage.py` fails if that stops being true. This keeps finding 34's rule intact: one query names inference spend, and
 the new number is *added beside* it rather than changing what it returns.
 
 **Consumed by:** `-914` (collector, ledger, portal surfacing), `-627` (status shows
-resident cost per agent), `-ede` (E2E asserts both dimensions appear).
+resident usage per agent), `-ede` (E2E asserts both dimensions appear).
 
 ---
 
@@ -329,7 +339,7 @@ So BYO is allowed **iff it is visible**. The agent's config records `model_sourc
 the portal shows the agent as BYO with its inference cost as an explicit **"off-ledger by
 design"** label — **never a silent $0**, because a silent zero reads as "free" or "broken"
 exactly the way finding 43's silence read as failure. The resident-time + compute meter
-(Contract 3) still bills a BYO agent, because it still holds a PVC and burns CPU on our
+(Contract 3) still meters a BYO agent, because it still holds a PVC and burns CPU on our
 hardware — BYO removes the *inference* row, not the *residency* row.
 
 ### BYO secret storage
@@ -445,16 +455,23 @@ alternatives, and the trade, and is **not** silently chosen.
    - **Why:** adding a new default component is a product decision; Maddy is the cleanest
      rule-compliant single binary, but the reach-vs-tier and ops-weight trades are Baron's.
 
-2. **Resident-time + compute cost basis (Contract 3b).** RESERVED — Baron decides.
-   - **Recommendation:** a per-hour resident rate (charged only while `running`, zero while
-     `stopped`) plus a CPU-core-hour rate applied to cAdvisor core-hours.
-   - **Alternatives:** compute-only (no flat resident rate — simpler, but under-charges an
-     idle-but-resident agent that still reserves a PVC and a scheduling slot); a flat
-     per-agent-hour rate with no core term (predictable, but blind to a CPU-heavy agent);
-     memory-weighted core-hours (fairer under memory pressure, more moving parts).
-   - **Why:** the *shape* (resident-hour + core-hour) is an engineering recommendation, but
-     the **dollar figures are pricing**, not engineering. `-914` reads the rates from config
-     so Baron's decision is a value, not a code change.
+2. **Resident-time + compute cost basis (Contract 3b).** ~~RESERVED~~ — **RULED by Baron,
+   2026-08-10, in `-914`: METER USAGE, NOT COST. Do not reintroduce a cost basis.**
+   - **What was recommended:** a per-hour resident rate (charged only while `running`, zero
+     while `stopped`) plus a CPU-core-hour rate applied to cAdvisor core-hours, with the
+     dollar figures read from config.
+   - **What was ruled:** none of it. Owned hardware is sunk cost, and inference is the only
+     dimension with a real upstream bill behind it (Forge). The resident dimension is
+     surfaced as **usage quantities** — hours, CPU-core-hours, peak megabytes — beside
+     inference spend, and there is no rate, no currency and no pricing configuration.
+   - **What is deferred, and where the seam is:** if commodity cloud compute is ever added,
+     it has a real invoice and the quantities above are what a cost would multiply. That is
+     a FUTURE item, not a gap in `-914`. The alternatives the recommendation weighed
+     (compute-only, flat per-agent-hour, memory-weighted core-hours) are all *rate shapes*
+     and are moot until there is a rate.
+   - **Why it is recorded here rather than quietly dropped:** the record said RESERVED, and
+     a reader who found this section without the ruling would build the rate. Contract 3(b)
+     above carries the same ruling inline for the same reason.
 
 ---
 
@@ -463,7 +480,7 @@ alternatives, and the trade, and is **not** silently chosen.
 | Item | Consumes |
 |---|---|
 | `-055` resident pod + parallel provisioner | Contract 1 (k8s names), 2 (Deployment/PVC/`opencode serve`, lifecycle mechanics), 6 (owns `test_code_surface_frozen.py`) |
-| `-627` Agents tab create/status/stop/delete | Contract 1 (identity), 2 (the four transitions), 3 (per-agent resident cost in status), 4 (config UI) |
+| `-627` Agents tab create/status/stop/delete | Contract 1 (identity), 2 (the four transitions), 3 (per-agent resident usage in status), 4 (config UI) |
 | `-0e7` console attach, owner-scoped | Contract 1 (console path + owner-scoping), 2 (attach-not-spawn) |
 | `-39d` integrated key vs BYO | Contract 4 (routing, Secret, visibility label), 1 (`agent_key_alias`/issuance) |
 | `-914` resident-time + compute metering | Contract 3 (collector, ledger, additive portal surfacing) |

@@ -1416,3 +1416,37 @@ with no key. Demonstrated both ways inside the running container by
 setting SearXNG answers 403 and the search leg reports "no results" rather than a
 misconfiguration — which is why the container's healthcheck runs a real JSON query instead of
 a liveness probe.
+
+### 46. The resident meter under-reports a pod that lives and dies between two samples
+
+`enterpriseaiframework-914` meters an agent's resident time by sampling `status.startTime`
+on a timer (default 60s) and accruing the interval since the last observation of the *same*
+pod. Two properties follow from that and are worth stating rather than discovering:
+
+**Compute loses nothing to a missed sample; resident time loses the gap.** CPU comes from
+cAdvisor's `container_cpu_usage_seconds_total`, a monotonic counter, so a scrape that fails
+costs nothing — the next successful read still sees the whole delta, which is exactly why
+the design record chose it over metrics-server's gauge. Resident time has no counter to
+recover from: a pod that starts *and* stops entirely between two ticks is never observed and
+contributes **zero** hours. Measured, not theoretical — it is the direct consequence of
+`stopped` being `replicas: 0` (Contract 2), which is also what makes the freeze exact.
+
+The bias is deliberately toward **under**-reporting. A meter that guessed at the unobserved
+window would produce a quantity nobody can reconcile, which is the one thing a usage figure
+must never be. If sub-minute agents ever matter, the fix is a shorter interval or a watch on
+pod deletion, not an estimate.
+
+**A stopped agent is marked, not merely stalled.** The first cut froze the totals correctly
+and left the last recorded phase saying `Running`, so a stopped agent rendered as running
+with numbers that had quietly stopped moving — the worst of both readings. A successful
+sample now also records which agents it did *not* see (`last_pod_phase = 'Absent'`), touching
+the phase column and nothing else; writing `last_observed_at` there would have made the next
+start-up credit the whole stopped interval as resident time.
+
+### 47. `?since=` on `/admin/spend` must be written with `Z`, not `+00:00`
+
+`+` in a query string decodes to a space, so `?since=2026-08-10T03:28:17+00:00` reaches
+Postgres as `2026-08-10T03:28:17 00:00` and the `::timestamptz` cast raises — a 500 that
+reads as a broken bill and is really a URL. `Z` (or percent-encoding the `+`) is correct.
+Found writing `tests-live/test_agent_usage.py`, which needed the same ledger rendered over
+two windows to prove the bill had not moved.

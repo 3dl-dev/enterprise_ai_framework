@@ -17,6 +17,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from . import (
+    agent_usage,
     chat_identity,
     db,
     export,
@@ -50,7 +51,15 @@ def require_admin(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> str:
 async def lifespan(app: FastAPI):
     await db.init()
     await db.audit("system", "control_plane.start")
-    yield
+    # The resident-usage collector (enterpriseaiframework-914). A timer, not a request
+    # hook: resident time is measured by sampling a pod that exists, and nobody opens the
+    # page while an agent runs overnight. It is a no-op where there is no cluster
+    # credential to read pods with, which is every compose deployment.
+    collector = agent_usage.start_collector()
+    try:
+        yield
+    finally:
+        await agent_usage.stop_collector(collector)
 
 
 app = FastAPI(title="control-plane", lifespan=lifespan)
@@ -357,6 +366,62 @@ async def spend(since: str | None = None):
         "by_user_and_surface": rows,
         "warnings": warnings,
     }
+
+
+# ---------------------------------------------------------------- the second dimension
+
+
+@app.get("/admin/agents/usage", dependencies=[Depends(require_admin)])
+async def agent_usage_view(username: str | None = None):
+    """Resident time and compute per agent, as USAGE. The browserless half of the portal view.
+
+    A SEPARATE endpoint from `/admin/spend` on purpose. `/admin/spend` is the bill — one
+    query, one meaning — and this landing must not change a byte of what it returns. So
+    the second dimension is served beside it rather than mixed into it, and a reader who
+    wants both asks for both.
+
+    There are no dollars in this payload and there is no rate to configure. Baron ruled
+    that owned hardware is metered as usage, not priced: the quantities are hours,
+    CPU-core-hours and megabytes. If commodity cloud compute is ever added, wiring a cost
+    onto these quantities is a future item — the seam is here, the multiplier is not.
+    """
+    rows = await agent_usage.usage_by_agent(username)
+    warnings = []
+    unmeasured = [r for r in rows if not r["compute_measured"]]
+    if unmeasured:
+        # The honest form of a missing number. A compute figure of 0 with no source is
+        # "we could not read the counter", and saying so beats letting it read as idle.
+        warnings.append({
+            "kind": "compute_not_measured",
+            "detail": "resident time is recorded for these agents but no compute counter "
+                      "was readable — the cAdvisor scrape is failing, so their "
+                      "CPU-core-hours are a floor and not a measurement",
+            "agents": [f"{r['user']}/{r['agent']}" for r in unmeasured],
+        })
+    return {
+        "units": {
+            "resident": "hours",
+            "compute": "cpu-core-hours",
+            "memory": "megabytes (peak working set)",
+        },
+        "collector": {
+            "enabled": agent_usage.enabled(),
+            "sample_seconds": agent_usage.SAMPLE_SECONDS,
+        },
+        "agents": rows,
+        "warnings": warnings,
+    }
+
+
+@app.post("/admin/agents/usage/collect", dependencies=[Depends(require_admin)])
+async def agent_usage_collect():
+    """Force one sample. Idempotent in the sense that matters: it can only add elapsed time.
+
+    Exists so an operator (and the live test) can observe the meter move without waiting
+    out the timer. It is not a different code path from the timer — it is the same
+    `collect_once`, so anything proven through this endpoint is proven about the collector.
+    """
+    return await agent_usage.collect_once()
 
 
 @app.get("/admin/unpriced", dependencies=[Depends(require_admin)])

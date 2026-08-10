@@ -1560,9 +1560,12 @@ The six binding contracts:
    `status.startTime`, compute from **cAdvisor `container_cpu_usage_seconds_total`** (a
    monotonic counter — chosen over metrics-server's lossy gauge; kube-state-metrics only
    cross-checks the stopped state), attributed by `(user, agent)` pod labels, in a
-   **separate control-plane ledger**. Cost basis **RESERVED to Baron** (recommended:
-   resident-hour + CPU-core-hour). It surfaces beside inference spend in `/portal/api/spend`
-   by endpoint-layer composition, leaving `metering.spend_by_user_and_surface` and
+   **separate control-plane ledger**. Cost basis: **RULED by Baron — meter USAGE, not cost.**
+   Owned hardware is sunk cost and only inference has a real upstream bill, so this
+   dimension is **quantities** (resident hours, CPU-core-hours, peak MB) with no rate and no
+   currency; a cost multiplier is a FUTURE item for commodity cloud compute, not a gap. It
+   surfaces beside inference spend in `/portal/api/spend` (a `by_agent` sibling) by
+   endpoint-layer composition, leaving `metering.spend_by_user_and_surface` and
    `/admin/spend` byte-unchanged.
 
 4. **Config: integrated key vs BYO.** Default is the integrated metered
@@ -1571,7 +1574,8 @@ The six binding contracts:
    ledger rows by design** — allowed because it is per-user, own-credential, and made
    **visible** (`model_source: byo`, an "off-ledger by design" label, never a silent $0);
    provenance, not the finding-4 leak. The BYO secret is a per-agent k8s Secret,
-   **set-once, never returned** (finding 2). Residency (Contract 3b) still bills BYO.
+   **set-once, never returned** (finding 2). Residency (Contract 3b) still meters BYO — it
+   holds a PVC and burns our CPU; BYO removes the inference row, not the residency row.
 
 5. **Email component — RESERVED to Baron.** Recommended default **Maddy (GPL-3.0)** — single
    no-tier binary, GPL-not-AGPL, standalone SMTP daemon (no linking). Alternatives:

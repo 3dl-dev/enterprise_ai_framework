@@ -1,0 +1,120 @@
+# The only Kubernetes authority the control plane holds, and why it is this small.
+#
+# Until enterpriseaiframework-914 the control plane had NO Kubernetes RBAC at all — it ran
+# on the namespace's `default` ServiceAccount, which is bound to nothing. The resident
+# meter (Contract 3 of docs/design/records/agents-surface.md) needs two facts the pod
+# cannot get any other way: which agent pods exist and when each one started, and how much
+# CPU each has burnt. So this file grants exactly those two reads and nothing else.
+#
+# NUMBERED 39, BEFORE 40-control-plane.yaml. deploy/bin/deploy.sh applies every manifest in
+# lexical order, and the Deployment names this ServiceAccount — applying it first means a
+# fresh cluster never has a control-plane pod referencing an account that does not exist
+# yet.
+#
+# WHAT IS DELIBERATELY NOT GRANTED, each with the reason:
+#
+#   * `nodes/proxy` — the obvious way to reach cAdvisor is
+#     `/api/v1/nodes/<node>/proxy/metrics/cadvisor` through the API server. That verb
+#     proxies the WHOLE kubelet API, `/exec` and `/run` included, which is a documented
+#     privilege-escalation path to running commands on any node. Measured on this cluster:
+#     with the ClusterRole below and nothing else, that URL returns 403 and the direct
+#     kubelet scrape returns 200. The meter is therefore built to address the kubelet by
+#     the pod's own `.status.hostIP`, which it already reads.
+#   * `nodes` list/get — not needed, for the same reason: the node address arrives with the
+#     pod, so the meter never enumerates nodes.
+#   * anything in the agents' or workspaces' ServiceAccounts. Those stay bound to nothing
+#     and keep `automountServiceAccountToken: false` (60-workspace-common.yaml,
+#     63-agent-common.yaml). This file widens the CONTROL PLANE, which is already the
+#     component that administers everything, and widens nothing that runs user code.
+#   * write verbs of any kind. The meter reads. Creating, scaling and deleting agents is
+#     enterpriseaiframework-627's problem and will need its own, separate grant.
+#
+# NETWORK: no NetworkPolicy in this namespace selects the control-plane pod
+# (`workspace-isolation` selects component=workspace, `agent-isolation` selects
+# component=agent), so its egress to the API server and to the kubelet needs no rule and
+# none is added here. If a default-deny is ever introduced for this pod, it needs egress to
+# the API server on 443 and to the node addresses on 10250, and that belongs next to the
+# deny — not here.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-plane
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: control-plane
+---
+# Namespaced, because agents are. The meter never looks outside enterprise-ai.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: control-plane-pod-reader
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: control-plane
+rules:
+  # `.status.startTime` is the resident-time source; `.status.hostIP` is how the compute
+  # scrape finds the right kubelet; the `agent.enterprise-ai/*` labels are the attribution
+  # key. All three are fields of a pod, so one read serves the whole meter.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # metrics-server's namespaced API. NOT what the meter uses — it is an instantaneous
+  # gauge, and the design record rejects it as a meter for exactly that reason: a missed
+  # sample is lost forever and the total can never be reconciled. It is granted because it
+  # is namespaced, read-only and strictly weaker than the pod read above, and it lets an
+  # operator cross-check a live agent's CPU against `kubectl top` from the same identity.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: control-plane-pod-reader
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: control-plane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: control-plane-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: control-plane
+    namespace: enterprise-ai
+---
+# CLUSTER-SCOPED, because a node is. This is the one grant in this file that leaves the
+# namespace, and it is the narrowest subresource that reaches a real CPU counter:
+# `nodes/metrics` authorises GET on the kubelet's /metrics* endpoints and nothing else —
+# not /exec, not /run, not /pods, not the container logs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: control-plane-node-metrics
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: control-plane
+rules:
+  - apiGroups: [""]
+    resources: ["nodes/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: control-plane-node-metrics
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: control-plane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: control-plane-node-metrics
+subjects:
+  - kind: ServiceAccount
+    name: control-plane
+    namespace: enterprise-ai

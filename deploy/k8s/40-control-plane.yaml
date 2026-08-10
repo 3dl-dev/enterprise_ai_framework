@@ -62,6 +62,11 @@ spec:
       hostAliases:
         - ip: "192.168.2.42"
           hostnames: ["gateway.tailcb6ef9.ts.net"]
+      # The pod's own account, so the resident meter's two reads (agent pods, and the
+      # kubelet's cAdvisor counter) are bound to THIS workload and not to the namespace's
+      # `default` account, which every other pod without an explicit account also uses.
+      # Everything it may do is in 39-control-plane-rbac.yaml, which is applied first.
+      serviceAccountName: control-plane
       containers:
         - name: control-plane
           # Built from ../control-plane and pushed to the rail registry by deploy.sh.
@@ -115,6 +120,14 @@ spec:
               value: "baron"
             - name: WORKSPACE_INTERNAL_TOKEN
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: WORKSPACE_INTERNAL_TOKEN } }
+            # How often the resident-usage meter samples agent pods
+            # (enterpriseaiframework-914). Stated rather than left to the code's default so
+            # an operator can find it. Longer is not less accurate for an agent that stays
+            # up — CPU is a monotonic counter and loses nothing, and resident time is
+            # accrued between ticks — it only widens the window lost when a pod appears
+            # and disappears entirely between two samples.
+            - name: AGENT_USAGE_SAMPLE_SECONDS
+              value: "60"
           ports: [{ containerPort: 8000 }]
           readinessProbe:
             httpGet: { path: /health, port: 8000 }
