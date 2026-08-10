@@ -22,11 +22,27 @@
 :8081 {
     # Identity and the chat surface must share one public origin, or the OIDC issuer
     # check fails. Keycloak owns these paths; the chat surface owns everything else.
+    #
+    # This block is plain HTTP — Tailscale Funnel terminated the browser's TLS on :8443
+    # before it reached here, so Caddy would otherwise forward `X-Forwarded-Proto: http`.
+    # Keycloak then treats the request as non-secure and strips Secure/SameSite=None from
+    # its SSO cookies (AUTH_SESSION_ID, KEYCLOAK_IDENTITY, ...). Those cookies are then not
+    # sent in the account console's redirect-based re-auth, so check-sso never finds a
+    # session and the console reloads itself forever (enterpriseaiframework-4f1). LibreChat
+    # and the portal oauth2-proxy dodged this by turning Secure off app-side, but the
+    # account console *needs* SameSite=None (which requires Secure), so the only correct fix
+    # for it is to assert the real public scheme here. The browser's connection to Funnel
+    # really is TLS, so this header is truthful. Only the :8081 block needs it; the :8443
+    # LAN block below terminates its own TLS and already reports https.
     handle /realms/* {
-        reverse_proxy 192.168.2.44:30382
+        reverse_proxy 192.168.2.44:30382 {
+            header_up X-Forwarded-Proto https
+        }
     }
     handle /resources/* {
-        reverse_proxy 192.168.2.44:30382
+        reverse_proxy 192.168.2.44:30382 {
+            header_up X-Forwarded-Proto https
+        }
     }
     # Published work. Deliberately NOT behind any auth: the audience is parents, who have
     # no account. Static files only, served by a plain web server with no interpreter and
