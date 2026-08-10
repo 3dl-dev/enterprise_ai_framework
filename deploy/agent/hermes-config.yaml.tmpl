@@ -1,0 +1,33 @@
+# Seed for $HERMES_HOME/config.yaml (/opt/data/config.yaml) on a resident Hermes agent.
+#
+# Rendered by the provisioner into a per-agent ConfigMap (agent-<user>-<name>-config)
+# and copied onto the PVC by an init container BEFORE the daemon starts — never mounted
+# read-only over HERMES_HOME, because Hermes rewrites config/skills/auth at runtime.
+#
+# Placeholders (substituted literally, like 64-agent.template.yaml):
+#   __MODEL__           a model id the gateway serves, e.g. deepseek-v4-flash@deepinfra
+#                       (bare id — NO opencode-style `enterprise-ai/` provider prefix;
+#                        the gateway rejects a prefixed name).
+#   __CONTEXT_LENGTH__  explicit context window. REQUIRED: Hermes cannot read a window
+#                       from LiteLLM's /v1/models and otherwise assumes ~0, which reads
+#                       as "context length exceeded" on the first turn. 128000 is a safe
+#                       floor for the deepinfra models.
+#   __MAX_TOKENS__      output cap. REQUIRED and must be <= the model's provider cap
+#                       (deepinfra caps glm-5.2 at 32768; exceeding it returns a 400 that
+#                        Hermes misreports as "context length exceeded"). 8000 is safe.
+#
+# INTEGRATED (default): base_url is our gateway; key_env names the env var carrying the
+# <user>::agents/<name> virtual key (injected from the agent's -key Secret). Metered on
+# the one bill. BYO swaps base_url to the user's provider and the key Secret to -byo.
+providers:
+  gateway:
+    base_url: http://gateway:4000/v1
+    key_env: OPENAI_API_KEY
+    discover_models: true
+model:
+  provider: gateway
+  default: __MODEL__
+  context_length: __CONTEXT_LENGTH__
+  max_tokens: __MAX_TOKENS__
+terminal:
+  backend: local

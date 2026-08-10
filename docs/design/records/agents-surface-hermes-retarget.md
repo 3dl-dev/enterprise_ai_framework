@@ -135,6 +135,49 @@ Code/workspace surface is still byte-identical and green (Contract 6). Retarget 
 
 ---
 
+## Validated live on k3s — 2026-08-10 (agent-baron-rudi)
+
+The recipe below was proven end to end against the real cluster before any template edit
+(the throwaway probe pod + the retargeted `agent-baron-rudi` Deployment). Everything here is
+observed, not inferred.
+
+- **Image `nousresearch/hermes-agent:v2026.8.3`** pulls from Docker Hub on the cluster;
+  Hermes v0.20.0, Python 3.13, `HERMES_HOME=/opt/data`, agent user **uid/gid 10000
+  (`hermes`)**.
+- **Daemon `hermes gateway run`** boots under the image's s6-overlay and stays foreground;
+  with no messaging platform wired it logs "No messaging platforms enabled" and keeps
+  running (valid resident PID). s6 supervises + auto-restarts it in-container.
+- **securityContext MUST allow root at boot.** The s6-overlay preinit chowns `/run` and the
+  PVC and *then drops to uid 10000*; under `runAsNonRoot: true` / `runAsUser: 1000` /
+  `drop: [ALL]` it dies with `/run belongs to uid 0 … lacking the privileges to fix it`.
+  So the pod runs with an **empty securityContext** (image default root → drops itself to
+  10000). **This is a real change from the opencode template**, which hardened to non-root
+  1000 + drop-ALL. Net posture: the *agent process* is still non-root (10000) and the
+  NetworkPolicy still locks egress; only the brief s6 init is root. **Flagged for Baron —
+  it is forced by the image, not chosen; if unacceptable the alternative is bypassing s6
+  (`command: [hermes, gateway, run]`, run as 1000 + `fsGroup`, set `HOME`), not tested.**
+- **Config seed via init container.** A per-agent ConfigMap (`agent-<user>-<name>-config`,
+  from `deploy/agent/hermes-config.yaml.tmpl`) is copied to `/opt/data/config.yaml` by an
+  init container that runs **as root** (`chown 10000:10000` needs CAP_CHOWN); the daemon
+  then reads/rewrites it as 10000. (First attempt failed two ways worth recording: a
+  non-root init can't chown, and `kubectl apply` silently *retained* the old opencode
+  Deployment's hardened securityContext — use `kubectl replace` / a clean object.)
+- **Inference through our gateway works.** Provider block above; model
+  **`deepseek-v4-flash@deepinfra`** (Baron's pick), `context_length: 128000`,
+  `max_tokens: 8000`. Live round-trip in the pod: `hermes chat -q` → correct answer,
+  metered on the `<baron::agents/rudi>` virtual key. Two integration traps, both recorded
+  in `hermes-config.yaml.tmpl`: the model id is **bare** (no `enterprise-ai/` prefix), and
+  a missing `context_length`/an over-cap `max_tokens` both surface as a misleading
+  "context length exceeded".
+- **Console** = `kubectl exec -it deploy/agent-<user>-<name> -c agent -- hermes --tui`,
+  sharing the daemon's `/opt/data/state.db`. The in-portal terminal (rewriting
+  `agent_console.py` to a `pods/exec` bridge, R3) is the productization and needs a
+  control-plane redeploy — deferred while the camp is live.
+
+Reference manifests as deployed: `deploy/agent/hermes-config.yaml.tmpl` (the seed) and the
+per-agent ConfigMap + Deployment shape in R4. The repo template build (`-8a9`) renders
+these; the live rudi objects are hand-applied equivalents pending that build.
+
 ### Sources
 NousResearch/hermes-agent; jyje/hermes-agent Helm chart (`charts/hermes-agent`, chart 1.4.0,
 appVersion `v2026.8.3`); upstream CLI reference (`gateway run`, `hermes --tui`, `hermes
