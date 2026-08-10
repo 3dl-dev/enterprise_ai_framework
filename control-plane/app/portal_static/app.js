@@ -662,11 +662,76 @@ const CONNECTOR_FIELDS = {
   ],
 };
 
+// Setup guidance shown inline with the fields, because "App-level token (starts xapp-)" is
+// not a thing a first-time user can produce without being told where it lives. Steps are
+// the same ones tracked as the human prerequisites (enterpriseaiframework-54d Slack,
+// -9ce Discord); the link goes to the console that mints the credential.
+const CONNECTOR_HELP = {
+  slack: {
+    summary: "How to create a Slack bot token",
+    url: "https://api.slack.com/apps",
+    steps: [
+      "At api.slack.com/apps → Create New App → From scratch, and pick your workspace.",
+      "OAuth & Permissions → Bot Token Scopes: add chat:write (and channels:history + app_mentions:read so it can read). Install to Workspace, then copy the Bot User OAuth Token — that is the xoxb- bot token.",
+      "Socket Mode → turn it on, and Generate an App-Level Token with the connections:write scope — that xapp- token is the App-level token above (it is how the agent listens).",
+      "Event Subscriptions → enable, and subscribe to message.channels (and/or app_mention).",
+      "In Slack, /invite @your-bot to a channel. For the default channel, open the channel details and copy its ID (looks like C0123ABCD).",
+    ],
+  },
+  discord: {
+    summary: "How to create a Discord bot token",
+    url: "https://discord.com/developers/applications",
+    steps: [
+      "At discord.com/developers/applications → New Application.",
+      "Bot → Reset Token → copy the token — that is the Bot token above.",
+      "Bot → Privileged Gateway Intents → turn ON MESSAGE CONTENT INTENT. Without it Discord delivers every message empty and reports no error.",
+      "OAuth2 → URL Generator → scopes: bot; bot permissions: Send Messages + Read Message History. Open the generated URL to add the bot to your server.",
+      "Settings → Advanced → enable Developer Mode, then right-click a channel → Copy Channel ID for the default channel.",
+    ],
+  },
+  email: {
+    summary: "Where these SMTP/IMAP settings come from",
+    steps: [
+      "Host, port and security are your email provider's — the agent connects as a normal client, nothing is self-hosted.",
+      "Gmail: smtp.gmail.com 465 ssl · imap.gmail.com 993 ssl · and an App Password (not your login) if 2-step verification is on.",
+      "Microsoft 365: smtp.office365.com 587 starttls · outlook.office365.com 993 ssl.",
+    ],
+  },
+};
+
 let SETUP_MODE = "create";   // "create" also names and creates the agent
 let SETUP_NAME = "";
 
+function connectorHelp(container, kind) {
+  const help = CONNECTOR_HELP[kind];
+  if (!help) return;
+  const d = document.createElement("details");
+  d.className = "connector-help";
+  const s = document.createElement("summary");
+  s.textContent = help.summary;
+  d.appendChild(s);
+  const ol = document.createElement("ol");
+  for (const step of help.steps) {
+    const li = document.createElement("li");
+    li.textContent = step;
+    ol.appendChild(li);
+  }
+  d.appendChild(ol);
+  if (help.url) {
+    const a = document.createElement("a");
+    a.href = help.url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.className = "connector-help-link";
+    a.textContent = "Open " + new URL(help.url).host + " ↗";
+    d.appendChild(a);
+  }
+  container.appendChild(d);
+}
+
 function connectorFields(container, kind) {
   container.innerHTML = "";
+  connectorHelp(container, kind);
   for (const f of CONNECTOR_FIELDS[kind] || []) {
     const label = document.createElement("label");
     label.className = "field";

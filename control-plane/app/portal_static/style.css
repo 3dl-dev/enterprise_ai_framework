@@ -402,3 +402,24 @@ dialog:not([open]) { display: none !important; }
 .check input { width: 15px; height: 15px; flex: none; }
 #setup-form .panel { margin: 0 0 14px; }
 #setup-form menu { display: flex; justify-content: flex-end; margin: 0; padding: 0; }
+
+/* Setup guidance inside a connector form — collapsed so it never crowds the fields, one
+   click from anyone who does not already know where an xapp- token lives. */
+.connector-help {
+  margin: 2px 0 10px; padding: 8px 10px;
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+  font-size: 12.5px;
+}
+.connector-help summary {
+  cursor: pointer; color: var(--ink-3); font-weight: 560; list-style: none;
+}
+.connector-help summary::-webkit-details-marker { display: none; }
+.connector-help summary::before { content: "\25B8  "; color: var(--accent); }
+.connector-help[open] summary::before { content: "\25BE  "; }
+.connector-help ol { margin: 8px 0 6px; padding-left: 18px; color: var(--ink-3); }
+.connector-help li { margin: 4px 0; line-height: 1.45; }
+.connector-help-link {
+  display: inline-block; margin-top: 2px;
+  color: var(--accent); font-weight: 560; text-decoration: none;
+}
+.connector-help-link:hover { text-decoration: underline; }
