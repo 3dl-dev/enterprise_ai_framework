@@ -64,16 +64,19 @@ const api = {
 const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 /* Whole prompts, not vague ones. A vague ask gets a vague program and the child concludes
- * the tool is bad — the phrasing here is doing real work. Every one ends in
- * "One index.html." because the preview cannot reveal anything else, and this is the one
- * place that guarantee can be made. */
+ * the tool is bad — the phrasing here is doing real work. These used to each end in
+ * "One index.html.", from when a project could only be a single hand-written file. It can
+ * now be an engine build too (the agent's house rules cover how the output stays
+ * openable), so the suffix is dropped — a starter a child clicks must not re-impose the
+ * old limit as their literal words. The last one advertises that a real 3D game is on the
+ * table now, not just canvas toys. */
 const IDEAS = [
-  "Make a game where a unicorn runs and jumps over rocks. Put it all in one index.html.",
-  "Make a drawing app with rainbow paint and a button to clear it. One index.html.",
-  "Make a memory card game with animal emojis that I can actually play. One index.html.",
-  "Make a quiz that asks me questions and tells me which dinosaur I am. One index.html.",
-  "Make a maze I can walk through with the arrow keys. One index.html.",
-  "Make a music toy where every key plays a different sound. One index.html.",
+  "Make a game where a unicorn runs and jumps over rocks.",
+  "Make a drawing app with rainbow paint and a button to clear it.",
+  "Make a memory card game with animal emojis that I can actually play.",
+  "Make a quiz that asks me questions and tells me which dinosaur I am.",
+  "Make a maze I can walk through with the arrow keys.",
+  "Make a 3D world made of blocks I can walk around and build in.",
 ];
 
 let STATE = { projects: [], project: "", models: [], has_index: false };

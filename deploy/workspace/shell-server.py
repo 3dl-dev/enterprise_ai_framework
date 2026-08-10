@@ -534,18 +534,34 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, payload: dict):
         self._send(code, json.dumps(payload).encode(), "application/json")
 
-    def _serve_file(self, path: Path, fallback_ctype="text/plain; charset=utf-8"):
+    def _serve_file(self, path: Path, fallback_ctype="application/octet-stream", extra=None):
         if not path.is_file():
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
         ctypes = {
             ".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
-            ".js": "text/javascript; charset=utf-8", ".json": "application/json",
+            ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
+            ".json": "application/json",
+            # A WebAssembly engine build (Godot, Unity, a hand-rolled emscripten runtime)
+            # is only reached through the preview, and `WebAssembly.instantiateStreaming`
+            # REFUSES a response that is not exactly `application/wasm` — get this wrong
+            # and a 3D game compiles to a blank canvas with a console error the child
+            # never sees. The default file server had no idea what a .wasm was, so this is
+            # the load-bearing line for every engine export, not a nicety.
+            ".wasm": "application/wasm",
+            # Godot packs the whole game into these opaque side-blobs; Unity uses .data.
+            # Served as text/* the browser tries to sniff them and the loader aborts.
+            ".pck": "application/octet-stream", ".data": "application/octet-stream",
             ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
             ".gif": "image/gif", ".svg": "image/svg+xml", ".ico": "image/x-icon",
             ".webp": "image/webp", ".mp3": "audio/mpeg", ".wav": "audio/wav",
+            ".ogg": "audio/ogg", ".m4a": "audio/mp4", ".mp4": "video/mp4",
+            ".ttf": "font/ttf", ".otf": "font/otf", ".woff": "font/woff",
+            ".woff2": "font/woff2", ".glb": "model/gltf-binary", ".gltf": "model/gltf+json",
+            ".txt": "text/plain; charset=utf-8", ".map": "application/json",
         }
-        self._send(200, path.read_bytes(), ctypes.get(path.suffix.lower(), fallback_ctype))
+        self._send(200, path.read_bytes(),
+                   ctypes.get(path.suffix.lower(), fallback_ctype), extra)
 
     def _safe_join(self, root: Path, rel: str) -> Path | None:
         """Resolve rel under root, refusing anything that escapes it.
@@ -636,7 +652,13 @@ class Handler(BaseHTTPRequestHandler):
                                 b"Nothing to preview yet. Ask the agent to make an "
                                 b"<code>index.html</code>.</body>", "text/html; charset=utf-8")
             else:
-                self._serve_file(f)
+                # Cross-Origin-Resource-Policy lets these assets load into an embedder
+                # that has turned on cross-origin isolation (COEP: require-corp) — which a
+                # THREADED WebAssembly build needs. The single-threaded engine export that
+                # is the default here does not require it, so this is belt-and-braces, not
+                # load-bearing; it costs one header and means a threaded export does not
+                # silently fail to fetch its own .wasm the day someone tries one.
+                self._serve_file(f, extra={"Cross-Origin-Resource-Policy": "cross-origin"})
         else:
             self._send(404, b"not found", "text/plain; charset=utf-8")
 

@@ -459,6 +459,35 @@ def test_preview_without_an_index_explains_itself(shell):
     assert b"index.html" in r.content
 
 
+def test_preview_serves_a_wasm_engine_build(shell):
+    """A WebAssembly engine export (Godot, Unity, a hand-rolled emscripten runtime) is only
+    reachable through this route, and it only RUNS if the .wasm comes back as exactly
+    application/wasm — `WebAssembly.instantiateStreaming` refuses anything else and the game
+    is a blank canvas. It also has to serve a multi-file build from subfolders, not just a
+    lone root index.html. This is the server half of "you can build a 3D game here".
+    """
+    game = shell.root / "alpha"
+    (game / "index.html").write_text("<canvas id=c></canvas><script src=game.js></script>")
+    (game / "game.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")  # the wasm magic bytes
+    (game / "game.pck").write_bytes(b"GDPC\x00\x00")             # a Godot data pack
+    (game / "assets").mkdir()
+    (game / "assets" / "world.glb").write_bytes(b"glTF\x02")
+
+    w = shell.get("/preview/game.wasm")
+    assert w.status_code == 200
+    assert w.headers["Content-Type"] == "application/wasm"
+    assert w.content.startswith(b"\x00asm")
+    # Lets a cross-origin-isolated (threaded) embedder load the module; harmless for the
+    # single-threaded default. Its silent absence is exactly how a threaded build fails.
+    assert w.headers.get("Cross-Origin-Resource-Policy") == "cross-origin"
+
+    assert shell.get("/preview/game.pck").headers["Content-Type"] == "application/octet-stream"
+
+    nested = shell.get("/preview/assets/world.glb")
+    assert nested.status_code == 200
+    assert nested.headers["Content-Type"] == "model/gltf-binary"
+
+
 @pytest.mark.parametrize("path", ["/preview/.git/config", "/preview/.meta/alpha.json"])
 def test_preview_refuses_repo_internals(shell, path):
     (shell.root / "alpha" / ".git").mkdir(exist_ok=True)

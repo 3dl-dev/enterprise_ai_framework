@@ -27,7 +27,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git make gcc g++ libc6-dev \
-        jq less nano vim-tiny procps tini rsync \
+        jq less nano vim-tiny procps tini rsync unzip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL -o /usr/local/bin/ttyd \
@@ -119,9 +119,16 @@ COPY model-settings.yml model-metadata.json /etc/aider/
 #                                          is a missing tenant file, not a config error.
 COPY opencode.json /etc/opencode/opencode.json
 COPY PLATFORM.md /etc/opencode/PLATFORM.md
-COPY entrypoint.sh workspace-shell publish shell-server.py /usr/local/bin/
+# install-godot / godot-web-export: the engine path. Not baked into the image itself —
+# the export templates are a 1.3GB download and most projects never touch Godot — so the
+# binary and templates install on demand onto the per-user PVC (see install-godot). These
+# two scripts are the turnkey front door for "the agent can install its own dependencies":
+# `install-godot` once, then `godot-web-export <project> <out>` per build.
+COPY entrypoint.sh workspace-shell publish shell-server.py install-godot godot-web-export /usr/local/bin/
 COPY shell/ /usr/local/bin/shell/
-RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/workspace-shell /usr/local/bin/publish /usr/local/bin/shell-server.py
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/workspace-shell \
+        /usr/local/bin/publish /usr/local/bin/shell-server.py \
+        /usr/local/bin/install-godot /usr/local/bin/godot-web-export
 
 USER coder
 WORKDIR /workspace
@@ -129,7 +136,11 @@ WORKDIR /workspace
 # aider reads these as if they were the matching command-line flags. Held in the image
 # rather than the manifest so every workspace is tuned identically; only the key, the
 # model and the identity come from the pod.
-ENV HOME=/home/coder \
+# /workspace/.tools/bin is where install-godot drops the engine binary (on the PVC, so it
+# survives restarts). Put it on PATH in the image itself, not just in entrypoint.sh, so a
+# hand-typed `godot` also resolves under `kubectl exec`, which never runs the entrypoint.
+ENV PATH=/workspace/.tools/bin:$PATH \
+    HOME=/home/coder \
     AIDER_MODEL_SETTINGS_FILE=/etc/aider/model-settings.yml \
     AIDER_MODEL_METADATA_FILE=/etc/aider/model-metadata.json \
     AIDER_ANALYTICS_DISABLE=1 \

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# install-godot — put the Godot engine on this workspace so the agent can build 2D/3D
+# games and export them for the browser.
+#
+# This is the "the agent can install its own dependencies" path made turnkey for the one
+# dependency that is a 1.3GB download and a finicky template layout. Everything lands on
+# the /workspace PVC (the binary under $WS_TOOLS, the templates under $XDG_DATA_HOME, both
+# of which the pod points at the PVC), so it survives a pod restart and only actually
+# downloads once per workspace. Run it as many times as you like; it is idempotent.
+#
+# Pinned + checksummed on purpose, exactly like ttyd/opencode/aider in the image: this is
+# shipped code, not a thing a child audits. Bump deliberately — new version, new URL, new
+# SHA512 from the release's SHA512-SUMS.txt, and re-verify a web export still runs.
+set -euo pipefail
+
+GODOT_VERSION="4.7.1"
+GODOT_RELEASE="${GODOT_VERSION}-stable"
+BIN_SHA512="4ccdab7a48eeccbe8819a2fc1f6262f8d72065d98601bcb3743fcbd7ebd39f373758a788ee3293a05ec5b2c48538266c437404312e372225cd2df273945a2de9"
+TPZ_SHA512="afcc83d8d3d298038f19c58744a0d660fa75dd4baa33cb55d1011bb2565a2a8c2381728924564cb909e37c205a23f21b521b23bd057993afd43ae4da0b2f9d47"
+
+BASE="https://github.com/godotengine/godot/releases/download/${GODOT_RELEASE}"
+TOOLS="${WS_TOOLS:-/workspace/.tools}"
+BIN_DIR="${TOOLS}/bin"
+GODOT_BIN="${BIN_DIR}/godot"
+
+# Godot looks for its export templates under $XDG_DATA_HOME/godot (falling back to
+# ~/.local/share/godot). The pod sets XDG_DATA_HOME to a path on the PVC
+# (deploy/k8s/61-workspace.template.yaml), so templates persist and are found with no
+# extra flags. The fallback keeps this script usable when run by hand outside a pod.
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+TPL_DIR="${DATA_HOME}/godot/export_templates/${GODOT_RELEASE}"
+
+if [[ -x "$GODOT_BIN" ]] \
+   && "$GODOT_BIN" --version 2>/dev/null | grep -q "${GODOT_VERSION}" \
+   && [[ -f "${TPL_DIR}/version.txt" ]]; then
+    echo "Godot ${GODOT_VERSION} is already set up. Build with: godot-web-export <project-dir> <output-dir>"
+    exit 0
+fi
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+echo "Setting up Godot ${GODOT_VERSION} — downloading, this takes a minute (once per workspace)..."
+
+# --- the engine binary (same binary runs headless with --headless) ---
+curl -fSL --retry 3 -o "$TMP/godot.zip" "${BASE}/Godot_v${GODOT_RELEASE}_linux.x86_64.zip"
+echo "${BIN_SHA512}  $TMP/godot.zip" | sha512sum -c - >/dev/null
+mkdir -p "$BIN_DIR"
+unzip -o -q "$TMP/godot.zip" -d "$TMP/bin"
+install -m 0755 "$TMP/bin/Godot_v${GODOT_RELEASE}_linux.x86_64" "$GODOT_BIN"
+
+# --- export templates: WEB ONLY ---
+# The .tpz carries every platform's templates (~5GB unpacked); a browser build only needs
+# the web ones plus the version marker. `unzip -j` flattens the archive's templates/
+# prefix so files land directly in the version dir, which is where Godot resolves them.
+curl -fSL --retry 3 -o "$TMP/templates.tpz" "${BASE}/Godot_v${GODOT_RELEASE}_export_templates.tpz"
+echo "${TPZ_SHA512}  $TMP/templates.tpz" | sha512sum -c - >/dev/null
+mkdir -p "$TPL_DIR"
+unzip -o -j -q "$TMP/templates.tpz" 'templates/web_*' 'templates/version.txt' -d "$TPL_DIR"
+
+if [[ ! -f "${TPL_DIR}/version.txt" ]]; then
+    echo "install-godot: templates unpacked but version.txt is missing — Godot will not" >&2
+    echo "               recognise them. The .tpz layout may have changed for this version." >&2
+    exit 1
+fi
+
+echo
+echo "Godot ${GODOT_VERSION} is ready."
+echo "Build a project into a browser folder with:  godot-web-export <project-dir> <output-dir>"
