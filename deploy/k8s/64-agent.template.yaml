@@ -6,6 +6,12 @@
 #   __IMAGE__     workspace image reference in the rail registry (reused verbatim)
 #   __MODEL__     opencode's default model, a name from the gateway catalogue
 #   __CFGSUM__    checksum of the entrypoint ConfigMap, so an entrypoint change rolls
+#   __MODEL_SOURCE__  `integrated` or `byo` (Contract 4) — provenance, see the label below
+#   __API_BASE__      where the agent's inference goes: our gateway, or the user's own
+#                     external provider under BYO
+#   __KEY_SECRET__    the Secret holding OPENAI_API_KEY: `agent-<user>-<name>-key` (the
+#                     integrated virtual key) or `agent-<user>-<name>-byo` (the user's
+#                     own provider credential, set-once and never read back)
 #
 # A COPY of 61-workspace.template.yaml's shape, deliberately, not a shared base: Contract
 # 6 of docs/design/records/agents-surface.md freezes that file byte-for-byte because the
@@ -78,6 +84,7 @@ metadata:
     app.kubernetes.io/component: agent
     agent.enterprise-ai/user: "__USER__"
     agent.enterprise-ai/name: "__NAME__"
+    agent.enterprise-ai/model-source: "__MODEL_SOURCE__"
 spec:
   # `created`/`running` is replicas: 1; `stopped` is replicas: 0 with the PVC retained;
   # `deleted` removes these objects and then the PVC (Contract 2, driven by
@@ -105,12 +112,31 @@ spec:
         # produces no gateway ledger row still bills for the hours it was resident.
         agent.enterprise-ai/user: "__USER__"
         agent.enterprise-ai/name: "__NAME__"
+        # PROVENANCE, Contract 4. `integrated` = the agent inferences through its
+        # __USER__::agents/__NAME__ virtual key on our gateway, so its spend is a row on
+        # the one bill. `byo` = the user supplied their own provider credential and the
+        # traffic never touches our layer, so there is NO gateway ledger row for it — by
+        # declaration, not by accident. This label is how every spend view knows the
+        # difference, which is what stops a BYO agent rendering as a silent $0: a silent
+        # zero reads as "free" or "broken", and finding 4's leak was exactly an
+        # unmetered path that rendered as healthy. Deliberately NOT in the Deployment's
+        # selector (which is immutable) so an agent can be switched between the two.
+        agent.enterprise-ai/model-source: "__MODEL_SOURCE__"
       annotations:
-        # Deliberately the ENTRYPOINT's checksum and not the virtual key's. The workspace
-        # template rolls its pod on every key rotation because a workspace pod is cheap to
-        # restart. Restarting an agent ends the resident session that is the entire
-        # product, so a re-run of the provisioner must be a no-op for a healthy agent.
+        # The ENTRYPOINT's checksum. The workspace template rolls its pod on every key
+        # ROTATION because a workspace pod is cheap to restart; restarting an agent ends
+        # the resident session that is the entire product, so a re-run of the provisioner
+        # must be a no-op for a healthy agent.
         checksum/entrypoint: "__CFGSUM__"
+        # The credential's checksum — and this is NOT the same thing as rotating on every
+        # run, because provision-agent.sh does not rotate a key that already works. It
+        # changes when the key actually changes: -055's sentinel being replaced by a real
+        # minted key, a deliberate rotation, or a re-supplied BYO credential. In every one
+        # of those cases the pod MUST restart, because env from a secretKeyRef is injected
+        # at pod start and never updated afterwards — so a running agent would keep
+        # presenting the old credential and 401 forever, silently, which on an unattended
+        # surface means nobody finds out. A hash, never the key.
+        checksum/api-key: "__KEYSUM__"
     spec:
       serviceAccountName: agent
       automountServiceAccountToken: false
@@ -152,16 +178,26 @@ spec:
             - name: OPENCODE_SERVER_PASSWORD
               valueFrom:
                 secretKeyRef: { name: agent-__USER__-__NAME__-key, key: OPENCODE_SERVER_PASSWORD }
-            # One route out of the building. The pod holds no provider credential of any
-            # kind — this is a virtual key on our own gateway, so the agent's inference is
-            # metered, budgeted and audited against __USER__ like every other surface.
-            # The BYO alternative (Contract 4) is enterpriseaiframework-39d's, and it is
-            # the only configuration in which these point anywhere but the gateway.
-            - { name: OPENAI_API_BASE, value: "http://gateway:4000/v1" }
-            - { name: OPENAI_BASE_URL, value: "http://gateway:4000/v1" }
+            # WHERE THE AGENT'S INFERENCE GOES — the entire integrated/BYO seam
+            # (Contract 4), and the only thing that differs between the two modes.
+            #
+            # INTEGRATED (the default): `http://gateway:4000/v1` with the
+            # `__USER__::agents/__NAME__` virtual key out of `agent-…-key`. The pod holds
+            # no provider credential of any kind; inference is metered, budgeted and
+            # audited against __USER__ like every other surface, and lands on the one bill
+            # under the per-instance surface `agents/__NAME__`.
+            #
+            # BYO: __API_BASE__ is the user's own provider and __KEY_SECRET__ is
+            # `agent-…-byo`, holding THEIR credential. That routes around our gateway on
+            # purpose, so it produces zero gateway ledger rows — permitted because it is
+            # per-user, declared, and labelled `model-source: byo` above, which is the
+            # difference between finding 4's accidental leak and a posture the standing
+            # constraint already allows.
+            - { name: OPENAI_API_BASE, value: "__API_BASE__" }
+            - { name: OPENAI_BASE_URL, value: "__API_BASE__" }
             - name: OPENAI_API_KEY
               valueFrom:
-                secretKeyRef: { name: agent-__USER__-__NAME__-key, key: OPENAI_API_KEY }
+                secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
             - { name: OPENCODE_MODEL, value: "enterprise-ai/__MODEL__" }
           ports:
             # Named, and reachable only through the ClusterIP Service that the

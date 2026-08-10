@@ -32,7 +32,12 @@ async def issue(username: str, surface: str, *, actor: str) -> dict:
     user's own name when they rotate their own from the portal. The PRINCIPAL is always
     `username`; there is deliberately no way to mint a key for somebody else here.
     """
-    if surface not in gateway.SURFACES:
+    # `is_known_surface`, so `agents/<name>` mints here too rather than through a parallel
+    # copy of the five steps above. That was the whole reason this module exists: an agent
+    # key minted anywhere else would skip the enabled check, or leave the ledger's token
+    # hash pointing at a key the gateway no longer holds. See gateway.AGENT_SURFACE for
+    # the alias grammar and why the instance rides in the surface field.
+    if not gateway.is_known_surface(surface):
         raise HTTPException(400, f"unknown surface: {surface}")
 
     pool = await db.pool()
@@ -52,7 +57,7 @@ async def issue(username: str, surface: str, *, actor: str) -> dict:
             principal["id"], surface,
         )
 
-    alias = gateway.key_alias(username, surface)
+    alias = gateway.surface_alias(username, surface)
     max_budget = (
         float(existing["max_budget"])
         if existing and existing["max_budget"] is not None

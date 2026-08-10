@@ -29,7 +29,15 @@ CREATE TABLE IF NOT EXISTS principal (
 CREATE TABLE IF NOT EXISTS virtual_key (
     id            BIGSERIAL PRIMARY KEY,
     principal_id  BIGINT NOT NULL REFERENCES principal(id) ON DELETE CASCADE,
-    surface       TEXT NOT NULL CHECK (surface IN ('chat', 'ide', 'terminal')),
+    -- 'chat' | 'ide' | 'terminal' | 'agents/<name>'. A user has ONE of each base surface
+    -- and MANY agents, so an agent's instance rides IN the surface field — see
+    -- gateway.AGENT_SURFACE for why that, and not a third '::' field, is the grammar.
+    -- UNIQUE (principal_id, surface) below therefore still means "one key per thing you
+    -- can spend from", per agent rather than per agent family.
+    surface       TEXT NOT NULL CHECK (
+        surface IN ('chat', 'ide', 'terminal')
+        OR surface ~ '^agents/[a-z0-9][a-z0-9-]{0,38}$'
+    ),
     key_alias     TEXT UNIQUE NOT NULL,
     -- The gateway's SHA-256 of the virtual key, never the key itself. It is the join
     -- column against the spend ledger, and it is not a credential — possessing it does
@@ -72,6 +80,19 @@ BEGIN
 END $$;
 
 UPDATE virtual_key SET gateway_token_hash = NULL WHERE gateway_token_hash LIKE 'sk-%';
+
+-- The agents surface, for a database created before it existed. CREATE TABLE IF NOT
+-- EXISTS above is a no-op on an existing deployment, so the widened CHECK it carries
+-- would never reach one — and the symptom would be an integrity error at the moment an
+-- operator provisions their first agent, which reads as "the agents surface is broken".
+-- Drop-then-add rather than ADD IF NOT EXISTS (Postgres has no such form for CHECK), and
+-- the constraint is named explicitly so this is idempotent on every boot: re-adding the
+-- identical predicate under the identical name.
+ALTER TABLE virtual_key DROP CONSTRAINT IF EXISTS virtual_key_surface_check;
+ALTER TABLE virtual_key ADD CONSTRAINT virtual_key_surface_check CHECK (
+    surface IN ('chat', 'ide', 'terminal')
+    OR surface ~ '^agents/[a-z0-9][a-z0-9-]{0,38}$'
+);
 """
 
 GENESIS_HASH = "0" * 64

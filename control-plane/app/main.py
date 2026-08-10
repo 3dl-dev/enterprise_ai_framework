@@ -226,6 +226,10 @@ async def list_keys(username: str | None = None):
 
 class IssueKeyRequest(BaseModel):
     username: str
+    # `chat` | `ide` | `terminal` | `agents/<name>`. The agents form is what
+    # deploy/bin/provision-agent.sh asks for, and it is deliberately this endpoint rather
+    # than a new one: an agent's key is a virtual key like any other, and a second
+    # issuance endpoint would be a second place for the five steps in issuance.py to drift.
     surface: str
 
 
@@ -264,7 +268,7 @@ class BudgetRequest(BaseModel):
 @app.post("/admin/budget", dependencies=[Depends(require_admin)])
 async def set_budget(req: BudgetRequest):
     """Set a hard budget. Past it the gateway refuses, it does not merely record."""
-    if req.surface and req.surface not in gateway.SURFACES:
+    if req.surface and not gateway.is_known_surface(req.surface):
         raise HTTPException(400, f"unknown surface: {req.surface}")
 
     # One predicate, used by both the select and the update, so they can never drift
