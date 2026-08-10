@@ -107,10 +107,16 @@ subjects:
 #     cannot widen itself. Granting write on `roles`/`rolebindings` to a component that
 #     already holds write is the classic path from "can create a Deployment" to "is
 #     cluster-admin", and it is absent on purpose.
-#   * NO `pods/exec`, NO `pods/attach`, NO `pods/portforward`. The control plane creates
-#     the pod; it cannot get a shell in one. -0e7 attaches a console over the agent's own
-#     authenticated HTTP port through the NetworkPolicy in 63-agent-common.yaml, which is
-#     a data-plane path, not a Kubernetes one.
+#   * `pods/exec` (create) IS granted — the one addition of the Hermes retarget, and a
+#     deliberate posture change from the opencode design, which refused it because that
+#     console was an HTTP proxy to the agent's own port. `hermes gateway run` opens no port,
+#     so the console attaches `hermes --tui` over the exec subresource instead
+#     (control-plane/app/agent_console.py, retarget record R3). It is scoped by the SAME
+#     owner guard everything else here relies on: agents.console_target() resolves the pod
+#     from the authenticated identity and re-checks its owner label before this account ever
+#     names a pod to exec — RBAC itself cannot express "only my own pods" (see below).
+#     `pods/attach` and `pods/portforward` remain absent; exec is the only shell path, and
+#     it runs a fixed command (`hermes --tui`), not an arbitrary one the caller supplies.
 #   * NO `serviceaccounts`, NO `networkpolicies`. The agent ServiceAccount is bound to
 #     nothing and the agent NetworkPolicy is the fence around every agent pod; both are
 #     deploy-time objects in 63-agent-common.yaml. A control plane that could rewrite them
@@ -153,6 +159,12 @@ rules:
   - apiGroups: [""]
     resources: ["services", "persistentvolumeclaims", "secrets", "configmaps"]
     verbs: ["create", "get", "list", "patch", "delete"]
+  # The console. `create` on pods/exec is how the API server opens the exec stream that
+  # runs `hermes --tui` in the caller's own agent pod (agent_console.py). Owner-scoped in
+  # agents.console_target(), never here — RBAC is per-kind, not per-owner-label.
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
