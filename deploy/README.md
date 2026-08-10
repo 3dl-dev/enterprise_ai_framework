@@ -171,3 +171,56 @@ camp's current rules are what a fresh deployment gets by default.
 - **No idle reclaim.** Pods run until deleted:
   `kubectl -n enterprise-ai delete deploy,svc,pvc,secret -l workspace.enterprise-ai/user=<name>`.
 - **No entry point from the chat surface.** Reaching a workspace means knowing its URL.
+
+## The agent surface — one command
+
+A **resident** agent is not a workspace with a different tab: its own process is
+`opencode serve`, a headless daemon that holds a session with no console attached and keeps
+holding it across every connect and disconnect. The whole value is being away from it.
+
+Standing one up used to be three commands and a checklist — provision the agent, wire the
+chat connector, then go and prove by hand that the pod is up, that the tool inside it can
+see its tokens, and that inference actually reaches the gateway. `hermes-up.sh` is the one
+command, and it is the *validation* that makes it worth having:
+
+```bash
+# Slack (the default) — resident agent, metered on the one bill, in your workspace
+deploy/bin/hermes-up.sh baron hermes --slack-config-file ~/.secrets/hermes-slack.env
+
+# Discord instead
+deploy/bin/hermes-up.sh baron hermes --chat discord \
+    --discord-config-file ~/.secrets/hermes-discord.env
+
+# Re-run it any time. Nothing restarts, nothing rotates, the credential file is not
+# needed again — re-supplying it is the only way to rotate.
+deploy/bin/hermes-up.sh baron hermes
+```
+
+It **composes** `provision-agent.sh` and the chat tools the pod already carries; it
+reimplements none of them. What is new is a default — integrated inference (gateway →
+Forge, metered, budgeted and audited as `<user>::agents/<name>`) plus Slack — and a refusal
+to print `READY` over anything it has not observed:
+
+| Checked | Why not just trust the previous step |
+|---|---|
+| Deployment `Available=True`, pod `Running` | `kubectl rollout status` is satisfied by a ReplicaSet reaching its target; the pod behind it can be CrashLoopBackOff by the time anyone looks |
+| `agent-<chat> config` **inside the pod** | The tool's own report. A Secret existing is not the same as the process that will post to Slack being able to see it — `envFrom` is injected at pod start and never updated |
+| The connector's `.md` composed into opencode's instructions | `entrypoint.sh` deliberately falls back to the image config rather than CrashLooping every agent over a doc file, so this failure is silent: the model simply never reaches for chat |
+| A **real 200** from `POST /chat/completions` in-pod | The only step that proves the agent can do its job. One call covers the egress allowlist, the minted key, the gateway, the upstream and the model name — and asserts the base is *our* gateway, because a BYO agent answers 200 too and produces no ledger row |
+
+Anything short of all four exits non-zero with the diagnosis and the `kubectl` line to run
+next. Proven in `tests/test_hermes_up.py`, which drives the real script through recording
+kubectl/curl and injects each of those failures in turn.
+
+For BYO (the user's own provider credential, no gateway ledger row, declared with
+`model-source: byo`), call `deploy/bin/provision-agent.sh --byo-key-file` directly —
+`hermes-up.sh` refuses a BYO environment rather than reporting an unmetered agent as
+metered.
+
+### Known gap
+
+- **Live turnkey needs the Agents-surface deploy.** The control plane currently running on
+  the cluster predates this surface, so `POST /admin/keys/issue` will not mint
+  `<user>::agents/<name>` and the inference check cannot pass against it. Tracked on the
+  ship checklist, `enterpriseaiframework-a39`. Until it lands, mint with a locally-run
+  control-plane app (`enterpriseaiframework-ede`) or supply `AGENT_OPENAI_API_KEY`.

@@ -486,3 +486,32 @@ alternatives, and the trade, and is **not** silently chosen.
 | `-914` resident-time + compute metering | Contract 3 (collector, ledger, additive portal surfacing) |
 | `-a4e` email via OSI component | Contract 5 (component + integration) |
 | `-ede` E2E | all six — especially 6 (Code still byte-identical and green) and the full lifecycle across 1–4 |
+| `-783` third-party chat (Slack, Discord) | Contract 5's shape reused for chat: the tenant's own workspace/guild, the tenant's own bot tokens, no chat server in any manifest |
+| `-e5ca` turnkey one-shot (`deploy/bin/hermes-up.sh`) | Contracts 1 (alias + console path), 2 (residency, and that a re-run must not end the session), 4 (integrated is the default and BYO is refused here), 5's connector shape. Composes `provision-agent.sh` and the pod's own chat tools; implements none of them |
+
+---
+
+## Live turnkey depends on the Agents-surface deploy (`-a39`)
+
+`deploy/bin/hermes-up.sh` cannot be confirmed end to end against the **currently deployed**
+control plane, and this is a deploy-lag fact rather than a defect in either.
+
+Observed 2026-08-10, read-only: `deploy/control-plane` on the cluster runs image tag
+`enterprise-ai-control-plane:04e98a9`. At commit `04e98a9` the files
+`control-plane/app/agents.py`, `agent_usage.py` and `agent_console.py` **do not exist** —
+they arrive with `-783`/`-a4e` on `main`. So `POST /admin/keys/issue` there cannot mint
+`<user>::agents/<name>` (Contract 1's grammar), and the provisioner's own alias assertion
+is what refuses, correctly.
+
+Consequences, so nobody re-derives this:
+
+- The turnkey path is proven in `tests/test_hermes_up.py` against the real scripts through
+  recording kubectl/curl, including each validation failure injected in turn. That is the
+  proof that exists today and it is not a live proof.
+- A live confirmation needs either the Agents-surface deploy (ship checklist
+  **`enterpriseaiframework-a39`**) or the local-app mint (`-ede`), plus a real tenant bot
+  token for the chat leg — the connector's presence check asks `agent-<chat> config` inside
+  the pod, and no fixture can answer that honestly.
+- Do not "confirm" it by pointing `hermes-up.sh` at a fixture. Its entire value is that it
+  refuses to print READY over something it did not observe; a faked observation removes the
+  only thing it does.
