@@ -355,28 +355,29 @@ def test_a_created_agent_gets_every_tool_its_connectors_need(cluster):
     repository — because two different values from one repository means provisioning by
     either route restarts every agent created by the other, ending resident sessions.
     """
-    cluster.add_workspace_pod()
+    # THE HERMES RETARGET changes how a connector credential reaches the program that reads
+    # it. opencode read connectors as shell tools mounted from a deployment-wide
+    # `agent-entrypoint` ConfigMap (force-applied — finding 49's clobber). `hermes gateway
+    # run` reads its messaging connectors from the ENVIRONMENT instead, so there is no shared
+    # tool ConfigMap at all, and the per-agent connector Secrets are injected with envFrom.
     assert client_as("alice").post(
         "/portal/api/agents", json={"name": "helper"}).status_code == 201
 
-    shipped = cluster.get("configmaps", "agent-entrypoint")["data"]
-    agent_dir = REPO / "deploy" / "agent"
-    expected = _shell_agent_files()
-    assert set(shipped) == set(expected), (
-        f"the portal ships {sorted(shipped)} but provision-agent.sh ships "
-        f"{sorted(expected)}; the ConfigMap is shared and written with force=true, so the "
-        "shorter list deletes the difference from every agent in the namespace"
+    assert cluster.get("configmaps", "agent-entrypoint") is None, (
+        "the opencode agent-entrypoint tool ConfigMap is retired — a shared, force-applied "
+        "tool ConfigMap was finding 49's clobber, and Hermes needs no such thing"
     )
-    for name in expected:
-        assert shipped[name] == (agent_dir / name).read_text(), f"{name} was altered"
-
-    concatenated = b"".join((agent_dir / name).read_bytes() for name in expected)
     dep = cluster.get("deployments", "agent-alice-helper")
-    annos = dep["spec"]["template"]["metadata"]["annotations"]
-    assert annos["checksum/entrypoint"] == \
-        hashlib.sha256(concatenated).hexdigest()[:16], (
-        "the portal's entrypoint checksum is not the one provision-agent.sh computes over "
-        "the same files, so the two paths would roll each other's agents"
+    env_from = dep["spec"]["template"]["spec"]["containers"][0]["envFrom"]
+    referenced = {e["secretRef"]["name"] for e in env_from}
+    for kind in ("email", "slack", "discord"):
+        assert f"agent-alice-helper-{kind}" in referenced, (
+            f"the {kind} connector Secret is not injected via envFrom, so hermes gateway "
+            "run could never read its credential from the environment"
+        )
+    assert all(e["secretRef"].get("optional") for e in env_from), (
+        "every connector Secret must be optional — an agent with none configured must start "
+        "exactly as it did before"
     )
 
 
