@@ -5,3 +5,8 @@ httpx==0.28.1
 pydantic==2.11.7
 pymongo==4.10.1
 websockets==13.1
+# The agent object set is a multi-document YAML template that app/agents.py renders and
+# then applies over the Kubernetes API (enterpriseaiframework-627). It arrived transitively
+# with uvicorn[standard]; named here because a direct import must be a direct dependency —
+# a transitive one can vanish in a patch release and take agent creation with it.
+PyYAML==6.0.3

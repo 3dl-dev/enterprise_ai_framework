@@ -93,18 +93,25 @@ function wire(id, href) {
 
 /* ---------------------------------------------------------------- tabs
 
-   Both surfaces stay mounted once visited. Switching tabs only flips visibility, because
-   reloading chat every time somebody glances at their code would throw away the
+   The framed surfaces stay mounted once visited. Switching tabs only flips visibility,
+   because reloading chat every time somebody glances at their code would throw away the
    conversation they were in the middle of — which is precisely the disjointedness this
-   whole change exists to remove. */
+   whole change exists to remove.
+
+   Agents is the odd one out and deliberately so: it is not an iframe, so there is nothing
+   to keep mounted, and its list is REFETCHED on every switch to it. Status is the point of
+   that view — an agent's pod can go from starting to running without anybody touching the
+   page — and a cached list would show a green dot next to something that has since
+   crashed. */
 
 let LINKS = {};
 let IS_ADMIN = false;
 const TAB_KEY = "eai.tab.v1";
+const TABS = ["chat", "code", "agents"];
 
 function mountFrames() {
-  const last = localStorage.getItem(TAB_KEY) === "code" ? "code" : "chat";
-  showTab(last);
+  const last = localStorage.getItem(TAB_KEY);
+  showTab(TABS.includes(last) ? last : "chat");
 }
 
 function loadFrame(which) {
@@ -117,27 +124,34 @@ function loadFrame(which) {
   frame.dataset.loaded = "1";
 }
 
+const TAB_TITLE = { chat: "Chat", code: "Code", agents: "Agents" };
+
 function showTab(which) {
-  const code = which === "code";
-  $("view-chat").hidden = code;
-  $("view-code").hidden = !code;
-  $("tab-chat").setAttribute("aria-selected", String(!code));
-  $("tab-code").setAttribute("aria-selected", String(code));
-  loadFrame(which);
-  // Tell the frame to re-measure once it is actually on screen. A frame laid out while
-  // its tab was hidden measures zero width, and ttyd sizes its terminal to whatever it
-  // measured — which is how the prompt ends up off-screen. Same-origin, so this is a
-  // plain event; wrapped because a frame that has not finished loading has no window yet.
-  requestAnimationFrame(() => {
-    const f = which === "code" ? $("frame-code") : $("frame-chat");
-    try { f.contentWindow?.dispatchEvent(new Event("resize")); } catch {}
-  });
+  if (!TABS.includes(which)) which = "chat";
+  for (const t of TABS) {
+    $("view-" + t).hidden = t !== which;
+    $("tab-" + t).setAttribute("aria-selected", String(t === which));
+  }
+  if (which === "agents") {
+    loadAgents();
+  } else {
+    loadFrame(which);
+    // Tell the frame to re-measure once it is actually on screen. A frame laid out while
+    // its tab was hidden measures zero width, and ttyd sizes its terminal to whatever it
+    // measured — which is how the prompt ends up off-screen. Same-origin, so this is a
+    // plain event; wrapped because a frame that has not finished loading has no window yet.
+    requestAnimationFrame(() => {
+      const f = which === "code" ? $("frame-code") : $("frame-chat");
+      try { f.contentWindow?.dispatchEvent(new Event("resize")); } catch {}
+    });
+  }
   localStorage.setItem(TAB_KEY, which);
-  document.title = code ? "Code — Enterprise AI" : "Chat — Enterprise AI";
+  document.title = `${TAB_TITLE[which]} — Enterprise AI`;
 }
 
 $("tab-chat").addEventListener("click", () => showTab("chat"));
 $("tab-code").addEventListener("click", () => showTab("code"));
+$("tab-agents").addEventListener("click", () => showTab("agents"));
 $("code-retry").addEventListener("click", () => {
   const f = $("frame-code");
   delete f.dataset.loaded;
@@ -193,6 +207,7 @@ document.addEventListener("keydown", (e) => {
   // Digit shortcuts, the way a tabbed app is expected to behave.
   if (e.key === "1") showTab("chat");
   if (e.key === "2") showTab("code");
+  if (e.key === "3") showTab("agents");
 });
 
 /* ---------------------------------------------------------------- spend */
@@ -406,6 +421,202 @@ async function loadAdmin() {
 }
 
 $("admin-since").addEventListener("change", loadAdmin);
+
+/* ---------------------------------------------------------------- agents
+
+   The third surface. Every control here is owner-scoped SERVER SIDE — the endpoints take
+   the owner from the signed-in session and never from anything this file sends — so
+   nothing below is a permission check. It is a rendering of what the caller owns, and if
+   it ever showed somebody else's agent, the bug would be in the control plane, not here.
+
+   Two dimensions per row, never added: `inference` is dollars off the gateway ledger,
+   `usage` is quantities off the resident meter. Owned compute has no price
+   (enterpriseaiframework-914), so putting a dollar sign on hours would be inventing a
+   number nobody owes. */
+
+const STATUS_TEXT = {
+  running: "running",
+  starting: "starting…",
+  stopped: "stopped",
+  unknown: "unknown",
+};
+
+async function del(path) {
+  const r = await fetch(path, { method: "DELETE", headers: { Accept: "application/json" } });
+  return { ok: r.ok, data: await r.json().catch(() => ({})) };
+}
+
+/* Hours, at the scale a camp session actually produces. Rounding 4 minutes to "0.1h"
+ * reads as a broken meter in exactly the way sub-cent spend did. */
+function hours(n) {
+  const v = Number(n || 0);
+  if (v === 0) return "0h";
+  if (v < 1) return Math.round(v * 60) + "m";
+  return v.toFixed(1) + "h";
+}
+
+let AGENTS_BUSY = false;
+
+async function loadAgents() {
+  let d;
+  try { d = await get("/portal/api/agents"); }
+  catch (e) {
+    $("agents-error").hidden = false;
+    $("agents-error").textContent =
+      "Could not read your agents just now. The list below may be out of date.";
+    return;
+  }
+  $("agents-error").hidden = !d.usage_error;
+  if (d.usage_error) {
+    // An empty usage block WITH an error means "we do not know", which is a different
+    // statement from zero and is worth more than a silent dash.
+    $("agents-error").textContent =
+      "Your agents are listed, but their hours could not be read: " + d.usage_error;
+  }
+
+  const models = d.models || [];
+  const sel = $("agent-model");
+  if (sel.dataset.filled !== String(models.length)) {
+    sel.innerHTML = "";
+    for (const m of models) {
+      const opt = document.createElement("option");
+      opt.value = m; opt.textContent = m;
+      sel.appendChild(opt);
+    }
+    sel.dataset.filled = String(models.length);
+    sel.hidden = models.length < 2;
+  }
+
+  const list = $("agentlist");
+  list.innerHTML = "";
+  const rows = d.agents || [];
+  for (const a of rows) list.appendChild(agentRow(a));
+  $("agents-empty").hidden = rows.length !== 0;
+}
+
+function agentRow(a) {
+  const li = document.createElement("li");
+  li.className = "agent " + (a.status || "unknown");
+
+  const head = document.createElement("div");
+  head.className = "agent-head";
+  const dot = document.createElement("span");
+  dot.className = "status-dot";
+  const name = document.createElement("span");
+  // textContent: an agent name is user-chosen. It is slug-constrained server side, and
+  // this page still does not hand it to the HTML parser.
+  name.className = "name grow"; name.textContent = a.name;
+  const state = document.createElement("span");
+  state.className = "status"; state.textContent = STATUS_TEXT[a.status] || a.status;
+  head.append(dot, name, state);
+
+  const meta = document.createElement("div");
+  meta.className = "agent-meta";
+  const inf = a.inference || {};
+  const use = a.usage;
+  const bits = [];
+  bits.push(inf.on_ledger === false
+    ? "inference off-ledger (your own provider)"
+    : `${money(inf.spend)} inference · ${compact(inf.requests)} requests`);
+  if (use) {
+    bits.push(`${hours(use.resident_hours)} resident`);
+    bits.push(use.compute_measured
+      ? `${hours(use.cpu_core_hours)} CPU-core`
+      : "compute not measured");
+  } else {
+    bits.push("no usage recorded yet");
+  }
+  meta.textContent = bits.join(" · ");
+
+  const controls = document.createElement("div");
+  controls.className = "agent-controls";
+
+  const open = document.createElement("a");
+  open.className = "btn small"; open.textContent = "Open console";
+  open.href = a.console_url; open.target = "_blank"; open.rel = "noopener";
+  if (a.status !== "running") open.classList.add("disabled");
+  controls.appendChild(open);
+
+  const toggle = document.createElement("button");
+  toggle.className = "btn small ghost";
+  toggle.textContent = a.status === "stopped" ? "Start" : "Stop";
+  toggle.addEventListener("click", () => a.status === "stopped"
+    ? act(`/portal/api/agents/${encodeURIComponent(a.name)}/start`, `${a.name} is starting.`)
+    : stopAgent(a.name));
+  controls.appendChild(toggle);
+
+  const drop = document.createElement("button");
+  drop.className = "btn small danger"; drop.textContent = "Delete";
+  drop.addEventListener("click", () => deleteAgent(a.name));
+  controls.appendChild(drop);
+
+  li.append(head, meta, controls);
+  return li;
+}
+
+async function act(path, okMsg) {
+  if (AGENTS_BUSY) return;
+  AGENTS_BUSY = true;
+  try {
+    const { ok, data } = await post(path, {});
+    if (!ok) { toast(data.detail || "That did not work.", false); return; }
+    toast(okMsg);
+    await loadAgents();
+  } finally { AGENTS_BUSY = false; }
+}
+
+async function stopAgent(name) {
+  const ok = await confirmDialog({
+    title: `Stop ${name}?`,
+    body: "It stops running and stops costing anything. Its work is kept on its disk and "
+        + "picks up where it left off when you start it again.",
+    danger: "Stop it",
+  });
+  if (ok) await act(`/portal/api/agents/${encodeURIComponent(name)}/stop`, `${name} is stopping.`);
+}
+
+async function deleteAgent(name) {
+  const ok = await confirmDialog({
+    title: `Delete ${name}?`,
+    body: "This destroys its disk and everything on it, and cannot be undone. Its key "
+        + "stops working immediately. Stopping it instead keeps all of that.",
+    danger: "Delete it for good",
+  });
+  if (!ok) return;
+  if (AGENTS_BUSY) return;
+  AGENTS_BUSY = true;
+  try {
+    const { ok: good, data } = await del(`/portal/api/agents/${encodeURIComponent(name)}`);
+    if (!good) { toast(data.detail || "Could not delete that agent.", false); return; }
+    // Honest about the one step that lags: the volume keeps a finalizer while its pod is
+    // still terminating. Claiming it is gone when it is not is how a deleted agent
+    // reappears on the next refresh and looks like a bug.
+    toast(data.volume_terminating
+      ? `${name} is deleted; its disk is still being released.`
+      : `${name} is deleted.`);
+    await loadAgents();
+  } finally { AGENTS_BUSY = false; }
+}
+
+$("agent-new").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const input = $("agent-name");
+  const name = input.value.trim();
+  if (!name || AGENTS_BUSY) return;
+  AGENTS_BUSY = true;
+  $("agent-create").disabled = true;
+  try {
+    const { ok, data } = await post("/portal/api/agents",
+      { name, model: $("agent-model").value || undefined });
+    if (!ok) { toast(data.detail || "Could not create that agent.", false); return; }
+    input.value = "";
+    toast(`${name} is starting. It takes about a minute to be ready.`);
+    await loadAgents();
+  } finally {
+    AGENTS_BUSY = false;
+    $("agent-create").disabled = false;
+  }
+});
 
 /* ---------------------------------------------------------------- boot */
 

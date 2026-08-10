@@ -34,7 +34,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse
 
-from . import agent_usage, chat_identity, db, gateway, issuance, metering
+from . import agent_usage, agents, chat_identity, db, gateway, issuance, metering
 
 router = APIRouter()
 
@@ -169,20 +169,8 @@ async def my_spend(since: str | None = None, user: str = Depends(require_user)):
     LibreChat's internal id, and filtering in SQL, before that translation, would
     silently drop every chat row from the user's own total.
     """
-    rows = await metering.spend_by_user_and_surface(since)
-    mine: dict[str, dict] = {}
-    total = {"requests": 0, "spend": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
-    for r in rows:
-        who = r.get("username") or ""
-        if who != user:
-            continue
-        surface = r.get("surface") or "(unknown)"
-        acc = mine.setdefault(surface, {"surface": surface, "requests": 0, "spend": 0.0,
-                                        "prompt_tokens": 0, "completion_tokens": 0})
-        for k in ("requests", "spend", "prompt_tokens", "completion_tokens"):
-            acc[k] += r.get(k) or 0
-            total[k] += r.get(k) or 0
-    agents, agents_error = await _agent_usage_beside_spend(user, mine)
+    mine, total = await _spend_by_surface(user, since)
+    agents_rows, agents_error = await _agent_usage_beside_spend(user, mine)
     return {
         "username": user,
         "since": since,
@@ -196,12 +184,36 @@ async def my_spend(since: str | None = None, user: str = Depends(require_user)):
         # burnt, peak megabytes. There are no dollars in it, by Baron's ruling; the
         # hardware is owned and its cost is sunk, so a rate here would be an invented
         # number. See app/agent_usage.py.
-        "by_agent": agents,
+        "by_agent": agents_rows,
         # Present only when the usage ledger could not be read. An empty `by_agent` with
         # no error means there are no agents; an empty one WITH an error means we do not
         # know, and saying so beats rendering zero.
         **({"agents_usage_error": agents_error} if agents_error else {}),
     }
+
+
+async def _spend_by_surface(user: str, since: str | None) -> tuple[dict, dict]:
+    """One user's inference spend, keyed by surface, plus their total.
+
+    Lifted verbatim out of `my_spend` when the Agents tab needed the same numbers per
+    agent row. It is the same filter over the same query for the same reason recorded
+    there — the principal is named by `chat_identity.attribute` AFTER the database has
+    answered, so filtering in SQL would silently drop the caller's own chat rows.
+    """
+    rows = await metering.spend_by_user_and_surface(since)
+    mine: dict[str, dict] = {}
+    total = {"requests": 0, "spend": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
+    for r in rows:
+        who = r.get("username") or ""
+        if who != user:
+            continue
+        surface = r.get("surface") or "(unknown)"
+        acc = mine.setdefault(surface, {"surface": surface, "requests": 0, "spend": 0.0,
+                                        "prompt_tokens": 0, "completion_tokens": 0})
+        for k in ("requests", "spend", "prompt_tokens", "completion_tokens"):
+            acc[k] += r.get(k) or 0
+            total[k] += r.get(k) or 0
+    return mine, total
 
 
 async def _agent_usage_beside_spend(user: str, by_surface: dict) -> tuple[list[dict], str]:
@@ -301,6 +313,106 @@ async def rotate_my_key(body: dict, user: str = Depends(require_user)):
         "rotated": issued["rotated"],
         "note": "Copy it now — it is not shown again.",
     }
+
+
+# ---------------------------------------------------------------- agents
+#
+# THE THIRD SURFACE, AND THE FIRST ONE A USER CAN CREATE INFRASTRUCTURE WITH.
+#
+# Chat and Code are surfaces a user is GIVEN: an operator provisions the workspace and the
+# portal points at it. An agent is a surface a user MAKES — a Deployment, a Service, a
+# PersistentVolumeClaim and a Secret, applied to a live namespace by a control plane that
+# holds namespaced write authority to do it (deploy/k8s/39-control-plane-rbac.yaml).
+#
+# So these four endpoints are the point at which "one control plane" starts to mean real
+# privilege delegated on a user's behalf, and there is exactly one thing keeping one
+# camper out of another camper's agent: OWNER IS ALWAYS `require_user()`. It is never a
+# body field, never a query parameter, never a path segment. That is the same rule
+# `/portal/api/keys/rotate` states above, and here it is enforced twice — the object name
+# is DERIVED from the authenticated name, and then the object's own owner label is checked
+# against it, because two different (user, name) pairs can derive the same object name
+# when either half contains a hyphen. See app/agents.py for that collision written out.
+
+
+@router.get("/portal/api/agents")
+async def my_agents(user: str = Depends(require_user)):
+    """The caller's own agents, each with BOTH metering dimensions beside its status.
+
+    The two dimensions are the ones Contract 3 names and they are kept apart here exactly
+    as `/portal/api/spend` keeps them apart: `inference` is dollars off the gateway ledger,
+    `usage` is quantities — hours, CPU-core-hours, megabytes — off the -914 resident meter,
+    and neither is folded into the other. A stopped agent shows frozen usage and unchanged
+    spend, which is the whole observable claim of Contract 2's scale-to-zero.
+    """
+    rows = await agents.list_agents(user)
+
+    spend, _ = await _spend_by_surface(user, None)
+    try:
+        usage = {u["agent"]: u for u in await agent_usage.usage_by_agent(user)}
+        usage_error = ""
+    except Exception as exc:  # noqa: BLE001 - reported to the caller, never swallowed
+        usage, usage_error = {}, f"{type(exc).__name__}: {exc}"
+
+    out = []
+    for row in rows:
+        spend_row = spend.get(row["surface"])
+        integrated = row.get("model_source") != "byo"
+        metered = usage.get(row["name"])
+        out.append({
+            **row,
+            "usage": {k: metered[k] for k in (
+                "resident_seconds", "resident_hours", "cpu_core_seconds",
+                "cpu_core_hours", "memory_peak_bytes", "memory_peak_mb",
+                "compute_source", "compute_measured",
+            )} if metered else None,
+            "inference": {
+                # A BYO agent is labelled off-ledger rather than rendered as $0: a silent
+                # zero reads as "free" or "broken", and finding 4's leak was exactly an
+                # unmetered path that rendered as healthy.
+                "on_ledger": integrated,
+                "requests": (spend_row or {}).get("requests", 0),
+                "spend": (spend_row or {}).get("spend", 0.0),
+                "prompt_tokens": (spend_row or {}).get("prompt_tokens", 0),
+                "completion_tokens": (spend_row or {}).get("completion_tokens", 0),
+            },
+        })
+    return {
+        "username": user,
+        "agents": out,
+        "models": list(agents.allowed_models()),
+        **({"usage_error": usage_error} if usage_error else {}),
+    }
+
+
+@router.post("/portal/api/agents", status_code=201)
+async def create_my_agent(body: dict, user: str = Depends(require_user)):
+    """Create one agent for the caller. The name is theirs to choose; the owner is not."""
+    name = ((body or {}).get("name") or "").strip()
+    model = ((body or {}).get("model") or "").strip() or None
+    return await agents.create(user, name, model=model)
+
+
+@router.post("/portal/api/agents/{name}/stop")
+async def stop_my_agent(name: str, user: str = Depends(require_user)):
+    """`replicas: 0`. The PVC is kept, the session is on it, and the meter freezes."""
+    return await agents.scale(user, name, 0)
+
+
+@router.post("/portal/api/agents/{name}/start")
+async def start_my_agent(name: str, user: str = Depends(require_user)):
+    """`replicas: 1`. The SAME agent resumes from the same volume, not a new one.
+
+    Contract 2 lists `stopped -> running` as a transition, so it is here. Without it a
+    stopped agent could only be revived with a kubeconfig, which would make Stop a
+    one-way door dressed up as a pause.
+    """
+    return await agents.scale(user, name, 1)
+
+
+@router.delete("/portal/api/agents/{name}")
+async def delete_my_agent(name: str, user: str = Depends(require_user)):
+    """The irreversible one: every object, then the volume, then the virtual key."""
+    return await agents.delete(user, name)
 
 
 @router.get("/portal/api/published")

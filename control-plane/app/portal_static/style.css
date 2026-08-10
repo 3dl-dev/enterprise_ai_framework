@@ -337,3 +337,50 @@ dialog:not([open]) { display: none !important; }
   color: var(--warn); font-size: 12.5px;
 }
 .note.bad { color: var(--danger); }
+
+/* ---------------------------------------------------------------- agents
+ *
+ * The one view that is a page rather than a frame. It scrolls (the framed surfaces do
+ * not — they fill the rectangle and manage their own scrolling), so it gets `.scroll`
+ * rather than a rule on `.view` that would give chat and code a second scrollbar. */
+
+.view.scroll { overflow-y: auto; }
+
+.agents-wrap { max-width: 940px; margin: 0 auto; padding: 26px 20px 60px; }
+
+.agents-head {
+  display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+.agents-head > div { flex: 1 1 380px; }
+.agents-head h2 { margin: 0 0 6px; font-size: 19px; }
+.agents-head .note.top { margin: 0; max-width: 62ch; }
+
+.agents-new { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.agents-new input, .agents-new select {
+  background: var(--surface-2); color: var(--ink); font: inherit; font-size: 13.5px;
+  border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
+}
+.agents-new input { width: 200px; font-family: var(--font-mono); }
+.agents-new input::placeholder { color: var(--ink-4); font-family: var(--font-ui); }
+
+.agentlist { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.agent {
+  display: grid; gap: 8px; padding: 14px 16px; border-radius: 12px;
+  background: var(--surface); border: 1px solid var(--line); box-shadow: var(--sh-1);
+}
+.agent-head { display: flex; align-items: center; gap: 10px; }
+.agent-head .name { font-family: var(--font-mono); font-weight: 560; font-size: 14px; }
+.agent .status { font-size: 12px; color: var(--ink-3); }
+
+/* The dot carries the state, and only `running` is green. `starting` is amber rather
+ * than green on purpose: a pod in ImagePullBackOff has replicas 1 and is not running,
+ * and a green dot beside it is the single most misleading thing this page could draw. */
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-4); flex: none; }
+.agent.running  .status-dot { background: var(--ok);     box-shadow: 0 0 0 3px var(--ok-a); }
+.agent.starting .status-dot { background: var(--warn); }
+.agent.stopped  .status-dot { background: var(--ink-4); }
+
+.agent-meta { font-size: 12px; color: var(--ink-4); }
+.agent-controls { display: flex; gap: 8px; flex-wrap: wrap; }
+.agent-controls .btn.disabled { opacity: .45; pointer-events: none; }

@@ -26,8 +26,9 @@
 #     and keep `automountServiceAccountToken: false` (60-workspace-common.yaml,
 #     63-agent-common.yaml). This file widens the CONTROL PLANE, which is already the
 #     component that administers everything, and widens nothing that runs user code.
-#   * write verbs of any kind. The meter reads. Creating, scaling and deleting agents is
-#     enterpriseaiframework-627's problem and will need its own, separate grant.
+#   * cluster-scoped write of any kind. `control-plane-agent-writer` below is the grant
+#     enterpriseaiframework-627 needed and it is a namespaced Role, not a ClusterRole. The
+#     only cluster-scoped object in this file remains `nodes/metrics`, which is read.
 #
 # NETWORK: no NetworkPolicy in this namespace selects the control-plane pod
 # (`workspace-isolation` selects component=workspace, `agent-isolation` selects
@@ -82,6 +83,89 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: control-plane-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: control-plane
+    namespace: enterprise-ai
+---
+# THE WRITE GRANT (enterpriseaiframework-627), and the reason it is shaped like this.
+#
+# The Agents tab lets a signed-in person create, stop and delete their own agent. Contract
+# 2 of docs/design/records/agents-surface.md defines each of those as a concrete Kubernetes
+# action on a concrete object, so the control plane — which is the only component that
+# knows who the caller is — has to be able to perform them. There is no way to build the
+# surface without this grant, and there is no smaller grant that builds it.
+#
+# WHAT MAKES IT NARROW, itemised, because "narrow" is a claim and not a description:
+#
+#   * NAMESPACED. A Role and a RoleBinding, both in enterprise-ai. Nothing here can touch
+#     an object in kube-system, in a training namespace, or in any namespace this platform
+#     does not own. Compare `control-plane-node-metrics` below, which is the one grant in
+#     this file that leaves the namespace, and is a read of one subresource.
+#   * FIVE RESOURCE KINDS, exactly the five an agent is made of. Not `*`.
+#   * NO `escalate`, NO `bind`, NO rbac.authorization.k8s.io of any kind, so this account
+#     cannot widen itself. Granting write on `roles`/`rolebindings` to a component that
+#     already holds write is the classic path from "can create a Deployment" to "is
+#     cluster-admin", and it is absent on purpose.
+#   * NO `pods/exec`, NO `pods/attach`, NO `pods/portforward`. The control plane creates
+#     the pod; it cannot get a shell in one. -0e7 attaches a console over the agent's own
+#     authenticated HTTP port through the NetworkPolicy in 63-agent-common.yaml, which is
+#     a data-plane path, not a Kubernetes one.
+#   * NO `serviceaccounts`, NO `networkpolicies`. The agent ServiceAccount is bound to
+#     nothing and the agent NetworkPolicy is the fence around every agent pod; both are
+#     deploy-time objects in 63-agent-common.yaml. A control plane that could rewrite them
+#     could hand a user's agent an API token or open its egress, and no amount of care in
+#     app/agents.py would help.
+#
+# WHAT THIS GRANT CANNOT DO, AND WHERE THE REAL GUARD IS
+#
+# Kubernetes RBAC has no notion of "only the objects whose owner label matches the person
+# who asked". It is per-verb and per-kind, so within enterprise-ai this account really can
+# delete any agent, any workspace Secret and any ConfigMap. That is unavoidable, and it
+# means THE OWNER SCOPING IN control-plane/app/agents.py IS THE ENTIRE ISOLATION BOUNDARY
+# between one user and another. It is enforced twice there — the object name is derived
+# from the authenticated identity, and the object's own `agent.enterprise-ai/user` label is
+# then checked against that identity, because two different (user, name) pairs can derive
+# one object name when either contains a hyphen. control-plane/tests/test_portal_agents.py
+# tests that as a security control, and tests-live/test_portal_agents.py proves it with a
+# real second identity against this cluster. If those tests are ever weakened, this grant
+# is what they were holding back.
+#
+# Secrets are in the list and that deserves its own line: an agent's Secret holds a
+# spendable virtual key, and `create` is how it gets one at all. `delete` is here so that
+# Contract 2's `deleted` cannot leave a live credential behind — a half-deleted agent whose
+# Secret survived is a key nobody is watching, which is strictly worse than the grant.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: control-plane-agent-writer
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: control-plane
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    # `patch` covers both directions of Contract 2's scale transition (replicas 0 and 1)
+    # and server-side apply. `deployments/scale` is deliberately not requested: patching
+    # the object we already fully manage needs no second subresource.
+    verbs: ["create", "get", "list", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims", "secrets", "configmaps"]
+    verbs: ["create", "get", "list", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: control-plane-agent-writer
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: control-plane
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: control-plane-agent-writer
 subjects:
   - kind: ServiceAccount
     name: control-plane

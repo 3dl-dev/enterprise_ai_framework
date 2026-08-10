@@ -143,6 +143,20 @@ ensure_tenant_skill_configmaps "$NS" chat-skill bundle/skills
 
 CFG_SUM=$( { cat bundle/litellm/config.generated.yaml bundle/librechat/librechat.yaml deploy/gateway/strip_reasoning.py deploy/gateway/require_principal.py deploy/gateway/flush_spend_on_shutdown.py deploy/gateway/allow_reasoning_effort.py bundle/skills/*/SKILL.md; } | sha256sum | cut -c1-16)
 
+# The two files the portal's Agents tab renders an agent from
+# (enterpriseaiframework-627). They live under deploy/ and the control-plane image is built
+# from control-plane/ alone, so they arrive as a ConfigMap — the same delivery mechanism
+# provision-agent.sh already uses for the entrypoint, and for the same reason: the image
+# must not carry a second copy of an object set that would drift from the template.
+#
+# Rebuilt from the repository on every deploy, so an edit to either file reaches the
+# control plane the way an edit to a manifest does.
+echo "==> agent assets -> configmap/agent-assets"
+kubectl -n "$NS" create configmap agent-assets \
+    --from-file=64-agent.template.yaml=deploy/k8s/64-agent.template.yaml \
+    --from-file=entrypoint.sh=deploy/agent/entrypoint.sh \
+    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+
 echo "==> build and push control-plane image -> ${IMAGE}"
 docker build -q -t "$IMAGE" ./control-plane
 docker push -q "$IMAGE"
