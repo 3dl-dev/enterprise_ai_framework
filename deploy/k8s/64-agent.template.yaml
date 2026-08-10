@@ -1,33 +1,55 @@
-# One named, resident agent instance. Rendered by deploy/bin/provision-agent.sh — the
-# placeholders are substituted literally, so this file is not applyable on its own.
+# One named, resident HERMES agent instance. Rendered by deploy/bin/provision-agent.sh
+# and by control-plane/app/agents.py (the self-serve portal path) — the placeholders are
+# substituted literally, so this file is not applyable on its own.
 #
-#   __USER__      Keycloak username; with __NAME__ it forms every object name
-#   __NAME__      the user-chosen agent slug
-#   __IMAGE__     workspace image reference in the rail registry (reused verbatim)
-#   __MODEL__     opencode's default model, a name from the gateway catalogue
-#   __CFGSUM__    checksum of the entrypoint ConfigMap, so an entrypoint change rolls
+#   __USER__          Keycloak username; with __NAME__ it forms every object name
+#   __NAME__          the user-chosen agent slug
+#   __IMAGE__         the Hermes Agent image (nousresearch/hermes-agent:<date-tag>)
+#   __MODEL__         a model id the gateway serves, bare (NO `enterprise-ai/` prefix)
+#   __CONTEXT_LENGTH__  explicit context window for the model (Hermes cannot read it from
+#                     our gateway's /v1/models; a missing value reads as "context exceeded")
+#   __MAX_TOKENS__    output cap, <= the model's provider cap (deepinfra caps some models at
+#                     32768; exceeding it 400s and Hermes misreports it as "context exceeded")
+#   __CFGSUM__        checksum of the seeded config.yaml, so a config change rolls the pod
 #   __MODEL_SOURCE__  `integrated` or `byo` (Contract 4) — provenance, see the label below
-#   __API_BASE__      where the agent's inference goes: our gateway, or the user's own
-#                     external provider under BYO
 #   __KEY_SECRET__    the Secret holding OPENAI_API_KEY: `agent-<user>-<name>-key` (the
-#                     integrated virtual key) or `agent-<user>-<name>-byo` (the user's
-#                     own provider credential, set-once and never read back)
-#   __EMAILSUM__      checksum of the mailbox credential (`agent-<user>-<name>-email`), or
-#                     `none` — so a re-supplied mail password rolls the pod and a re-run
-#                     that supplies nothing does not
-#   __SLACKSUM__      the same, for the Slack bot + app tokens (`…-slack`)
-#   __DISCORDSUM__    the same, for the Discord bot token (`…-discord`)
+#                     integrated virtual key) or `agent-<user>-<name>-byo` (the user's own)
+#   __KEYSUM__        checksum of the model-API credential (rolls the pod on rotation)
+#   __EMAILSUM__ / __SLACKSUM__ / __DISCORDSUM__   connector checksums or `none`
 #
-# A COPY of 61-workspace.template.yaml's shape, deliberately, not a shared base: Contract
-# 6 of docs/design/records/agents-surface.md freezes that file byte-for-byte because the
-# camp runs on it. Read the differences as the design, they are all Contract 1 and 2:
-#
-#   * every object is `agent-__USER__-__NAME__` (a user has ONE workspace and MANY agents)
-#   * `command:` overrides the image ENTRYPOINT so the container's own process is
-#     `opencode serve`, RESIDENT, instead of ttyd spawning an opencode per websocket
-#   * no ttyd, no shell-server, no published mount, no per-user oauth2-proxy NodePort
-#   * `app.kubernetes.io/component: agent`, a different value from `workspace`, so the
-#     workspace NetworkPolicy and Service selectors do not see these pods at all
+# This is the RETARGET of the surface from opencode to Hermes
+# (docs/design/records/agents-surface-hermes-retarget.md), validated live 2026-08-10.
+# The residency shape (RWO PVC, replicas 1, Recreate, scale-to-zero stop) is unchanged from
+# Contract 2 — only the container it wraps changed. Contract 6 still freezes deploy/workspace/*;
+# this file sits beside it and is Hermes-only.
+---
+# The seeded Hermes config. Copied onto the PVC at /opt/data/config.yaml by the init
+# container BELOW (never mounted read-only over HERMES_HOME — Hermes rewrites config at
+# runtime). Source of truth for the body: deploy/agent/hermes-config.yaml.tmpl.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-__USER__-__NAME__-config
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+data:
+  config.yaml: |
+    providers:
+      gateway:
+        base_url: __API_BASE__
+        key_env: OPENAI_API_KEY
+        discover_models: true
+    model:
+      provider: gateway
+      default: __MODEL__
+      context_length: __CONTEXT_LENGTH__
+      max_tokens: __MAX_TOKENS__
+    terminal:
+      backend: local
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -41,43 +63,14 @@ metadata:
     agent.enterprise-ai/name: "__NAME__"
 spec:
   accessModes: [ReadWriteOnce]
-  # local-path, which lives on the node's disk. NON-DURABLE in the same way a workspace
-  # PVC is (k3s-worker is cattle); the tank-backed dataset that fixes this is staged
-  # behind a reboot gate. This matters MORE here than for a workspace: the lifecycle in
-  # Contract 2 promises that `stopped` keeps state and only `deleted` destroys it, and a
-  # node rebuild breaks that promise without passing through either transition.
+  # local-path (node disk). NON-DURABLE like a workspace PVC (k3s-worker is cattle); the
+  # tank-backed dataset that fixes this is staged behind a reboot gate. Matters more here:
+  # Contract 2 promises `stopped` keeps state and only `deleted` destroys it, and a node
+  # rebuild breaks that without passing through either transition.
   storageClassName: local-path
   resources:
     requests:
       storage: 5Gi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: agent-__USER__-__NAME__
-  namespace: enterprise-ai
-  labels:
-    app.kubernetes.io/part-of: enterprise-ai-framework
-    app.kubernetes.io/component: agent
-    agent.enterprise-ai/user: "__USER__"
-    agent.enterprise-ai/name: "__NAME__"
-spec:
-  # ClusterIP. There is no NodePort and there must not be one — this port is a headless
-  # coding agent holding a spendable key. The portal proxies it at /agents/__NAME__/ on
-  # the same origin as chat, resolving __USER__ from the authenticated identity and never
-  # from the path (Contract 1); enterpriseaiframework-0e7 builds that attach.
-  #
-  # Reachable only from the control-plane pod; see the NetworkPolicy in
-  # 63-agent-common.yaml and OPENCODE_SERVER_PASSWORD below for what guards it beyond
-  # that.
-  selector:
-    app.kubernetes.io/component: agent
-    agent.enterprise-ai/user: "__USER__"
-    agent.enterprise-ai/name: "__NAME__"
-  ports:
-    - name: opencode
-      port: 4096
-      targetPort: 4096
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -91,15 +84,12 @@ metadata:
     agent.enterprise-ai/name: "__NAME__"
     agent.enterprise-ai/model-source: "__MODEL_SOURCE__"
 spec:
-  # `created`/`running` is replicas: 1; `stopped` is replicas: 0 with the PVC retained;
-  # `deleted` removes these objects and then the PVC (Contract 2, driven by
-  # enterpriseaiframework-627). Scale-to-zero is what makes "stopped costs nothing"
-  # literally true rather than a billing rate: there is no pod, so there is no
-  # status.startTime advancing and no cAdvisor counter incrementing.
+  # created/running = replicas 1; stopped = replicas 0 (PVC retained); deleted = remove
+  # these objects then the PVC (Contract 2). Scale-to-zero makes "stopped costs nothing"
+  # literally true: no pod, no status.startTime, no cAdvisor counter.
   replicas: 1
-  # The PVC is ReadWriteOnce and the daemon holds a live session. Two replicas of one
-  # stateful agent is never what anyone wanted, and a rolling update would try to start a
-  # second one against the same volume.
+  # RWO PVC + a live session: two replicas is never wanted, and a rolling update would try
+  # to start a second against the same volume. Hermes is single-writer; Recreate is required.
   strategy: { type: Recreate }
   selector:
     matchLabels:
@@ -111,237 +101,90 @@ spec:
       labels:
         app.kubernetes.io/part-of: enterprise-ai-framework
         app.kubernetes.io/component: agent
-        # Contract 3's attribution key for the resident-time and compute meter
-        # (enterpriseaiframework-914) is read from THESE labels, not from the virtual key:
-        # compute is consumed by the pod, not by an inference call, so a BYO agent that
-        # produces no gateway ledger row still bills for the hours it was resident.
+        # Contract 3's resident-time/compute meter (enterpriseaiframework-914) keys on THESE
+        # labels, not the virtual key: compute is the pod's, so a BYO agent with no gateway
+        # ledger row still bills for the hours it was resident.
         agent.enterprise-ai/user: "__USER__"
         agent.enterprise-ai/name: "__NAME__"
-        # PROVENANCE, Contract 4. `integrated` = the agent inferences through its
-        # __USER__::agents/__NAME__ virtual key on our gateway, so its spend is a row on
-        # the one bill. `byo` = the user supplied their own provider credential and the
-        # traffic never touches our layer, so there is NO gateway ledger row for it — by
-        # declaration, not by accident. This label is how every spend view knows the
-        # difference, which is what stops a BYO agent rendering as a silent $0: a silent
-        # zero reads as "free" or "broken", and finding 4's leak was exactly an
-        # unmetered path that rendered as healthy. Deliberately NOT in the Deployment's
-        # selector (which is immutable) so an agent can be switched between the two.
+        # PROVENANCE, Contract 4. `integrated` = inference through the __USER__::agents/__NAME__
+        # virtual key on our gateway (on the one bill). `byo` = the user's own credential,
+        # off our gateway by declaration; this label is what stops a BYO agent rendering as a
+        # silent $0. Deliberately NOT in the immutable selector so an agent can switch modes.
         agent.enterprise-ai/model-source: "__MODEL_SOURCE__"
       annotations:
-        # The ENTRYPOINT's checksum. The workspace template rolls its pod on every key
-        # ROTATION because a workspace pod is cheap to restart; restarting an agent ends
-        # the resident session that is the entire product, so a re-run of the provisioner
-        # must be a no-op for a healthy agent.
-        checksum/entrypoint: "__CFGSUM__"
-        # The credential's checksum — and this is NOT the same thing as rotating on every
-        # run, because provision-agent.sh does not rotate a key that already works. It
-        # changes when the key actually changes: -055's sentinel being replaced by a real
-        # minted key, a deliberate rotation, or a re-supplied BYO credential. In every one
-        # of those cases the pod MUST restart, because env from a secretKeyRef is injected
-        # at pod start and never updated afterwards — so a running agent would keep
-        # presenting the old credential and 401 forever, silently, which on an unattended
-        # surface means nobody finds out. A hash, never the key.
+        # config.yaml's checksum — a config change (model, context, gateway) rolls the pod.
+        checksum/config: "__CFGSUM__"
+        # The model-API credential's checksum. env from a secretKeyRef is injected at pod
+        # start and never updated, so a rotated key MUST roll the pod or the agent 401s
+        # forever, silently, on a surface nobody watches. A hash, never the key.
         checksum/api-key: "__KEYSUM__"
-        # The MAILBOX credential's checksum (enterpriseaiframework-a4e), and it is here
-        # for exactly the reason checksum/api-key is: `envFrom` is injected at pod start
-        # and never updated afterwards, so an agent whose mail password was re-supplied
-        # would keep presenting the old one and keep getting rejected by the provider,
-        # silently, on a surface nobody is watching.
-        #
-        # It is a HASH the provisioner stores beside the credential, never the credential:
-        # provision-agent.sh writes AGENT_EMAIL_CONFIG_SUM into the Secret and reads that
-        # key back, so a re-run with no --email-config-file renders the SAME value here
-        # and the agent is not restarted. That matters more than it looks: restarting an
-        # agent ends the resident session, so "re-provisioning is a no-op" has to survive
-        # a credential the provisioner is forbidden to read.
-        # "none" when this agent has no mailbox at all.
+        # The connector credentials' checksums (email/Slack/Discord), same reason: envFrom is
+        # injected at pod start and never updated. "none" when the agent has no such connector.
         checksum/email: "__EMAILSUM__"
-        # THE CHAT CREDENTIALS' checksums (enterpriseaiframework-783), one per connector,
-        # for exactly the reason checksum/email is above: `envFrom` is injected at pod start
-        # and never updated, so a re-supplied bot token that did not roll the pod would
-        # leave the agent presenting the old one — and a revoked Slack token fails as a
-        # silent `invalid_auth` on a surface nobody is watching.
-        #
-        # SEPARATE annotations, not one combined chat checksum: rotating the Slack tokens
-        # must not be indistinguishable from rotating the Discord one when somebody is
-        # reading `kubectl describe` to work out why an agent restarted. Each is a HASH the
-        # provisioner stores beside the credential it cannot read back. "none" when this
-        # agent has no such connector.
         checksum/slack: "__SLACKSUM__"
         checksum/discord: "__DISCORDSUM__"
     spec:
       serviceAccountName: agent
       automountServiceAccountToken: false
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000
-        runAsGroup: 1000
-        # The PVC arrives owned by root; without this the agent cannot write its own
-        # workdir or its session db, which reads as "the agent is broken".
-        fsGroup: 1000
-        seccompProfile: { type: RuntimeDefault }
-      containers:
-        - name: agent
-          # The SAME image the Code surface runs. Not a fork and not a rebuild: it already
-          # carries the pinned opencode (1.18.7), the provider config at
-          # /etc/opencode/opencode.json and the platform instructions. Contract 6 forbids
-          # editing deploy/workspace/, and reusing the artefact it produces is how this
-          # surface gets opencode without touching one byte of it.
+      # NO securityContext, DELIBERATELY (validated live 2026-08-10). The Hermes image's
+      # s6-overlay init MUST start as root to fix /run and chown the PVC, then drops the
+      # agent process to uid/gid 10000 itself. Under runAsNonRoot/runAsUser:1000/drop:[ALL]
+      # the s6 preinit dies: "/run belongs to uid 0 ... lacking the privileges to fix it".
+      # Net posture: the long-running agent process is still non-root (10000) and the
+      # NetworkPolicy (63-agent-common.yaml) still locks egress; only the brief s6 init is
+      # root. This is the one securityContext difference from the frozen opencode template
+      # and it is forced by the image, not chosen.
+      initContainers:
+        # Seed HERMES_HOME/config.yaml from the per-agent ConfigMap onto the writable PVC.
+        # Runs as root (image default) so the chown to the agent uid succeeds — the daemon
+        # then reads and rewrites config as 10000.
+        - name: config-seed
           image: __IMAGE__
           imagePullPolicy: IfNotPresent
-          # THE RESIDENCY LINE. Overrides the image ENTRYPOINT (tini -> the workspace's
-          # ttyd entrypoint) so this container's own process is a long-lived
-          # `opencode serve` — see deploy/agent/entrypoint.sh for why that is the whole
-          # difference between an Agent and a workspace. tini is kept as PID 1 so the
-          # daemon's children are reaped.
-          command: ["/usr/bin/tini", "--", "/bin/bash", "/etc/agent/entrypoint.sh"]
-          securityContext:
-            allowPrivilegeEscalation: false
-            capabilities: { drop: ["ALL"] }
+          command: ["sh", "-c", "cp /seed/config.yaml /opt/data/config.yaml && chown 10000:10000 /opt/data/config.yaml && echo seeded"]
+          volumeMounts:
+            - { name: data, mountPath: /opt/data }
+            - { name: seed, mountPath: /seed, readOnly: true }
+      containers:
+        - name: agent
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          # Keep the image ENTRYPOINT (s6-overlay). The long-lived daemon is the foreground
+          # messaging gateway + cron scheduler; s6 supervises and auto-restarts it. Consoles
+          # ATTACH with `hermes --tui` over the Kubernetes pods/exec subresource
+          # (control-plane/app/agent_console.py), sharing /opt/data/state.db — no console
+          # spawns the daemon, and a disconnect never ends it (Contract 2).
+          args: ["gateway", "run"]
           env:
-            - { name: AGENT_USER, value: "__USER__" }
-            - { name: AGENT_NAME, value: "__NAME__" }
-            - { name: AGENT_WORKDIR, value: "/workspace/work" }
-            # Session sqlite onto the PVC. Deliberately NOT inside the workdir: it is
-            # ours, not the user's work, and must never be scanned or committed with it.
-            - { name: XDG_DATA_HOME, value: "/workspace/.agent-state" }
-            # HTTP Basic on the opencode server. entrypoint.sh refuses to start without
-            # it rather than coming up unauthenticated.
-            - name: OPENCODE_SERVER_PASSWORD
-              valueFrom:
-                secretKeyRef: { name: agent-__USER__-__NAME__-key, key: OPENCODE_SERVER_PASSWORD }
-            # WHERE THE AGENT'S INFERENCE GOES — the entire integrated/BYO seam
-            # (Contract 4), and the only thing that differs between the two modes.
-            #
-            # INTEGRATED (the default): `http://gateway:4000/v1` with the
-            # `__USER__::agents/__NAME__` virtual key out of `agent-…-key`. The pod holds
-            # no provider credential of any kind; inference is metered, budgeted and
-            # audited against __USER__ like every other surface, and lands on the one bill
-            # under the per-instance surface `agents/__NAME__`.
-            #
-            # BYO: __API_BASE__ is the user's own provider and __KEY_SECRET__ is
-            # `agent-…-byo`, holding THEIR credential. That routes around our gateway on
-            # purpose, so it produces zero gateway ledger rows — permitted because it is
-            # per-user, declared, and labelled `model-source: byo` above, which is the
-            # difference between finding 4's accidental leak and a posture the standing
-            # constraint already allows.
-            - { name: OPENAI_API_BASE, value: "__API_BASE__" }
-            - { name: OPENAI_BASE_URL, value: "__API_BASE__" }
+            - { name: HERMES_HOME, value: "/opt/data" }
+            # WHERE INFERENCE GOES (Contract 4). config.yaml's provider block names key_env:
+            # OPENAI_API_KEY; INTEGRATED points base_url at our gateway with the
+            # __USER__::agents/__NAME__ virtual key from `agent-…-key`; BYO points base_url at
+            # the user's provider with their credential from `agent-…-byo`.
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
-            - { name: OPENCODE_MODEL, value: "enterprise-ai/__MODEL__" }
-          # THE MAILBOX (enterpriseaiframework-a4e). An EXTERNAL provider — M365, Gmail,
-          # or any IMAP+SMTP host — reached with the tenant's own credential. There is no
-          # mail server in this deployment and there must never be one; Baron's ruling on
-          # -a4e says so and tests/test_agent_email.py asserts it against every manifest.
-          #
-          # envFrom, not a list of secretKeyRefs, because the mailbox is a SET of settings
-          # (host, port, security, username, password, address) whose shape differs per
-          # provider, and enumerating them here would mean a template edit — and a rolled
-          # agent — every time a provider needed one more.
-          #
-          # `optional: true` is what makes email ADDITIVE: an agent provisioned without
-          # `--email-config-file` has no such Secret, starts exactly as it did before, and
-          # simply has no AGENT_EMAIL_* variables. Without `optional` every existing agent
-          # would wedge in ContainerCreating the moment this line merged.
-          #
-          # ORDER IS THE SECURITY PROPERTY: Kubernetes applies `envFrom` FIRST and lets
-          # the explicit `env` entries above win on a collision. So a mail config that
-          # named OPENAI_API_KEY or OPENCODE_SERVER_PASSWORD could not override either of
-          # them. provision-agent.sh additionally refuses any key outside the
-          # AGENT_EMAIL_* allowlist, so the file cannot smuggle a PATH either — belt and
-          # braces, because only one of the two is visible from this file.
-          #
-          # THE CHAT CONNECTORS (enterpriseaiframework-783) arrive the same way and for the
-          # same reasons: the tenant's own Slack workspace and Discord guild, reached with
-          # the tenant's own bot tokens. There is no chat server in this deployment either
-          # — tests/test_agent_slack.py and tests/test_agent_discord.py assert that against
-          # every manifest — and both are `optional: true`, so an agent with only a mailbox,
-          # or with nothing at all, starts exactly as it did before.
-          #
-          # THREE separate Secrets rather than one "connectors" Secret: they have different
-          # lifecycles (a Slack token is rotated in Slack's admin UI, a mail password in
-          # M365's) and one Secret would mean re-supplying all of them to rotate any of
-          # them, plus one checksum that rolls the pod for a credential that did not change.
+          # The tenant connectors — email (enterpriseaiframework-a4e), Slack + Discord (-783) —
+          # an EXTERNAL provider/workspace/guild reached with the tenant's own credential.
+          # There is NO mail or chat server in this deployment. envFrom + optional:true keeps
+          # them ADDITIVE: an agent with none starts exactly as it did before. `gateway run`
+          # enables whichever connector's env vars it recognises.
           envFrom:
-            - secretRef:
-                name: agent-__USER__-__NAME__-email
-                optional: true
-            - secretRef:
-                name: agent-__USER__-__NAME__-slack
-                optional: true
-            - secretRef:
-                name: agent-__USER__-__NAME__-discord
-                optional: true
-          ports:
-            # Named, and reachable only through the ClusterIP Service that the
-            # NetworkPolicy admits from the control-plane pod alone.
-            - { name: opencode, containerPort: 4096 }
+            - secretRef: { name: agent-__USER__-__NAME__-email, optional: true }
+            - secretRef: { name: agent-__USER__-__NAME__-slack, optional: true }
+            - secretRef: { name: agent-__USER__-__NAME__-discord, optional: true }
           volumeMounts:
-            - { name: state, mountPath: /workspace }
-            - { name: home, mountPath: /home/coder }
-            - { name: entrypoint, mountPath: /etc/agent, readOnly: true }
-            # The operator's house rules, the SAME deployment-wide ConfigMap the workspace
-            # pods mount (`workspace-tenant-instructions`), read here by the same opencode
-            # config baked into the shared image. Mounted as a DIRECTORY, not with
-            # subPath, for the reason recorded on the workspace template: only a
-            # whole-volume mount receives the kubelet's ConfigMap sync, so an operator's
-            # edit reaches an already-running pod with no restart — which matters more
-            # here, since restarting an agent ends its session.
-            # `optional: true`: an agent provisioned on a deployment where no workspace
-            # has ever been provisioned still starts, with an empty tenant directory,
-            # instead of hanging in ContainerCreating.
-            - { name: tenant-instructions, mountPath: /etc/opencode/tenant, readOnly: true }
-            # The same tenant Agent Skills corpus the chat and Code surfaces load, through
-            # opencode's own native skill loader (`skills.paths` in the image's
-            # opencode.json). No invocation code of ours; only the directory is shared.
-            - { name: skill-incident-escalation, mountPath: /etc/opencode/tenant-skills/incident-escalation, readOnly: true }
-            - { name: skill-meeting-notes-format, mountPath: /etc/opencode/tenant-skills/meeting-notes-format, readOnly: true }
+            - { name: data, mountPath: /opt/data }
           resources:
-            # ONE WORKSPACE-SIZED ENVELOPE, identical to 61-workspace.template.yaml and
-            # not a byte larger. k3s-worker runs live GPU training; an agent is worse than
-            # a workspace in exactly one way — it keeps running when nobody is watching —
-            # so the limit is real and the request is honest about the steady state.
-            requests: { cpu: "500m", memory: "1Gi", ephemeral-storage: "1Gi" }
-            limits:   { cpu: "1",    memory: "2Gi", ephemeral-storage: "4Gi" }
-          # An exec probe, not tcpSocket, for the reason 61-workspace.template.yaml
-          # records: it is the check that the DAEMON holds the port, independent of which
-          # interface it bound and of whether any client is attached. Liveness here means
-          # "the resident process is up", which is the surface's whole claim.
-          startupProbe:
-            exec:
-              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/4096"]
-            periodSeconds: 3
-            failureThreshold: 40
-          readinessProbe:
-            exec:
-              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/4096"]
-            periodSeconds: 30
-            failureThreshold: 3
+            # A workspace-sized envelope. k3s-worker runs live GPU training; an agent keeps
+            # running when nobody is watching, so the limit is real.
+            requests: { cpu: "250m", memory: "512Mi", ephemeral-storage: "1Gi" }
+            limits:   { cpu: "1",    memory: "2Gi",   ephemeral-storage: "4Gi" }
+          # No ports and no tcp probe: `gateway run` opens no inbound port, and the console
+          # attaches over the API server's exec subresource, not a pod Service. s6 supervises
+          # the process in-container; k8s readiness is "container up".
       volumes:
-        - name: state
+        - name: data
           persistentVolumeClaim: { claimName: agent-__USER__-__NAME__ }
-        # $HOME is not on the PVC, matching the workspace: caches and build dirs are
-        # rebuilt on restart, so the durable volume holds the agent's work and its session
-        # and nothing else.
-        - name: home
-          emptyDir: { sizeLimit: 2Gi }
-        # Deployment-wide, created by deploy/bin/provision-agent.sh from
-        # deploy/agent/entrypoint.sh. One control plane: every agent in the namespace runs
-        # the same entrypoint, and its checksum is the annotation above.
-        - name: entrypoint
-          # 0755, because this volume now carries `agent-email`, `agent-slack` and
-          # `agent-discord` as well as entrypoint.sh (enterpriseaiframework-a4e, -783) and
-          # the entrypoint puts /etc/agent on PATH. A
-          # ConfigMap's default 0644 would make the mail tool present, on PATH, and
-          # "permission denied" — the most confusing possible way for a tool to be
-          # missing. The volume stays readOnly at the mount, so executable here does not
-          # mean writable.
-          configMap: { name: agent-entrypoint, defaultMode: 0755 }
-        - name: tenant-instructions
-          configMap: { name: workspace-tenant-instructions, optional: true }
-        - name: skill-incident-escalation
-          configMap: { name: chat-skill-incident-escalation, optional: true }
-        - name: skill-meeting-notes-format
-          configMap: { name: chat-skill-meeting-notes-format, optional: true }
+        - name: seed
+          configMap: { name: agent-__USER__-__NAME__-config }

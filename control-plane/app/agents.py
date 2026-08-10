@@ -75,10 +75,26 @@ MODEL_SOURCE_LABEL = agent_usage.MODEL_SOURCE_LABEL
 # words, as deploy/bin/provision-agent.sh.
 MAX_OBJECT_NAME = 63
 
-# opencode's default model for a new agent. The same default provision-agent.sh carries,
-# and overridable per deployment rather than per request — a model name from an untrusted
-# request body ends up in a pod spec.
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "glm-5.2@deepinfra")
+# The Hermes agent's default model for a new agent. The same default provision-agent.sh
+# carries, and overridable per deployment rather than per request — a model name from an
+# untrusted request body ends up in a pod spec. Baron's pick 2026-08-10; a bare gateway
+# model id (NO `enterprise-ai/` prefix — the gateway rejects a prefixed name).
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "deepseek-v4-flash@deepinfra")
+
+# The model's context window and output cap, seeded into config.yaml. Both are REQUIRED and
+# both, when wrong, surface as a misleading "context length exceeded": Hermes cannot read a
+# window from our gateway's /v1/models (assumes ~0 without this), and an over-cap max_tokens
+# 400s at the provider (deepinfra caps some models at 32768). Validated live 2026-08-10.
+DEFAULT_CONTEXT_LENGTH = os.environ.get("AGENT_CONTEXT_LENGTH", "128000")
+DEFAULT_MAX_TOKENS = os.environ.get("AGENT_MAX_TOKENS", "8000")
+
+# The Hermes Agent image the pod runs. Date-tagged (vYYYY.M.D); `0.8.0` does not exist on
+# Docker Hub. Unlike the opencode surface, an agent does NOT reuse the workspace image — it
+# runs Hermes, a different product, so the image is named configuration, not read off a
+# workspace pod.
+HERMES_IMAGE = os.environ.get(
+    "AGENT_IMAGE", "nousresearch/hermes-agent:v2026.8.3"
+)
 
 GATEWAY_BASE = os.environ.get("AGENT_GATEWAY_BASE", "http://gateway:4000/v1")
 
@@ -545,64 +561,63 @@ def console_url(name: str) -> str:
     return f"/agents/{name}/"
 
 
-# The port `opencode serve` binds in the agent pod, and the port the per-agent Service
-# publishes. One name, spelled the same as the variable deploy/agent/entrypoint.sh reads
-# (`AGENT_SERVE_PORT`), so moving it moves both ends at once.
-SERVE_PORT = int(os.environ.get("AGENT_SERVE_PORT", "4096"))
+# The container name in the agent pod (the resident `hermes gateway run`). The console
+# exec-attaches `hermes --tui` INTO this container, sharing its /opt/data/state.db.
+AGENT_CONTAINER = "agent"
 
-# The username half of the daemon's HTTP Basic credential. `opencode serve` ignores it and
-# checks only the password (deploy/agent/entrypoint.sh records the measurement), but a
-# Basic header needs both halves and this is the one every other caller uses —
-# tests-live/test_agent_resident.py curls `-u opencode:$password`.
-CONSOLE_BASIC_USER = "opencode"
+# The command the console runs inside the pod. `hermes --tui` is self-contained and
+# coordinates with the resident daemon only through the shared on-disk session, so it must
+# run in the SAME container/HERMES_HOME — which is exactly what pods/exec gives.
+CONSOLE_COMMAND = ("hermes", "--tui")
 
 
 async def console_target(user: str, name: str) -> dict:
-    """Where the caller's OWN resident daemon is, and the credential to speak to it.
+    """The caller's OWN agent pod to exec the console into — never anybody else's.
 
-    This is the whole owner-scoping of the console proxy (enterpriseaiframework-0e7), and
-    it is deliberately the SAME guard the stop/start/delete endpoints use rather than a
-    second implementation of it: `_owned_deployment` derives `agent-<user>-<name>` from the
+    This is the whole owner-scoping of the console (enterpriseaiframework-0e7), and it is
+    deliberately the SAME guard the stop/start/delete endpoints use rather than a second
+    implementation of it: `_owned_deployment` derives `agent-<user>-<name>` from the
     authenticated name and then re-reads the object and insists its labels say the same
     thing. See the module docstring for the hyphen collision that makes the second half
     necessary — without it `alice` asking for the console of `bot-two` would attach to
     `alice-bot`'s agent `two`, which is a live session and a spendable key.
 
-    It returns a host and a password, not an open connection, so that the proxy in
-    `agent_console.py` holds no authorisation logic at all: there is no code path there
-    that can reach a daemon this function did not name.
+    It returns the resolved pod/container/command, not an open connection, so that the
+    exec bridge in `agent_console.py` holds no authorisation logic at all: there is no code
+    path there that can reach a pod this function did not name.
 
     404 for "not yours" as well as for "not there", for the reason `_owned_deployment`
     gives — a distinct 403 confirms to a prober that somebody owns an agent by that name.
+    A running pod is required: exec has nothing to attach to on a `stopped` (replicas 0)
+    agent, so the 409 says "start it" rather than a bare exec failure.
     """
-    obj = object_name(user, name)
     async with _client() as client:
         await _owned_deployment(client, user, name)
-        secret = await _get(client, "v1", "Secret", f"{obj}-key")
-
-    encoded = ((secret or {}).get("data") or {}).get("OPENCODE_SERVER_PASSWORD")
-    if not encoded:
-        # The daemon refuses to start without this (deploy/agent/entrypoint.sh), so a
-        # missing one means the Secret was replaced or hand-edited. Attaching without it
-        # would 401 at the daemon and read as "the agent is broken".
-        raise HTTPException(
-            503,
-            f"the agent {name!r} has no console credential in its Secret {obj}-key. It is "
-            "written at create time and the daemon refuses to start without it; "
-            "re-provision the agent rather than attaching to it.",
+        pods = await _list(
+            client, "v1", "Pod",
+            f"{USER_LABEL}={user},{NAME_LABEL}={name},"
+            "app.kubernetes.io/component=agent",
         )
-    return {
-        "host": obj,
-        "port": SERVE_PORT,
-        "username": CONSOLE_BASIC_USER,
-        "password": base64.b64decode(encoded).decode(),
-    }
+    for pod in pods:
+        if (pod.get("status") or {}).get("phase") == "Running":
+            return {
+                "namespace": namespace(),
+                "pod": pod["metadata"]["name"],
+                "container": AGENT_CONTAINER,
+                "command": list(CONSOLE_COMMAND),
+            }
+    raise HTTPException(
+        409,
+        f"the agent {name!r} is not running, so there is no console to attach to. Start it "
+        "first — the console exec-attaches into the live pod and shares its session.",
+    )
 
 
 # ---------------------------------------------------------------- create
 
 
 def render(user: str, name: str, *, image: str, model: str, api_base: str,
+           context_length: str, max_tokens: str,
            model_source: str, key_secret: str, cfgsum: str, keysum: str,
            connector_sums: dict[str, str] | None = None) -> list[dict]:
     """The template, substituted exactly as provision-agent.sh substitutes it.
@@ -626,6 +641,7 @@ def render(user: str, name: str, *, image: str, model: str, api_base: str,
     for placeholder, value in (
         ("__USER__", user), ("__NAME__", name), ("__IMAGE__", image),
         ("__MODEL__", model), ("__CFGSUM__", cfgsum), ("__KEYSUM__", keysum),
+        ("__CONTEXT_LENGTH__", context_length), ("__MAX_TOKENS__", max_tokens),
         ("__MODEL_SOURCE__", model_source), ("__API_BASE__", api_base),
         ("__KEY_SECRET__", key_secret),
         ("__EMAILSUM__", sums.get("email") or NO_CONNECTOR),
@@ -921,37 +937,33 @@ async def create(user: str, name: str, *, model: str | None = None) -> dict:
         if existing is not None:
             raise HTTPException(409, f"you already have an agent called {name!r}")
 
-        image = await _workspace_image(client)
+        # Hermes runs its OWN image, not the workspace artefact (the retarget — Hermes is a
+        # different product from opencode). The per-agent config.yaml is seeded from the
+        # ConfigMap the template renders (agent-<user>-<name>-config); there is no
+        # deployment-wide entrypoint ConfigMap any more — the Hermes image carries its own
+        # entrypoint, and connectors are read by `hermes gateway run` from env, not from
+        # shell tools on a mounted PATH.
+        image = HERMES_IMAGE
+        context_length = DEFAULT_CONTEXT_LENGTH
+        max_tokens = DEFAULT_MAX_TOKENS
 
-        # The resident entrypoint AND every tool it puts on PATH, deployment-wide (one
-        # control plane). Applied here for the same reason provision-agent.sh applies it:
-        # the pod mounts the ConfigMap by name, and an agent must never be able to exist
-        # before the things it runs do.
-        #
-        # The checksum is over ALL of them, concatenated in AGENT_FILES order — byte for
-        # byte the value `CFGSUM=$(for f in "${AGENT_FILES[@]}"; do cat ...; done |
-        # sha256sum)` produces in the shell. That equality is the point: the two paths
-        # must render the SAME annotation from the same repository, or provisioning an
-        # agent by either route would restart every agent created by the other.
-        files = {name: asset(name) for name in AGENT_FILES}
+        # checksum/config over the inputs that define the seeded config.yaml, so a change to
+        # the model, the window, the cap or the gateway rolls the pod (env is injected at
+        # start and never updated). Must match provision-agent.sh's CFGSUM over the same
+        # canonical string, or provisioning by either route would roll the other's agents.
         cfgsum = hashlib.sha256(
-            "".join(files[name] for name in AGENT_FILES).encode()
+            f"{GATEWAY_BASE}|{model}|{context_length}|{max_tokens}".encode()
         ).hexdigest()[:16]
-        await _apply(client, {
-            "apiVersion": "v1", "kind": "ConfigMap",
-            "metadata": {"name": "agent-entrypoint", "namespace": namespace()},
-            "data": files,
-        })
 
         issued = await issuance.issue(user, gateway.agent_surface(name), actor=user)
         api_key = issued["key"]
         keysum = hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
-        # HTTP Basic on the opencode server: entrypoint.sh refuses to start without it,
-        # so an agent can never come up reachable and unauthenticated.
-        password = secrets.token_urlsafe(24)
+        # The model-API key only. `hermes gateway run` opens no inbound server port, so
+        # there is no console credential to store (the console attaches over the Kubernetes
+        # pods/exec subresource, authenticated by RBAC + the owner-label re-check, not by a
+        # per-agent password). This is the opencode OPENCODE_SERVER_PASSWORD, retired.
         await _apply(client, _secret_object(f"{obj}-key", {
-            "OPENCODE_SERVER_PASSWORD": password,
             "OPENAI_API_KEY": api_key,
         }))
 
@@ -963,6 +975,7 @@ async def create(user: str, name: str, *, model: str | None = None) -> dict:
 
         for doc in render(
             user, name, image=image, model=model, api_base=GATEWAY_BASE,
+            context_length=context_length, max_tokens=max_tokens,
             connector_sums=sums,
             # Integrated only from the portal. BYO takes a provider credential that must
             # be handled set-once and never read back (Contract 4); accepting one through
