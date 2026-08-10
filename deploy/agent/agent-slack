@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""The resident agent's Slack presence: POST over the Web API, RECEIVE over Socket Mode.
+
+WHAT THIS IS NOT, WHICH IS THE WHOLE DESIGN
+===========================================
+There is no chat server here and there must never be one. The ruling on
+enterpriseaiframework-783 is the same one -a4e made for mail: the agent USES the tenant's
+EXISTING Slack workspace, with the tenant's own app and the tenant's own bot token. No
+Mattermost, no Rocket.Chat, no Zulip, no chat component in any deploy manifest.
+tests/test_agent_slack.py asserts that mechanically, because "we didn't accidentally grow a
+chat server" is the kind of claim that only stays true if something checks it.
+
+RECEIVE IS SOCKET MODE, AND THAT IS A SECURITY DECISION, NOT A CONVENIENCE ONE
+=============================================================================
+Slack offers two ways to receive: the Events API, which POSTs to a PUBLIC HTTPS endpoint
+you operate, and Socket Mode, where YOU dial OUT over a websocket. The Events API would
+mean publishing an inbound internet route into a pod that holds a spendable model key and
+runs unattended — the exact shape deploy/k8s/63-agent-common.yaml's NetworkPolicy exists to
+prevent, and it would need one route per agent. Socket Mode needs no inbound anything: the
+agent's existing egress (the internet minus every private range) is already enough.
+
+It costs one extra credential — an app-level token (`xapp-…`) alongside the bot token
+(`xoxb-…`) — and that is why the provisioner requires BOTH or neither. An agent with only a
+bot token can post and can never hear an answer, which reads as "Slack is broken" long
+after the provisioning that caused it.
+
+WHY A CLI AND NOT AN MCP SERVER
+===============================
+Identical reasoning to deploy/agent/agent-email, and it is written out in full there. In
+one line: a REMOTE MCP server would be one shared component holding EVERY tenant's bot
+token on a port the agent NetworkPolicy admits unauthenticated, a LOCAL one needs the `mcp`
+package in an image Contract 6 forbids editing, and this process holds the token for the
+length of one command and then exits.
+
+OUTPUT IS JSON, ON PURPOSE
+==========================
+Every command prints one JSON document to stdout; errors print JSON to stderr with a
+non-zero exit. The caller is a language model reading a terminal, and `receive` returning
+`[]` is unambiguously "nothing arrived", where "No new messages." is a sentence the model
+has to decide about — and, worse, is indistinguishable from a failure.
+
+THE TOKENS ARE NEVER PRINTED
+============================
+Not in an error, not in a traceback, not in a debug dump. `_redact()` is applied to every
+string that reaches stdout or stderr, and there is no verbose mode that bypasses it. A
+`xoxb-` token posts as the company in every channel the app is in; it is worth the same
+care as the mailbox password.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import agentws  # noqa: E402  (ships beside this file in the agent ConfigMap)
+
+ENV_PREFIX = "AGENT_SLACK_"
+
+DEFAULTS = {
+    # The real Slack Web API. Overridable so a tenant on an enterprise proxy — or this
+    # repo's own protocol fixture — can point it elsewhere; there is no other reason to.
+    "API_BASE": "https://slack.com/api",
+    # GUILD/CHANNEL messages only by default. Slack has no intents; this is here so the
+    # two tools' config surfaces read the same way.
+    "RECEIVE_TIMEOUT": "60",
+}
+
+
+class SlackError(Exception):
+    """Anything the caller did wrong, or Slack refused. Never a traceback."""
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    return os.environ.get(ENV_PREFIX + name) or DEFAULTS.get(name) or default
+
+
+def _require(name: str, what: str) -> str:
+    value = _env(name)
+    if not value:
+        raise SlackError(
+            f"{ENV_PREFIX}{name} is not set, so this agent cannot {what}. Provision it "
+            "with `provision-agent.sh <user> <name> --slack-config-file FILE`."
+        )
+    return value
+
+
+def _bot_token() -> str:
+    return _require("BOT_TOKEN", "post to Slack")
+
+
+def _app_token() -> str:
+    return _require("APP_TOKEN", "receive from Slack over Socket Mode")
+
+
+def _redact(text: str) -> str:
+    """Strip both tokens out of anything on its way to a human or a model.
+
+    Applied at the exit boundary, not at each raise site: Slack echoes request context in
+    some error bodies and urllib puts the whole URL into an HTTPError, so a redactor that
+    only covered the messages WE write would miss exactly the paths that leak.
+    """
+    for name in ("BOT_TOKEN", "APP_TOKEN"):
+        secret = os.environ.get(ENV_PREFIX + name)
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "***REDACTED***")
+    return text
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Verifying, always. There is no insecure switch and there must not be one."""
+    ca_file = _env("CA_FILE")
+    return ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+
+
+def _api(method: str, token: str, payload: dict | None = None, *, form: bool = False) -> dict:
+    """One Slack Web API call.
+
+    `ok: false` is a FAILURE here, not a result with a footnote. Slack answers HTTP 200 for
+    almost every application-level refusal — `channel_not_found`, `not_in_channel`,
+    `invalid_auth` — so a caller that checks only the status code reports "posted" for a
+    message nobody received. On an unattended surface nobody finds out.
+    """
+    url = f"{_env('API_BASE')}/{method}"
+    if form:
+        # apps.connections.open takes a form POST with no parameters; Slack's own docs
+        # specify that content type for it.
+        body = b""
+        content_type = "application/x-www-form-urlencoded"
+    else:
+        body = json.dumps(payload or {}).encode()
+        content_type = "application/json; charset=utf-8"
+
+    request = urllib.request.Request(url, data=body, method="POST")
+    request.add_header("Authorization", f"Bearer {token}")
+    request.add_header("Content-Type", content_type)
+    try:
+        with urllib.request.urlopen(request, timeout=60, context=_ssl_context()) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:400]
+        raise SlackError(f"Slack answered HTTP {exc.code} to {method}: {detail}") from None
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        raise SlackError(f"Slack answered {method} with something that is not JSON: "
+                         f"{raw[:200]}") from None
+    if not parsed.get("ok"):
+        raise SlackError(f"Slack refused {method}: {parsed.get('error') or parsed}")
+    return parsed
+
+
+# --------------------------------------------------------------------------- send
+
+def _text(args) -> str:
+    if args.text_file:
+        return sys.stdin.read() if args.text_file == "-" else open(args.text_file).read()
+    if args.text is not None:
+        return args.text
+    # stdin, when it is a pipe. A model that ran `agent-slack send ... <<'EOF'` should not
+    # be told to use a flag it already avoided.
+    return "" if sys.stdin.isatty() else sys.stdin.read()
+
+
+def cmd_send(args) -> dict:
+    channel = args.channel or _env("DEFAULT_CHANNEL")
+    if not channel:
+        raise SlackError(
+            "--channel is required (a channel id like C0123ABCD, or #name), or set "
+            f"{ENV_PREFIX}DEFAULT_CHANNEL in this agent's Slack config."
+        )
+    text = _text(args)
+    if not text.strip():
+        raise SlackError("refusing to post an empty message.")
+
+    payload = {"channel": channel, "text": text}
+    if args.thread_ts:
+        # Threading, so a reply from an agent lands in the conversation a human is already
+        # reading rather than starting a second one beside it.
+        payload["thread_ts"] = args.thread_ts
+    body = _api("chat.postMessage", _bot_token(), payload)
+    return {
+        "sent": True,
+        "channel": body.get("channel", channel),
+        # The handle that identifies THIS message afterwards: it is what `--thread-ts`
+        # takes, and without it a reply cannot be threaded at all.
+        "ts": body.get("ts"),
+        "thread_ts": payload.get("thread_ts"),
+        "text": text,
+    }
+
+
+# --------------------------------------------------------------------------- receive
+
+def _summarise(envelope: dict) -> dict | None:
+    event = ((envelope.get("payload") or {}).get("event") or {})
+    if not event:
+        return None
+    return {
+        "envelope_id": envelope.get("envelope_id"),
+        "type": event.get("type"),
+        "subtype": event.get("subtype"),
+        "channel": event.get("channel"),
+        "user": event.get("user"),
+        "bot_id": event.get("bot_id"),
+        "text": event.get("text", ""),
+        "ts": event.get("ts"),
+        "thread_ts": event.get("thread_ts"),
+    }
+
+
+def cmd_receive(args) -> list:
+    """Dial out, listen for a bounded time, acknowledge everything, print what arrived.
+
+    BOUNDED ON PURPOSE. This is a command a model runs and reads the output of, not a
+    daemon: an unbounded listener would be a second resident process beside `opencode
+    serve`, holding a bot token while nobody is watching, with no way for the model that
+    started it to ever see the result.
+    """
+    opened = _api("apps.connections.open", _app_token(), form=True)
+    url = opened.get("url")
+    if not url:
+        raise SlackError("Slack opened a Socket Mode connection with no url in it.")
+
+    connection = agentws.connect(url, ca_file=_env("CA_FILE"), timeout=30)
+    events: list[dict] = []
+    deadline = time.monotonic() + args.timeout
+    try:
+        while len(events) < args.limit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                raw = connection.recv(timeout=remaining)
+            except TimeoutError:
+                break
+            if raw is None:
+                break
+            try:
+                envelope = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            kind = envelope.get("type")
+            if kind == "hello":
+                continue
+            if kind == "disconnect":
+                # Slack asks clients to reconnect when it refreshes a server. For a bounded
+                # read the honest answer is to stop and report what arrived, not to
+                # silently redial and blur how long "listening" actually lasted.
+                break
+
+            # ACKNOWLEDGED FIRST, and unconditionally. Slack retries an unacknowledged
+            # envelope three times and then disables the subscription; an ack that only
+            # happened for events we liked would look fine and quietly degrade.
+            envelope_id = envelope.get("envelope_id")
+            if envelope_id:
+                connection.send(json.dumps({"envelope_id": envelope_id}))
+
+            summary = _summarise(envelope)
+            if summary is None:
+                continue
+            if args.type and summary["type"] != args.type:
+                continue
+            if summary["bot_id"] and not args.include_bots:
+                # The default that stops a loop. This agent's own posts come back as
+                # events; an agent that answers everything it hears answers itself forever,
+                # in a real workspace, in front of real people.
+                continue
+            events.append(summary)
+    finally:
+        connection.close()
+    return events
+
+
+# --------------------------------------------------------------------------- diagnostics
+
+def cmd_check(_args) -> dict:
+    """One command an operator runs to find out which half is broken.
+
+    Both legs are probed independently and both results are reported rather than
+    short-circuiting: "posting works, Socket Mode is refusing the app token" is the
+    diagnosis, and a check that stops at the first error never produces it.
+    """
+    result = {"api_base": _env("API_BASE"), "post": {}, "receive": {}}
+    try:
+        identity = _api("auth.test", _bot_token())
+        result["post"] = {"ok": True, "team": identity.get("team"),
+                          "bot_user": identity.get("user"), "url": identity.get("url")}
+    except Exception as exc:
+        result["post"] = {"ok": False, "error": _redact(f"{type(exc).__name__}: {exc}")}
+    try:
+        opened = _api("apps.connections.open", _app_token(), form=True)
+        # The url carries a single-use ticket, so it is reported as reachable and never
+        # printed: it is a bearer credential for the length of its life.
+        result["receive"] = {"ok": bool(opened.get("url"))}
+    except Exception as exc:
+        result["receive"] = {"ok": False, "error": _redact(f"{type(exc).__name__}: {exc}")}
+    result["ok"] = bool(result["post"].get("ok") and result["receive"].get("ok"))
+    return result
+
+
+def cmd_config(_args) -> dict:
+    """Everything except the tokens, which are not printable by any command here."""
+    return {
+        "api_base": _env("API_BASE"),
+        "bot_token_set": bool(os.environ.get(ENV_PREFIX + "BOT_TOKEN")),
+        "app_token_set": bool(os.environ.get(ENV_PREFIX + "APP_TOKEN")),
+        "default_channel": _env("DEFAULT_CHANNEL"),
+        "ca_file": _env("CA_FILE"),
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent-slack",
+        description="Post to and listen on this agent's Slack workspace.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    send = sub.add_parser("send", help="post a message with chat.postMessage")
+    send.add_argument("--channel", help="channel id (C…) or #name; defaults to the "
+                                        "configured default channel")
+    send.add_argument("--text", help="message text; omit to read stdin")
+    send.add_argument("--text-file", help="read the text from a file, or - for stdin")
+    send.add_argument("--thread-ts", help="ts of the message to reply to (threading)")
+    send.set_defaults(func=cmd_send)
+
+    receive = sub.add_parser("receive", help="listen over Socket Mode for a bounded time")
+    receive.add_argument("--timeout", type=float, default=float(DEFAULTS["RECEIVE_TIMEOUT"]),
+                         help="seconds to listen before returning what arrived")
+    receive.add_argument("--limit", type=int, default=20,
+                         help="stop after this many events")
+    receive.add_argument("--type", help="only surface events of this type, e.g. message")
+    receive.add_argument("--include-bots", action="store_true",
+                         help="also surface messages posted by bots, including this one")
+    receive.set_defaults(func=cmd_receive)
+
+    sub.add_parser("check", help="probe posting and Socket Mode, report both") \
+        .set_defaults(func=cmd_check)
+    sub.add_parser("config", help="show the configuration, without the tokens") \
+        .set_defaults(func=cmd_config)
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = args.func(args)
+    except SlackError as exc:
+        print(json.dumps({"ok": False, "error": _redact(str(exc))}), file=sys.stderr)
+        return 1
+    except (agentws.WebSocketError, urllib.error.URLError, OSError, ssl.SSLError,
+            TimeoutError) as exc:
+        # Slack said no, or the network did. A traceback here would put the request object
+        # — and on some paths a token — into the agent's transcript, which is durable and
+        # which a person may later read.
+        print(json.dumps({"ok": False,
+                          "error": _redact(f"{type(exc).__name__}: {exc}")}), file=sys.stderr)
+        return 1
+    print(_redact(json.dumps(result, indent=2, default=str)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

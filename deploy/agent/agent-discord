@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""The resident agent's Discord presence: POST over the REST API, RECEIVE over the Gateway.
+
+WHAT THIS IS NOT, WHICH IS THE WHOLE DESIGN
+===========================================
+There is no chat server here and there must never be one. The ruling on
+enterpriseaiframework-783 is -a4e's ruling for mail, applied to chat: the agent USES the
+tenant's EXISTING Discord guild, with the tenant's own application and the tenant's own bot
+token. No Revolt, no Spacebar, no self-hosted Discord-alike, no chat component in any deploy
+manifest. tests/test_agent_discord.py asserts that against every manifest under deploy/ and
+bundle/, because it is exactly the kind of decision that erodes by accretion.
+
+RECEIVE IS THE GATEWAY, WHICH MEANS NO INBOUND ROUTE
+====================================================
+Discord's alternative is the Interactions endpoint: a PUBLIC HTTPS URL you operate, which
+Discord POSTs to. That would mean publishing an inbound internet route into a pod holding a
+spendable model key — per agent. The Gateway is a websocket the agent dials OUT on, so the
+existing egress rule (the internet minus every private range, see
+deploy/k8s/63-agent-common.yaml) is already sufficient and nothing new is exposed.
+
+ONE TOKEN, TWO DIRECTIONS — unlike Slack, which needs a second app-level token for its
+socket. So `--discord-config-file` requires exactly one credential, and an agent that can
+post can also listen.
+
+INTENTS ARE A REAL CONFIGURATION AND THE DEFAULT IS DELIBERATE
+==============================================================
+Discord will happily connect, deliver events with an EMPTY `content` on every message, and
+report no error at all, if the application does not have the MESSAGE CONTENT intent enabled
+in the developer portal. That failure reads as "the agent gets messages but they are blank"
+and has nothing anywhere pointing at the cause, so `receive` says so in its output rather
+than leaving a model to guess. The default asks for guild messages, DMs and message content
+(512 | 4096 | 32768 = 37376); a tenant that wants less sets AGENT_DISCORD_INTENTS.
+
+The tokens, the JSON output contract, and the redaction rule are all identical to
+deploy/agent/agent-slack and deploy/agent/agent-email; the reasoning is written out in
+full in agent-email.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import agentws  # noqa: E402  (ships beside this file in the agent ConfigMap)
+
+ENV_PREFIX = "AGENT_DISCORD_"
+
+# GUILD_MESSAGES (1<<9) | DIRECT_MESSAGES (1<<12) | MESSAGE_CONTENT (1<<15).
+DEFAULT_INTENTS = (1 << 9) | (1 << 12) | (1 << 15)
+MESSAGE_CONTENT_INTENT = 1 << 15
+
+DEFAULTS = {
+    "API_BASE": "https://discord.com",
+    # Pinned. Discord versions its REST API and its Gateway together, and an unversioned
+    # path silently follows whatever Discord decides is current.
+    "API_VERSION": "10",
+    "INTENTS": str(DEFAULT_INTENTS),
+    "RECEIVE_TIMEOUT": "60",
+}
+
+
+class DiscordError(Exception):
+    """Anything the caller did wrong, or Discord refused. Never a traceback."""
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    return os.environ.get(ENV_PREFIX + name) or DEFAULTS.get(name) or default
+
+
+def _token() -> str:
+    value = _env("BOT_TOKEN")
+    if not value:
+        raise DiscordError(
+            f"{ENV_PREFIX}BOT_TOKEN is not set. This agent has no Discord bot configured; "
+            "provision it with `provision-agent.sh <user> <name> --discord-config-file FILE`."
+        )
+    return value
+
+
+def _redact(text: str) -> str:
+    secret = os.environ.get(ENV_PREFIX + "BOT_TOKEN")
+    if secret and len(secret) >= 8:
+        text = text.replace(secret, "***REDACTED***")
+    return text
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Verifying, always. There is no insecure switch and there must not be one."""
+    ca_file = _env("CA_FILE")
+    return ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+
+
+def _url(path: str) -> str:
+    return f"{_env('API_BASE')}/api/v{_env('API_VERSION')}{path}"
+
+
+def _rest(path: str, *, method: str = "GET", payload: dict | None = None) -> dict:
+    """One Discord REST call, authenticated the way Discord requires.
+
+    `Authorization: Bot <token>` — the `Bot ` prefix is not decoration. Without it Discord
+    treats the credential as a user token and answers 401, which is a confusing failure to
+    diagnose from the outside because the token itself is correct.
+    """
+    body = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(_url(path), data=body, method=method)
+    request.add_header("Authorization", f"Bot {_token()}")
+    # Discord asks bots to identify themselves and rate-limits unidentified clients harder.
+    request.add_header("User-Agent",
+                       "DiscordBot (https://github.com/3dl-dev/enterprise-ai-framework, 0.1)")
+    if body is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=60, context=_ssl_context()) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:400]
+        if exc.code == 429:
+            raise DiscordError(
+                f"Discord rate-limited this bot (429) on {method} {path}: {detail}"
+            ) from None
+        raise DiscordError(
+            f"Discord answered HTTP {exc.code} to {method} {path}: {detail}"
+        ) from None
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise DiscordError(f"Discord answered {path} with something that is not JSON: "
+                           f"{raw[:200]}") from None
+
+
+# --------------------------------------------------------------------------- send
+
+def _text(args) -> str:
+    if args.text_file:
+        return sys.stdin.read() if args.text_file == "-" else open(args.text_file).read()
+    if args.text is not None:
+        return args.text
+    return "" if sys.stdin.isatty() else sys.stdin.read()
+
+
+def cmd_send(args) -> dict:
+    channel = args.channel or _env("DEFAULT_CHANNEL")
+    if not channel:
+        raise DiscordError(
+            "--channel is required (a numeric channel id), or set "
+            f"{ENV_PREFIX}DEFAULT_CHANNEL in this agent's Discord config."
+        )
+    text = _text(args)
+    if not text.strip():
+        raise DiscordError("refusing to post an empty message.")
+
+    payload: dict = {"content": text}
+    if args.reply_to:
+        payload["message_reference"] = {"message_id": args.reply_to}
+    # Mentions are OFF unless asked for. A bot posting `@everyone` because a summary it was
+    # given happened to contain the string is a real incident in a real company's guild, and
+    # the default has to be the one that cannot cause it.
+    if not args.allow_mentions:
+        payload["allowed_mentions"] = {"parse": []}
+
+    created = _rest(f"/channels/{channel}/messages", method="POST", payload=payload)
+    return {
+        "sent": True,
+        "channel": created.get("channel_id", channel),
+        "message_id": created.get("id"),
+        "reply_to": args.reply_to,
+        "text": text,
+    }
+
+
+# --------------------------------------------------------------------------- receive
+
+def _summarise(event: dict) -> dict:
+    author = event.get("author") or {}
+    return {
+        "type": "message",
+        "message_id": event.get("id"),
+        "channel": event.get("channel_id"),
+        "guild": event.get("guild_id"),
+        "author": author.get("username"),
+        "author_id": author.get("id"),
+        "bot": bool(author.get("bot")),
+        "content": event.get("content", ""),
+        "timestamp": event.get("timestamp"),
+    }
+
+
+def cmd_receive(args) -> dict:
+    """Dial the Gateway, identify, listen for a bounded time, print what arrived.
+
+    BOUNDED ON PURPOSE, for the reason `agent-slack receive` gives: this is a command a
+    model runs and reads, not a second resident daemon holding a bot token while nobody
+    watches.
+
+    Returns an OBJECT, not a bare list, because the empty case is ambiguous in a way Slack's
+    is not: zero messages can mean "nothing was said" or "the MESSAGE CONTENT intent is not
+    enabled on this application", and those need different actions from whoever reads it.
+    """
+    intents = int(_env("INTENTS"))
+    gateway = _rest("/gateway/bot")
+    url = gateway.get("url")
+    if not url:
+        raise DiscordError("Discord returned no Gateway url for this bot.")
+    url = f"{url}?v={_env('API_VERSION')}&encoding=json"
+
+    connection = agentws.connect(url, ca_file=_env("CA_FILE"), timeout=30)
+    messages: list[dict] = []
+    deadline = time.monotonic() + args.timeout
+    sequence = None
+    identified = False
+    ready = None
+    heartbeat_every = None
+    next_heartbeat = None
+
+    try:
+        while len(messages) < args.limit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            # Heartbeats are the difference between a connection that lasts and one that is
+            # dropped at the first missed interval with no error. The recv window is capped
+            # at the next due beat so a quiet channel does not starve them.
+            if next_heartbeat is not None:
+                remaining = min(remaining, max(0.05, next_heartbeat - time.monotonic()))
+            try:
+                raw = connection.recv(timeout=remaining)
+            except TimeoutError:
+                if next_heartbeat is not None and time.monotonic() >= next_heartbeat:
+                    connection.send(json.dumps({"op": 1, "d": sequence}))
+                    next_heartbeat = time.monotonic() + heartbeat_every
+                    continue
+                break
+            if raw is None:
+                break
+            try:
+                frame = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            if frame.get("s") is not None:
+                sequence = frame["s"]
+            op = frame.get("op")
+
+            if op == 10:  # HELLO
+                heartbeat_every = (frame.get("d") or {}).get("heartbeat_interval", 41250) / 1000.0
+                next_heartbeat = time.monotonic() + heartbeat_every
+                if not identified:
+                    connection.send(json.dumps({
+                        "op": 2,
+                        "d": {
+                            "token": _token(),
+                            "intents": intents,
+                            "properties": {"os": "linux",
+                                           "browser": "enterprise-ai-agent",
+                                           "device": "enterprise-ai-agent"},
+                        },
+                    }))
+                    identified = True
+                continue
+            if op == 1:  # the Gateway asking for a beat right now
+                connection.send(json.dumps({"op": 1, "d": sequence}))
+                if heartbeat_every:
+                    next_heartbeat = time.monotonic() + heartbeat_every
+                continue
+            if op == 11:  # heartbeat ack
+                continue
+            if op == 9:  # INVALID SESSION
+                raise DiscordError(
+                    "Discord rejected the Gateway session (op 9). The usual cause is an "
+                    "intent this application is not approved for."
+                )
+            if op == 0:
+                name = frame.get("t")
+                if name == "READY":
+                    user = (frame.get("d") or {}).get("user") or {}
+                    ready = {"bot_user": user.get("username"), "bot_id": user.get("id")}
+                    continue
+                if name != "MESSAGE_CREATE":
+                    continue
+                summary = _summarise(frame.get("d") or {})
+                if summary["bot"] and not args.include_bots:
+                    # The default that stops a loop: this bot's own posts arrive back as
+                    # MESSAGE_CREATE, and an agent that answers everything it hears answers
+                    # itself forever, in a real guild, in front of real people.
+                    continue
+                if args.channel and summary["channel"] != args.channel:
+                    continue
+                messages.append(summary)
+    finally:
+        connection.close()
+
+    result = {
+        "messages": messages,
+        "connected": identified,
+        "identity": ready,
+        "intents": intents,
+        "message_content_intent": bool(intents & MESSAGE_CONTENT_INTENT),
+    }
+    if messages and all(not m["content"] for m in messages):
+        # The failure that otherwise has nothing pointing at it. Every message arrived with
+        # empty content, which is exactly what Discord does when the application does not
+        # have MESSAGE CONTENT enabled in the developer portal — no error, no warning.
+        result["warning"] = (
+            "every message arrived with empty content. Enable the MESSAGE CONTENT intent "
+            "for this application in the Discord developer portal; Discord delivers blank "
+            "messages rather than an error when it is off."
+        )
+    return result
+
+
+# --------------------------------------------------------------------------- diagnostics
+
+def cmd_check(_args) -> dict:
+    """Both legs, independently, both reported. See agent-slack's `check` for why."""
+    result = {"api_base": _env("API_BASE"), "post": {}, "receive": {}}
+    try:
+        identity = _rest("/users/@me")
+        result["post"] = {"ok": True, "bot_user": identity.get("username"),
+                          "bot_id": identity.get("id")}
+    except Exception as exc:
+        result["post"] = {"ok": False, "error": _redact(f"{type(exc).__name__}: {exc}")}
+    try:
+        gateway = _rest("/gateway/bot")
+        result["receive"] = {"ok": bool(gateway.get("url")),
+                             "session_starts_left": (gateway.get("session_start_limit") or {})
+                             .get("remaining")}
+    except Exception as exc:
+        result["receive"] = {"ok": False, "error": _redact(f"{type(exc).__name__}: {exc}")}
+    result["ok"] = bool(result["post"].get("ok") and result["receive"].get("ok"))
+    return result
+
+
+def cmd_config(_args) -> dict:
+    """Everything except the token, which is not printable by any command here."""
+    intents = int(_env("INTENTS"))
+    return {
+        "api_base": _env("API_BASE"),
+        "api_version": _env("API_VERSION"),
+        "bot_token_set": bool(os.environ.get(ENV_PREFIX + "BOT_TOKEN")),
+        "default_channel": _env("DEFAULT_CHANNEL"),
+        "intents": intents,
+        "message_content_intent": bool(intents & MESSAGE_CONTENT_INTENT),
+        "ca_file": _env("CA_FILE"),
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent-discord",
+        description="Post to and listen on this agent's Discord guild.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    send = sub.add_parser("send", help="post a message to a channel over the REST API")
+    send.add_argument("--channel", help="numeric channel id; defaults to the configured one")
+    send.add_argument("--text", help="message content; omit to read stdin")
+    send.add_argument("--text-file", help="read the content from a file, or - for stdin")
+    send.add_argument("--reply-to", help="message id to reply to")
+    send.add_argument("--allow-mentions", action="store_true",
+                      help="permit @mentions to actually ping people (off by default)")
+    send.set_defaults(func=cmd_send)
+
+    receive = sub.add_parser("receive", help="listen on the Gateway for a bounded time")
+    receive.add_argument("--timeout", type=float, default=float(DEFAULTS["RECEIVE_TIMEOUT"]),
+                         help="seconds to listen before returning what arrived")
+    receive.add_argument("--limit", type=int, default=20, help="stop after this many messages")
+    receive.add_argument("--channel", help="only surface messages from this channel id")
+    receive.add_argument("--include-bots", action="store_true",
+                         help="also surface messages posted by bots, including this one")
+    receive.set_defaults(func=cmd_receive)
+
+    sub.add_parser("check", help="probe the REST API and the Gateway, report both") \
+        .set_defaults(func=cmd_check)
+    sub.add_parser("config", help="show the configuration, without the token") \
+        .set_defaults(func=cmd_config)
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = args.func(args)
+    except DiscordError as exc:
+        print(json.dumps({"ok": False, "error": _redact(str(exc))}), file=sys.stderr)
+        return 1
+    except (agentws.WebSocketError, urllib.error.URLError, OSError, ssl.SSLError,
+            TimeoutError) as exc:
+        print(json.dumps({"ok": False,
+                          "error": _redact(f"{type(exc).__name__}: {exc}")}), file=sys.stderr)
+        return 1
+    print(_redact(json.dumps(result, indent=2, default=str)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -70,13 +70,15 @@ cd "${AGENT_WORKDIR}"
 # live in $HOME/.config — /home/coder is an emptyDir and anything baked there is masked.
 export OPENCODE_CONFIG="${OPENCODE_CONFIG:-/etc/opencode/opencode.json}"
 
-# ---------------------------------------------------------------------- the mailbox
-# The agent's email capability (enterpriseaiframework-a4e). /etc/agent is this same
-# ConfigMap volume, mounted 0755, so `agent-email` is on PATH for opencode's shell tool
-# and for anyone who `kubectl exec`s in. There is NO mail server anywhere in this
-# deployment and there must never be one — Baron's ruling is that the agent USES an
-# external provider (M365 / Gmail / any IMAP+SMTP host) with the tenant's own mailbox.
-# See deploy/agent/agent-email for why this is a CLI and not an MCP server.
+# ------------------------------------------------------- the mailbox and the chat rooms
+# The agent's outside-world capabilities: email (enterpriseaiframework-a4e) and third-party
+# chat — Slack and Discord (enterpriseaiframework-783). /etc/agent is this same ConfigMap
+# volume, mounted 0755, so `agent-email`, `agent-slack` and `agent-discord` are on PATH for
+# opencode's shell tool and for anyone who `kubectl exec`s in. There is NO mail server and
+# NO chat server anywhere in this deployment and there must never be one — Baron's ruling
+# is that the agent USES the tenant's existing providers (M365 / Gmail / any IMAP+SMTP
+# host; the tenant's own Slack workspace and Discord guild) with the tenant's own
+# credentials. See deploy/agent/agent-email for why these are CLIs and not MCP servers.
 #
 # APPENDED, not prepended. /etc/agent is a ConfigMap mount, so whoever edits that
 # ConfigMap decides what is in it; at the front of PATH a key named `git` or `python3`
@@ -84,10 +86,28 @@ export OPENCODE_CONFIG="${OPENCODE_CONFIG:-/etc/opencode/opencode.json}"
 # can only add a command that did not exist.
 export PATH="${PATH}:/etc/agent"
 
-# Whether this agent HAS a mailbox is decided entirely by whether the per-agent Secret
-# `agent-<user>-<name>-email` exists; the pod template mounts it `optional: true`, so an
-# agent without one simply has no AGENT_EMAIL_* variables and `agent-email` says so.
+# Whether this agent HAS a mailbox, a Slack workspace or a Discord guild is decided
+# entirely by whether the matching per-agent Secret exists — `agent-<user>-<name>-email`,
+# `-slack`, `-discord`. The pod template mounts all three `optional: true`, so an agent
+# without one simply has no AGENT_EMAIL_* / AGENT_SLACK_* / AGENT_DISCORD_* variables and
+# the corresponding tool says so instead of failing.
+#
+# EACH capability contributes its own instructions file, and only if it is configured. An
+# agent that has Slack and no mailbox must not be handed EMAIL.md: instructions for a tool
+# whose credential is absent are instructions to attempt something that will fail, and the
+# model has no way to know the difference in advance.
+TOOL_DOCS=()
 if [[ -n "${AGENT_EMAIL_SMTP_HOST:-}" ]]; then
+    TOOL_DOCS+=("/etc/agent/EMAIL.md")
+fi
+if [[ -n "${AGENT_SLACK_BOT_TOKEN:-}" ]]; then
+    TOOL_DOCS+=("/etc/agent/SLACK.md")
+fi
+if [[ -n "${AGENT_DISCORD_BOT_TOKEN:-}" ]]; then
+    TOOL_DOCS+=("/etc/agent/DISCORD.md")
+fi
+
+if [[ ${#TOOL_DOCS[@]} -gt 0 ]]; then
     # opencode has to be TOLD the tool exists, and the only channel for that is the
     # `instructions` list in its config — which lives in the workspace image, and Contract
     # 6 forbids editing deploy/workspace/ including that file. So the config is COMPOSED
@@ -102,7 +122,12 @@ if [[ -n "${AGENT_EMAIL_SMTP_HOST:-}" ]]; then
     # Composed from whatever config is ACTUALLY in effect ($OPENCODE_CONFIG, set just
     # above), not from a second hard-coded copy of the same path: two places naming the
     # image's config is how one of them ends up pointing at a file the other replaced.
-    if jq '.instructions += ["/etc/agent/EMAIL.md"]' \
+    # The docs are handed to jq as a JSON ARRAY through --argjson, not spliced into the
+    # filter string. A path is data, and a filter built by string concatenation is a filter
+    # whose meaning depends on that data — the same class of mistake as building SQL by
+    # concatenation, in a script that runs as the container's first process.
+    TOOL_DOCS_JSON=$(printf '%s\n' "${TOOL_DOCS[@]}" | jq -R . | jq -s -c .)
+    if jq --argjson docs "$TOOL_DOCS_JSON" '.instructions += $docs' \
            "$OPENCODE_CONFIG" > "${RENDERED}.tmp" 2>/dev/null \
        && jq -e . "${RENDERED}.tmp" >/dev/null 2>&1 \
        && OPENCODE_CONFIG="${RENDERED}.tmp" opencode debug config >/dev/null 2>&1; then
@@ -119,7 +144,7 @@ if [[ -n "${AGENT_EMAIL_SMTP_HOST:-}" ]]; then
         # names for verifying config claims, and it costs about a second, once, at boot.
         mv "${RENDERED}.tmp" "$RENDERED"
         export OPENCODE_CONFIG="$RENDERED"
-        echo "email: mailbox configured; opencode config composed at ${RENDERED}"
+        echo "tools: ${TOOL_DOCS[*]} configured; opencode config composed at ${RENDERED}"
     else
         # FALL BACK TO THE IMAGE CONFIG AND KEEP GOING. opencode 1.18.7 hard-errors and
         # exits non-zero on a config it cannot parse, so a bad render here would turn a
@@ -127,8 +152,9 @@ if [[ -n "${AGENT_EMAIL_SMTP_HOST:-}" ]]; then
         # a documentation file. The CLI is still on PATH and still works; only the
         # instructions entry is lost, and this line is what says so in `kubectl logs`.
         rm -f "${RENDERED}.tmp"
-        echo "email: could not compose opencode config; falling back to the image's." >&2
-        echo "  agent-email still works, but opencode was not told about it." >&2
+        echo "tools: could not compose opencode config; falling back to the image's." >&2
+        echo "  agent-email/agent-slack/agent-discord still work, but opencode was not" >&2
+        echo "  told about them." >&2
     fi
 fi
 
