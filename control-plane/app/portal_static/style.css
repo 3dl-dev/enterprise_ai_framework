@@ -384,3 +384,21 @@ dialog:not([open]) { display: none !important; }
 .agent-meta { font-size: 12px; color: var(--ink-4); }
 .agent-controls { display: flex; gap: 8px; flex-wrap: wrap; }
 .agent-controls .btn.disabled { opacity: .45; pointer-events: none; }
+
+/* The setup wizard's credential fields (enterpriseaiframework-c79).
+ *
+ * Monospace on the inputs because every value in here is a token, a hostname or a port,
+ * and a proportional font makes an `l` and a `1` in a bot token indistinguishable at the
+ * one moment somebody is checking a paste. */
+.field { display: grid; gap: 5px; margin: 0 0 12px; }
+.field > span { font-size: 12px; color: var(--ink-3); font-weight: 560; }
+.field input, .field select {
+  padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--surface); color: var(--ink-1); font-size: 13px;
+  font-family: var(--font-mono); width: 100%;
+}
+.field input::placeholder { color: var(--ink-4); font-family: var(--font-ui); }
+.check { display: flex; align-items: center; gap: 9px; font-size: 13px; color: var(--ink-2); }
+.check input { width: 15px; height: 15px; flex: none; }
+#setup-form .panel { margin: 0 0 14px; }
+#setup-form menu { display: flex; justify-content: flex-end; margin: 0; padding: 0; }

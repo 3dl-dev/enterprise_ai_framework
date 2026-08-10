@@ -526,6 +526,11 @@ function agentRow(a) {
   } else {
     bits.push("no usage recorded yet");
   }
+  // WHICH connectors, never a credential. The server sends booleans read off the pod
+  // template — there is no endpoint that could send back a token, so there is nothing
+  // here that could render one.
+  const wired = Object.keys(a.connectors || {}).filter((k) => a.connectors[k]).sort();
+  bits.push(wired.length ? wired.join(" + ") + " connected" : "no chat or email yet");
   meta.textContent = bits.join(" · ");
 
   const controls = document.createElement("div");
@@ -544,6 +549,14 @@ function agentRow(a) {
     ? act(`/portal/api/agents/${encodeURIComponent(a.name)}/start`, `${a.name} is starting.`)
     : stopAgent(a.name));
   controls.appendChild(toggle);
+
+  // The same wizard, attached to an agent that already exists. An agent created before
+  // this existed, or created without a connector, is reachable here rather than needing
+  // to be deleted and made again.
+  const wire = document.createElement("button");
+  wire.className = "btn small ghost"; wire.textContent = "Chat & email";
+  wire.addEventListener("click", () => openSetup(a.name));
+  controls.appendChild(wire);
 
   const drop = document.createElement("button");
   drop.className = "btn small danger"; drop.textContent = "Delete";
@@ -597,6 +610,203 @@ async function deleteAgent(name) {
     await loadAgents();
   } finally { AGENTS_BUSY = false; }
 }
+
+/* ---------------------------------------------------------------- the setup wizard
+
+   THE STEP THAT USED TO NEED AN OPERATOR. Creating an agent has been self-serve since
+   -627; giving it the Slack workspace or the mailbox that makes it useful could only be
+   done by somebody with a kubeconfig running provision-agent.sh. This dialog is that step,
+   and nothing else: it POSTs the user's own credential to
+   /portal/api/agents/<name>/connectors, which writes the same Secret the shell script
+   writes and rolls the pod.
+
+   THE FIELD LIST IS NOT INVENTED HERE. Every `key` below is one of the AGENT_<KIND>_*
+   names app/agents.py allows and deploy/bin/provision-agent.sh allows, and
+   control-plane/tests/test_portal_connectors.py compares this table against the Python
+   one so a field added on one side cannot go missing on the other. A key this page made
+   up would be refused by the endpoint; a key it omitted would be a setting no user could
+   reach.
+
+   `secret: true` means the input is type=password AND is never read back — there is no
+   endpoint that returns a credential, so the only place these values ever exist on this
+   page is between the keystroke and the POST. */
+
+const CONNECTOR_FIELDS = {
+  slack: [
+    { key: "AGENT_SLACK_BOT_TOKEN", label: "Bot token", hint: "starts xoxb-",
+      secret: true, required: true },
+    // Both, always. The bot token posts; the app-level token opens the Socket Mode
+    // connection the agent LISTENS on. With only the first it can talk and never hear an
+    // answer, which is not a state worth letting somebody create.
+    { key: "AGENT_SLACK_APP_TOKEN", label: "App-level token", hint: "starts xapp-",
+      secret: true, required: true },
+    { key: "AGENT_SLACK_DEFAULT_CHANNEL", label: "Default channel",
+      hint: "optional — a channel id like C0123ABCD" },
+  ],
+  discord: [
+    { key: "AGENT_DISCORD_BOT_TOKEN", label: "Bot token", secret: true, required: true },
+    { key: "AGENT_DISCORD_DEFAULT_CHANNEL", label: "Default channel",
+      hint: "optional — a channel id" },
+  ],
+  email: [
+    { key: "AGENT_EMAIL_ADDRESS", label: "Address", required: true,
+      hint: "the address it sends from" },
+    { key: "AGENT_EMAIL_USERNAME", label: "Username", hint: "optional — defaults to the address" },
+    { key: "AGENT_EMAIL_PASSWORD", label: "Password", secret: true, required: true },
+    { key: "AGENT_EMAIL_SMTP_HOST", label: "SMTP host", required: true },
+    { key: "AGENT_EMAIL_SMTP_PORT", label: "SMTP port", hint: "optional" },
+    { key: "AGENT_EMAIL_SMTP_SECURITY", label: "SMTP security", hint: "starttls or ssl" },
+    { key: "AGENT_EMAIL_IMAP_HOST", label: "IMAP host", required: true },
+    { key: "AGENT_EMAIL_IMAP_PORT", label: "IMAP port", hint: "optional" },
+    { key: "AGENT_EMAIL_IMAP_SECURITY", label: "IMAP security", hint: "ssl or starttls" },
+  ],
+};
+
+let SETUP_MODE = "create";   // "create" also names and creates the agent
+let SETUP_NAME = "";
+
+function connectorFields(container, kind) {
+  container.innerHTML = "";
+  for (const f of CONNECTOR_FIELDS[kind] || []) {
+    const label = document.createElement("label");
+    label.className = "field";
+    const span = document.createElement("span");
+    span.textContent = f.label;
+    const input = document.createElement("input");
+    // type=password on anything that is a credential: it keeps it off the screen of a
+    // shared machine and out of the browser's autofill history for ordinary text fields.
+    input.type = f.secret ? "password" : "text";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.dataset.key = f.key;
+    input.dataset.kind = kind;
+    if (f.required) input.dataset.required = "1";
+    if (f.hint) input.placeholder = f.hint;
+    label.append(span, input);
+    container.appendChild(label);
+  }
+}
+
+function readConnector(container, kind) {
+  const values = {};
+  for (const input of container.querySelectorAll("input[data-key]")) {
+    const v = input.value.trim();
+    if (v) values[input.dataset.key] = v;
+  }
+  const missing = [...container.querySelectorAll("input[data-required]")]
+    .filter((i) => !i.value.trim())
+    .map((i) => i.previousElementSibling.textContent);
+  return { kind, values, missing };
+}
+
+function openSetup(name) {
+  SETUP_MODE = name ? "configure" : "create";
+  SETUP_NAME = name || "";
+  $("setup-title").textContent = name ? `Chat and email for ${name}` : "Set up an agent";
+  $("setup-identity").hidden = SETUP_MODE === "configure";
+  $("setup-name").required = SETUP_MODE === "create";
+  $("setup-name").value = SETUP_MODE === "create" ? ($("agent-name").value.trim() || "") : "";
+  $("setup-submit").textContent = name ? "Connect it" : "Create and connect";
+  $("setup-chat").value = "slack";
+  $("setup-email-on").checked = false;
+  $("setup-email-fields").hidden = true;
+  $("setup-error").hidden = true;
+  $("setup-progress").hidden = true;
+  connectorFields($("setup-chat-fields"), "slack");
+  connectorFields($("setup-email-fields"), "email");
+  // The model list is already loaded for the inline form; mirror it rather than fetching.
+  $("setup-model").innerHTML = $("agent-model").innerHTML;
+  $("setup-model-field").hidden = $("agent-model").hidden;
+  $("dlg-agent-setup").showModal();
+}
+
+function closeSetup() {
+  // Clear before closing: a token left in a detached-but-still-parented input is a
+  // credential sitting in the DOM of whatever tab this is, for as long as it stays open.
+  for (const input of $("dlg-agent-setup").querySelectorAll("input")) {
+    if (input.type === "checkbox") input.checked = false; else input.value = "";
+  }
+  $("dlg-agent-setup").close();
+}
+
+$("agent-setup-open").addEventListener("click", () => openSetup(""));
+$("setup-close").addEventListener("click", closeSetup);
+$("setup-chat").addEventListener("change", () => {
+  const kind = $("setup-chat").value;
+  connectorFields($("setup-chat-fields"), kind === "none" ? "" : kind);
+});
+$("setup-email-on").addEventListener("change", () => {
+  $("setup-email-fields").hidden = !$("setup-email-on").checked;
+});
+
+async function configureConnector(name, kind, values) {
+  return post(`/portal/api/agents/${encodeURIComponent(name)}/connectors`,
+              { kind, values });
+}
+
+$("setup-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (AGENTS_BUSY) return;
+
+  const chat = $("setup-chat").value;
+  const wanted = [];
+  if (chat !== "none") wanted.push(readConnector($("setup-chat-fields"), chat));
+  if ($("setup-email-on").checked) wanted.push(readConnector($("setup-email-fields"), "email"));
+
+  // Checked here so a half-filled form does not create an agent and then fail — the
+  // create is the irreversible half of this pair.
+  const short = wanted.find((w) => w.missing.length);
+  if (short) {
+    $("setup-error").hidden = false;
+    $("setup-error").textContent =
+      `${short.kind} needs ${short.missing.join(" and ")}. A connector with only some of `
+      + "its settings can talk and not listen, which looks like the agent ignoring you.";
+    return;
+  }
+  $("setup-error").hidden = true;
+
+  const name = SETUP_MODE === "create" ? $("setup-name").value.trim() : SETUP_NAME;
+  if (!name) return;
+
+  AGENTS_BUSY = true;
+  $("setup-submit").disabled = true;
+  $("setup-progress").hidden = false;
+  try {
+    if (SETUP_MODE === "create") {
+      $("setup-progress").textContent = `Creating ${name}…`;
+      const { ok, data } = await post("/portal/api/agents",
+        { name, model: $("setup-model").value || undefined });
+      if (!ok) {
+        $("setup-error").hidden = false;
+        $("setup-error").textContent = data.detail || "Could not create that agent.";
+        return;
+      }
+      $("agent-name").value = "";
+    }
+    for (const w of wanted) {
+      $("setup-progress").textContent = `Connecting ${w.kind}…`;
+      const { ok, data } = await configureConnector(name, w.kind, w.values);
+      if (!ok) {
+        // Precise about the split outcome: the agent exists, this one connector did not
+        // take. Saying "it failed" would send somebody to create a second agent.
+        $("setup-error").hidden = false;
+        $("setup-error").textContent =
+          (SETUP_MODE === "create" ? `${name} was created, but ` : "")
+          + `${w.kind} was not connected: ` + (data.detail || "the request was refused.");
+        return;
+      }
+    }
+    closeSetup();
+    toast(wanted.length
+      ? `${name} is starting with ${wanted.map((w) => w.kind).join(" and ")} connected.`
+      : `${name} is starting. It takes about a minute to be ready.`);
+  } finally {
+    AGENTS_BUSY = false;
+    $("setup-submit").disabled = false;
+    $("setup-progress").hidden = true;
+    await loadAgents();
+  }
+});
 
 $("agent-new").addEventListener("submit", async (e) => {
   e.preventDefault();

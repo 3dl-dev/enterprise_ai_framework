@@ -409,6 +409,40 @@ async def start_my_agent(name: str, user: str = Depends(require_user)):
     return await agents.scale(user, name, 1)
 
 
+@router.post("/portal/api/agents/{name}/connectors")
+async def configure_my_agent_connector(name: str, body: dict,
+                                       user: str = Depends(require_user)):
+    """Wire the caller's OWN agent to their Slack, their Discord or their mailbox.
+
+    THE LAST OPERATOR-ONLY STEP IN THIS SURFACE. -627 let a user create, stop and delete
+    an agent from the browser, but the thing that makes a resident agent useful — a chat
+    workspace it answers in, a mailbox it reads — could only be supplied by somebody with
+    a kubeconfig running `deploy/bin/provision-agent.sh --slack-config-file`. So "the
+    user stands one up themselves" was true right up to the point it mattered.
+
+    The credential is the USER'S OWN — their tenant's Slack app, their bot token — which
+    is the same shape as every other credential this platform handles: the customer's
+    layer talking to the customer's providers with the customer's credentials.
+
+    Set-once and never returned. There is no GET beside this that answers with a
+    credential; `/portal/api/agents` reports only WHETHER each connector is configured,
+    as a boolean read off the pod template. The body is
+    `{"kind": "slack"|"discord"|"email", "values": {...}}`, and for callers that send the
+    credential flat beside `kind` — which is how the item specified it and how a small
+    form naturally serialises — the remaining top-level keys are taken as the values.
+    Nothing is guessed beyond that: every key is checked against `agents.CONNECTORS`.
+    """
+    body = body or {}
+    # Taken exactly as documented, never normalised. `kind` selects a schema and a Secret
+    # name; a lower-casing shim here is one more place the three connector names are
+    # spelled, and the refusal already lists the ones this surface carries.
+    kind = body.get("kind")
+    values = body.get("values")
+    if values is None:
+        values = {k: v for k, v in body.items() if k != "kind"}
+    return await agents.configure_connector(user, name, kind, values)
+
+
 @router.delete("/portal/api/agents/{name}")
 async def delete_my_agent(name: str, user: str = Depends(require_user)):
     """The irreversible one: every object, then the volume, then the virtual key."""
