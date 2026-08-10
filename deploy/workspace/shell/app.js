@@ -940,6 +940,16 @@ async function createProject() {
   await load(); reloadPanes(`Starting the agent in "${name}"…`); toast(data.message);
 }
 
+// Enter in this one-field form must MAKE the project. A <form method="dialog"> fires its
+// FIRST submit button on implicit (Enter) submission, and "Cancel" is authored before
+// "Make it", so a typed name plus Enter used to close the dialog with returnValue "cancel"
+// — newProjectDialog resolved null and createProject bailed, so the dialog just vanished
+// and nothing was ever made. Route Enter to the primary action; Cancel stays visually
+// first without being the keyboard default. isComposing guards an IME's own Enter.
+$("new-name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); $("new-go").click(); }
+});
+
 $("reset-project").addEventListener("click", async () => {
   $("dlg-settings").close();
   if (!await confirmDialog({
