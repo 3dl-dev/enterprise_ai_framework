@@ -66,6 +66,7 @@ because it is the one thing that gets rewritten.
 """
 
 import base64
+import hashlib
 import re
 
 import httpx
@@ -128,9 +129,24 @@ def _shim(name: str) -> bytes:
     (`WebSocket.OPEN`), `instanceof` and the prototype chain all survive untouched; the
     console reads `WebSocket.OPEN` and a hand-rolled wrapper would drop it.
     """
+    return (b"<script>" + _shim_js(name).encode() + b"</script>")
+
+
+def _shim_js(name: str) -> str:
+    """The shim's JavaScript, WITHOUT the `<script>` wrapper.
+
+    Separated from `_shim` because opencode serves the console under a strict
+    Content-Security-Policy whose `script-src` has no `'unsafe-inline'` — it whitelists its
+    own one inline script by sha256 hash. An injected inline script the browser cannot
+    verify is simply not executed, silently (enterpriseaiframework-f4c), and with the shim
+    dead every runtime request resolves against the origin ROOT instead of this prefix, so
+    `/api/event` and the pty socket 404 in a reconnect loop and the console is a broken
+    shell. So the exact bytes hashed into the CSP below must be the exact bytes injected;
+    both come from here.
+    """
     prefix = _prefix(name)
     return (
-        "<script>(function(){var P=" + _js_string(prefix) + ";"
+        "(function(){var P=" + _js_string(prefix) + ";"
         "function mine(p){return p===P||p.indexOf(P+'/')===0;}"
         "function fix(u){try{"
         "if(u===null||u===undefined)return u;"
@@ -151,8 +167,44 @@ def _shim(name: str) -> bytes:
         "['EventSource','WebSocket'].forEach(function(n){var C=window[n];if(!C)return;"
         "window[n]=new Proxy(C,{construct:function(t,a){a[0]=fix(a[0]);"
         "return Reflect.construct(t,a);}});});"
-        "})();</script>"
-    ).encode()
+        "})();"
+    )
+
+
+def _shim_csp_source(name: str) -> str:
+    """The CSP `script-src` token that authorises this agent's injected shim.
+
+    A hash source, not `'unsafe-inline'`: the shim is one known script, so it is admitted
+    by exactly the mechanism opencode admits its own — `'sha256-<base64>'` over the script's
+    text content — and nothing else inline is permitted. The digest is over `_shim_js`'s
+    exact bytes, which are what `_shim` injects between the tags."""
+    digest = hashlib.sha256(_shim_js(name).encode()).digest()
+    return "'sha256-" + base64.b64encode(digest).decode() + "'"
+
+
+def _authorise_shim_in_csp(csp: str, name: str) -> str:
+    """Add the shim's hash to a forwarded CSP so the browser will run the injected script.
+
+    The console's own CSP is preserved in full — this only widens `script-src` by the one
+    hash. If the policy has no `script-src`, scripts fall back to `default-src`, so an
+    explicit `script-src` is added that mirrors that fallback and adds the hash; without a
+    `default-src` either, a minimal `'self'`-plus-hash is used. Idempotent.
+    """
+    source = _shim_csp_source(name)
+    directives = [d.strip() for d in csp.split(";") if d.strip()]
+    default_src = None
+    for i, d in enumerate(directives):
+        parts = d.split()
+        key = parts[0].lower()
+        if key == "default-src":
+            default_src = parts[1:]
+        if key == "script-src":
+            if source not in parts:
+                directives[i] = d + " " + source
+            return "; ".join(directives)
+    fallback = default_src if default_src is not None else ["'self'"]
+    directives.append("script-src " + " ".join(fallback + [source]))
+    return "; ".join(directives)
 
 
 def _js_string(value: str) -> str:
@@ -262,6 +314,14 @@ async def agent_console_proxy(name: str, path: str, request: Request,
         finally:
             await upstream.aclose()
             await client.aclose()
+        # The entry document is the one response that gains an inline script (the shim).
+        # If the daemon guards the console with a CSP — opencode does — that script has to
+        # be admitted by hash, or the browser drops it and the console never rewrites its
+        # own URLs. Only the entry document is touched, because it is the only response the
+        # shim is injected into.
+        for key in list(out_headers):
+            if key.lower() == "content-security-policy":
+                out_headers[key] = _authorise_shim_in_csp(out_headers[key], name)
         return Response(
             content=_rewrite_entry_document(content, name),
             status_code=upstream.status_code,
