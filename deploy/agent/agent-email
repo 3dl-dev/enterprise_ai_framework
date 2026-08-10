@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""The resident agent's mailbox: SEND over SMTP submission, READ over IMAP.
+
+WHAT THIS IS NOT, WHICH IS THE WHOLE DESIGN
+===========================================
+There is no mail server here and there must never be one. Baron's ruling on
+enterpriseaiframework-a4e: the agent USES an EXTERNAL provider — Microsoft 365, Gmail,
+or any host that speaks IMAP+SMTP — with the tenant's own mailbox and the tenant's own
+credential. No Maddy, no Stalwart, no Postfix, no mail component in any deploy manifest.
+tests/test_agent_email.py asserts that mechanically, because "we didn't accidentally
+grow a mail server" is the kind of claim that only stays true if something checks it.
+
+That ruling is also why this file is ~400 lines of argument parsing over `smtplib`,
+`imaplib` and `email` rather than a mail client. Those three are the Python standard
+library's implementations of RFC 5321, RFC 3501 and RFC 5322 — already written, already
+maintained, already shipped inside the pinned python:3.12-slim the workspace image is
+built from. "Integrate, do not reimplement" applies to a mail client exactly as it
+applies to an inference engine; what is missing is not a protocol implementation, it is
+a command surface a coding agent can drive, and that is all this adds.
+
+WHY A CLI AND NOT AN MCP SERVER
+===============================
+The item allowed either. A CLI is what shipped, for three reasons, in order:
+
+  1. A REMOTE MCP server would be a shared, deployed component holding EVERY agent's
+     mail credential. deploy/k8s/06-mcp-echo.yaml's own comment states the rule it would
+     break: "A tool server that carries any authority must authenticate its caller before
+     it goes on that list." A mailbox credential is authority — it sends mail as a real
+     person at a real company — and the agent NetworkPolicy admits tool servers
+     unauthenticated. So a shared email MCP server is the one shape that is definitely
+     wrong: one compromised agent would reach every other tenant's mailbox.
+  2. A LOCAL MCP server (an opencode `type: "local"` subprocess in the agent pod) fixes
+     that — the credential never leaves the pod — but needs the `mcp` Python package at
+     runtime, and the agent pod runs the WORKSPACE image byte-for-byte (Contract 6 of
+     docs/design/records/agents-surface.md forbids editing deploy/workspace/, including
+     its Dockerfile). We cannot add a dependency to an image we may not touch, and an
+     MCP server that fails to start is not a missing tool, it is opencode reporting a
+     broken tool server on every session of a surface whose entire value is running
+     unattended.
+  3. This process holds the credential for the length of one command and then exits.
+     There is no resident listener next to a resident agent, which is one less thing that
+     is holding a password while nobody is watching.
+
+The credential stays pod-local either way: it arrives as env from the per-agent Secret
+`agent-<user>-<name>-email` (provision-agent.sh writes it, set-once, from a file), and
+this process reads it from its own environment. Nothing sends it anywhere but the
+tenant's own mail host.
+
+OUTPUT IS JSON, ON PURPOSE
+==========================
+Every command prints one JSON document to stdout. The caller is a language model reading
+a terminal, and JSON is the shape it can act on without the ambiguity of parsing prose —
+`list` returning `[]` is unambiguously "no mail", where "No messages found." is a
+sentence the model has to decide about. Errors go to stderr as JSON too, with a non-zero
+exit, so a failure is never mistaken for an empty inbox.
+
+THE PASSWORD IS NEVER PRINTED
+=============================
+Not in an error, not in a traceback, not in a debug dump. `_redact()` is applied to every
+string that reaches stdout or stderr, and there is no verbose mode that would bypass it.
+smtplib/imaplib both put credentials into exception text on some failure paths (imaplib's
+`error` carries the server's rejection line, which echoes the login), which is precisely
+why redaction is applied at the exit boundary rather than at each call site.
+"""
+
+from __future__ import annotations
+
+import argparse
+import email
+import email.policy
+import email.utils
+import imaplib
+import json
+import os
+import smtplib
+import ssl
+import sys
+from email.message import EmailMessage
+
+# Every knob, in one place, so `agent-email config` can print exactly what the pod holds
+# (minus the password) and an operator debugging "the agent cannot send" does not have to
+# guess which variable is missing.
+ENV_PREFIX = "AGENT_EMAIL_"
+
+DEFAULTS = {
+    # 587 + STARTTLS is the submission port (RFC 6409) that Microsoft 365 and Gmail both
+    # want, and 993 + implicit TLS is what both want for IMAP. Defaulting to the secure
+    # form means the insecure form has to be asked for by name.
+    "SMTP_PORT": "587",
+    "SMTP_SECURITY": "starttls",
+    "IMAP_PORT": "993",
+    "IMAP_SECURITY": "ssl",
+}
+
+SECURITY_CHOICES = ("starttls", "ssl", "none")
+
+
+class EmailError(Exception):
+    """Anything the caller did wrong, or the mail host refused. Never a traceback."""
+
+
+def _env(name: str, default: str | None = None) -> str | None:
+    return os.environ.get(ENV_PREFIX + name) or DEFAULTS.get(name) or default
+
+
+def _require(name: str) -> str:
+    value = _env(name)
+    if not value:
+        raise EmailError(
+            f"{ENV_PREFIX}{name} is not set. This agent has no mailbox configured; "
+            "provision it with `provision-agent.sh <user> <name> --email-config-file FILE`."
+        )
+    return value
+
+
+def _password() -> str:
+    return _require("PASSWORD")
+
+
+def _redact(text: str) -> str:
+    """Strip the credential out of anything on its way to a human or a model.
+
+    Applied at the boundary, not at each raise site: imaplib surfaces the server's own
+    rejection line verbatim, and some hosts echo the AUTH argument back in it. A redactor
+    that only covered the messages WE write would miss exactly the case that leaks.
+    """
+    secret = os.environ.get(ENV_PREFIX + "PASSWORD")
+    if secret and len(secret) >= 4:
+        text = text.replace(secret, "***REDACTED***")
+    return text
+
+
+def _security(kind: str) -> str:
+    value = (_env(f"{kind}_SECURITY") or "").lower()
+    if value not in SECURITY_CHOICES:
+        raise EmailError(
+            f"{ENV_PREFIX}{kind}_SECURITY is '{value}', expected one of "
+            f"{', '.join(SECURITY_CHOICES)}."
+        )
+    return value
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Verifying, always. There is no insecure switch and there must not be one.
+
+    An unattended agent holding a mailbox credential is the exact caller who would never
+    notice a MITM, because there is no human watching the session to see the warning. If
+    a tenant's mail host presents a private CA, the fix is to put that CA in the trust
+    store (AGENT_EMAIL_CA_FILE), not to stop checking.
+    """
+    ca_file = _env("CA_FILE")
+    return ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+
+
+# --------------------------------------------------------------------------- SMTP
+
+def _smtp():
+    host = _require("SMTP_HOST")
+    port = int(_require("SMTP_PORT"))
+    security = _security("SMTP")
+
+    if security == "ssl":
+        conn = smtplib.SMTP_SSL(host, port, timeout=60, context=_ssl_context())
+    else:
+        conn = smtplib.SMTP(host, port, timeout=60)
+        conn.ehlo()
+        if security == "starttls":
+            conn.starttls(context=_ssl_context())
+            conn.ehlo()
+
+    # AUTH is attempted whenever a password is configured, and its failure is fatal.
+    # Deliberately NOT "try to authenticate, carry on if it fails": a submission server
+    # that accepts unauthenticated mail will happily take the message and then have it
+    # rejected downstream for SPF, so a silent fallback turns an auth problem into a
+    # delivery problem discovered by nobody, days later.
+    password = os.environ.get(ENV_PREFIX + "PASSWORD")
+    if password:
+        conn.login(_username(), password)
+    return conn
+
+
+def _username() -> str:
+    """The login. Defaults to the address, because for M365 and Gmail they are the same."""
+    return _env("USERNAME") or _require("ADDRESS")
+
+
+def cmd_send(args) -> dict:
+    body = args.body
+    if args.body_file:
+        body = sys.stdin.read() if args.body_file == "-" else open(args.body_file).read()
+    if body is None:
+        # stdin, when it is a pipe. A model that ran `agent-email send ... <<'EOF'` should
+        # not be told to use a flag it already avoided.
+        body = "" if sys.stdin.isatty() else sys.stdin.read()
+
+    sender = _require("ADDRESS")
+    to = [a.strip() for a in ",".join(args.to).split(",") if a.strip()]
+    cc = [a.strip() for a in ",".join(args.cc or []).split(",") if a.strip()]
+    if not to:
+        raise EmailError("--to is required and must contain at least one address.")
+
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = ", ".join(to)
+    if cc:
+        message["Cc"] = ", ".join(cc)
+    message["Subject"] = args.subject
+    # Set HERE rather than left to the submission server. Two reasons, both about the
+    # agent being unattended: it is the only handle the caller gets back that identifies
+    # this exact message in a mailbox afterwards (so "did my mail actually arrive" is
+    # answerable), and a server-assigned id is not knowable by the sender at all, which
+    # makes threading a later reply impossible. The domain comes from the configured
+    # address so the id is plausibly ours and not `@localhost`.
+    message["Message-ID"] = email.utils.make_msgid(domain=sender.rpartition("@")[2] or None)
+    if args.in_reply_to:
+        # Threading, so a reply from an agent lands in the conversation a human is already
+        # reading rather than starting a second one beside it.
+        message["In-Reply-To"] = args.in_reply_to
+        message["References"] = args.in_reply_to
+    message.set_content(body)
+
+    with _smtp() as conn:
+        refused = conn.send_message(message)
+
+    # A partially-refused envelope is a FAILURE here, not a success with a footnote: the
+    # agent will report "sent" to whoever asked, and the recipient who was refused is the
+    # one nobody finds out about.
+    if refused:
+        raise EmailError(f"the mail host refused these recipients: {sorted(refused)}")
+
+    return {
+        "sent": True,
+        "from": sender,
+        "to": to,
+        "cc": cc,
+        "subject": args.subject,
+        "message_id": message.get("Message-ID"),
+    }
+
+
+# --------------------------------------------------------------------------- IMAP
+
+def _imap():
+    host = _require("IMAP_HOST")
+    port = int(_require("IMAP_PORT"))
+    security = _security("IMAP")
+
+    if security == "ssl":
+        conn = imaplib.IMAP4_SSL(host, port, ssl_context=_ssl_context(), timeout=60)
+    else:
+        conn = imaplib.IMAP4(host, port, timeout=60)
+        if security == "starttls":
+            conn.starttls(ssl_context=_ssl_context())
+    conn.login(_username(), _password())
+    return conn
+
+
+def _ok(typ: str, data, what: str):
+    if typ != "OK":
+        raise EmailError(f"IMAP {what} failed: {typ} {data}")
+    return data
+
+
+def _header_summary(uid: str, raw: bytes, flags: bytes) -> dict:
+    parsed = email.message_from_bytes(raw, policy=email.policy.default)
+    return {
+        "uid": uid,
+        "from": str(parsed.get("From", "")),
+        "to": str(parsed.get("To", "")),
+        "subject": str(parsed.get("Subject", "")),
+        "date": str(parsed.get("Date", "")),
+        "message_id": str(parsed.get("Message-ID", "")),
+        "seen": b"\\Seen" in (flags or b""),
+    }
+
+
+def cmd_list(args) -> list:
+    conn = _imap()
+    try:
+        _ok(*conn.select(args.mailbox, readonly=True), what=f"SELECT {args.mailbox}")
+        criteria = "UNSEEN" if args.unseen else "ALL"
+        data = _ok(*conn.uid("search", None, criteria), what=f"SEARCH {criteria}")
+        uids = data[0].split()
+        # Newest last on the wire; newest FIRST is what a reader wants, and the limit has
+        # to be applied to the newest end or `--limit 5` on a busy mailbox returns the
+        # five oldest messages, which is the opposite of the question being asked.
+        uids = list(reversed(uids))[: args.limit]
+
+        out = []
+        for uid in uids:
+            fetched = _ok(
+                *conn.uid("fetch", uid, "(FLAGS BODY.PEEK[HEADER])"),
+                what=f"FETCH {uid!r}",
+            )
+            raw, flags = b"", b""
+            for part in fetched:
+                if isinstance(part, tuple):
+                    flags = part[0]
+                    raw = part[1]
+            out.append(_header_summary(uid.decode(), raw, flags))
+        return out
+    finally:
+        _close(conn)
+
+
+def cmd_read(args) -> dict:
+    conn = _imap()
+    try:
+        # readonly unless --mark-seen: reading a mailbox to answer a question must not
+        # silently mark a human's unread mail as read behind them.
+        _ok(
+            *conn.select(args.mailbox, readonly=not args.mark_seen),
+            what=f"SELECT {args.mailbox}",
+        )
+        item = "(FLAGS RFC822)" if args.mark_seen else "(FLAGS BODY.PEEK[])"
+        fetched = _ok(*conn.uid("fetch", args.uid, item), what=f"FETCH {args.uid}")
+
+        raw, flags = b"", b""
+        for part in fetched:
+            if isinstance(part, tuple):
+                flags = part[0]
+                raw = part[1]
+        if not raw:
+            raise EmailError(f"no message with uid {args.uid} in {args.mailbox}")
+
+        parsed = email.message_from_bytes(raw, policy=email.policy.default)
+        summary = _header_summary(args.uid, raw, flags)
+        body_part = parsed.get_body(preferencelist=("plain", "html"))
+        summary["body"] = body_part.get_content() if body_part else ""
+        summary["attachments"] = [
+            att.get_filename() or "(unnamed)" for att in parsed.iter_attachments()
+        ]
+        return summary
+    finally:
+        _close(conn)
+
+
+def _close(conn) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+    try:
+        conn.logout()
+    except Exception:
+        pass
+
+
+def cmd_mailboxes(_args) -> list:
+    conn = _imap()
+    try:
+        data = _ok(*conn.list(), what="LIST")
+        return [line.decode(errors="replace") for line in data if line]
+    finally:
+        _close(conn)
+
+
+def cmd_check(_args) -> dict:
+    """One command an operator runs to find out which half is broken.
+
+    Both legs are probed independently and both results are reported, rather than
+    short-circuiting on the first failure: "SMTP is fine, IMAP is refusing the password"
+    is the diagnosis, and a check that stops at the first error never produces it.
+    """
+    result = {"address": _env("ADDRESS"), "smtp": {}, "imap": {}}
+    for leg, host_var, opener in (
+        ("smtp", "SMTP_HOST", _smtp),
+        ("imap", "IMAP_HOST", _imap),
+    ):
+        result[leg] = {"host": _env(host_var), "port": _env(f"{leg.upper()}_PORT"),
+                       "security": _env(f"{leg.upper()}_SECURITY")}
+        try:
+            conn = opener()
+            result[leg]["ok"] = True
+            (conn.quit if leg == "smtp" else lambda: _close(conn))()
+        except Exception as exc:
+            result[leg]["ok"] = False
+            result[leg]["error"] = _redact(f"{type(exc).__name__}: {exc}")
+    result["ok"] = bool(result["smtp"].get("ok") and result["imap"].get("ok"))
+    return result
+
+
+def cmd_config(_args) -> dict:
+    """Everything except the password, which is not printable by any command here."""
+    return {
+        "address": _env("ADDRESS"),
+        "username": _env("USERNAME") or _env("ADDRESS"),
+        "password_set": bool(os.environ.get(ENV_PREFIX + "PASSWORD")),
+        "smtp": {"host": _env("SMTP_HOST"), "port": _env("SMTP_PORT"),
+                 "security": _env("SMTP_SECURITY")},
+        "imap": {"host": _env("IMAP_HOST"), "port": _env("IMAP_PORT"),
+                 "security": _env("IMAP_SECURITY")},
+        "ca_file": _env("CA_FILE"),
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="agent-email",
+        description="Send and read mail through this agent's external mailbox.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    send = sub.add_parser("send", help="send a message over SMTP submission")
+    send.add_argument("--to", action="append", required=True,
+                      help="recipient; repeatable, or comma-separated")
+    send.add_argument("--cc", action="append", help="cc recipient; repeatable")
+    send.add_argument("--subject", required=True)
+    send.add_argument("--body", help="message body; omit to read stdin")
+    send.add_argument("--body-file", help="read the body from a file, or - for stdin")
+    send.add_argument("--in-reply-to", help="Message-ID being replied to (threading)")
+    send.set_defaults(func=cmd_send)
+
+    listing = sub.add_parser("list", help="list messages in a mailbox over IMAP")
+    listing.add_argument("--mailbox", default="INBOX")
+    listing.add_argument("--limit", type=int, default=20)
+    listing.add_argument("--unseen", action="store_true", help="only unread messages")
+    listing.set_defaults(func=cmd_list)
+
+    read = sub.add_parser("read", help="read one message in full over IMAP")
+    read.add_argument("--uid", required=True, help="uid from `agent-email list`")
+    read.add_argument("--mailbox", default="INBOX")
+    read.add_argument("--mark-seen", action="store_true",
+                      help="mark the message read (default: leave it as it was)")
+    read.set_defaults(func=cmd_read)
+
+    sub.add_parser("mailboxes", help="list IMAP folders").set_defaults(func=cmd_mailboxes)
+    sub.add_parser("check", help="probe SMTP and IMAP and report both").set_defaults(func=cmd_check)
+    sub.add_parser("config", help="show the configuration, without the password").set_defaults(func=cmd_config)
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = args.func(args)
+    except EmailError as exc:
+        print(json.dumps({"ok": False, "error": _redact(str(exc))}), file=sys.stderr)
+        return 1
+    except (smtplib.SMTPException, imaplib.IMAP4.error, OSError, ssl.SSLError) as exc:
+        # The mail host said no, or the network did. A traceback here would put the
+        # connection object — and on some paths the credential — into the agent's
+        # transcript, which is durable and which a person may later read.
+        print(json.dumps({"ok": False,
+                          "error": _redact(f"{type(exc).__name__}: {exc}")}), file=sys.stderr)
+        return 1
+    print(_redact(json.dumps(result, indent=2, default=str)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

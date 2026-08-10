@@ -85,6 +85,25 @@ create)
             configmap) kind=ConfigMap; name="${args[$((i+1))]:-}" ;;
         esac
     done
+
+    # REAL KUBECTL REFUSES THIS COMBINATION, and this recorder used to accept it. That is
+    # not a detail: the provisioner was written to pass `--from-env-file` alongside
+    # `--from-literal`, every test here went green, and the command would have failed on
+    # the first real cluster with "from-env-file cannot be combined with from-file or
+    # from-literal". A recorder that is more permissive than the tool it stands in for
+    # does not simplify the test, it deletes it. Verified against kubectl before being
+    # written down here.
+    have_env_file=0; have_other=0
+    for a in "$@"; do
+        case "$a" in
+            --from-env-file=*) have_env_file=1 ;;
+            --from-file=*|--from-literal=*) have_other=1 ;;
+        esac
+    done
+    if (( have_env_file && have_other )); then
+        echo "error: from-env-file cannot be combined with from-file or from-literal" >&2
+        exit 1
+    fi
     echo "apiVersion: v1"
     echo "kind: ${kind}"
     echo "metadata:"
@@ -99,6 +118,20 @@ create)
             --from-file=*)
                 kv="${a#--from-file=}"; k="${kv%%=*}"; p="${kv#*=}"
                 echo "  ${k}: $(base64 -w0 < "$p")"
+                ;;
+            --from-env-file=*)
+                # Real kubectl turns each KEY=value line into a Secret key, taking the
+                # value LITERALLY (it strips no quotes) and skipping blanks and comments.
+                # Modelled here rather than approximated, because the mail config
+                # (enterpriseaiframework-a4e) arrives this way and the test that matters
+                # asserts on which keys land in the Secret.
+                p="${a#--from-env-file=}"
+                while IFS= read -r line || [[ -n "$line" ]]; do
+                    [[ -z "${line//[[:space:]]/}" ]] && continue
+                    [[ "${line#"${line%%[![:space:]]*}"}" == \#* ]] && continue
+                    k="${line%%=*}"; v="${line#*=}"
+                    echo "  ${k}: $(printf '%s' "$v" | base64 -w0)"
+                done < "$p"
                 ;;
         esac
     done
@@ -210,11 +243,17 @@ class Run:
 
 
 def provision(tmp_path: Path, *args: str, existing_key: str | None = None,
-              env: dict | None = None) -> Run:
+              existing_email_sum: str | None = None, env: dict | None = None) -> Run:
     """Run the real provisioner against the recorders.
 
     `existing_key` seeds what the cluster already holds in `agent-<user>-<name>-key`'s
     OPENAI_API_KEY — the input that decides whether the script mints, keeps, or refuses.
+
+    `existing_email_sum` seeds `agent-<user>-<name>-email`'s AGENT_EMAIL_CONFIG_SUM, i.e.
+    an agent that already has a mailbox. That is the input that decides whether a re-run
+    with no `--email-config-file` leaves the mailbox alone and renders the SAME rollout
+    annotation — the difference between re-provisioning being a no-op and it silently
+    restarting a resident agent (enterpriseaiframework-a4e).
     """
     stub_dir = tmp_path / "stubs"
     (stub_dir / "bin").mkdir(parents=True, exist_ok=True)
@@ -222,10 +261,12 @@ def provision(tmp_path: Path, *args: str, existing_key: str | None = None,
 
     (stub_dir / "state" / "enterprise-ai-secrets.CONTROL_PLANE_ADMIN_TOKEN").write_text(ADMIN_TOKEN)
     (stub_dir / "state" / "enterprise-ai-secrets.GATEWAY_MASTER_KEY").write_text(MASTER_KEY)
+    # args[0]/args[1] are <user> <name>; the object family is agent-<user>-<name>.
+    obj = f"agent-{args[0]}-{args[1]}"
     if existing_key is not None:
-        # args[0]/args[1] are <user> <name>; the object family is agent-<user>-<name>.
-        obj = f"agent-{args[0]}-{args[1]}"
         (stub_dir / "state" / f"{obj}-key.OPENAI_API_KEY").write_text(existing_key)
+    if existing_email_sum is not None:
+        (stub_dir / "state" / f"{obj}-email.AGENT_EMAIL_CONFIG_SUM").write_text(existing_email_sum)
 
     kubectl = stub_dir / "bin" / "kubectl"
     kubectl.write_text(_KUBECTL)
