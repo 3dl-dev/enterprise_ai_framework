@@ -80,7 +80,11 @@ custom_template/release=""
 variant/extensions_support=false
 variant/thread_support=false
 vram_texture_compression/for_desktop=true
-vram_texture_compression/for_mobile=true
+# for_mobile MUST stay false: when true, Godot's export gate demands the mobile
+# (ETC2/ASTC) texture-import support a plain project has not configured, and the web
+# export then aborts with a BLANK "configuration errors" message. Verified live: flipping
+# only this key is the difference between a produced index.html+wasm and a silent failure.
+vram_texture_compression/for_mobile=false
 html/export_icon=true
 html/custom_html_shell=""
 html/head_include=""
