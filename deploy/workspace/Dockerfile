@@ -28,6 +28,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git make gcc g++ libc6-dev \
         jq less nano vim-tiny procps tini rsync unzip \
+        fontconfig libfontconfig1 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL -o /usr/local/bin/ttyd \

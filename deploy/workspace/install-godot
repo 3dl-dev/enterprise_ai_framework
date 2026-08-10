@@ -28,7 +28,11 @@ GODOT_BIN="${BIN_DIR}/godot"
 # (deploy/k8s/61-workspace.template.yaml), so templates persist and are found with no
 # extra flags. The fallback keeps this script usable when run by hand outside a pod.
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
-TPL_DIR="${DATA_HOME}/godot/export_templates/${GODOT_RELEASE}"
+# Godot's export-template directory is named with DOTS — "4.7.1.stable" — not the dash the
+# download filenames use ("4.7.1-stable"). Get this wrong and the templates install to a
+# directory Godot never looks in, and a web export dies with "No export template found at
+# the expected path". Verified live in a workspace pod.
+TPL_DIR="${DATA_HOME}/godot/export_templates/${GODOT_VERSION}.stable"
 
 if [[ -x "$GODOT_BIN" ]] \
    && "$GODOT_BIN" --version 2>/dev/null | grep -q "${GODOT_VERSION}" \

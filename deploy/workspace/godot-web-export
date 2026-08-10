@@ -48,6 +48,9 @@ if [[ ! -f "$PRESETS" ]] || ! grep -q 'platform="Web"' "$PRESETS"; then
     LAST="$(grep -oE '^\[preset\.[0-9]+\]' "$PRESETS" 2>/dev/null \
             | grep -oE '[0-9]+' | sort -rn | head -1 || true)"
     IDX=$(( ${LAST:--1} + 1 ))
+    # The full key set Godot's exporter requires. include_filter / exclude_filter and the
+    # encryption/patches/seed keys have NO defaults in headless export — omit any one and the
+    # export aborts with "Couldn't find the given section/key". Verified live in a pod.
     cat >> "$PRESETS" <<EOF
 
 [preset.${IDX}]
@@ -55,10 +58,20 @@ if [[ ! -f "$PRESETS" ]] || ! grep -q 'platform="Web"' "$PRESETS"; then
 name="Web"
 platform="Web"
 runnable=true
+advanced_options=false
 dedicated_server=false
 custom_features=""
 export_filter="all_resources"
+include_filter=""
+exclude_filter=""
 export_path="index.html"
+patches=PackedStringArray()
+encryption_include_filters=""
+encryption_exclude_filters=""
+seed=0
+encrypt_pck=false
+encrypt_directory=false
+script_export_mode=2
 
 [preset.${IDX}.options]
 
@@ -69,8 +82,11 @@ variant/thread_support=false
 vram_texture_compression/for_desktop=true
 vram_texture_compression/for_mobile=true
 html/export_icon=true
+html/custom_html_shell=""
+html/head_include=""
 html/canvas_resize_policy=2
 html/focus_canvas_on_start=true
+html/experimental_virtual_keyboard=false
 progressive_web_app/enabled=false
 EOF
 fi
