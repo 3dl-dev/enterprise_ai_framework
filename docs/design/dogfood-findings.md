@@ -1450,3 +1450,25 @@ Postgres as `2026-08-10T03:28:17 00:00` and the `::timestamptz` cast raises — 
 reads as a broken bill and is really a URL. `Z` (or percent-encoding the `+`) is correct.
 Found writing `tests-live/test_agent_usage.py`, which needed the same ledger rendered over
 two windows to prove the bill had not moved.
+
+### 48. `agent-email` is on the resident daemon's PATH, and on nothing else
+
+`deploy/agent/entrypoint.sh` does `export PATH="${PATH}:/etc/agent"` and its comment says
+the mail tool is thereby on PATH "for opencode's shell tool **and for anyone who
+`kubectl exec`s in**". Only the first half is true, and the half that is false is the one a
+human hits first.
+
+`export` reaches the entrypoint's own children — `opencode serve`, and therefore the shell
+tool the agent actually drives — so the capability itself is intact. A `kubectl exec`
+starts a new process from the *container image's* PATH and never sees `/etc/agent`.
+Measured on a live agent while composing `tests-live/test_agents_e2e.py`: `command -v
+agent-email` under `kubectl exec` is empty, while `/proc/<serve-pid>/environ` carries
+`/etc/agent` in PATH and `/etc/agent/agent-email config` runs and answers correctly.
+
+So this is not a broken mailbox, it is a mailbox that reads as broken to the first person
+who goes looking. The operator's diagnostic move for "email isn't working" is to exec in
+and run the tool, and what they get is `command not found` — pointing at delivery rather
+than at credentials, which is where the fault will actually be. Either correct the comment
+or put the tool somewhere the image's own PATH already covers; the e2e suite addresses it
+by absolute path and asserts the daemon's PATH out of `/proc`, because asserting on
+`command -v` from an exec measures the wrong process and calls a working capability dead.
