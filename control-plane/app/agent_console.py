@@ -40,14 +40,23 @@ served bundle: `location.hostname.includes("opencode.ai") ? "http://localhost:40
 location.origin`). Mounted under `/agents/<name>/` on the portal origin, every one of those
 requests would leave the prefix and land on the chat surface at the origin root.
 
-Two rewrites fix that, and both are deliberately about URLS ONLY — nothing here interprets
+Three rewrites fix that, and all are deliberately about URLS ONLY — nothing here interprets
 or rewrites the agent's content:
 
   1. the entry document's root-absolute `src=`/`href=` gain the prefix, so the bundle and
      its stylesheet load from under it (and any later `import()` chunk resolves relative to
      that, for free);
   2. a small inline shim prefixes same-origin, root-absolute URLs passed to `fetch`,
-     `XMLHttpRequest`, `EventSource` and `WebSocket`.
+     `XMLHttpRequest`, `EventSource` and `WebSocket`;
+  3. the same shim strips the prefix from `location.pathname` before the bundle runs and
+     re-adds it after, because the console's ROUTER also assumes the origin root: it reads
+     the path to pick a view, so under the prefix it matches nothing and renders an empty
+     `<main>` — the whole page blank but for its toolbar. Stripping it for the router while
+     keeping the address bar prefixed (so a reload still lands here) is the routing analogue
+     of what (2) does for requests.
+
+The injected inline script the CSP must then admit by hash covers all of (2) and (3);
+`_shim_js` is the single source of those bytes.
 
 The shim is written against web platform APIs rather than against opencode's internals for
 the reason the alternative fails: the identifiers in a 3 MB minified bundle change on every
@@ -66,6 +75,7 @@ because it is the one thing that gets rewritten.
 """
 
 import base64
+import hashlib
 import re
 
 import httpx
@@ -128,9 +138,24 @@ def _shim(name: str) -> bytes:
     (`WebSocket.OPEN`), `instanceof` and the prototype chain all survive untouched; the
     console reads `WebSocket.OPEN` and a hand-rolled wrapper would drop it.
     """
+    return (b"<script>" + _shim_js(name).encode() + b"</script>")
+
+
+def _shim_js(name: str) -> str:
+    """The shim's JavaScript, WITHOUT the `<script>` wrapper.
+
+    Separated from `_shim` because opencode serves the console under a strict
+    Content-Security-Policy whose `script-src` has no `'unsafe-inline'` — it whitelists its
+    own one inline script by sha256 hash. An injected inline script the browser cannot
+    verify is simply not executed, silently (enterpriseaiframework-f4c), and with the shim
+    dead every runtime request resolves against the origin ROOT instead of this prefix, so
+    `/api/event` and the pty socket 404 in a reconnect loop and the console is a broken
+    shell. So the exact bytes hashed into the CSP below must be the exact bytes injected;
+    both come from here.
+    """
     prefix = _prefix(name)
     return (
-        "<script>(function(){var P=" + _js_string(prefix) + ";"
+        "(function(){var P=" + _js_string(prefix) + ";"
         "function mine(p){return p===P||p.indexOf(P+'/')===0;}"
         "function fix(u){try{"
         "if(u===null||u===undefined)return u;"
@@ -151,8 +176,66 @@ def _shim(name: str) -> bytes:
         "['EventSource','WebSocket'].forEach(function(n){var C=window[n];if(!C)return;"
         "window[n]=new Proxy(C,{construct:function(t,a){a[0]=fix(a[0]);"
         "return Reflect.construct(t,a);}});});"
-        "})();</script>"
-    ).encode()
+        # ROUTING. Rewriting the console's network URLs is not enough: opencode's console is
+        # a single-page app whose router reads `location.pathname` and matches it against
+        # root-relative routes, because — like its asset and server URLs — it assumes it is
+        # served at the ORIGIN ROOT. Mounted under this prefix, the initial path matches no
+        # route and the app renders an empty `<main>` — a "mostly blank page" with only its
+        # toolbar. So, before the bundle runs, strip the prefix so the router initialises at
+        # root; then keep every navigation the app makes prefixed in the address bar, and
+        # restore the prefix once the router has read the initial path — so a reload lands
+        # back on the console and not on the chat surface at the origin root. Verified in a
+        # real browser against the daemon: without this `<main>` is empty; with it the home
+        # view renders and survives a reload (enterpriseaiframework-f4c).
+        "function strip(u){var s=String(u);"
+        "if(s.indexOf(P+'/')===0)return s.slice(P.length);if(s===P)return '/';return s;}"
+        "function hp(u){if(u==null)return u;var s=String(u);"
+        "if(s.charAt(0)==='/'&&s.charAt(1)!=='/'&&!mine(s))return P+s;return s;}"
+        "var ops=history.pushState,ors=history.replaceState;"
+        "if(location.pathname.indexOf(P)===0)"
+        "ors.call(history,history.state,'',strip(location.pathname)+location.search+location.hash);"
+        "history.pushState=function(a,b,u){return ops.call(this,a,b,arguments.length>2?hp(u):u);};"
+        "history.replaceState=function(a,b,u){return ors.call(this,a,b,arguments.length>2?hp(u):u);};"
+        "window.addEventListener('DOMContentLoaded',function(){var p=location.pathname;"
+        "if(p.indexOf(P)!==0)ors.call(history,history.state,'',hp(p)+location.search+location.hash);});"
+        "})();"
+    )
+
+
+def _shim_csp_source(name: str) -> str:
+    """The CSP `script-src` token that authorises this agent's injected shim.
+
+    A hash source, not `'unsafe-inline'`: the shim is one known script, so it is admitted
+    by exactly the mechanism opencode admits its own — `'sha256-<base64>'` over the script's
+    text content — and nothing else inline is permitted. The digest is over `_shim_js`'s
+    exact bytes, which are what `_shim` injects between the tags."""
+    digest = hashlib.sha256(_shim_js(name).encode()).digest()
+    return "'sha256-" + base64.b64encode(digest).decode() + "'"
+
+
+def _authorise_shim_in_csp(csp: str, name: str) -> str:
+    """Add the shim's hash to a forwarded CSP so the browser will run the injected script.
+
+    The console's own CSP is preserved in full — this only widens `script-src` by the one
+    hash. If the policy has no `script-src`, scripts fall back to `default-src`, so an
+    explicit `script-src` is added that mirrors that fallback and adds the hash; without a
+    `default-src` either, a minimal `'self'`-plus-hash is used. Idempotent.
+    """
+    source = _shim_csp_source(name)
+    directives = [d.strip() for d in csp.split(";") if d.strip()]
+    default_src = None
+    for i, d in enumerate(directives):
+        parts = d.split()
+        key = parts[0].lower()
+        if key == "default-src":
+            default_src = parts[1:]
+        if key == "script-src":
+            if source not in parts:
+                directives[i] = d + " " + source
+            return "; ".join(directives)
+    fallback = default_src if default_src is not None else ["'self'"]
+    directives.append("script-src " + " ".join(fallback + [source]))
+    return "; ".join(directives)
 
 
 def _js_string(value: str) -> str:
@@ -262,6 +345,14 @@ async def agent_console_proxy(name: str, path: str, request: Request,
         finally:
             await upstream.aclose()
             await client.aclose()
+        # The entry document is the one response that gains an inline script (the shim).
+        # If the daemon guards the console with a CSP — opencode does — that script has to
+        # be admitted by hash, or the browser drops it and the console never rewrites its
+        # own URLs. Only the entry document is touched, because it is the only response the
+        # shim is injected into.
+        for key in list(out_headers):
+            if key.lower() == "content-security-policy":
+                out_headers[key] = _authorise_shim_in_csp(out_headers[key], name)
         return Response(
             content=_rewrite_entry_document(content, name),
             status_code=upstream.status_code,

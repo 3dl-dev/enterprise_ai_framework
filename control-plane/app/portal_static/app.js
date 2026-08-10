@@ -135,6 +135,9 @@ function showTab(which) {
   if (which === "agents") {
     loadAgents();
   } else {
+    // Leaving the Agents tab: no view to update, so stop the status poll until it is shown
+    // again (loadAgents on the next switch back restarts it if anything is still starting).
+    stopAgentsPoll();
     loadFrame(which);
     // Tell the frame to re-measure once it is actually on screen. A frame laid out while
     // its tab was hidden measures zero width, and ttyd sizes its terminal to whatever it
@@ -152,6 +155,14 @@ function showTab(which) {
 $("tab-chat").addEventListener("click", () => showTab("chat"));
 $("tab-code").addEventListener("click", () => showTab("code"));
 $("tab-agents").addEventListener("click", () => showTab("agents"));
+
+// A backgrounded browser tab throttles timers to a crawl, so the status poll effectively
+// stalls while the window is hidden. On return, refetch once if the Agents tab is the one
+// showing — that both refreshes what went stale and restarts the poll if anything is still
+// coming up.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && agentsTabActive()) loadAgents();
+});
 $("code-retry").addEventListener("click", () => {
   const f = $("frame-code");
   delete f.dataset.loaded;
@@ -457,6 +468,31 @@ function hours(n) {
 
 let AGENTS_BUSY = false;
 
+// A pod goes `starting` -> `running` with nothing on this page to trigger a refetch: the
+// list reloads only on a tab switch or an action (see the design note at showTab). So an
+// agent the user just created — or just wired a connector to — sits at "starting…" until
+// they navigate away and back, a working boot that reads as a stuck one. That is exactly
+// the finding-43 failure mode. While the Agents tab is on screen and any agent is still in
+// a transient state, re-poll until it settles; stop the moment nothing is transitioning,
+// the tab is hidden, or the browser tab is backgrounded.
+const AGENTS_POLL_MS = 4000;
+let agentsPollTimer = null;
+
+function agentsTabActive() {
+  return !$("view-agents").hidden;
+}
+
+function stopAgentsPoll() {
+  if (agentsPollTimer) { clearTimeout(agentsPollTimer); agentsPollTimer = null; }
+}
+
+function scheduleAgentsPoll(rows) {
+  stopAgentsPoll();
+  const transitioning = rows.some((a) => a.status === "starting");
+  if (!transitioning || !agentsTabActive() || document.hidden) return;
+  agentsPollTimer = setTimeout(loadAgents, AGENTS_POLL_MS);
+}
+
 async function loadAgents() {
   let d;
   try { d = await get("/portal/api/agents"); }
@@ -464,6 +500,12 @@ async function loadAgents() {
     $("agents-error").hidden = false;
     $("agents-error").textContent =
       "Could not read your agents just now. The list below may be out of date.";
+    // A blip while an agent was still coming up must not freeze the view at "starting…" —
+    // keep retrying on the same cadence as long as the tab is the one being watched.
+    stopAgentsPoll();
+    if (agentsTabActive() && !document.hidden) {
+      agentsPollTimer = setTimeout(loadAgents, AGENTS_POLL_MS);
+    }
     return;
   }
   $("agents-error").hidden = !d.usage_error;
@@ -492,6 +534,8 @@ async function loadAgents() {
   const rows = d.agents || [];
   for (const a of rows) list.appendChild(agentRow(a));
   $("agents-empty").hidden = rows.length !== 0;
+
+  scheduleAgentsPoll(rows);
 }
 
 function agentRow(a) {

@@ -83,6 +83,20 @@ ENTRY_DOCUMENT = b"""<!doctype html>
 
 BUNDLE = b'console.log("the opencode console bundle");'
 
+# opencode guards the console with a strict CSP whose `script-src` has NO 'unsafe-inline':
+# it whitelists its own one inline script by sha256 and nothing else. The proxy injects the
+# URL-rewriting shim as an inline script, so it must extend this policy with the shim's own
+# hash or the browser drops the shim and every runtime request escapes the prefix. This is
+# the real header, byte-for-byte, so the forwarding + authorising path is exercised for
+# real.  (enterpriseaiframework-f4c — the broken agent console.)
+DAEMON_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'wasm-unsafe-eval' "
+    "'sha256-jURJv6M3UYb5GqNE3+c1I0SvGlqS1+LmHVWtqFsefBk='; "
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; "
+    "font-src 'self' data:; media-src 'self' data:; connect-src * data:"
+)
+
 
 class FakeDaemon:
     """A stand-in for the RESIDENT `opencode serve`, with the properties that matter.
@@ -138,10 +152,12 @@ class FakeDaemon:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
-            def _send(self, status, ctype, body: bytes, close=False):
+            def _send(self, status, ctype, body: bytes, close=False, csp=None):
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
+                if csp:
+                    self.send_header("Content-Security-Policy", csp)
                 if close:
                     self.send_header("Connection", "close")
                 self.end_headers()
@@ -161,7 +177,8 @@ class FakeDaemon:
                     return
 
                 if path in ("/", "/app"):
-                    self._send(200, "text/html; charset=utf-8", ENTRY_DOCUMENT)
+                    self._send(200, "text/html; charset=utf-8", ENTRY_DOCUMENT,
+                               csp=DAEMON_CSP)
                 elif path == "/assets/index-CgMYRCpN.js":
                     self._send(200, "text/javascript", BUNDLE)
                 elif path == "/pid":
@@ -376,6 +393,97 @@ def test_the_owner_attaches_and_the_console_is_served_under_its_own_prefix(world
     # The browser never carries the daemon's credential; this hop adds it.
     assert all(authed for _m, _p, authed in world.daemon.requests), world.daemon.requests
     assert "authorization" not in {k.lower() for k in alice.headers}
+
+
+def test_the_injected_shim_is_authorised_by_the_forwarded_csp(world):
+    """The console's CSP must be widened to admit the shim, or the browser drops it.
+
+    opencode serves a `script-src` with no `'unsafe-inline'`. The proxy injects the
+    URL-rewriting shim as an inline script; unless the policy carries that script's own
+    sha256, the browser refuses to run it and — with the shim dead — every runtime request
+    resolves against the origin ROOT instead of the console's prefix, so `/api/event` and
+    the pty socket 404 in a reconnect loop and the console is a broken shell. This is the
+    exact defect a dogfood user hit.
+
+    The hash is checked against the ACTUAL bytes injected, the way a browser computes it, so
+    the test fails if the shim text and the authorised hash ever drift apart.
+    """
+    import base64
+    import hashlib
+    import re as _re
+
+    from app import agent_console
+
+    world.add_agent("alice", "scraper")
+    alice = app_client("alice")
+    page = alice.get("/agents/scraper/app")
+    assert page.status_code == 200, page.text
+
+    csp = page.headers.get("content-security-policy")
+    assert csp, "the console's CSP must be forwarded, not dropped"
+
+    # The exact inline script the browser will try to run, and the hash it will demand.
+    injected = agent_console._shim_js("scraper")
+    served = page.text
+    assert "<script>" + injected + "</script>" in served, (
+        "the authorised hash must be of the same bytes actually injected into the page"
+    )
+    want = "'sha256-" + base64.b64encode(hashlib.sha256(injected.encode()).digest()).decode() + "'"
+
+    script_src = next(
+        d.strip() for d in csp.split(";") if d.strip().lower().startswith("script-src")
+    )
+    assert want in script_src.split(), (
+        f"script-src must carry the injected shim's hash {want}\n  script-src: {script_src}"
+    )
+    # opencode's own policy is preserved, not replaced: its inline-script hash and the rest
+    # of the directives still stand.
+    assert "'sha256-jURJv6M3UYb5GqNE3+c1I0SvGlqS1+LmHVWtqFsefBk='" in csp
+    assert "style-src 'self' 'unsafe-inline'" in csp
+    assert "'unsafe-inline'" not in script_src, (
+        "the shim must be admitted by hash, not by opening script-src to all inline scripts"
+    )
+
+
+def test_the_shim_teaches_the_router_its_prefix(world):
+    """Rewriting network URLs is not enough — the console's ROUTER also assumes the root.
+
+    opencode's console is a single-page app whose router reads `location.pathname` to pick a
+    view. Mounted under `/agents/<name>/`, the initial path matches no route and the app
+    renders an empty `<main>` — the whole page blank but for its toolbar (a dogfood user's
+    "mostly blank page"). So the shim strips the prefix before the bundle runs, so the router
+    initialises at root, and keeps the address bar prefixed so a reload lands back here. This
+    pins that wiring: the strip on load, the history interposition, and the re-add after load.
+    """
+    world.add_agent("alice", "scraper")
+    page = app_client("alice").get("/agents/scraper/app")
+    body = page.text
+    assert "history.pushState=function" in body and "history.replaceState=function" in body, (
+        "the shim must interpose on the History API so navigations stay under the prefix"
+    )
+    assert "location.pathname.indexOf(P)===0" in body, (
+        "the shim must strip the prefix on load so the router initialises at root, or the "
+        "console renders an empty <main> (enterpriseaiframework-f4c)"
+    )
+    assert "DOMContentLoaded" in body, (
+        "the shim must re-add the prefix after load so a reload lands on the console, not the "
+        "chat surface at the origin root"
+    )
+
+
+def test_csp_authorisation_falls_back_to_default_src_when_no_script_src():
+    """A daemon whose CSP has no explicit `script-src` lets scripts fall back to
+    `default-src`. Authorising the shim must then ADD a `script-src` that keeps that
+    fallback and adds the hash — not silently leave the shim unauthorised."""
+    from app import agent_console
+
+    src = agent_console._shim_csp_source("bot")
+    out = agent_console._authorise_shim_in_csp("default-src 'self' https://cdn.example", "bot")
+    script = next(d.strip() for d in out.split(";") if d.strip().lower().startswith("script-src"))
+    parts = script.split()
+    assert "'self'" in parts and "https://cdn.example" in parts and src in parts, out
+    # And the original default-src is untouched.
+    assert "default-src 'self' https://cdn.example" in out
 
 
 def test_a_percent_encoded_path_reaches_the_daemon_unchanged(world):
