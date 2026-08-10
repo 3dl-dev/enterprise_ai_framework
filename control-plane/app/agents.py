@@ -420,6 +420,60 @@ def console_url(name: str) -> str:
     return f"/agents/{name}/"
 
 
+# The port `opencode serve` binds in the agent pod, and the port the per-agent Service
+# publishes. One name, spelled the same as the variable deploy/agent/entrypoint.sh reads
+# (`AGENT_SERVE_PORT`), so moving it moves both ends at once.
+SERVE_PORT = int(os.environ.get("AGENT_SERVE_PORT", "4096"))
+
+# The username half of the daemon's HTTP Basic credential. `opencode serve` ignores it and
+# checks only the password (deploy/agent/entrypoint.sh records the measurement), but a
+# Basic header needs both halves and this is the one every other caller uses —
+# tests-live/test_agent_resident.py curls `-u opencode:$password`.
+CONSOLE_BASIC_USER = "opencode"
+
+
+async def console_target(user: str, name: str) -> dict:
+    """Where the caller's OWN resident daemon is, and the credential to speak to it.
+
+    This is the whole owner-scoping of the console proxy (enterpriseaiframework-0e7), and
+    it is deliberately the SAME guard the stop/start/delete endpoints use rather than a
+    second implementation of it: `_owned_deployment` derives `agent-<user>-<name>` from the
+    authenticated name and then re-reads the object and insists its labels say the same
+    thing. See the module docstring for the hyphen collision that makes the second half
+    necessary — without it `alice` asking for the console of `bot-two` would attach to
+    `alice-bot`'s agent `two`, which is a live session and a spendable key.
+
+    It returns a host and a password, not an open connection, so that the proxy in
+    `agent_console.py` holds no authorisation logic at all: there is no code path there
+    that can reach a daemon this function did not name.
+
+    404 for "not yours" as well as for "not there", for the reason `_owned_deployment`
+    gives — a distinct 403 confirms to a prober that somebody owns an agent by that name.
+    """
+    obj = object_name(user, name)
+    async with _client() as client:
+        await _owned_deployment(client, user, name)
+        secret = await _get(client, "v1", "Secret", f"{obj}-key")
+
+    encoded = ((secret or {}).get("data") or {}).get("OPENCODE_SERVER_PASSWORD")
+    if not encoded:
+        # The daemon refuses to start without this (deploy/agent/entrypoint.sh), so a
+        # missing one means the Secret was replaced or hand-edited. Attaching without it
+        # would 401 at the daemon and read as "the agent is broken".
+        raise HTTPException(
+            503,
+            f"the agent {name!r} has no console credential in its Secret {obj}-key. It is "
+            "written at create time and the daemon refuses to start without it; "
+            "re-provision the agent rather than attaching to it.",
+        )
+    return {
+        "host": obj,
+        "port": SERVE_PORT,
+        "username": CONSOLE_BASIC_USER,
+        "password": base64.b64decode(encoded).decode(),
+    }
+
+
 # ---------------------------------------------------------------- create
 
 
