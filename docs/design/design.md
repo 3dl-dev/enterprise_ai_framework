@@ -1519,6 +1519,81 @@ Stated plainly rather than papered over. Each names what would close it.
 
 ---
 
+## 12. The resident "Agents" surface
+
+Full design record: **`docs/design/records/agents-surface.md`**. This section states the
+binding contracts every downstream item consumes; the record carries the reasoning, the
+losing arguments, and the two RESERVED rulings. Epic `enterpriseaiframework-da7`.
+
+A fourth portal tab beside Chat and Code that lets a user fire up and manage named,
+persistent *hermes* agents — each a long-running opencode process on its own PVC that keeps
+working after the browser closes and lives until intentional shutdown. It generalises the
+per-user Code/workspace surface, and its defining difference is finding 43: Code **spawns**
+opencode per websocket and the agent **dies on disconnect**; an Agent is a **resident**
+daemon the console **attaches** to. This is a new surface, not a workspace flag.
+
+**Hard invariant (outranks the rest of this section):** the Code/workspace surface stays
+**byte-unchanged and green** — the camp runs on it 2026-08-11. Contract 6 makes that
+mechanical.
+
+The six binding contracts:
+
+1. **Identity / alias.** An agent instance is `(<user>, <name>)`, `<name>` a slug under the
+   workspace's existing `^[a-z0-9][a-z0-9-]{0,38}$`. k8s objects are `agent-<user>-<name>`;
+   the owner-scoped console path is `/agents/<name>/` (user from auth, never the path). The
+   metering alias is **`<username>::agents/<name>`** — one `::`, instance folded into the
+   surface field with `/`, so it **round-trips unchanged** through both `gateway.parse_alias`
+   (`rpartition`) and `metering.py`'s `split_part(_,1)/(_,2)`, and lands per-instance on
+   `/admin/spend` with no query change. The only edit is an additive `agent_key_alias` +
+   one `parse_alias` clause in `gateway.py`; `key_alias`/`SURFACES` are untouched.
+
+2. **Residency.** A resident **`opencode serve`** daemon is the pod's main process; the
+   console attaches (ttyd → client on loopback), and a disconnect never ends the session
+   (tmux-attach is the documented fallback). Session state on the PVC via `XDG_DATA_HOME`
+   (finding 30). Lifecycle: **created → running → stopped → deleted**, mechanised as
+   Deployment `replicas: 1` (running) / **`replicas: 0`, PVC retained** (stopped) / delete
+   Deployment+Service+Secret then PVC (deleted). *Stopped accrues no resident cost* because
+   there is no pod to meter — not a "stopped rate".
+
+3. **Two metering dimensions.** (a) **Inference tokens** ride the existing virtual-key path
+   gateway→Forge, unchanged. (b) **Net-new resident-time + compute**: wall-clock from pod
+   `status.startTime`, compute from **cAdvisor `container_cpu_usage_seconds_total`** (a
+   monotonic counter — chosen over metrics-server's lossy gauge; kube-state-metrics only
+   cross-checks the stopped state), attributed by `(user, agent)` pod labels, in a
+   **separate control-plane ledger**. Cost basis **RESERVED to Baron** (recommended:
+   resident-hour + CPU-core-hour). It surfaces beside inference spend in `/portal/api/spend`
+   by endpoint-layer composition, leaving `metering.spend_by_user_and_surface` and
+   `/admin/spend` byte-unchanged.
+
+4. **Config: integrated key vs BYO.** Default is the integrated metered
+   `<user>::agents/<name>` virtual key. **BYO** points the agent's `OPENAI_API_BASE`/`_KEY`
+   at an external provider, routing inference **around the gateway** and producing **zero
+   ledger rows by design** — allowed because it is per-user, own-credential, and made
+   **visible** (`model_source: byo`, an "off-ledger by design" label, never a silent $0);
+   provenance, not the finding-4 leak. The BYO secret is a per-agent k8s Secret,
+   **set-once, never returned** (finding 2). Residency (Contract 3b) still bills BYO.
+
+5. **Email component — RESERVED to Baron.** Recommended default **Maddy (GPL-3.0)** — single
+   no-tier binary, GPL-not-AGPL, standalone SMTP daemon (no linking). Alternatives:
+   **Stalwart** (AGPL-3.0 + commercial — its enterprise tier disqualifies it as *default*
+   under the open-core rule; documented swap) and **Postfix** (IPL-1.0, no tier, MTA-only,
+   heaviest ops).
+
+6. **Code-untouched invariant.** Frozen byte-identical: `deploy/workspace/*`,
+   `deploy/k8s/60-workspace-common.yaml`, `deploy/k8s/61-workspace.template.yaml`,
+   `deploy/bin/provision-workspace.sh`, `tests/test_workspace_shell.py`. Enforced
+   mechanically by `tests/test_code_surface_frozen.py` (owned by `-055`) running
+   **`git diff --exit-code`** over that path set against the pre-Agents baseline, fault-
+   injected to prove it bites. The surface is built from new files beside the frozen set.
+
+Downstream consumers: `-055` (1, 2, 6), `-627` (1, 2, 3, 4), `-0e7` (1, 2), `-39d` (4, 1),
+`-914` (3), `-a4e` (5), `-ede` (all — especially 6). Map in the record.
+
+This is an **architecture-change-cascade** item: the record is the design artifact, and the
+seven items above are its build cascade.
+
+---
+
 ## Appendix: decisions ruled in this document
 
 For the implementer who needs the short list.
