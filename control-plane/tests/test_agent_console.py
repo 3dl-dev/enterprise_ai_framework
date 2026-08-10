@@ -445,6 +445,32 @@ def test_the_injected_shim_is_authorised_by_the_forwarded_csp(world):
     )
 
 
+def test_the_shim_teaches_the_router_its_prefix(world):
+    """Rewriting network URLs is not enough — the console's ROUTER also assumes the root.
+
+    opencode's console is a single-page app whose router reads `location.pathname` to pick a
+    view. Mounted under `/agents/<name>/`, the initial path matches no route and the app
+    renders an empty `<main>` — the whole page blank but for its toolbar (a dogfood user's
+    "mostly blank page"). So the shim strips the prefix before the bundle runs, so the router
+    initialises at root, and keeps the address bar prefixed so a reload lands back here. This
+    pins that wiring: the strip on load, the history interposition, and the re-add after load.
+    """
+    world.add_agent("alice", "scraper")
+    page = app_client("alice").get("/agents/scraper/app")
+    body = page.text
+    assert "history.pushState=function" in body and "history.replaceState=function" in body, (
+        "the shim must interpose on the History API so navigations stay under the prefix"
+    )
+    assert "location.pathname.indexOf(P)===0" in body, (
+        "the shim must strip the prefix on load so the router initialises at root, or the "
+        "console renders an empty <main> (enterpriseaiframework-f4c)"
+    )
+    assert "DOMContentLoaded" in body, (
+        "the shim must re-add the prefix after load so a reload lands on the console, not the "
+        "chat surface at the origin root"
+    )
+
+
 def test_csp_authorisation_falls_back_to_default_src_when_no_script_src():
     """A daemon whose CSP has no explicit `script-src` lets scripts fall back to
     `default-src`. Authorising the shim must then ADD a `script-src` that keeps that

@@ -40,14 +40,23 @@ served bundle: `location.hostname.includes("opencode.ai") ? "http://localhost:40
 location.origin`). Mounted under `/agents/<name>/` on the portal origin, every one of those
 requests would leave the prefix and land on the chat surface at the origin root.
 
-Two rewrites fix that, and both are deliberately about URLS ONLY — nothing here interprets
+Three rewrites fix that, and all are deliberately about URLS ONLY — nothing here interprets
 or rewrites the agent's content:
 
   1. the entry document's root-absolute `src=`/`href=` gain the prefix, so the bundle and
      its stylesheet load from under it (and any later `import()` chunk resolves relative to
      that, for free);
   2. a small inline shim prefixes same-origin, root-absolute URLs passed to `fetch`,
-     `XMLHttpRequest`, `EventSource` and `WebSocket`.
+     `XMLHttpRequest`, `EventSource` and `WebSocket`;
+  3. the same shim strips the prefix from `location.pathname` before the bundle runs and
+     re-adds it after, because the console's ROUTER also assumes the origin root: it reads
+     the path to pick a view, so under the prefix it matches nothing and renders an empty
+     `<main>` — the whole page blank but for its toolbar. Stripping it for the router while
+     keeping the address bar prefixed (so a reload still lands here) is the routing analogue
+     of what (2) does for requests.
+
+The injected inline script the CSP must then admit by hash covers all of (2) and (3);
+`_shim_js` is the single source of those bytes.
 
 The shim is written against web platform APIs rather than against opencode's internals for
 the reason the alternative fails: the identifiers in a 3 MB minified bundle change on every
@@ -167,6 +176,28 @@ def _shim_js(name: str) -> str:
         "['EventSource','WebSocket'].forEach(function(n){var C=window[n];if(!C)return;"
         "window[n]=new Proxy(C,{construct:function(t,a){a[0]=fix(a[0]);"
         "return Reflect.construct(t,a);}});});"
+        # ROUTING. Rewriting the console's network URLs is not enough: opencode's console is
+        # a single-page app whose router reads `location.pathname` and matches it against
+        # root-relative routes, because — like its asset and server URLs — it assumes it is
+        # served at the ORIGIN ROOT. Mounted under this prefix, the initial path matches no
+        # route and the app renders an empty `<main>` — a "mostly blank page" with only its
+        # toolbar. So, before the bundle runs, strip the prefix so the router initialises at
+        # root; then keep every navigation the app makes prefixed in the address bar, and
+        # restore the prefix once the router has read the initial path — so a reload lands
+        # back on the console and not on the chat surface at the origin root. Verified in a
+        # real browser against the daemon: without this `<main>` is empty; with it the home
+        # view renders and survives a reload (enterpriseaiframework-f4c).
+        "function strip(u){var s=String(u);"
+        "if(s.indexOf(P+'/')===0)return s.slice(P.length);if(s===P)return '/';return s;}"
+        "function hp(u){if(u==null)return u;var s=String(u);"
+        "if(s.charAt(0)==='/'&&s.charAt(1)!=='/'&&!mine(s))return P+s;return s;}"
+        "var ops=history.pushState,ors=history.replaceState;"
+        "if(location.pathname.indexOf(P)===0)"
+        "ors.call(history,history.state,'',strip(location.pathname)+location.search+location.hash);"
+        "history.pushState=function(a,b,u){return ops.call(this,a,b,arguments.length>2?hp(u):u);};"
+        "history.replaceState=function(a,b,u){return ors.call(this,a,b,arguments.length>2?hp(u):u);};"
+        "window.addEventListener('DOMContentLoaded',function(){var p=location.pathname;"
+        "if(p.indexOf(P)!==0)ors.call(history,history.state,'',hp(p)+location.search+location.hash);});"
         "})();"
     )
 
