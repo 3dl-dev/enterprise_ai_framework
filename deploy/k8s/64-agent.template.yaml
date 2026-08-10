@@ -12,6 +12,9 @@
 #   __KEY_SECRET__    the Secret holding OPENAI_API_KEY: `agent-<user>-<name>-key` (the
 #                     integrated virtual key) or `agent-<user>-<name>-byo` (the user's
 #                     own provider credential, set-once and never read back)
+#   __EMAILSUM__      checksum of the mailbox credential (`agent-<user>-<name>-email`), or
+#                     `none` — so a re-supplied mail password rolls the pod and a re-run
+#                     that supplies nothing does not
 #
 # A COPY of 61-workspace.template.yaml's shape, deliberately, not a shared base: Contract
 # 6 of docs/design/records/agents-surface.md freezes that file byte-for-byte because the
@@ -137,6 +140,20 @@ spec:
         # presenting the old credential and 401 forever, silently, which on an unattended
         # surface means nobody finds out. A hash, never the key.
         checksum/api-key: "__KEYSUM__"
+        # The MAILBOX credential's checksum (enterpriseaiframework-a4e), and it is here
+        # for exactly the reason checksum/api-key is: `envFrom` is injected at pod start
+        # and never updated afterwards, so an agent whose mail password was re-supplied
+        # would keep presenting the old one and keep getting rejected by the provider,
+        # silently, on a surface nobody is watching.
+        #
+        # It is a HASH the provisioner stores beside the credential, never the credential:
+        # provision-agent.sh writes AGENT_EMAIL_CONFIG_SUM into the Secret and reads that
+        # key back, so a re-run with no --email-config-file renders the SAME value here
+        # and the agent is not restarted. That matters more than it looks: restarting an
+        # agent ends the resident session, so "re-provisioning is a no-op" has to survive
+        # a credential the provisioner is forbidden to read.
+        # "none" when this agent has no mailbox at all.
+        checksum/email: "__EMAILSUM__"
     spec:
       serviceAccountName: agent
       automountServiceAccountToken: false
@@ -199,6 +216,31 @@ spec:
               valueFrom:
                 secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
             - { name: OPENCODE_MODEL, value: "enterprise-ai/__MODEL__" }
+          # THE MAILBOX (enterpriseaiframework-a4e). An EXTERNAL provider — M365, Gmail,
+          # or any IMAP+SMTP host — reached with the tenant's own credential. There is no
+          # mail server in this deployment and there must never be one; Baron's ruling on
+          # -a4e says so and tests/test_agent_email.py asserts it against every manifest.
+          #
+          # envFrom, not a list of secretKeyRefs, because the mailbox is a SET of settings
+          # (host, port, security, username, password, address) whose shape differs per
+          # provider, and enumerating them here would mean a template edit — and a rolled
+          # agent — every time a provider needed one more.
+          #
+          # `optional: true` is what makes email ADDITIVE: an agent provisioned without
+          # `--email-config-file` has no such Secret, starts exactly as it did before, and
+          # simply has no AGENT_EMAIL_* variables. Without `optional` every existing agent
+          # would wedge in ContainerCreating the moment this line merged.
+          #
+          # ORDER IS THE SECURITY PROPERTY: Kubernetes applies `envFrom` FIRST and lets
+          # the explicit `env` entries above win on a collision. So a mail config that
+          # named OPENAI_API_KEY or OPENCODE_SERVER_PASSWORD could not override either of
+          # them. provision-agent.sh additionally refuses any key outside the
+          # AGENT_EMAIL_* allowlist, so the file cannot smuggle a PATH either — belt and
+          # braces, because only one of the two is visible from this file.
+          envFrom:
+            - secretRef:
+                name: agent-__USER__-__NAME__-email
+                optional: true
           ports:
             # Named, and reachable only through the ClusterIP Service that the
             # NetworkPolicy admits from the control-plane pod alone.
@@ -256,7 +298,13 @@ spec:
         # deploy/agent/entrypoint.sh. One control plane: every agent in the namespace runs
         # the same entrypoint, and its checksum is the annotation above.
         - name: entrypoint
-          configMap: { name: agent-entrypoint }
+          # 0755, because this volume now carries `agent-email` as well as entrypoint.sh
+          # (enterpriseaiframework-a4e) and the entrypoint puts /etc/agent on PATH. A
+          # ConfigMap's default 0644 would make the mail tool present, on PATH, and
+          # "permission denied" — the most confusing possible way for a tool to be
+          # missing. The volume stays readOnly at the mount, so executable here does not
+          # mean writable.
+          configMap: { name: agent-entrypoint, defaultMode: 0755 }
         - name: tenant-instructions
           configMap: { name: workspace-tenant-instructions, optional: true }
         - name: skill-incident-escalation
