@@ -85,7 +85,8 @@ IMAGE="${AGENT_IMAGE:-${WORKSPACE_IMAGE:-${REGISTRY}/${IMAGE_NAME}:${WORKSPACE_T
 
 USAGE="usage: provision-agent.sh <keycloak-username> <agent-name> [--model NAME]
                                  [--byo-key-file FILE] [--byo-api-base URL]
-                                 [--email-config-file FILE]"
+                                 [--email-config-file FILE]
+                                 [--slack-config-file FILE] [--discord-config-file FILE]"
 USER_NAME="${1:?${USAGE}}"
 AGENT_NAME="${2:?${USAGE}}"
 shift 2
@@ -93,6 +94,8 @@ MODEL="${AGENT_MODEL:-glm-5.2@deepinfra}"
 BYO_KEY_FILE=""
 BYO_API_BASE="${AGENT_BYO_API_BASE:-}"
 EMAIL_CONFIG_FILE="${AGENT_EMAIL_CONFIG_FILE:-}"
+SLACK_CONFIG_FILE="${AGENT_SLACK_CONFIG_FILE:-}"
+DISCORD_CONFIG_FILE="${AGENT_DISCORD_CONFIG_FILE:-}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --model)         MODEL="$2"; shift 2 ;;
@@ -102,6 +105,10 @@ while [[ $# -gt 0 ]]; do
         --byo-api-base)  BYO_API_BASE="$2"; shift 2 ;;
         # Same rule, same reason: the mailbox app-password never appears in argv.
         --email-config-file) EMAIL_CONFIG_FILE="$2"; shift 2 ;;
+        # And the same again for the chat bot tokens (enterpriseaiframework-783). A Slack
+        # `xoxb-` token posts as the whole organisation in every channel the app is in.
+        --slack-config-file) SLACK_CONFIG_FILE="$2"; shift 2 ;;
+        --discord-config-file) DISCORD_CONFIG_FILE="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -191,20 +198,30 @@ kubectl apply -f deploy/k8s/63-agent-common.yaml >/dev/null
 # The resident entrypoint, deployment-wide (one control plane), delivered as a ConfigMap
 # because the image is the workspace image and Contract 6 forbids rebuilding it.
 #
-# It carries THREE files now: the entrypoint, the mail tool it puts on PATH, and the
-# instructions file that tells opencode the mail tool exists
-# (enterpriseaiframework-a4e). One ConfigMap rather than three because they roll together
-# — a new agent-email with an old entrypoint is a tool nothing has put on PATH — and
-# because the pod's rollout annotation is a single checksum over all of them.
+# It carries the entrypoint, every outside-world tool the entrypoint puts on PATH, and the
+# instructions file that tells opencode each tool exists (enterpriseaiframework-a4e for
+# mail, -783 for Slack and Discord). ONE ConfigMap rather than one per tool because they
+# roll together — a new agent-slack with an old entrypoint is a tool nothing has put on
+# PATH — and because the pod's rollout annotation is a single checksum over all of them.
+#
+# agentws.py is a MODULE, not a command: it is the RFC 6455 client both chat tools import,
+# and it has to sit in the same directory as them because that directory is what they add
+# to sys.path. Shipping it here rather than baking it into the image is forced by Contract
+# 6, which freezes deploy/workspace/ including the Dockerfile.
+AGENT_FILES=(entrypoint.sh agent-email EMAIL.md agent-slack SLACK.md
+             agent-discord DISCORD.md agentws.py)
+CONFIGMAP_ARGS=()
+for f in "${AGENT_FILES[@]}"; do
+    CONFIGMAP_ARGS+=("--from-file=${f}=deploy/agent/${f}")
+done
 kubectl -n "$NS" create configmap agent-entrypoint \
-    --from-file=entrypoint.sh=deploy/agent/entrypoint.sh \
-    --from-file=agent-email=deploy/agent/agent-email \
-    --from-file=EMAIL.md=deploy/agent/EMAIL.md \
+    "${CONFIGMAP_ARGS[@]}" \
     --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-# Over all three, so editing the mail tool actually rolls the agents. It used to hash
-# entrypoint.sh alone; a checksum that covers only one of the files in a ConfigMap is a
-# rollout trigger that quietly stops firing for the other two.
-CFGSUM=$(cat deploy/agent/entrypoint.sh deploy/agent/agent-email deploy/agent/EMAIL.md \
+# Over EVERY file, so editing any tool actually rolls the agents. It used to hash
+# entrypoint.sh alone; a checksum that covers only some of the files in a ConfigMap is a
+# rollout trigger that quietly stops firing for the rest. Derived from the same array the
+# ConfigMap is built from, so a file can never be shipped without being hashed.
+CFGSUM=$(for f in "${AGENT_FILES[@]}"; do cat "deploy/agent/${f}"; done \
          | sha256sum | cut -c1-16)
 
 # ---------------------------------------------------------------- the pod's secret
@@ -329,23 +346,36 @@ else
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 fi
 
-# ---------------------------------------------------------------- the mailbox
-# The agent's EMAIL capability (enterpriseaiframework-a4e). An EXTERNAL provider — M365,
-# Gmail, or any IMAP+SMTP host — with the tenant's own mailbox and the tenant's own
-# credential. THERE IS NO MAIL SERVER IN THIS DEPLOYMENT AND THERE MUST NEVER BE ONE: no
-# Maddy, no Stalwart, no Postfix, no mail component in any manifest. That is Baron's
-# ruling on -a4e, and tests/test_agent_email.py asserts it against every deploy manifest
-# rather than trusting this comment.
+# ------------------------------------------- the outside world: mail, Slack, Discord
+# The agent's EMAIL capability (enterpriseaiframework-a4e) and its CHAT connectors
+# (enterpriseaiframework-783). In every case an EXTERNAL provider the tenant already has —
+# M365, Gmail or any IMAP+SMTP host; the tenant's own Slack workspace; the tenant's own
+# Discord guild — reached with the tenant's own credential.
 #
-# The credential is handled EXACTLY like the BYO key above, for the same reason: it is the
-# user's own external credential, we cannot revoke it, and it buys real authority — it
-# sends mail as a real person at a real company. So it comes from a FILE and never from
-# argv, it is written set-once, it is never echoed, and there is no path in this script or
-# in the control plane that reads it back out. Re-supplying the file is the only rotation.
+# THERE IS NO MAIL SERVER AND NO CHAT SERVER IN THIS DEPLOYMENT AND THERE MUST NEVER BE
+# ONE: no Maddy, no Stalwart, no Postfix, no Mattermost, no Rocket.Chat, no Zulip, no chat
+# or mail component in any manifest. That is Baron's ruling on -a4e and -783, and
+# tests/test_agent_email.py, tests/test_agent_slack.py and tests/test_agent_discord.py
+# assert it against every deploy manifest rather than trusting this comment.
 #
-# The file is `KEY=value` per line, the shape `kubectl create secret --from-env-file`
-# takes. A worked example (an M365 mailbox):
+# Each credential is handled EXACTLY like the BYO key above, for the same reason: it is the
+# user's own external credential, we cannot revoke it, and it buys real authority — a
+# mailbox password sends mail as a real person at a real company, and a Slack `xoxb-` token
+# posts as the organisation in every channel its app is in. So it comes from a FILE and
+# never from argv, it is written set-once, it is never echoed, and there is no path in this
+# script or in the control plane that reads it back out. Re-supplying the file is the only
+# rotation.
 #
+# ONE FUNCTION, THREE CALLS. The three connectors differ only in their allowlist, their
+# required keys and their nouns; everything that is actually load-bearing — the file is
+# never printed, CRLF is refused, only allowlisted keys survive, the hash lives beside the
+# credential — is identical, and three copies of it would be three places for one of those
+# properties to quietly stop being true.
+#
+# Each config file is `KEY=value` per line, the shape `kubectl create secret
+# --from-env-file` takes. Worked examples:
+#
+#     # --email-config-file (an M365 mailbox)
 #     AGENT_EMAIL_ADDRESS=ops-agent@contoso.com
 #     AGENT_EMAIL_USERNAME=ops-agent@contoso.com
 #     AGENT_EMAIL_PASSWORD=<app password>
@@ -356,28 +386,56 @@ fi
 #     AGENT_EMAIL_IMAP_PORT=993
 #     AGENT_EMAIL_IMAP_SECURITY=ssl
 #
-# Values are taken literally — kubectl does not strip quotes — so a password wrapped in
-# quotes becomes a password WITH quotes, which is a 401 nobody diagnoses.
-EMAIL_SECRET="${OBJ}-email"
+#     # --slack-config-file (a Slack app with Socket Mode enabled)
+#     AGENT_SLACK_BOT_TOKEN=xoxb-...
+#     AGENT_SLACK_APP_TOKEN=xapp-...
+#     AGENT_SLACK_DEFAULT_CHANNEL=C0123ABCD
+#
+#     # --discord-config-file (a Discord application's bot)
+#     AGENT_DISCORD_BOT_TOKEN=...
+#     AGENT_DISCORD_DEFAULT_CHANNEL=123456789012345678
+#
+# Values are taken literally — kubectl does not strip quotes — so a token wrapped in quotes
+# becomes a token WITH quotes, which is a 401 nobody diagnoses.
 
-# Only AGENT_EMAIL_* keys, checked here rather than trusted. The pod injects this Secret
-# with `envFrom`, so every key in it becomes an environment variable in a container that
-# holds a spendable API key — a file containing `PATH=/tmp/evil` or `LD_PRELOAD=...` would
-# be an arbitrary-code-execution channel dressed up as a mail setting. The template's
-# explicit `env:` already wins over `envFrom` for OPENAI_API_KEY and
-# OPENCODE_SERVER_PASSWORD, but that only defends the two names anyone thought of.
-EMAIL_KEYS_ALLOWED="AGENT_EMAIL_ADDRESS AGENT_EMAIL_USERNAME AGENT_EMAIL_PASSWORD
-AGENT_EMAIL_SMTP_HOST AGENT_EMAIL_SMTP_PORT AGENT_EMAIL_SMTP_SECURITY
-AGENT_EMAIL_IMAP_HOST AGENT_EMAIL_IMAP_PORT AGENT_EMAIL_IMAP_SECURITY
-AGENT_EMAIL_CA_FILE"
+# provision_connector <label> <flag> <file> <noun> <sum-key> <none-message>
+#                     <allowed-keys> <required-keys>
+#
+# Sets CONNECTOR_SUM to the value the pod template's checksum/<label> annotation renders
+# from: the hash of the supplied file, the hash already stored beside an existing
+# credential, or "none".
+CONNECTOR_SUM=""
+provision_connector() {
+    local label="$1" flag="$2" file="$3" noun="$4" sum_key="$5" none_msg="$6"
+    local allowed="$7" required="$8"
+    local secret="${OBJ}-${label}"
+    local k line tmp
 
-if [[ -n "$EMAIL_CONFIG_FILE" ]]; then
-    [[ -r "$EMAIL_CONFIG_FILE" ]] || {
-        echo "cannot read --email-config-file ${EMAIL_CONFIG_FILE}" >&2; exit 1; }
+    if [[ -z "$file" ]]; then
+        # Untouched. A re-provision that says nothing about this connector must not delete
+        # the credential of a running agent, and must not roll it either.
+        CONNECTOR_SUM="$(existing_in "$secret" "$sum_key")"
+        if [[ -n "$CONNECTOR_SUM" ]]; then
+            printf '    %-8s %s (kept; re-supply %s to rotate)\n' "$label" "$secret" "$flag"
+        else
+            CONNECTOR_SUM="none"
+            printf '    %-8s %s\n' "$label" "$none_msg"
+        fi
+        return 0
+    fi
 
-    # Parsed for VALIDATION only, and kubectl reads the file itself — nothing here is
-    # passed on. Be precise about what that does and does not mean: `$line` DOES hold the
-    # password for one iteration, because a line-oriented parser cannot avoid it. What is
+    [[ -r "$file" ]] || { echo "cannot read ${flag} ${file}" >&2; exit 1; }
+
+    # Only allowlisted keys, checked here rather than trusted. The pod injects this Secret
+    # with `envFrom`, so every key in it becomes an environment variable in a container that
+    # holds a spendable API key — a file containing `PATH=/tmp/evil` or `LD_PRELOAD=...`
+    # would be an arbitrary-code-execution channel dressed up as a chat setting. The
+    # template's explicit `env:` already wins over `envFrom` for OPENAI_API_KEY and
+    # OPENCODE_SERVER_PASSWORD, but that only defends the two names anyone thought of.
+    #
+    # Parsed for VALIDATION only, and kubectl reads the file itself — nothing here is passed
+    # on. Be precise about what that does and does not mean: `$line` DOES hold the
+    # credential for one iteration, because a line-oriented parser cannot avoid it. What is
     # guaranteed is that no branch below prints `$line`, that only `$k` (the key name)
     # survives the loop, and that the refusal messages name the KEY and never the value —
     # which is the case that matters, since the malformed-line branch is exactly where
@@ -386,84 +444,105 @@ if [[ -n "$EMAIL_CONFIG_FILE" ]]; then
         [[ -z "${line//[[:space:]]/}" || "${line#"${line%%[![:space:]]*}"}" == \#* ]] && continue
         # CRLF, refused rather than tolerated or silently stripped. kubectl stores values
         # literally, so a file saved on Windows gives every setting a trailing carriage
-        # return: the host becomes "smtp.office365.com\r" (DNS failure) and the password
-        # becomes "secret\r" (authentication failure). Both present as "email is broken"
-        # with nothing pointing at the file. The BYO key path strips \r for the same
-        # reason; here the whole file is at stake, so it is a refusal with a diagnosis.
+        # return: a host becomes "smtp.office365.com\r" (DNS failure) and a token becomes
+        # "xoxb-...\r" (authentication failure). Both present as "it is broken" with nothing
+        # pointing at the file. The BYO key path strips \r for the same reason; here the
+        # whole file is at stake, so it is a refusal with a diagnosis.
         if [[ "$line" == *$'\r' ]]; then
-            echo "refusing: ${EMAIL_CONFIG_FILE} has Windows (CRLF) line endings." >&2
+            echo "refusing: ${file} has Windows (CRLF) line endings." >&2
             echo "  Every value would gain a trailing carriage return, which reads as a" >&2
-            echo "  wrong host and a wrong password. Convert it: dos2unix, or" >&2
-            echo "  \`sed -i 's/\\r\$//' ${EMAIL_CONFIG_FILE}\`." >&2
+            echo "  wrong host and a wrong credential. Convert it: dos2unix, or" >&2
+            echo "  \`sed -i 's/\\r\$//' ${file}\`." >&2
             exit 1
         fi
         if [[ ! "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
-            echo "refusing: ${EMAIL_CONFIG_FILE} has a line that is not KEY=value." >&2
+            echo "refusing: ${file} has a line that is not KEY=value." >&2
             echo "  (the offending value is not printed, on purpose)" >&2
             exit 1
         fi
         k="${line%%=*}"
-        case " ${EMAIL_KEYS_ALLOWED//$'\n'/ } " in
+        case " ${allowed//$'\n'/ } " in
             *" $k "*) ;;
-            *)  echo "refusing: '${k}' is not a mail setting." >&2
+            *)  echo "refusing: '${k}' is not a ${noun}." >&2
                 echo "  This file becomes the agent pod's environment via envFrom, so an" >&2
                 echo "  unexpected key here is an environment variable in a container that" >&2
                 echo "  holds a spendable API key. Allowed:" >&2
-                echo "    ${EMAIL_KEYS_ALLOWED//$'\n'/ }" >&2
+                echo "    ${allowed//$'\n'/ }" >&2
                 exit 1 ;;
         esac
-    done < "$EMAIL_CONFIG_FILE"
+    done < "$file"
 
-    # Both halves of the mailbox, or neither. A config with SMTP and no IMAP produces an
-    # agent that can send and cannot read, which reads as "email is broken" long after the
-    # provisioning that caused it.
-    for required in AGENT_EMAIL_ADDRESS AGENT_EMAIL_PASSWORD \
-                    AGENT_EMAIL_SMTP_HOST AGENT_EMAIL_IMAP_HOST; do
-        grep -qE "^[[:space:]]*${required}=." "$EMAIL_CONFIG_FILE" || {
-            echo "refusing: ${EMAIL_CONFIG_FILE} has no ${required}." >&2
-            echo "  A mailbox needs an address, a password, an SMTP host and an IMAP host;" >&2
-            echo "  send-only or read-only is not a configuration this surface offers." >&2
+    # Every required key, or none of them. A config with SMTP and no IMAP produces an agent
+    # that can send and cannot read; a Slack config with a bot token and no app token
+    # produces an agent that can post and can never hear an answer. Both read as "it is
+    # broken" long after the provisioning that caused it, with nothing connecting the two.
+    local requirement
+    for requirement in $required; do
+        grep -qE "^[[:space:]]*${requirement}=." "$file" || {
+            echo "refusing: ${file} has no ${requirement}." >&2
+            echo "  Every one of these is required, because a half-configured connector is" >&2
+            echo "  not a configuration this surface offers:" >&2
+            echo "    ${required//$'\n'/ }" >&2
             exit 1; }
     done
 
     # A hash of the file, stored BESIDE the credential in the same Secret. It is what the
-    # pod template's checksum/email annotation renders from, and storing it in the Secret
-    # (rather than deriving it from the credential, which this script may not read back)
-    # is what lets a re-run with no --email-config-file produce the SAME annotation and
-    # therefore NOT restart a healthy agent. A hash, never the credential.
-    EMAILSUM=$(sha256sum "$EMAIL_CONFIG_FILE" | cut -c1-16)
+    # pod template's checksum/<label> annotation renders from, and storing it in the Secret
+    # (rather than deriving it from the credential, which this script may not read back) is
+    # what lets a re-run with no flag produce the SAME annotation and therefore NOT restart
+    # a healthy agent. A hash, never the credential.
+    CONNECTOR_SUM=$(sha256sum "$file" | cut -c1-16)
     # ONE file, because `kubectl create secret` REFUSES `--from-env-file` together with
-    # `--from-literal` ("from-env-file cannot be combined with from-file or
-    # from-literal"). So the sum is appended to a copy rather than passed as a literal.
-    # The copy is created under `umask 077` and removed on every exit path — the same
-    # handling the BYO key above gets, and for the same reason: for the moments it exists
-    # this file holds the customer's mail password.
+    # `--from-literal` ("from-env-file cannot be combined with from-file or from-literal").
+    # So the sum is appended to a copy rather than passed as a literal. The copy is created
+    # under `umask 077` and removed on every exit path — the same handling the BYO key gets,
+    # and for the same reason: for the moments it exists this file holds a live credential.
     #
     # The leading newline before the sum is not cosmetic: a config file saved without a
-    # trailing newline would otherwise concatenate its last value with the sum key, and
-    # the result is a secret with a mangled setting and no sum at all. kubectl skips the
-    # blank line that produces.
-    EMAIL_TMP="$(umask 077; mktemp -t agent-email-XXXXXX)"
-    trap 'rm -f "$EMAIL_TMP"' EXIT
-    cat "$EMAIL_CONFIG_FILE" > "$EMAIL_TMP"
-    printf '\nAGENT_EMAIL_CONFIG_SUM=%s\n' "$EMAILSUM" >> "$EMAIL_TMP"
-    kubectl -n "$NS" create secret generic "$EMAIL_SECRET" \
-        --from-env-file="$EMAIL_TMP" \
+    # trailing newline would otherwise concatenate its last value with the sum key, and the
+    # result is a secret with a mangled setting and no sum at all. kubectl skips the blank
+    # line that produces.
+    tmp="$(umask 077; mktemp -t "agent-${label}-XXXXXX")"
+    trap 'rm -f "$tmp"' EXIT
+    cat "$file" > "$tmp"
+    printf '\n%s=%s\n' "$sum_key" "$CONNECTOR_SUM" >> "$tmp"
+    kubectl -n "$NS" create secret generic "$secret" \
+        --from-env-file="$tmp" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-    rm -f "$EMAIL_TMP"
+    rm -f "$tmp"
     trap - EXIT
-    echo "    email    mailbox credential stored in ${EMAIL_SECRET} (not shown, not readable back)"
-else
-    # Untouched. A re-provision that says nothing about email must not delete the mailbox
-    # of a running agent, and must not roll it either.
-    EMAILSUM="$(existing_in "$EMAIL_SECRET" AGENT_EMAIL_CONFIG_SUM)"
-    if [[ -n "$EMAILSUM" ]]; then
-        echo "    email    ${EMAIL_SECRET} (kept; re-supply --email-config-file to rotate)"
-    else
-        EMAILSUM="none"
-        echo "    email    none — this agent has no mailbox"
-    fi
-fi
+    printf '    %-8s credential stored in %s (not shown, not readable back)\n' "$label" "$secret"
+}
+
+provision_connector email "--email-config-file" "$EMAIL_CONFIG_FILE" \
+    "mail setting" AGENT_EMAIL_CONFIG_SUM "none — this agent has no mailbox" \
+"AGENT_EMAIL_ADDRESS AGENT_EMAIL_USERNAME AGENT_EMAIL_PASSWORD
+AGENT_EMAIL_SMTP_HOST AGENT_EMAIL_SMTP_PORT AGENT_EMAIL_SMTP_SECURITY
+AGENT_EMAIL_IMAP_HOST AGENT_EMAIL_IMAP_PORT AGENT_EMAIL_IMAP_SECURITY
+AGENT_EMAIL_CA_FILE" \
+    "AGENT_EMAIL_ADDRESS AGENT_EMAIL_PASSWORD AGENT_EMAIL_SMTP_HOST AGENT_EMAIL_IMAP_HOST"
+EMAILSUM="$CONNECTOR_SUM"
+
+# BOTH Slack tokens are required. The bot token (`xoxb-`) posts; the app-level token
+# (`xapp-`) is what opens the Socket Mode websocket, and Socket Mode is how the agent
+# RECEIVES without anyone publishing an inbound internet route into a pod that holds a
+# spendable model key. An agent with only the bot token can talk and can never listen.
+provision_connector slack "--slack-config-file" "$SLACK_CONFIG_FILE" \
+    "Slack setting" AGENT_SLACK_CONFIG_SUM "none — this agent has no Slack workspace" \
+"AGENT_SLACK_BOT_TOKEN AGENT_SLACK_APP_TOKEN AGENT_SLACK_DEFAULT_CHANNEL
+AGENT_SLACK_API_BASE AGENT_SLACK_CA_FILE" \
+    "AGENT_SLACK_BOT_TOKEN AGENT_SLACK_APP_TOKEN"
+SLACKSUM="$CONNECTOR_SUM"
+
+# Discord needs ONE token for both directions — the same bot token authenticates the REST
+# call that posts and the Gateway websocket that listens — which is the only structural
+# difference between the two chat connectors.
+provision_connector discord "--discord-config-file" "$DISCORD_CONFIG_FILE" \
+    "Discord setting" AGENT_DISCORD_CONFIG_SUM "none — this agent has no Discord guild" \
+"AGENT_DISCORD_BOT_TOKEN AGENT_DISCORD_DEFAULT_CHANNEL AGENT_DISCORD_API_BASE
+AGENT_DISCORD_API_VERSION AGENT_DISCORD_INTENTS AGENT_DISCORD_CA_FILE" \
+    "AGENT_DISCORD_BOT_TOKEN"
+DISCORDSUM="$CONNECTOR_SUM"
 
 # ---------------------------------------------------------------- apply
 sed -e "s|__USER__|${USER_NAME}|g" \
@@ -476,6 +555,8 @@ sed -e "s|__USER__|${USER_NAME}|g" \
     -e "s|__API_BASE__|${API_BASE}|g" \
     -e "s|__KEY_SECRET__|${KEY_SECRET}|g" \
     -e "s|__EMAILSUM__|${EMAILSUM}|g" \
+    -e "s|__SLACKSUM__|${SLACKSUM}|g" \
+    -e "s|__DISCORDSUM__|${DISCORDSUM}|g" \
     deploy/k8s/64-agent.template.yaml | kubectl apply -f - >/dev/null
 
 kubectl -n "$NS" rollout status "deployment/${OBJ}" --timeout=600s

@@ -243,7 +243,10 @@ class Run:
 
 
 def provision(tmp_path: Path, *args: str, existing_key: str | None = None,
-              existing_email_sum: str | None = None, env: dict | None = None) -> Run:
+              existing_email_sum: str | None = None,
+              existing_slack_sum: str | None = None,
+              existing_discord_sum: str | None = None,
+              env: dict | None = None) -> Run:
     """Run the real provisioner against the recorders.
 
     `existing_key` seeds what the cluster already holds in `agent-<user>-<name>-key`'s
@@ -254,6 +257,9 @@ def provision(tmp_path: Path, *args: str, existing_key: str | None = None,
     with no `--email-config-file` leaves the mailbox alone and renders the SAME rollout
     annotation — the difference between re-provisioning being a no-op and it silently
     restarting a resident agent (enterpriseaiframework-a4e).
+
+    `existing_slack_sum` / `existing_discord_sum` are the same input for the chat
+    connectors (enterpriseaiframework-783), which are provisioned by the same code path.
     """
     stub_dir = tmp_path / "stubs"
     (stub_dir / "bin").mkdir(parents=True, exist_ok=True)
@@ -265,8 +271,11 @@ def provision(tmp_path: Path, *args: str, existing_key: str | None = None,
     obj = f"agent-{args[0]}-{args[1]}"
     if existing_key is not None:
         (stub_dir / "state" / f"{obj}-key.OPENAI_API_KEY").write_text(existing_key)
-    if existing_email_sum is not None:
-        (stub_dir / "state" / f"{obj}-email.AGENT_EMAIL_CONFIG_SUM").write_text(existing_email_sum)
+    for label, value in (("email", existing_email_sum), ("slack", existing_slack_sum),
+                         ("discord", existing_discord_sum)):
+        if value is not None:
+            (stub_dir / "state"
+             / f"{obj}-{label}.AGENT_{label.upper()}_CONFIG_SUM").write_text(value)
 
     kubectl = stub_dir / "bin" / "kubectl"
     kubectl.write_text(_KUBECTL)

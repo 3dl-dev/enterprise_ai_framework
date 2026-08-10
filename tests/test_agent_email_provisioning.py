@@ -188,11 +188,20 @@ def test_the_pod_takes_the_mailbox_as_optional_env_so_agents_without_one_still_s
     container = run.deployment()["spec"]["template"]["spec"]["containers"][0]
 
     sources = container["envFrom"]
-    assert [s["secretRef"]["name"] for s in sources] == ["agent-baron-mailer-email"]
-    assert sources[0]["secretRef"]["optional"] is True, (
-        "the mail Secret is mounted as required. Every agent provisioned before this "
-        "feature existed would wedge in ContainerCreating the moment it merged."
-    )
+    # The mailbox, plus the chat connectors that joined it in enterpriseaiframework-783.
+    # Exact and ordered, not a subset: an envFrom source nobody meant to add is a Secret
+    # whose every key becomes an environment variable in this container.
+    assert [s["secretRef"]["name"] for s in sources] == [
+        "agent-baron-mailer-email",
+        "agent-baron-mailer-slack",
+        "agent-baron-mailer-discord",
+    ]
+    for source in sources:
+        assert source["secretRef"]["optional"] is True, (
+            f"{source['secretRef']['name']} is mounted as required. Every agent "
+            "provisioned before that feature existed would wedge in ContainerCreating the "
+            "moment it merged."
+        )
 
     # `env` must still win over `envFrom`, which is what stops a mail config file from
     # overriding the spendable model credential or the daemon's own password. Kubernetes
@@ -215,7 +224,16 @@ def test_the_mail_tool_is_delivered_to_the_pod_and_is_executable(tmp_path):
 
     configmap = _configmap(run, "agent-entrypoint")
     assert configmap is not None, "the entrypoint ConfigMap was never applied"
-    assert set(configmap["data"]) == {"entrypoint.sh", "agent-email", "EMAIL.md"}
+    assert set(configmap["data"]) == {
+        "entrypoint.sh",
+        "agent-email", "EMAIL.md",
+        # enterpriseaiframework-783 added the chat connectors to the same ConfigMap, for
+        # the reason the provisioner records: they roll together with the entrypoint that
+        # puts them on PATH.
+        "agent-slack", "SLACK.md",
+        "agent-discord", "DISCORD.md",
+        "agentws.py",
+    }
 
     shipped = base64.b64decode(configmap["data"]["agent-email"]).decode()
     assert shipped == (REPO / "deploy/agent/agent-email").read_text(), \
@@ -244,6 +262,8 @@ def test_editing_the_mail_tool_rolls_the_agents(tmp_path):
                             "--email-config-file", _config_file(tmp_path))
     expected = subprocess.run(
         "cat deploy/agent/entrypoint.sh deploy/agent/agent-email deploy/agent/EMAIL.md "
+        "deploy/agent/agent-slack deploy/agent/SLACK.md deploy/agent/agent-discord "
+        "deploy/agent/DISCORD.md deploy/agent/agentws.py "
         "| sha256sum | cut -c1-16",
         shell=True, capture_output=True, text=True, cwd=str(REPO), timeout=60,
     ).stdout.strip()
