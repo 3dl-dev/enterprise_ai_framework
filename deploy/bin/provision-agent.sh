@@ -334,5 +334,6 @@ if [[ "$MODEL_SOURCE" == "byo" ]]; then
     echo "  BYO: this agent's inference goes to ${API_BASE} on the user's own credential."
     echo "  It produces NO rows on the gateway ledger — by design, not by accident. The pod"
     echo "  carries agent.enterprise-ai/model-source=byo so every spend view can say so"
-    echo "  rather than showing it as \$0. Resident time and compute still bill normally."
+    echo "  rather than showing it as \$0. Resident time and compute are still METERED as"
+    echo "  usage (hours, CPU-core-hours) — BYO removes the inference row, not the residency row."
 fi

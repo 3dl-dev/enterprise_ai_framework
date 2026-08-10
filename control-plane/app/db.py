@@ -93,6 +93,67 @@ ALTER TABLE virtual_key ADD CONSTRAINT virtual_key_surface_check CHECK (
     surface IN ('chat', 'ide', 'terminal')
     OR surface ~ '^agents/[a-z0-9][a-z0-9-]{0,38}$'
 );
+
+-- The SECOND metering dimension (enterpriseaiframework-914, Contract 3 of
+-- docs/design/records/agents-surface.md): how long each agent was RESIDENT and what it
+-- burned. Deliberately its own table and NOT the inference ledger — inference spend lives
+-- in the gateway's own database and is read, never written, by this service. Composing
+-- the two happens in the endpoint layer, so `metering.spend_by_user_and_surface` and
+-- therefore `/admin/spend` are byte-unchanged by this table existing.
+--
+-- QUANTITIES ONLY. Baron's ruling: meter usage, not cost. Owned hardware is sunk cost and
+-- there is no real dollar figure to record here, so there is no rate column, no cost
+-- column and no currency anywhere in this table. See app/agent_usage.py.
+--
+-- The columns split into two groups and the split is load-bearing:
+--   * `resident_seconds` / `cpu_core_seconds` / `memory_peak_bytes` are DURABLE totals.
+--     They only ever go up. Nothing recomputes them from scratch, so a collector restart
+--     or a pod replacement cannot make them fall.
+--   * `last_*` is the bookmark the next sample deltas against. `last_pod_uid` in
+--     particular is what makes a new pod incarnation start its CPU delta at zero
+--     (cAdvisor's counter restarts with the container) instead of subtracting the old
+--     pod's counter from the new one's.
+CREATE TABLE IF NOT EXISTS agent_usage (
+    id                BIGSERIAL PRIMARY KEY,
+    -- The attribution key, taken from the pod labels agent.enterprise-ai/user and
+    -- agent.enterprise-ai/name — not from the virtual key. Compute is consumed by the
+    -- POD, so a BYO agent with no gateway ledger row at all still has usage here.
+    agent_user        TEXT NOT NULL,
+    agent_name        TEXT NOT NULL,
+    resident_seconds  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    cpu_core_seconds  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    memory_peak_bytes BIGINT NOT NULL DEFAULT 0,
+    -- Where the compute number came from, or NULL if it was never measurable here. NULL
+    -- next to a zero means "not measured"; a source next to a zero means "measured, and
+    -- it really was idle". A bare zero cannot say which, and an unmetered path that
+    -- renders as healthy is finding 4.
+    compute_source    TEXT,
+    model_source      TEXT,
+    last_pod_uid      TEXT,
+    last_pod_name     TEXT,
+    last_pod_phase    TEXT,
+    last_cpu_counter  DOUBLE PRECISION,
+    last_observed_at  TIMESTAMPTZ,
+    first_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (agent_user, agent_name)
+);
+
+-- Same reasoning as the virtual_key CHECK above, in the form Postgres does offer for
+-- columns: CREATE TABLE IF NOT EXISTS is a no-op against a database that already has an
+-- earlier shape of this table, so every column is also asserted individually. Idempotent
+-- on every boot, and the failure it prevents is an UndefinedColumnError at the moment an
+-- operator first opens the usage view — which reads as "the meter is broken".
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS resident_seconds  DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS cpu_core_seconds  DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS memory_peak_bytes BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS compute_source    TEXT;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS model_source      TEXT;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS last_pod_uid      TEXT;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS last_pod_name     TEXT;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS last_pod_phase    TEXT;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS last_cpu_counter  DOUBLE PRECISION;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS last_observed_at  TIMESTAMPTZ;
+ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS first_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now();
 """
 
 GENESIS_HASH = "0" * 64

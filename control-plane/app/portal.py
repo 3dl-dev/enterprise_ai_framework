@@ -34,7 +34,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse
 
-from . import chat_identity, db, gateway, issuance, metering
+from . import agent_usage, chat_identity, db, gateway, issuance, metering
 
 router = APIRouter()
 
@@ -182,12 +182,81 @@ async def my_spend(since: str | None = None, user: str = Depends(require_user)):
         for k in ("requests", "spend", "prompt_tokens", "completion_tokens"):
             acc[k] += r.get(k) or 0
             total[k] += r.get(k) or 0
+    agents, agents_error = await _agent_usage_beside_spend(user, mine)
     return {
         "username": user,
         "since": since,
         "by_surface": sorted(mine.values(), key=lambda x: -x["spend"]),
         "total": total,
+        # THE SECOND DIMENSION, ADDED BESIDE THE FIRST AND NEVER FOLDED INTO IT
+        # (enterpriseaiframework-914, Contract 3 of the agents-surface record). Every key
+        # above is exactly what it was before this landed — the inference query is
+        # untouched and `total` still totals inference spend only. What is new is a
+        # sibling list carrying USAGE QUANTITIES per agent: hours resident, CPU-core-hours
+        # burnt, peak megabytes. There are no dollars in it, by Baron's ruling; the
+        # hardware is owned and its cost is sunk, so a rate here would be an invented
+        # number. See app/agent_usage.py.
+        "by_agent": agents,
+        # Present only when the usage ledger could not be read. An empty `by_agent` with
+        # no error means there are no agents; an empty one WITH an error means we do not
+        # know, and saying so beats rendering zero.
+        **({"agents_usage_error": agents_error} if agents_error else {}),
     }
+
+
+async def _agent_usage_beside_spend(user: str, by_surface: dict) -> tuple[list[dict], str]:
+    """Line each agent's USAGE up against that same agent's inference SPEND.
+
+    The two dimensions are joined here, in the endpoint, and deliberately not in SQL: the
+    inference numbers come out of the gateway's database and the usage numbers out of the
+    control plane's, and a join across them would mean one query owning both — which is
+    exactly how a change to the usage meter would come to move the operator's bill.
+
+    The join key is Contract 1's per-instance surface, `agents/<name>`, which the alias
+    grammar already puts on the spend row for free.
+
+    A BYO agent is reported with `inference.on_ledger: false` rather than as a $0 row. A
+    silent zero reads as "free" or "broken"; the label says "this agent's inference does
+    not traverse our layer, by declaration", which is the whole basis on which Contract 4
+    permits BYO at all.
+    """
+    try:
+        rows = await agent_usage.usage_by_agent(user)
+    except Exception as exc:  # noqa: BLE001 - reported to the caller, never swallowed
+        return [], f"{type(exc).__name__}: {exc}"
+
+    out = []
+    for row in rows:
+        spend_row = by_surface.get(row["surface"])
+        integrated = row.get("model_source") != "byo"
+        out.append({
+            "agent": row["agent"],
+            "surface": row["surface"],
+            "model_source": row.get("model_source") or "",
+            "running": row["running"],
+            # Quantities. Named `usage` and not `cost` because that is what they are.
+            "usage": {
+                k: row[k] for k in (
+                    "resident_seconds", "resident_hours",
+                    "cpu_core_seconds", "cpu_core_hours",
+                    "memory_peak_bytes", "memory_peak_mb",
+                    "compute_source", "compute_measured",
+                )
+            },
+            "inference": {
+                "on_ledger": integrated,
+                "requests": (spend_row or {}).get("requests", 0),
+                "spend": (spend_row or {}).get("spend", 0.0),
+                "prompt_tokens": (spend_row or {}).get("prompt_tokens", 0),
+                "completion_tokens": (spend_row or {}).get("completion_tokens", 0),
+                **({} if integrated else {
+                    "note": "off-ledger by design — this agent uses the user's own "
+                            "provider credential and its inference never traverses "
+                            "this layer",
+                }),
+            },
+        })
+    return out, ""
 
 
 @router.get("/portal/api/keys")
@@ -313,10 +382,23 @@ async def admin_overview(since: str | None = None,
         ]
 
     unpriced = await metering.unpriced_models(since)
+    # The resident dimension for everybody, beside the inference dimension for everybody.
+    # A separate key rather than a field folded into `people`, for the same reason
+    # `by_agent` is a sibling of `by_surface` above: `people[*].spend` means inference
+    # spend and must go on meaning exactly that.
+    try:
+        agent_usage_rows = await agent_usage.usage_by_agent()
+        agent_usage_error = ""
+    except Exception as exc:  # noqa: BLE001
+        agent_usage_rows, agent_usage_error = [], f"{type(exc).__name__}: {exc}"
     return {
         "since": since,
         "totals": await metering.totals(since),
         "people": sorted(people.values(), key=lambda p: -p["spend"]),
+        # Usage quantities per agent — hours, CPU-core-hours, MB. No dollars: Baron's
+        # ruling is that owned compute is metered, not priced (enterpriseaiframework-914).
+        "agent_usage": agent_usage_rows,
+        **({"agent_usage_error": agent_usage_error} if agent_usage_error else {}),
         # Travels with the number, not on a page nobody opens: a bill quietly missing a
         # model is worse than one that is obviously incomplete.
         "unpriced_models": unpriced,
