@@ -708,7 +708,7 @@ async function pollPulse() {
 
 // One 500 ms ticker: it drives the settle gate while armed or dirty, the elapsed counter,
 // and the degraded phrase. Cheap enough to just always run.
-setInterval(() => { renderRibbon(); syncFailBars(); evaluateGate(); }, 500);
+setInterval(() => { renderRibbon(); syncFailBars(); evaluateGate(); syncBooting(); }, 500);
 
 $("btn-reload-page").addEventListener("click", () => location.reload());
 $("btn-restart-term").addEventListener("click", restartAgent);
@@ -785,7 +785,7 @@ $("btn-new-session").addEventListener("click", async () => {
   if (!ok) { toast(data.message || "Could not start a fresh chat.", false); return; }
   // The switch takes effect on the next connection, and reloading the frame IS the next
   // connection — ttyd gives every websocket its own shell.
-  $("terminal-frame").src = "terminal/";
+  reloadTerminal("Starting a fresh chat…");
   toast(data.message);
 });
 $("btn-stuck").addEventListener("click", () => openStuck());
@@ -798,18 +798,82 @@ async function restartAgent() {
     danger: "Restart it",
   })) return;
   // ttyd spawns a fresh shell per websocket, so reloading the frame IS the restart.
-  $("terminal-frame").src = "terminal/";
+  reloadTerminal("Restarting the agent…");
   $("bar-stuck").hidden = true;
   transient("Fresh start. Type what you want to make.", "grey");
 }
 $("stuck-restart").addEventListener("click", restartAgent);
 
+/* ------------------------------------------------------------------ booting */
+
+/* EVERY terminal reload goes through reloadTerminal(), not a bare .src assignment.
+ *
+ * Assigning .src is instantaneous and tells the user nothing: ttyd kills the old shell,
+ * spawns a new one, and the agent cold-boots inside it. Measured on a live workspace pod
+ * (2026-08-02): opencode at 55% CPU and 712 MB RSS while booting, in a pod capped at 1 CPU
+ * — so the black rectangle is seconds long and looks exactly like a dead surface. The
+ * reported shape was "it did nothing, and apparently didn't work; but things got slow".
+ *
+ * Cleared by GROUND TRUTH rather than a timer wherever possible: /api/pulse reports
+ * `busy: null` when no agent process exists at all (shell-server.py#_update_busy), so a
+ * non-null `busy` sampled AFTER the reload means the agent is genuinely running. The
+ * settle delay exists because ttyd kills the outgoing shell on websocket close, and a
+ * sample taken in the first moment can still be describing the agent we just replaced.
+ *
+ * Both fallbacks below exist so that a stuck overlay can never outlive the thing it is
+ * describing — covering a working terminal forever is a worse bug than the one this
+ * fixes. */
+const BOOT_SETTLE_MS = 2000;      // ignore pulse samples this close to the reload
+const BOOT_GIVE_UP_MS = 45000;    // hard ceiling, whatever pulse says
+
+let bootingSince = 0;
+
+/* Split from reloadTerminal so a caller can narrate a request that happens BEFORE the
+ * reload without triggering an extra one. Reloading twice is not free and not cosmetic:
+ * every websocket gets its own shell and its own agent process, in a pod capped at 1 CPU
+ * (enterpriseaiframework-3fe). */
+function showBooting(text) {
+  bootingSince = Date.now();
+  $("booting-text").textContent = text || "Starting the agent…";
+  $("booting").hidden = false;
+}
+
+function reloadTerminal(text) {
+  showBooting(text);
+  $("terminal-frame").src = "terminal/";
+}
+
+function hideBooting() {
+  bootingSince = 0;
+  $("booting").hidden = true;
+}
+
+/* Driven by the 500 ms ticker, so the deadline is actually checked rather than only
+ * evaluated when a poll happens to land. */
+function syncBooting() {
+  if (!bootingSince) return;
+  // Contact is gone, so "starting the agent…" is no longer something we know. Stop saying
+  // it — the failure bar is the true statement now, and it is the one the user can act on.
+  if (!$("bar-lost").hidden) { hideBooting(); return; }
+  const waited = Date.now() - bootingSince;
+  if (waited >= BOOT_GIVE_UP_MS) { hideBooting(); return; }
+  if (M.havePulse !== true) return;   // no agent signal at all — the load event clears it
+  if (waited < BOOT_SETTLE_MS) return;
+  if (M.snapAt > bootingSince && M.snap && M.snap.busy != null) hideBooting();
+}
+
+/* Without pulse there is no way to know the agent is up, so fall back to the weaker but
+ * honest signal: ttyd's own page has loaded. */
+$("terminal-frame").addEventListener("load", () => {
+  if (bootingSince && M.havePulse !== true) hideBooting();
+});
+
 /* ------------------------------------------------------------------ projects */
 
 /* Switching only writes one file and reloads two frames: ttyd spawns a fresh shell per
  * websocket, so reloading the terminal lands in the new directory by itself. */
-function reloadPanes() {
-  $("terminal-frame").src = "terminal/";
+function reloadPanes(text) {
+  reloadTerminal(text);
   $("preview").src = "about:blank";
   previewRunning = false;      // a project switch must not leave the gate claiming it runs
   if (M.havePulse !== true) {
@@ -835,8 +899,10 @@ function renderMenu() {
     b.addEventListener("click", async () => {
       toggleMenu(false);
       if (p.name === STATE.project) return;
+      showBooting(`Opening "${p.name}"…`);
       const { ok, data } = await api.post("api/switch", { name: p.name });
-      if (ok) { await load(); reloadPanes(); toast(data.message); } else toast(data.message, false);
+      if (ok) { await load(); reloadPanes(`Opening "${p.name}"…`); toast(data.message); }
+      else { hideBooting(); toast(data.message, false); }
     });
     m.appendChild(b);
   }
@@ -861,9 +927,17 @@ $("project-menu").addEventListener("click", (e) => e.stopPropagation());
 async function createProject() {
   const name = await newProjectDialog();
   if (!name) return;
+  // The dialog closes on submit, so without this the entire round trip — request, state
+  // refresh, reload, agent boot — is a menu that vanished and nothing else.
+  showBooting(`Making "${name}"…`);
   const { ok, data } = await api.post("api/projects", { name });
-  if (!ok) { toast(data.message || "Could not make it.", false); return; }
-  await load(); reloadPanes(); toast(data.message);
+  // A rejected name ("already exists", bad characters) must put the terminal back, not
+  // leave the user staring at a spinner for a project that was never created.
+  if (!ok) { hideBooting(); toast(data.message || "Could not make it.", false); return; }
+  // Carry the name into the boot phase. The reload is the LONG half of this wait, so
+  // dropping back to a generic "Starting the agent…" here is exactly where the user most
+  // needs to be told which project they are now waiting on.
+  await load(); reloadPanes(`Starting the agent in "${name}"…`); toast(data.message);
 }
 
 $("reset-project").addEventListener("click", async () => {
@@ -936,7 +1010,7 @@ async function load() {
       // Reconnect so the change takes effect NOW. opencode reads its model at startup, and
       // ttyd gives every websocket its own shell — so reloading this frame IS the restart.
       // It costs nothing any more, because the agent resumes the session it was in.
-      $("terminal-frame").src = "terminal/";
+      reloadTerminal(`Switching to ${name}…`);
       toast(data.message || "Switched.");
       await load();
     });
