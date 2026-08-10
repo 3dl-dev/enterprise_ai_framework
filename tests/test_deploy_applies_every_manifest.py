@@ -34,6 +34,12 @@ EXPECTED_SKIPS = {
     "00-namespace.yaml",
     "01-tank-pvs.yaml",
     "61-workspace.template.yaml",
+    # The agents surface's per-instance template (enterpriseaiframework-055). Carries
+    # __USER__/__NAME__ placeholders and is rendered one agent at a time by
+    # deploy/bin/provision-agent.sh. Its namespace-wide companion, 63-agent-common.yaml,
+    # is deliberately NOT here: the ServiceAccount and NetworkPolicy that fence an agent
+    # must be applied by every deploy.
+    "64-agent.template.yaml",
 }
 
 

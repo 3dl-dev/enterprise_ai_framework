@@ -1,0 +1,120 @@
+# Shared, per-namespace objects for the AGENTS surface.
+#
+# This file is a deliberate COPY of the shape in 60-workspace-common.yaml, not an import
+# and not an edit of it. Contract 6 of docs/design/records/agents-surface.md freezes the
+# Code/workspace surface byte-for-byte — the camp runs on it — so the Agents surface gets
+# its own ServiceAccount and its own NetworkPolicy selecting its own component label, and
+# the workspace objects are not touched. The duplication is the point: a future change to
+# an agent's egress must not be able to reach a workspace pod by editing one shared rule.
+#
+# What these objects make true: an agent pod runs a RESIDENT `opencode serve` next to a
+# spendable virtual key, on a node that is also running live GPU training. It must be able
+# to reach the gateway and the named tool servers, and nothing else we run.
+#
+# Numbering: the design record suggested `62-agent.template.yaml`, but 62 is already
+# 62-published.yaml on disk. 63/64 are the next free pair; the record's intent (a new file
+# beside the frozen set) is what binds, not the digit.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+# Same two-lock posture as the workspace account: no RoleBinding anywhere in this repo
+# grants this account anything, AND the pods that use it set
+# automountServiceAccountToken: false. The first makes a stolen token useless, the second
+# makes there be no token to steal. An agent is strictly worse to compromise than a
+# workspace, because nobody is watching it — it is by construction unattended.
+automountServiceAccountToken: false
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-isolation
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+spec:
+  # Selects ONLY agent pods. `component: agent` is a different value from the workspace's
+  # `component: workspace`, so `workspace-isolation` neither selects these pods nor is
+  # affected by this object existing. That separation is what makes this file additive.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: agent
+  policyTypes: [Ingress, Egress]
+
+  ingress:
+    # The portal, attaching a console to a living agent (enterpriseaiframework-0e7).
+    # ONLY the control-plane pod, and only the opencode server port.
+    #
+    # There is deliberately NO LAN/tailnet ingress rule here — the workspace has one for
+    # its per-user oauth2-proxy NodePort, which this surface does not have and must not
+    # grow. An agent has exactly one front door and it is the portal.
+    #
+    # The `from` selector is the entire control, and the reason is the CNI, recorded at
+    # length in 60-workspace-common.yaml: kube-router accepts a packet as soon as the
+    # DESTINATION pod's ingress rules allow it, WITHOUT consulting the source pod's egress
+    # rules. So an ingress rule with an empty `from` would open every agent's opencode
+    # server to every other agent and to every workspace, in spite of the egress section
+    # below excluding the whole pod CIDR. Naming the one allowed source is what actually
+    # closes agent-to-agent traffic.
+    - from:
+        - podSelector:
+            matchLabels: { app: control-plane }
+      ports:
+        - { protocol: TCP, port: 4096 }
+
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+
+    # The gateway. One route out of the building for model traffic; the pod cannot reach
+    # the control plane, the identity provider's internal service, Postgres, a workspace,
+    # or another agent.
+    - to:
+        - podSelector:
+            matchLabels: { app: gateway }
+      ports:
+        - { protocol: TCP, port: 4000 }
+
+    # ------------------------------------------------------------------ tool servers
+    # ONE `podSelector` PER SERVER, MATCHING THAT SERVER'S OWN `app` LABEL, AND NOTHING
+    # BROADER. Not `namespaceSelector`, not the pod CIDR, not a shared label. The full
+    # reasoning is in 60-workspace-common.yaml and applies here verbatim, with one extra
+    # weight: every rule below is an authority grant to a process that runs UNATTENDED
+    # with a spendable key. A workspace's user is looking at the screen. An agent's is not.
+    - to:
+        - podSelector:
+            matchLabels: { app: mcp-echo }
+      ports:
+        - { protocol: TCP, port: 8080 }
+
+    # The internet, for pip / npm / git clone — the same working set a coding agent needs.
+    # Every private range is excluded, which is what closes the routes that matter:
+    #   10.43.0.1:443   the Kubernetes API server (service CIDR)
+    #   192.168.2.43/44 the API server on the nodes, and the image registry
+    #   10.42.0.0/16    every other pod, including other agents and every workspace
+    #   169.254.0.0/16  link-local, i.e. any metadata service
+    #
+    # Note what is NOT copied from the workspace policy: its egress to 192.168.2.42:8443
+    # exists for the per-pod oauth2-proxy sidecar's OIDC backchannel. An agent pod has no
+    # sidecar and no OIDC flow of its own, so it does not get that rule.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16

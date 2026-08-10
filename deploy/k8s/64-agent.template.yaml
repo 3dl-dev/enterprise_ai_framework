@@ -1,0 +1,229 @@
+# One named, resident agent instance. Rendered by deploy/bin/provision-agent.sh — the
+# placeholders are substituted literally, so this file is not applyable on its own.
+#
+#   __USER__      Keycloak username; with __NAME__ it forms every object name
+#   __NAME__      the user-chosen agent slug
+#   __IMAGE__     workspace image reference in the rail registry (reused verbatim)
+#   __MODEL__     opencode's default model, a name from the gateway catalogue
+#   __CFGSUM__    checksum of the entrypoint ConfigMap, so an entrypoint change rolls
+#
+# A COPY of 61-workspace.template.yaml's shape, deliberately, not a shared base: Contract
+# 6 of docs/design/records/agents-surface.md freezes that file byte-for-byte because the
+# camp runs on it. Read the differences as the design, they are all Contract 1 and 2:
+#
+#   * every object is `agent-__USER__-__NAME__` (a user has ONE workspace and MANY agents)
+#   * `command:` overrides the image ENTRYPOINT so the container's own process is
+#     `opencode serve`, RESIDENT, instead of ttyd spawning an opencode per websocket
+#   * no ttyd, no shell-server, no published mount, no per-user oauth2-proxy NodePort
+#   * `app.kubernetes.io/component: agent`, a different value from `workspace`, so the
+#     workspace NetworkPolicy and Service selectors do not see these pods at all
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-__USER__-__NAME__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+spec:
+  accessModes: [ReadWriteOnce]
+  # local-path, which lives on the node's disk. NON-DURABLE in the same way a workspace
+  # PVC is (k3s-worker is cattle); the tank-backed dataset that fixes this is staged
+  # behind a reboot gate. This matters MORE here than for a workspace: the lifecycle in
+  # Contract 2 promises that `stopped` keeps state and only `deleted` destroys it, and a
+  # node rebuild breaks that promise without passing through either transition.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-__USER__-__NAME__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+spec:
+  # ClusterIP. There is no NodePort and there must not be one — this port is a headless
+  # coding agent holding a spendable key. The portal proxies it at /agents/__NAME__/ on
+  # the same origin as chat, resolving __USER__ from the authenticated identity and never
+  # from the path (Contract 1); enterpriseaiframework-0e7 builds that attach.
+  #
+  # Reachable only from the control-plane pod; see the NetworkPolicy in
+  # 63-agent-common.yaml and OPENCODE_SERVER_PASSWORD below for what guards it beyond
+  # that.
+  selector:
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+  ports:
+    - name: opencode
+      port: 4096
+      targetPort: 4096
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-__USER__-__NAME__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+spec:
+  # `created`/`running` is replicas: 1; `stopped` is replicas: 0 with the PVC retained;
+  # `deleted` removes these objects and then the PVC (Contract 2, driven by
+  # enterpriseaiframework-627). Scale-to-zero is what makes "stopped costs nothing"
+  # literally true rather than a billing rate: there is no pod, so there is no
+  # status.startTime advancing and no cAdvisor counter incrementing.
+  replicas: 1
+  # The PVC is ReadWriteOnce and the daemon holds a live session. Two replicas of one
+  # stateful agent is never what anyone wanted, and a rolling update would try to start a
+  # second one against the same volume.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: agent
+      agent.enterprise-ai/user: "__USER__"
+      agent.enterprise-ai/name: "__NAME__"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: enterprise-ai-framework
+        app.kubernetes.io/component: agent
+        # Contract 3's attribution key for the resident-time and compute meter
+        # (enterpriseaiframework-914) is read from THESE labels, not from the virtual key:
+        # compute is consumed by the pod, not by an inference call, so a BYO agent that
+        # produces no gateway ledger row still bills for the hours it was resident.
+        agent.enterprise-ai/user: "__USER__"
+        agent.enterprise-ai/name: "__NAME__"
+      annotations:
+        # Deliberately the ENTRYPOINT's checksum and not the virtual key's. The workspace
+        # template rolls its pod on every key rotation because a workspace pod is cheap to
+        # restart. Restarting an agent ends the resident session that is the entire
+        # product, so a re-run of the provisioner must be a no-op for a healthy agent.
+        checksum/entrypoint: "__CFGSUM__"
+    spec:
+      serviceAccountName: agent
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        # The PVC arrives owned by root; without this the agent cannot write its own
+        # workdir or its session db, which reads as "the agent is broken".
+        fsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: agent
+          # The SAME image the Code surface runs. Not a fork and not a rebuild: it already
+          # carries the pinned opencode (1.18.7), the provider config at
+          # /etc/opencode/opencode.json and the platform instructions. Contract 6 forbids
+          # editing deploy/workspace/, and reusing the artefact it produces is how this
+          # surface gets opencode without touching one byte of it.
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          # THE RESIDENCY LINE. Overrides the image ENTRYPOINT (tini -> the workspace's
+          # ttyd entrypoint) so this container's own process is a long-lived
+          # `opencode serve` — see deploy/agent/entrypoint.sh for why that is the whole
+          # difference between an Agent and a workspace. tini is kept as PID 1 so the
+          # daemon's children are reaped.
+          command: ["/usr/bin/tini", "--", "/bin/bash", "/etc/agent/entrypoint.sh"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          env:
+            - { name: AGENT_USER, value: "__USER__" }
+            - { name: AGENT_NAME, value: "__NAME__" }
+            - { name: AGENT_WORKDIR, value: "/workspace/work" }
+            # Session sqlite onto the PVC. Deliberately NOT inside the workdir: it is
+            # ours, not the user's work, and must never be scanned or committed with it.
+            - { name: XDG_DATA_HOME, value: "/workspace/.agent-state" }
+            # HTTP Basic on the opencode server. entrypoint.sh refuses to start without
+            # it rather than coming up unauthenticated.
+            - name: OPENCODE_SERVER_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-key, key: OPENCODE_SERVER_PASSWORD }
+            # One route out of the building. The pod holds no provider credential of any
+            # kind — this is a virtual key on our own gateway, so the agent's inference is
+            # metered, budgeted and audited against __USER__ like every other surface.
+            # The BYO alternative (Contract 4) is enterpriseaiframework-39d's, and it is
+            # the only configuration in which these point anywhere but the gateway.
+            - { name: OPENAI_API_BASE, value: "http://gateway:4000/v1" }
+            - { name: OPENAI_BASE_URL, value: "http://gateway:4000/v1" }
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-key, key: OPENAI_API_KEY }
+            - { name: OPENCODE_MODEL, value: "enterprise-ai/__MODEL__" }
+          ports:
+            # Named, and reachable only through the ClusterIP Service that the
+            # NetworkPolicy admits from the control-plane pod alone.
+            - { name: opencode, containerPort: 4096 }
+          volumeMounts:
+            - { name: state, mountPath: /workspace }
+            - { name: home, mountPath: /home/coder }
+            - { name: entrypoint, mountPath: /etc/agent, readOnly: true }
+            # The operator's house rules, the SAME deployment-wide ConfigMap the workspace
+            # pods mount (`workspace-tenant-instructions`), read here by the same opencode
+            # config baked into the shared image. Mounted as a DIRECTORY, not with
+            # subPath, for the reason recorded on the workspace template: only a
+            # whole-volume mount receives the kubelet's ConfigMap sync, so an operator's
+            # edit reaches an already-running pod with no restart — which matters more
+            # here, since restarting an agent ends its session.
+            # `optional: true`: an agent provisioned on a deployment where no workspace
+            # has ever been provisioned still starts, with an empty tenant directory,
+            # instead of hanging in ContainerCreating.
+            - { name: tenant-instructions, mountPath: /etc/opencode/tenant, readOnly: true }
+            # The same tenant Agent Skills corpus the chat and Code surfaces load, through
+            # opencode's own native skill loader (`skills.paths` in the image's
+            # opencode.json). No invocation code of ours; only the directory is shared.
+            - { name: skill-incident-escalation, mountPath: /etc/opencode/tenant-skills/incident-escalation, readOnly: true }
+            - { name: skill-meeting-notes-format, mountPath: /etc/opencode/tenant-skills/meeting-notes-format, readOnly: true }
+          resources:
+            # ONE WORKSPACE-SIZED ENVELOPE, identical to 61-workspace.template.yaml and
+            # not a byte larger. k3s-worker runs live GPU training; an agent is worse than
+            # a workspace in exactly one way — it keeps running when nobody is watching —
+            # so the limit is real and the request is honest about the steady state.
+            requests: { cpu: "500m", memory: "1Gi", ephemeral-storage: "1Gi" }
+            limits:   { cpu: "1",    memory: "2Gi", ephemeral-storage: "4Gi" }
+          # An exec probe, not tcpSocket, for the reason 61-workspace.template.yaml
+          # records: it is the check that the DAEMON holds the port, independent of which
+          # interface it bound and of whether any client is attached. Liveness here means
+          # "the resident process is up", which is the surface's whole claim.
+          startupProbe:
+            exec:
+              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/4096"]
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/4096"]
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: state
+          persistentVolumeClaim: { claimName: agent-__USER__-__NAME__ }
+        # $HOME is not on the PVC, matching the workspace: caches and build dirs are
+        # rebuilt on restart, so the durable volume holds the agent's work and its session
+        # and nothing else.
+        - name: home
+          emptyDir: { sizeLimit: 2Gi }
+        # Deployment-wide, created by deploy/bin/provision-agent.sh from
+        # deploy/agent/entrypoint.sh. One control plane: every agent in the namespace runs
+        # the same entrypoint, and its checksum is the annotation above.
+        - name: entrypoint
+          configMap: { name: agent-entrypoint }
+        - name: tenant-instructions
+          configMap: { name: workspace-tenant-instructions, optional: true }
+        - name: skill-incident-escalation
+          configMap: { name: chat-skill-incident-escalation, optional: true }
+        - name: skill-meeting-notes-format
+          configMap: { name: chat-skill-meeting-notes-format, optional: true }

@@ -181,6 +181,11 @@ skip_manifest() {
         # A template, not a manifest: carries per-user placeholders and is rendered one pod
         # at a time by deploy/bin/provision-workspace.sh.
         61-workspace.template.yaml) return 0 ;;
+        # Same: a template, rendered one agent at a time by deploy/bin/provision-agent.sh.
+        # Note that 63-agent-common.yaml is NOT skipped — the agents ServiceAccount and
+        # NetworkPolicy are namespace-wide objects and must land on every deploy, so an
+        # agent can never exist before the policy that fences it.
+        64-agent.template.yaml) return 0 ;;
         *) return 1 ;;
     esac
 }
