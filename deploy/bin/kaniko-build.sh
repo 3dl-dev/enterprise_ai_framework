@@ -36,8 +36,12 @@ if (( SIZE > 700000 )); then
 fi
 echo "==> context ${CONTEXT} -> ${SIZE} bytes"
 
-kubectl -n "$NS" create configmap "$CM" --from-file=context.tar.gz="$TARBALL" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# `create`, not `apply`: apply stores a copy of the object in a
+# `last-applied-configuration` annotation, and annotations cap at 256KiB — so a context
+# larger than that fails on the annotation long before the ~1MiB ConfigMap limit this
+# script actually guards against (289KB control-plane build, enterpriseaiframework-f4c).
+# The name is unique per build, so there is nothing to reconcile and nothing to apply over.
+kubectl -n "$NS" create configmap "$CM" --from-file=context.tar.gz="$TARBALL" >/dev/null
 
 BUILD_ARGS=""
 for a in "$@"; do
