@@ -1526,11 +1526,19 @@ binding contracts every downstream item consumes; the record carries the reasoni
 losing arguments, and the two RESERVED rulings. Epic `enterpriseaiframework-da7`.
 
 A fourth portal tab beside Chat and Code that lets a user fire up and manage named,
-persistent *hermes* agents — each a long-running opencode process on its own PVC that keeps
-working after the browser closes and lives until intentional shutdown. It generalises the
-per-user Code/workspace surface, and its defining difference is finding 43: Code **spawns**
-opencode per websocket and the agent **dies on disconnect**; an Agent is a **resident**
-daemon the console **attaches** to. This is a new surface, not a workspace flag.
+persistent **Hermes** agents — each a long-running **`hermes gateway run`** daemon
+(NousResearch's Hermes Agent) on its own PVC that keeps working after the browser closes and
+lives until intentional shutdown. It reuses the residency *chassis* of the Code/workspace
+surface (PVC-backed, single-writer, scale-to-zero stop) but runs an autonomous agent, **not
+opencode** — opencode is the Code/coding surface, and conflating the two was the original
+error (see the retarget record). The console is a **terminal into the running agent**
+(`hermes --tui`, exec-attach), the operator surface you drive it from and console in to when
+chat goes sideways — not a coding IDE. This is a new surface, not a workspace flag.
+
+Runtime + console detail: **`docs/design/records/agents-surface-hermes-retarget.md`**
+(supersedes Contract 2 and the console half of Contracts 1/4 below; the chassis contracts
+stand). Default runtime chart `jyje/hermes-agent`; image `nousresearch/hermes-agent`
+(date-tagged); inference routes through our gateway at `http://gateway:4000/v1`.
 
 **Hard invariant (outranks the rest of this section):** the Code/workspace surface stays
 **byte-unchanged and green** — the camp runs on it 2026-08-11. Contract 6 makes that
@@ -1547,10 +1555,10 @@ The six binding contracts:
    `/admin/spend` with no query change. The only edit is an additive `agent_key_alias` +
    one `parse_alias` clause in `gateway.py`; `key_alias`/`SURFACES` are untouched.
 
-2. **Residency.** A resident **`opencode serve`** daemon is the pod's main process; the
-   console attaches (ttyd → client on loopback), and a disconnect never ends the session
-   (tmux-attach is the documented fallback). Session state on the PVC via `XDG_DATA_HOME`
-   (finding 30). Lifecycle: **created → running → stopped → deleted**, mechanised as
+2. **Residency.** A resident **`hermes gateway run`** daemon is the pod's main process; the
+   console **exec-attaches** `hermes --tui` inside the pod (sharing the daemon's on-disk
+   session `state.db`), and a disconnect never ends the daemon. Session state on the PVC at
+   **`HERMES_HOME=/opt/data`**. Lifecycle: **created → running → stopped → deleted**, mechanised as
    Deployment `replicas: 1` (running) / **`replicas: 0`, PVC retained** (stopped) / delete
    Deployment+Service+Secret then PVC (deleted). *Stopped accrues no resident cost* because
    there is no pod to meter — not a "stopped rate".

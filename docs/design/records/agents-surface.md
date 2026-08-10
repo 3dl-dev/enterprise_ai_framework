@@ -1,5 +1,16 @@
 # Design record — the resident "Agents" surface
 
+> **⚠ RETARGETED — read `agents-surface-hermes-retarget.md` first.** This record's
+> **runtime and console** are superseded: the resident process is **Hermes Agent
+> (`hermes gateway run`)**, not `opencode serve`, and the console is an **exec-attach to
+> `hermes --tui`**, not a proxy of opencode's web IDE. Making a "hermes agent" an opencode
+> process conflated the Agents surface with the Code surface (Baron's ruling 2026-08-10) —
+> the retarget record fixes exactly that. **Everything else below still stands unchanged:**
+> the alias grammar (Contract 1), the two metering dimensions (Contract 3), integrated-vs-BYO
+> routing (Contract 4), the email/chat connectors (Contract 5), and the Code-untouched
+> invariant (Contract 6). Where the text below says `opencode serve` / port 4096 / an
+> attached web console, read Hermes / no inbound port / exec-`--tui` per the retarget record.
+
 **Status:** design record for epic `enterpriseaiframework-da7`. Normative for the six
 contracts below; two rulings inside them were RESERVED to Baron and marked as such — the
 email default (Contract 5) is still open, and the resident-metering cost basis (Contract 3b)
