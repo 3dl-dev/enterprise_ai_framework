@@ -27,12 +27,13 @@ lo` in the workspace pods.
 the portal does not confer any operator capability. Authentication is not authorisation.
 """
 
+import hashlib
 import os
 from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 from . import agent_usage, agents, chat_identity, db, gateway, issuance, metering
 
@@ -77,13 +78,38 @@ async def portal_root():
     return RedirectResponse("/portal/", status_code=307)
 
 
+def _asset_version(name: str) -> str:
+    """A short content hash used to cache-bust a static asset's URL.
+
+    Changes exactly when the file's bytes change, so a deploy's new app.js/style.css reach
+    an already-visited browser instead of being masked by the previous copy.
+    """
+    try:
+        return hashlib.sha1((STATIC / name).read_bytes()).hexdigest()[:12]
+    except OSError:
+        return "0"
+
+
 @router.get("/portal/", include_in_schema=False)
 async def portal_index(user: str = Depends(require_user)):
-    return FileResponse(STATIC / "index.html")
+    # Stamp the asset URLs with a content hash so the browser fetches the CURRENT app.js and
+    # style.css after a deploy. FileResponse sends no Cache-Control, so a bare
+    # `/portal/static/app.js` is served from heuristic cache after a redeploy — which is how
+    # a freshly-deployed index.html (new Agents tab) ends up running the OLD app.js that has
+    # no handler for it, and the tab does nothing. The hash in the query changes the URL, so
+    # the cache misses and the new file loads. index.html itself is served no-store so these
+    # hashed URLs are never themselves stale.
+    html = (STATIC / "index.html").read_text()
+    for asset in ("app.js", "style.css"):
+        html = html.replace(
+            f"/portal/static/{asset}",
+            f"/portal/static/{asset}?v={_asset_version(asset)}",
+        )
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
 @router.get("/portal/static/{name}", include_in_schema=False)
-async def portal_static(name: str, user: str = Depends(require_user)):
+async def portal_static(request: Request, name: str, user: str = Depends(require_user)):
     # Resolve then verify containment, rather than inspecting the string.
     target = (STATIC / name).resolve()
     try:
@@ -92,7 +118,12 @@ async def portal_static(name: str, user: str = Depends(require_user)):
         raise HTTPException(403, "denied")
     if not target.is_file():
         raise HTTPException(404, "not found")
-    return FileResponse(target)
+    # A request that carries the content-hash query (?v=...) names an immutable byte-for-byte
+    # version — safe to cache hard. A bare request (no version) must revalidate, so an old
+    # bookmark or a hand-typed URL can never pin a stale asset.
+    cache = ("public, max-age=31536000, immutable"
+             if request.query_params.get("v") else "no-cache")
+    return FileResponse(target, headers={"Cache-Control": cache})
 
 
 # WHO IS AN OPERATOR
