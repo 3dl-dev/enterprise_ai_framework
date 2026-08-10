@@ -398,6 +398,53 @@ See *Reserved rulings*.
 **Consumed by:** `-a4e` (the component and its integration), `-39d`/`-627` (email config in
 the console).
 
+### The connector shape, and who may supply a credential (`-c79`)
+
+Contract 5's shape — the tenant's own provider, reached with the tenant's own credential,
+no server of that kind in any manifest — is reused unchanged by `-783`'s chat connectors.
+`-c79` changes only **who can supply the credential**, and it is the last operator-only
+step in this surface.
+
+`-a4e` and `-783` landed their credential path as
+`deploy/bin/provision-agent.sh --slack-config-file`, which needs a kubeconfig. So a user
+could create an agent from the browser (`-627`) and then could not give it the one thing
+that makes it useful. `POST /portal/api/agents/<name>/connectors` closes that: the
+control-plane pod writes **the same Secret, under the same name, with the same keys and
+the same `AGENT_<KIND>_CONFIG_SUM` beside them**, and bumps the same
+`checksum/<connector>` pod-template annotation. An agent configured from the browser is
+indistinguishable from one an operator provisioned, because it is the same object.
+
+Rules, all of which are tested rather than promised:
+
+- **The owner is `require_user()`.** Never a body field, never a path segment. The guard is
+  Contract 2's — derive `agent-<user>-<name>`, then re-read the object and check its owner
+  LABEL, because two `(user, name)` pairs can derive one object name when either half
+  contains a hyphen. A chat connector is a higher-value target than the stop button: a
+  cross-user write would put a live agent holding somebody else's spendable model key into
+  the attacker's own workspace, taking their instructions.
+- **The allowlist is a security control.** These Secrets are injected with `envFrom`, so
+  every key becomes an environment variable in a container that holds a spendable API key.
+  The accepted keys are exactly `provision-agent.sh`'s, and a test parses the shell script
+  and fails on drift — three copies of one schema (Python, shell, the browser form) with
+  the divergence measured.
+- **Set-once, never returned.** No endpoint answers with a credential. The agent listing
+  reports only *whether* each connector is configured, read from the pod-template
+  annotation rather than from the Secret's existence — the annotation is what the pod is
+  actually running with.
+- **The checksum is over the credential's canonical form**, so re-supplying the same
+  credential does not roll the pod. Restarting an agent ends the resident session that is
+  the entire product (Contract 2).
+- **Delete takes the connector Secrets with it**, for the same reason it revokes the
+  virtual key: a left-behind `agent-<user>-<name>-slack` is a live bot token with nothing
+  using it and nothing rendering it.
+
+One defect was found and fixed on the way: `-627`'s renderer predates `-a4e`/`-783`, so it
+never substituted `__EMAILSUM__`, `__SLACKSUM__` or `__DISCORDSUM__`, and an agent created
+from the portal carried those literals as annotation values. Harmless in itself, invisible,
+and the same class as a forgotten `__USER__`.
+
+**Consumed by:** `-c79` (the endpoint and the Agents-tab wizard).
+
 ---
 
 ## Contract 6 — the Code-untouched invariant, made mechanical
@@ -487,6 +534,7 @@ alternatives, and the trade, and is **not** silently chosen.
 | `-a4e` email via OSI component | Contract 5 (component + integration) |
 | `-ede` E2E | all six — especially 6 (Code still byte-identical and green) and the full lifecycle across 1–4 |
 | `-783` third-party chat (Slack, Discord) | Contract 5's shape reused for chat: the tenant's own workspace/guild, the tenant's own bot tokens, no chat server in any manifest |
+| `-c79` self-serve connectors + the Agents-tab wizard | Contract 5's connector shape (same Secrets, same keys, same checksums as `-a4e`/`-783`), 2 (the owner guard, and that a re-supplied credential must not end the session), 4 (set-once, never read back). Reuses `-627`'s create path and writes no new schema |
 | `-e5ca` turnkey one-shot (`deploy/bin/hermes-up.sh`) | Contracts 1 (alias + console path), 2 (residency, and that a re-run must not end the session), 4 (integrated is the default and BYO is refused here), 5's connector shape. Composes `provision-agent.sh` and the pod's own chat tools; implements none of them |
 
 ---

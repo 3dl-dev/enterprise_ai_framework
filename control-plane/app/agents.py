@@ -91,9 +91,30 @@ GATEWAY_BASE = os.environ.get("AGENT_GATEWAY_BASE", "http://gateway:4000/v1")
 ASSETS_DIR = Path(os.environ.get("AGENT_ASSETS_DIR", "/etc/agent-assets"))
 
 _REPO = Path(__file__).resolve().parents[2]
+
+# EVERY file the agent pod mounts at /etc/agent, in the order provision-agent.sh lists
+# them — the entrypoint, every outside-world tool the entrypoint puts on PATH, and the
+# instructions that tell opencode each tool exists.
+#
+# THIS USED TO BE `entrypoint.sh` ALONE, and that was worse than incomplete. The ConfigMap
+# is deployment-wide and shared by every agent, and `_apply` is a server-side apply with
+# `force=true`: a create from the portal did not merely omit `agent-slack` from the agent
+# it was making, it REPLACED the ConfigMap and took the chat and mail tools away from
+# every agent an operator had already provisioned. Their credentials stayed in their
+# environments and the tools that read them vanished, which presents as an agent that has
+# stopped answering in Slack for no reason anybody changed.
+#
+# `agentws.py` is a MODULE, not a command: the RFC 6455 client both chat tools import, and
+# it must sit in the directory they add to sys.path. It ships here rather than in the image
+# because Contract 6 freezes deploy/workspace/, including the Dockerfile.
+AGENT_FILES = (
+    "entrypoint.sh", "agent-email", "EMAIL.md", "agent-slack", "SLACK.md",
+    "agent-discord", "DISCORD.md", "agentws.py",
+)
+
 _ASSET_FALLBACK = {
     "64-agent.template.yaml": _REPO / "deploy" / "k8s" / "64-agent.template.yaml",
-    "entrypoint.sh": _REPO / "deploy" / "agent" / "entrypoint.sh",
+    **{name: _REPO / "deploy" / "agent" / name for name in AGENT_FILES},
 }
 
 # What the pod's Secret holds before a real key is written into it. -055's sentinel,
@@ -104,6 +125,106 @@ KEY_SENTINEL = "unset-pending-enterpriseaiframework-39d"
 # replicas is 1 but no pod is Running yet, and calling that "running" is how a page comes
 # to show a green dot next to an agent that is in ImagePullBackOff.
 RUNNING, STARTING, STOPPED, UNKNOWN = "running", "starting", "stopped", "unknown"
+
+
+# ---------------------------------------------------------------- connectors
+#
+# WHAT A CONNECTOR IS AND WHY IT IS HERE RATHER THAN IN A SHELL SCRIPT
+#
+# -a4e gave an agent a mailbox and -783 gave it a Slack workspace and a Discord guild.
+# Both landed as `deploy/bin/provision-agent.sh --slack-config-file …`, which is an
+# operator on an operator's laptop with an operator's kubeconfig. So a user could create
+# an agent from the browser (-627) and then could not give it the one thing that makes it
+# useful without finding an operator. This section is that last step moved into the
+# product: the SAME Secrets, the SAME key names, the SAME checksum annotations, written by
+# the control-plane pod on behalf of an authenticated person.
+#
+# It is deliberately not a second schema. Every field below is quoted from the allowlists
+# provision-agent.sh passes to `provision_connector`, and
+# `control-plane/tests/test_portal_connectors.py::test_the_python_schema_matches_the_shell
+# _provisioners_allowlists` parses that script and fails if the two ever diverge — because
+# a key this file accepts and the shell script does not is a key the agent tools will
+# never read, and a key the shell accepts and this does not is a setting a user cannot
+# reach from the browser.
+#
+# THE ALLOWLIST IS A SECURITY CONTROL, NOT VALIDATION POLISH. The pod injects each of
+# these Secrets with `envFrom`, so every key in one becomes an environment variable in a
+# container that holds a spendable API key. A request body carrying `LD_PRELOAD` or
+# `PATH=/tmp/evil` would be arbitrary code execution dressed up as a chat setting. The
+# template's explicit `env:` wins over `envFrom` for OPENAI_API_KEY and
+# OPENCODE_SERVER_PASSWORD, but that only defends the two names somebody thought of.
+
+class Connector:
+    """One connector's Secret name, its allowed keys, and what it cannot go without."""
+
+    def __init__(self, kind: str, *, allowed: tuple[str, ...],
+                 required: tuple[str, ...], sum_key: str, noun: str):
+        self.kind = kind
+        self.allowed = allowed
+        self.required = required
+        self.sum_key = sum_key
+        self.noun = noun
+
+    def secret_name(self, obj: str) -> str:
+        return f"{obj}-{self.kind}"
+
+    @property
+    def annotation(self) -> str:
+        # The pod template's `checksum/<connector>` annotation. Changing it is what rolls
+        # the pod, and rolling the pod is the only way a re-supplied credential reaches a
+        # running agent: `envFrom` is injected at pod start and never updated afterwards.
+        return f"checksum/{self.kind}"
+
+
+CONNECTORS: dict[str, Connector] = {
+    # BOTH Slack tokens are required, for the reason provision-agent.sh states: the bot
+    # token posts, the app-level token opens the Socket Mode websocket that RECEIVES. An
+    # agent given only the first can talk and can never listen, which presents as "it
+    # ignores me" long after the configuration that caused it.
+    "slack": Connector(
+        "slack",
+        allowed=("AGENT_SLACK_BOT_TOKEN", "AGENT_SLACK_APP_TOKEN",
+                 "AGENT_SLACK_DEFAULT_CHANNEL", "AGENT_SLACK_API_BASE",
+                 "AGENT_SLACK_CA_FILE"),
+        required=("AGENT_SLACK_BOT_TOKEN", "AGENT_SLACK_APP_TOKEN"),
+        sum_key="AGENT_SLACK_CONFIG_SUM",
+        noun="Slack setting",
+    ),
+    # Discord needs ONE token for both directions — the same bot token authenticates the
+    # REST call that posts and the Gateway websocket that listens.
+    "discord": Connector(
+        "discord",
+        allowed=("AGENT_DISCORD_BOT_TOKEN", "AGENT_DISCORD_DEFAULT_CHANNEL",
+                 "AGENT_DISCORD_API_BASE", "AGENT_DISCORD_API_VERSION",
+                 "AGENT_DISCORD_INTENTS", "AGENT_DISCORD_CA_FILE"),
+        required=("AGENT_DISCORD_BOT_TOKEN",),
+        sum_key="AGENT_DISCORD_CONFIG_SUM",
+        noun="Discord setting",
+    ),
+    # A mailbox that could send and not read, or read and not send, is not a configuration
+    # this surface offers — hence four required keys rather than one.
+    "email": Connector(
+        "email",
+        allowed=("AGENT_EMAIL_ADDRESS", "AGENT_EMAIL_USERNAME", "AGENT_EMAIL_PASSWORD",
+                 "AGENT_EMAIL_SMTP_HOST", "AGENT_EMAIL_SMTP_PORT",
+                 "AGENT_EMAIL_SMTP_SECURITY", "AGENT_EMAIL_IMAP_HOST",
+                 "AGENT_EMAIL_IMAP_PORT", "AGENT_EMAIL_IMAP_SECURITY",
+                 "AGENT_EMAIL_CA_FILE"),
+        required=("AGENT_EMAIL_ADDRESS", "AGENT_EMAIL_PASSWORD",
+                  "AGENT_EMAIL_SMTP_HOST", "AGENT_EMAIL_IMAP_HOST"),
+        sum_key="AGENT_EMAIL_CONFIG_SUM",
+        noun="mail setting",
+    ),
+}
+
+# What the template's checksum annotation says when an agent has no such connector. The
+# literal provision-agent.sh writes, so an agent provisioned either way reads the same.
+NO_CONNECTOR = "none"
+
+# A credential is not this long. The cap exists because the whole body ends up in a Secret
+# and then in a pod's environment, and an unbounded string from a request body is a way to
+# make a pod fail to start (the kernel's argument/environment limit) from the browser.
+MAX_CONNECTOR_VALUE = 4096
 
 
 # ---------------------------------------------------------------- assets
@@ -411,6 +532,10 @@ async def list_agents(user: str) -> list[dict]:
             # surface is complete from a user's side the moment the proxy lands; the path
             # never carries the owner, which is Contract 1's rule for exactly this URL.
             "console_url": console_url(name),
+            # Which connectors this agent has — booleans, never key names and never
+            # values. It is read from the pod template the agent is running with, so it
+            # costs no extra API call and cannot claim a credential the pod never saw.
+            "connectors": _connector_state(dep),
         })
     return sorted(out, key=lambda a: a["name"])
 
@@ -478,19 +603,34 @@ async def console_target(user: str, name: str) -> dict:
 
 
 def render(user: str, name: str, *, image: str, model: str, api_base: str,
-           model_source: str, key_secret: str, cfgsum: str, keysum: str) -> list[dict]:
+           model_source: str, key_secret: str, cfgsum: str, keysum: str,
+           connector_sums: dict[str, str] | None = None) -> list[dict]:
     """The template, substituted exactly as provision-agent.sh substitutes it.
 
-    Literal replacement of the same nine placeholders, then a YAML parse — not a
+    Literal replacement of the same twelve placeholders, then a YAML parse — not a
     hand-built object graph. The template is the design (its comments are the reasoning
     for every field in it) and this is a second renderer of it, not a second copy.
+
+    THE THREE CONNECTOR CHECKSUMS ARE PART OF THAT SET and were missed when -627's
+    renderer was written, because -a4e and -783 added them to the template afterwards.
+    An agent created from the portal therefore carried the literal string
+    `checksum/slack: "__SLACKSUM__"` — a valid annotation value, so nothing failed, and
+    the first credential written to it would then produce a checksum that DID change and
+    roll the pod anyway. It is fixed rather than worked around because the next
+    placeholder somebody adds to the template must not be silently ignored by this path:
+    `test_creating_an_agent_applies_the_real_template_with_every_placeholder_filled` is
+    the check, and it was already red against the merged Agents surface.
     """
+    sums = connector_sums or {}
     text = asset("64-agent.template.yaml")
     for placeholder, value in (
         ("__USER__", user), ("__NAME__", name), ("__IMAGE__", image),
         ("__MODEL__", model), ("__CFGSUM__", cfgsum), ("__KEYSUM__", keysum),
         ("__MODEL_SOURCE__", model_source), ("__API_BASE__", api_base),
         ("__KEY_SECRET__", key_secret),
+        ("__EMAILSUM__", sums.get("email") or NO_CONNECTOR),
+        ("__SLACKSUM__", sums.get("slack") or NO_CONNECTOR),
+        ("__DISCORDSUM__", sums.get("discord") or NO_CONNECTOR),
     ):
         text = text.replace(placeholder, value)
     docs = [d for d in yaml.safe_load_all(text) if d]
@@ -528,15 +668,214 @@ async def _workspace_image(client: httpx.AsyncClient) -> str:
     )
 
 
-def _secret_object(name: str, data: dict[str, str]) -> dict:
+def _secret_object(name: str, data: dict[str, str],
+                   labels: dict[str, str] | None = None) -> dict:
     return {
         "apiVersion": "v1", "kind": "Secret",
         "metadata": {"name": name, "namespace": namespace(), "labels": {
             "app.kubernetes.io/part-of": "enterprise-ai-framework",
             "app.kubernetes.io/component": "agent",
+            **(labels or {}),
         }},
         "type": "Opaque",
         "data": {k: base64.b64encode(v.encode()).decode() for k, v in data.items()},
+    }
+
+
+async def _existing_connector_sums(client: httpx.AsyncClient, obj: str) -> dict[str, str]:
+    """The checksum already stored beside each connector credential, or nothing.
+
+    `provision_connector`'s `existing_in`, in Python. It exists so a render that is not
+    supplying a credential produces the SAME annotation the last one did and therefore
+    does NOT restart a healthy agent — the sum is stored in the Secret precisely because
+    neither this code nor the shell script reads the credential back to derive it.
+    """
+    out: dict[str, str] = {}
+    for kind, spec in CONNECTORS.items():
+        secret = await _get(client, "v1", "Secret", spec.secret_name(obj))
+        encoded = ((secret or {}).get("data") or {}).get(spec.sum_key)
+        if encoded:
+            out[kind] = base64.b64decode(encoded).decode()
+    return out
+
+
+def _connector_state(deployment: dict) -> dict[str, bool]:
+    """Which connectors this agent actually has, read off the POD TEMPLATE.
+
+    The source is the `checksum/<connector>` annotation rather than the existence of the
+    Secret, and that is the more honest of the two: the annotation is what the pod is
+    running with. A Secret written without rolling the pod would show as configured while
+    the agent had never read it, which is exactly the failure this surface exists to make
+    impossible.
+
+    `none` is provision-agent.sh's literal for "this agent has no such connector", and an
+    unsubstituted `__SLACKSUM__` (every agent created by -627 before this change) means
+    the same thing — neither is a credential.
+    """
+    annotations = (((deployment.get("spec") or {}).get("template") or {})
+                   .get("metadata") or {}).get("annotations") or {}
+    out = {}
+    for kind, spec in CONNECTORS.items():
+        value = (annotations.get(spec.annotation) or "").strip()
+        out[kind] = bool(value) and value != NO_CONNECTOR and not value.startswith("__")
+    return out
+
+
+def _clean_connector_values(spec: Connector, values: dict) -> dict[str, str]:
+    """The user's credential, checked before it can become a pod's environment.
+
+    Four refusals, each of which is a real way for a browser form to produce something
+    that is not a credential:
+
+    1. A KEY OUTSIDE THE ALLOWLIST. The security control — see the section header. Not
+       silently dropped: a dropped key is a setting the user believes they supplied.
+    2. A NON-STRING VALUE. JSON can carry a list or an object; a Secret cannot.
+    3. A CONTROL CHARACTER, including CR and LF. This is the injection refusal. The shell
+       path refuses a whole CRLF file with a diagnosis because `token\\r` fails as a 401
+       nobody connects to the file they saved on Windows; here a newline pasted into an
+       input would do the same, and an interior newline in a value that is later read as
+       KEY=value lines is a way to smuggle a second key in.
+    4. AN OVERLONG VALUE.
+
+    It DOES strip surrounding whitespace, which is the one place this path deliberately
+    differs from `--slack-config-file` (where values are taken literally, quotes and all).
+    The reason is the input channel: a token pasted into an HTML field routinely arrives
+    with a trailing space or newline from the copy, no credential in any of these three
+    schemas has meaningful leading or trailing whitespace, and refusing the paste that
+    every user makes would be a worse answer than trimming it. Anything left inside the
+    value after trimming is refused, not trimmed.
+    """
+    if not isinstance(values, dict):
+        raise HTTPException(400, "the credential must be an object of KEY: value pairs")
+
+    cleaned: dict[str, str] = {}
+    for key, raw in values.items():
+        if key not in spec.allowed:
+            raise HTTPException(
+                400,
+                f"{key!r} is not a {spec.noun}. This becomes the agent pod's environment "
+                f"via envFrom, so an unexpected key here would be an environment variable "
+                f"in a container that holds a spendable API key. Allowed: "
+                f"{', '.join(spec.allowed)}.",
+            )
+        if raw is None:
+            continue
+        if not isinstance(raw, str):
+            raise HTTPException(400, f"{key} must be a string.")
+        value = raw.strip()
+        if not value:
+            continue
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+            raise HTTPException(
+                400,
+                f"{key} contains a line break or a control character. Paste the value "
+                "alone, without the surrounding line — a credential with an invisible "
+                "carriage return in it fails as an authentication error that points at "
+                "nothing.",
+            )
+        if len(value) > MAX_CONNECTOR_VALUE:
+            raise HTTPException(
+                400,
+                f"{key} is {len(value)} characters, over the {MAX_CONNECTOR_VALUE} this "
+                "surface accepts.",
+            )
+        cleaned[key] = value
+
+    missing = [k for k in spec.required if k not in cleaned]
+    if missing:
+        raise HTTPException(
+            400,
+            f"missing {', '.join(missing)}. Every one of these is required, because a "
+            f"half-configured connector is not a configuration this surface offers: "
+            f"{', '.join(spec.required)}.",
+        )
+    return cleaned
+
+
+def connector_sum(values: dict[str, str]) -> str:
+    """The hash that goes beside the credential and into the annotation. Never the value.
+
+    Over a canonical `KEY=value` rendering rather than the raw request body, so that the
+    same credential supplied twice — in a different field order, or with a whitespace the
+    trim removed — produces the SAME sum and therefore does NOT roll a healthy agent.
+    Restarting an agent ends the resident session that is the entire product.
+    """
+    canonical = "\n".join(f"{k}={values[k]}" for k in sorted(values))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+async def configure_connector(user: str, name: str, kind: str, values: dict) -> dict:
+    """Give the CALLER'S OWN agent a Slack workspace, a Discord guild or a mailbox.
+
+    This is the last operator-only step in the Agents surface moved into the product. It
+    writes the same Secret `deploy/bin/provision-agent.sh` writes, under the same name,
+    with the same keys and the same `AGENT_<KIND>_CONFIG_SUM` beside them, and then bumps
+    the same pod-template annotation — so `deploy/agent/agent-slack`, `agent-discord` and
+    `agent-email` pick it up unchanged, and an agent configured from the browser is
+    indistinguishable from one an operator provisioned.
+
+    THE OWNER IS `require_user()` AND THE GUARD IS THE SAME ONE. `_owned_deployment`
+    derives `agent-<user>-<name>` from the authenticated name and then re-reads the object
+    and insists its labels agree, because two different (user, name) pairs can derive the
+    same object name when either half contains a hyphen. Without the second half, `alice`
+    could write a bot token into `alice-bot`'s agent — and a chat connector is worse than
+    the stop button: it would put a live agent that holds somebody else's spendable model
+    key into an attacker's own Slack workspace, taking instructions from them.
+
+    404 for "not yours" as for "not there", for the reason `_owned_deployment` gives.
+
+    NOTHING IS RETURNED BUT KEY NAMES. Set-once, never read back (Contract 4). There is
+    deliberately no GET that answers with a credential, so there is no endpoint an XSS or
+    a confused-deputy could read one out of, and the agent's own `agent-slack config`
+    reports `bot_token_set: true` rather than the token for the same reason.
+    """
+    spec = CONNECTORS.get(kind) if isinstance(kind, str) else None
+    if spec is None:
+        raise HTTPException(
+            400,
+            f"unknown connector {kind!r}. This agent surface carries "
+            f"{', '.join(sorted(CONNECTORS))}.",
+        )
+    cleaned = _clean_connector_values(spec, values)
+    obj = object_name(user, name)
+    checksum = connector_sum(cleaned)
+
+    async with _client() as client:
+        deployment = await _owned_deployment(client, user, name)
+        labels = (deployment.get("metadata") or {}).get("labels") or {}
+        await _apply(client, _secret_object(
+            spec.secret_name(obj),
+            # The sum is stored BESIDE the credential, exactly as the shell script stores
+            # it, so a later render can reproduce this annotation without reading the
+            # credential back. It is not accepted from the request (it is not in any
+            # allowlist), so it cannot be spoofed into suppressing a roll.
+            {**cleaned, spec.sum_key: checksum},
+            # The owner labels the -914 meter and every listing already attribute by. A
+            # credential Secret with no owner on it is one nothing can clean up or account
+            # for; the shell path predates the label and leaves them unlabelled.
+            labels={USER_LABEL: user, NAME_LABEL: name},
+        ))
+        # The roll. `envFrom` is injected at pod start and never updated afterwards, so
+        # without this the running agent would keep presenting whatever it started with
+        # and the user would watch a correctly-stored token do nothing.
+        await _patch(client, "apps/v1", "Deployment", obj, {
+            "spec": {"template": {"metadata": {
+                "annotations": {spec.annotation: checksum},
+            }}},
+        })
+
+    await db.audit(user, "agent.connector.configure", f"{user}/{name}",
+                   # The KEYS, never the values. An audit trail that recorded a bot token
+                   # would be a credential store with a retention policy.
+                   connector=kind, keys=sorted(cleaned), checksum=checksum)
+    return {
+        "name": name,
+        "kind": kind,
+        "configured": True,
+        "secret": spec.secret_name(obj),
+        "keys": sorted(cleaned),
+        "rolled": (deployment.get("spec") or {}).get("replicas", 0) > 0,
+        "model_source": labels.get(MODEL_SOURCE_LABEL, ""),
     }
 
 
@@ -584,15 +923,24 @@ async def create(user: str, name: str, *, model: str | None = None) -> dict:
 
         image = await _workspace_image(client)
 
-        # The resident entrypoint, deployment-wide (one control plane). Applied here for
-        # the same reason provision-agent.sh applies it: the pod mounts it by name, and an
-        # agent must never be able to exist before the thing it runs does.
-        entrypoint = asset("entrypoint.sh")
-        cfgsum = hashlib.sha256(entrypoint.encode()).hexdigest()[:16]
+        # The resident entrypoint AND every tool it puts on PATH, deployment-wide (one
+        # control plane). Applied here for the same reason provision-agent.sh applies it:
+        # the pod mounts the ConfigMap by name, and an agent must never be able to exist
+        # before the things it runs do.
+        #
+        # The checksum is over ALL of them, concatenated in AGENT_FILES order — byte for
+        # byte the value `CFGSUM=$(for f in "${AGENT_FILES[@]}"; do cat ...; done |
+        # sha256sum)` produces in the shell. That equality is the point: the two paths
+        # must render the SAME annotation from the same repository, or provisioning an
+        # agent by either route would restart every agent created by the other.
+        files = {name: asset(name) for name in AGENT_FILES}
+        cfgsum = hashlib.sha256(
+            "".join(files[name] for name in AGENT_FILES).encode()
+        ).hexdigest()[:16]
         await _apply(client, {
             "apiVersion": "v1", "kind": "ConfigMap",
             "metadata": {"name": "agent-entrypoint", "namespace": namespace()},
-            "data": {"entrypoint.sh": entrypoint},
+            "data": files,
         })
 
         issued = await issuance.issue(user, gateway.agent_surface(name), actor=user)
@@ -607,8 +955,15 @@ async def create(user: str, name: str, *, model: str | None = None) -> dict:
             "OPENAI_API_KEY": api_key,
         }))
 
+        # A connector credential can outlive the agent it was written for — an operator
+        # who ran provision-agent.sh --slack-config-file before the Deployment existed,
+        # for instance. Rendering "none" over it would leave the Secret mounted and the
+        # annotation claiming there is nothing there.
+        sums = await _existing_connector_sums(client, obj)
+
         for doc in render(
             user, name, image=image, model=model, api_base=GATEWAY_BASE,
+            connector_sums=sums,
             # Integrated only from the portal. BYO takes a provider credential that must
             # be handled set-once and never read back (Contract 4); accepting one through
             # a JSON body on a page is a different item's design, and the operator path
@@ -682,6 +1037,14 @@ async def delete(user: str, name: str) -> dict:
             ("v1", "Service", obj),
             ("v1", "Secret", f"{obj}-key"),
             ("v1", "Secret", f"{obj}-byo"),
+            # The connector credentials, for exactly the reason the virtual key is
+            # revoked below: a delete that left `agent-alice-bot-slack` behind would leave
+            # a live Slack bot token — the tenant's own, with whatever scopes they granted
+            # it — sitting in the namespace with nothing using it and nothing rendering
+            # it. Before this item nothing could write them from the portal, so nothing
+            # had noticed; now that a user can create one from the browser, a user
+            # pressing Delete must not be able to leave one behind.
+            *(("v1", "Secret", CONNECTORS[k].secret_name(obj)) for k in sorted(CONNECTORS)),
         ):
             if await _delete(client, api_version, kind, target):
                 removed.append(f"{kind}/{target}")

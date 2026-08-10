@@ -1472,3 +1472,43 @@ than at credentials, which is where the fault will actually be. Either correct t
 or put the tool somewhere the image's own PATH already covers; the e2e suite addresses it
 by absolute path and asserts the daemon's PATH out of `/proc`, because asserting on
 `command -v` from an exec measures the wrong process and calls a working capability dead.
+
+### 49. Pressing "Create" in the Agents tab deleted the chat tools from every other agent
+
+The agent pod mounts one deployment-wide ConfigMap, `agent-entrypoint`, at `/etc/agent`:
+the entrypoint plus every outside-world tool the entrypoint puts on PATH — `agent-email`,
+`agent-slack`, `agent-discord`, the `agentws.py` module both chat tools import, and the
+instruction files that tell opencode each tool exists. `deploy/bin/provision-agent.sh`
+ships all eight.
+
+`control-plane/app/agents.py` — the self-serve create path from `-627` — shipped
+`entrypoint.sh` alone, and it writes with a **server-side apply carrying `force=true`**.
+Server-side apply means the object sent IS the object. So one user pressing Create in the
+Agents tab did not merely get an agent with no chat tools: it replaced the shared
+ConfigMap and removed `agent-slack`, `agent-email`, `agent-discord` and `agentws.py` from
+**every agent in the namespace**, including agents an operator had provisioned and wired
+days earlier. Their credentials stayed in their environments; the programs that read them
+were gone. The pod does not restart for a ConfigMap content change, so the tools disappear
+from the mounted volume silently, and the symptom is an agent that stopped answering in
+Slack with nothing in any diff to explain it.
+
+It was also under-hashing: the checksum feeding `checksum/entrypoint` covered
+`entrypoint.sh` only, while the shell hashes the concatenation of all eight. Two different
+values from the same repository, so provisioning by either route restarted every agent
+created by the other — the exact thing Contract 2 says a re-run must never do, because it
+ends the resident session that is the product.
+
+Found by running the new connector endpoint against live k3s
+(`tests-live/test_portal_connectors.py`) rather than by reading code. The credential
+arrived in the pod's environment exactly as designed, the Secret and the roll were both
+correct, and `/etc/agent/agent-slack config` exited 1 — because the file was not there. A
+hermetic test of the endpoint passes in full against this bug; nothing short of executing
+the shipped tool inside the real pod distinguishes "the credential is wired" from "the
+credential is wired to nothing".
+
+Fixed in `-c79`: `app/agents.py` names the same eight files in the same order and hashes
+the concatenation the way the shell does, `deploy/bin/deploy.sh` puts all of them in the
+`agent-assets` ConfigMap the control-plane pod reads them from, and
+`tests/test_agent_assets.py` parses all three lists and fails on drift. The third list is
+the trap: the control-plane image is built from `control-plane/` alone, so a file the
+deploy does not hand it is one it cannot ship even when it means to.

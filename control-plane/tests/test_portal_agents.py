@@ -155,6 +155,20 @@ def _stub_ledger(monkeypatch):
 # ---------------------------------------------------------------- the fake cluster
 
 
+def _strategic_merge(current: dict, patch: dict) -> None:
+    """Maps merge key by key, all the way down; anything else replaces.
+
+    That is what `application/strategic-merge-patch+json` does to a map field, and it is
+    the only behaviour `app/agents.py` depends on — `{"spec": {"replicas": 0}}` must not
+    erase the pod template, and an annotations patch must not erase the containers.
+    """
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(current.get(key), dict):
+            _strategic_merge(current[key], value)
+        else:
+            current[key] = value
+
+
 class FakeCluster:
     """A Kubernetes API server with an object store, over real HTTP.
 
@@ -329,12 +343,15 @@ class FakeCluster:
                 if current is None:
                     self._json(404, {"message": f"{collection} {name} not found"})
                     return
-                # Strategic merge, one level deep, which is all `{"spec": {...}}` needs.
-                for key, value in body.items():
-                    if isinstance(value, dict):
-                        current.setdefault(key, {}).update(value)
-                    else:
-                        current[key] = value
+                # Strategic merge. RECURSIVE, because the API server's is: the connector
+                # roll patches
+                # `{"spec": {"template": {"metadata": {"annotations": {...}}}}}`, and a
+                # one-level merge would REPLACE the whole pod template with a stub —
+                # dropping the containers, the volumes and the image. That would have
+                # been a fake that punished correct code, and the test built on it would
+                # have "proved" a rollout mechanism the real API server implements
+                # differently.
+                _strategic_merge(current, body)
                 cluster.put(collection, current)
                 self._json(200, current)
 

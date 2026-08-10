@@ -80,6 +80,11 @@
                  pattern="[a-z0-9][a-z0-9-]{0,38}" required>
           <select id="agent-model" aria-label="Model"></select>
           <button class="btn primary" id="agent-create" type="submit">Create</button>
+          <!-- The same create, plus the step that used to need an operator. It is a
+               separate button rather than a replacement so the one-click create the camp
+               uses on day one is not made two clicks longer for everyone who does not
+               want a chat connector. -->
+          <button class="btn" id="agent-setup-open" type="button">Set up with chat…</button>
         </form>
       </div>
 
@@ -173,6 +178,66 @@
     <button class="btn" id="copy-key">Copy</button>
     <button class="btn primary" id="close-key" autofocus>Done</button>
   </menu>
+</dialog>
+
+<!-- THE SETUP WIZARD. One dialog, two modes: "create" also names and creates the agent,
+     "configure" attaches to one that already exists. Both end in the same POST to
+     /portal/api/agents/<name>/connectors.
+
+     Every credential field is built by app.js from CONNECTOR_FIELDS, which is the same
+     key list app/agents.py allows and deploy/bin/provision-agent.sh allows — a test
+     compares all three, because a field this page invents is one the agent's tools will
+     never read.
+
+     WRITE-ONLY. Nothing in here is ever populated from a response. There is no endpoint
+     that returns a credential, and the dialog clears its own inputs on close, so a token
+     does not sit in the DOM of a tab left open on a shared machine. -->
+<dialog class="dlg sheet" id="dlg-agent-setup">
+  <div class="sheet-head">
+    <h2 id="setup-title">Set up an agent</h2>
+    <button class="btn ghost" id="setup-close" type="button">Cancel</button>
+  </div>
+  <main>
+    <form id="setup-form">
+      <section class="panel" id="setup-identity">
+        <div class="panel-head"><h3>The agent</h3></div>
+        <label class="field"><span>Name</span>
+          <input id="setup-name" autocomplete="off" pattern="[a-z0-9][a-z0-9-]{0,38}"
+                 placeholder="helper">
+        </label>
+        <label class="field" id="setup-model-field"><span>Model</span>
+          <select id="setup-model"></select>
+        </label>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h3>Where it talks</h3></div>
+        <p class="note">Your own workspace, reached with your own bot token. Nothing is
+          hosted here and nothing is shared between agents.</p>
+        <label class="field"><span>Chat</span>
+          <select id="setup-chat">
+            <option value="slack" selected>Slack</option>
+            <option value="discord">Discord</option>
+            <option value="none">Not now</option>
+          </select>
+        </label>
+        <div id="setup-chat-fields"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h3>Mailbox</h3></div>
+        <label class="check"><input type="checkbox" id="setup-email-on">
+          <span>Give it an email address on your own mail provider</span></label>
+        <div id="setup-email-fields" hidden></div>
+      </section>
+
+      <p class="warn" id="setup-error" hidden></p>
+      <p class="note" id="setup-progress" hidden></p>
+      <menu>
+        <button class="btn primary" id="setup-submit" type="submit">Create and connect</button>
+      </menu>
+    </form>
+  </main>
 </dialog>
 
 <dialog class="dlg" id="dlg-confirm">
