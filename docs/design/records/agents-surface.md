@@ -341,6 +341,22 @@ hint), **never the key material** — the write-only mirror of the `keys/rotate`
 never again" rule, and a direct application of finding 2 (never hold or hand back a raw
 credential). Rotating BYO is re-supplying it; there is no read path, ever.
 
+### How `model_source` is actually spelled, as landed by `-39d`
+
+Recorded here so `-627` and `-914` read it rather than guess it. The provenance lives on
+the Kubernetes objects, not in a side table: `agent-<user>-<name>`'s Deployment **and its
+pod template** carry the label
+
+> **`agent.enterprise-ai/model-source: integrated | byo`**
+
+— hyphenated, matching the `agent.enterprise-ai/user` and `.../name` labels Contract 3
+already keys the resident meter on, and deliberately **not** in the Deployment's
+`selector.matchLabels`, which is immutable and would make switching an agent between the
+two modes a delete-and-recreate of a pod holding a ReadWriteOnce PVC and a live session.
+A spend view therefore reads the mode from the same object it already reads the
+attribution key from, and a BYO agent cannot render as `$0` without that label being
+looked at.
+
 **Consumed by:** `-39d` (integrated-vs-BYO routing, the Secret, the visibility label),
 `-627` (config UI), `-a4e` (email config sits in the same model).
 
