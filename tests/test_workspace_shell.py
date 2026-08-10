@@ -879,6 +879,32 @@ def test_the_booting_state_clears_once_an_agent_is_actually_running(page, tmp_pa
         proc.wait(timeout=TIMEOUT)
 
 
+def test_pressing_enter_in_the_name_field_creates_the_project(page, shell):
+    """Enter is how a person submits a one-field form, and it must MAKE the project.
+
+    The bug: in `<form method="dialog">`, Enter triggers implicit submission, which fires
+    the form's FIRST submit button. "Cancel" was authored before "Make it", so a typed
+    name plus Enter closed the dialog with returnValue "cancel" — newProjectDialog resolved
+    null and createProject bailed. The dialog vanished and nothing was ever made, which is
+    exactly the reported symptom. The click-based _make_project helper never exercised this
+    path, so the whole browser suite passed while a name-and-Enter did nothing.
+    """
+    page.click("#project-button")
+    page.click("#project-menu button.new")
+    page.fill("#new-name", "enter game")
+    page.press("#new-name", "Enter")
+
+    # The booting overlay naming the project is proof the create path ran, not the cancel
+    # path. Before the fix this times out: the dialog closed to nothing.
+    page.wait_for_selector("#booting", state="visible", timeout=PAGE_TIMEOUT)
+    page.wait_for_function(
+        """() => document.getElementById('booting-text').textContent.includes('enter game')""",
+        timeout=PAGE_TIMEOUT,
+    )
+    # And the project really exists, under its slug, as the active one.
+    shell.wait_for(lambda p: p["project"] == "enter-game", "the new project to be active")
+
+
 def test_a_rejected_name_puts_the_terminal_back(page, shell):
     """A 400 must not strand the user under a spinner for a project that was never made.
 
