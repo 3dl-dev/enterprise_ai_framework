@@ -1053,6 +1053,10 @@ async def delete(user: str, name: str) -> dict:
         for api_version, kind, target in (
             ("apps/v1", "Deployment", obj),
             ("v1", "Service", obj),
+            # The seeded Hermes config (agent-<user>-<name>-config) the retarget added — a
+            # delete that left it behind is orphaned cruft that also makes re-creating the
+            # same agent name adopt a stale config.
+            ("v1", "ConfigMap", f"{obj}-config"),
             ("v1", "Secret", f"{obj}-key"),
             ("v1", "Secret", f"{obj}-byo"),
             # The connector credentials, for exactly the reason the virtual key is

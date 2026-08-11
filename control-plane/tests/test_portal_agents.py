@@ -454,7 +454,8 @@ def test_a_user_lists_stops_starts_and_deletes_their_own_agent(cluster):
 
     body = alice.request("DELETE", "/portal/api/agents/scraper").json()
     assert body["deleted"] is True
-    for kind in ("deployments", "services", "secrets", "persistentvolumeclaims"):
+    for kind in ("deployments", "services", "secrets", "persistentvolumeclaims",
+                 "configmaps"):
         assert cluster.names(kind) == [], f"{kind} survived the delete: {cluster.names(kind)}"
     assert body["key_revoked"] == "alice::agents/scraper", (
         "deleting the pod without revoking the key leaves a spendable credential at the "
