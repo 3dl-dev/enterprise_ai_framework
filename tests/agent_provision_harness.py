@@ -309,8 +309,10 @@ def _install_stubs(tmp_path: Path, obj: str, *, existing_key: str | None = None,
     for label, value in (("email", existing_email_sum), ("slack", existing_slack_sum),
                          ("discord", existing_discord_sum)):
         if value is not None:
+            # Hermes-native sum key: `<LABEL>_CONFIG_SUM` (the opencode `AGENT_` prefix was
+            # dropped in the connector retarget). Matches provision-agent.sh's sum_key.
             (stub_dir / "state"
-             / f"{obj}-{label}.AGENT_{label.upper()}_CONFIG_SUM").write_text(value)
+             / f"{obj}-{label}.{label.upper()}_CONFIG_SUM").write_text(value)
     for name, value in (cluster or {}).items():
         if value is not None:
             (stub_dir / "state" / name).write_text(value)

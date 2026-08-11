@@ -56,11 +56,9 @@
 # summary true rather than assumed: a BYO agent (Contract 4) would answer with the user's
 # own provider here, produce no ledger row, and must not be reported as metered.
 #
-# NOTE (enterpriseaiframework-8a9): the connector Secret keys are still the opencode
-# `AGENT_*` names (kept in step with the control-plane parity test). `hermes gateway run`
-# reads UNPREFIXED env (SLACK_BOT_TOKEN, DISCORD_BOT_TOKEN, EMAIL_ADDRESS, ...), so step 2
-# proves the credential reached the environment, not yet that Hermes is actively listening;
-# the AGENT_*->unprefixed translation is the open item, documented in provision-agent.sh.
+# The connector Secret keys are Hermes's OWN env var names (SLACK_BOT_TOKEN, DISCORD_BOT_
+# TOKEN, EMAIL_ADDRESS, ...), which `hermes gateway run` reads directly — so step 2 probing
+# their presence in the pod's environment proves the credential is where the gateway looks.
 #
 # INTEGRATED IS NOT A DEFAULT THIS SCRIPT WILL LET YOU SLIP OUT OF. provision-agent.sh
 # derives BYO mode from the environment as well as from flags, so `AGENT_BYO_API_BASE` set
@@ -142,19 +140,19 @@ if [[ "$CHAT" == discord && -n "$SLACK_CONFIG_FILE" ]]; then
     exit 1
 fi
 
-# The env vars the connector Secret injects that PROVE it reached the pod. These are still
-# the opencode `AGENT_*` names — the ones provision-agent.sh writes and the control-plane
-# parity test pins (see the NOTE in the header): Slack needs BOTH (the bot token posts, the
-# app token opens Socket Mode that RECEIVES), Discord needs its one bot token.
+# The env vars the connector Secret injects that PROVE it reached the pod. These are
+# Hermes's OWN env var names — the ones `hermes gateway run` reads and provision-agent.sh
+# now writes: Slack needs BOTH (the bot token posts, the app token opens Socket Mode that
+# RECEIVES), Discord needs its one bot token.
 if [[ "$CHAT" == slack ]]; then
     CHAT_FLAG="--slack-config-file"; CHAT_FILE="$SLACK_CONFIG_FILE"
-    CHAT_SUM_KEY=AGENT_SLACK_CONFIG_SUM
-    CHAT_ENV_VARS="AGENT_SLACK_BOT_TOKEN AGENT_SLACK_APP_TOKEN"
+    CHAT_SUM_KEY=SLACK_CONFIG_SUM
+    CHAT_ENV_VARS="SLACK_BOT_TOKEN SLACK_APP_TOKEN"
     CHAT_NOUN="Slack workspace"
 else
     CHAT_FLAG="--discord-config-file"; CHAT_FILE="$DISCORD_CONFIG_FILE"
-    CHAT_SUM_KEY=AGENT_DISCORD_CONFIG_SUM
-    CHAT_ENV_VARS="AGENT_DISCORD_BOT_TOKEN"
+    CHAT_SUM_KEY=DISCORD_CONFIG_SUM
+    CHAT_ENV_VARS="DISCORD_BOT_TOKEN"
     CHAT_NOUN="Discord guild"
 fi
 
@@ -250,12 +248,12 @@ in_pod() { kubectl -n "$NS" exec "$POD" -c agent -- bash -c "$1"; }
 #
 # Presence only, never the value: the probe prints the NAME of any variable that is empty
 # or unset, and nothing about the ones that are set. Slack needs both tokens (post + Socket
-# Mode receive); Discord needs its one. See the header NOTE on the AGENT_* -> Hermes
-# unprefixed env translation that is still outstanding.
+# Mode receive); Discord needs its one. These are Hermes's own env var names, the ones the
+# gateway reads.
 CHAT_MISSING="$(in_pod "missing=; for v in ${CHAT_ENV_VARS}; do [ -n \"\${!v:-}\" ] || missing=\"\${missing} \${v}\"; done; echo \"\${missing# }\"" 2>/dev/null || echo "probe-failed")"
 if [[ "$CHAT_MISSING" == "probe-failed" ]]; then
     fail "could not read the connector environment inside ${POD}.
-  kubectl -n ${NS} exec ${POD} -c agent -- env | grep -i AGENT_${CHAT^^}_"
+  kubectl -n ${NS} exec ${POD} -c agent -- env | grep -i ${CHAT^^}_"
 fi
 if [[ -n "$CHAT_MISSING" ]]; then
     fail "the ${CHAT} credential is not in ${POD}'s environment: ${CHAT_MISSING}.

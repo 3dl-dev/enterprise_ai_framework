@@ -40,16 +40,17 @@ TEMPLATE = REPO / "deploy/k8s/64-agent.template.yaml"
 # ANYWHERE unexpected — argv, stdout, stderr, a manifest that is not the Secret — is
 # unambiguous rather than a judgement call.
 MAILBOX_PASSWORD = "mAiLbOx-App-Password-8f31c7d0"
+# Hermes's own mail env vars. It AUTO-DETECTS ports and TLS, so there is no username, no
+# SMTP/IMAP port and no security field — those opencode keys were dropped from the allowlist
+# in the connector retarget and provision-agent.sh now REJECTS them (see
+# test_a_dropped_opencode_email_field_is_now_refused). EMAIL_ALLOW_ALL_USERS is an optional
+# allowed key that opts out of Hermes's deny-by-default.
 MAILBOX = f"""\
-AGENT_EMAIL_ADDRESS=ops-agent@contoso.com
-AGENT_EMAIL_USERNAME=ops-agent@contoso.com
-AGENT_EMAIL_PASSWORD={MAILBOX_PASSWORD}
-AGENT_EMAIL_SMTP_HOST=smtp.office365.com
-AGENT_EMAIL_SMTP_PORT=587
-AGENT_EMAIL_SMTP_SECURITY=starttls
-AGENT_EMAIL_IMAP_HOST=outlook.office365.com
-AGENT_EMAIL_IMAP_PORT=993
-AGENT_EMAIL_IMAP_SECURITY=ssl
+EMAIL_ADDRESS=ops-agent@contoso.com
+EMAIL_PASSWORD={MAILBOX_PASSWORD}
+EMAIL_SMTP_HOST=smtp.office365.com
+EMAIL_IMAP_HOST=outlook.office365.com
+EMAIL_ALLOW_ALL_USERS=true
 """
 
 
@@ -76,10 +77,10 @@ def test_the_mailbox_is_written_to_its_own_per_agent_secret(tmp_path):
     # have different lifecycles (one is rotated by re-supplying a file, the other by
     # minting at the gateway) and merging them would mean rotating either one rewrites
     # both.
-    assert run.secret_data("agent-baron-mailer-email", "AGENT_EMAIL_PASSWORD") == MAILBOX_PASSWORD
-    assert run.secret_data("agent-baron-mailer-email", "AGENT_EMAIL_ADDRESS") == "ops-agent@contoso.com"
-    assert run.secret_data("agent-baron-mailer-email", "AGENT_EMAIL_SMTP_HOST") == "smtp.office365.com"
-    assert run.secret_data("agent-baron-mailer-email", "AGENT_EMAIL_IMAP_HOST") == "outlook.office365.com"
+    assert run.secret_data("agent-baron-mailer-email", "EMAIL_PASSWORD") == MAILBOX_PASSWORD
+    assert run.secret_data("agent-baron-mailer-email", "EMAIL_ADDRESS") == "ops-agent@contoso.com"
+    assert run.secret_data("agent-baron-mailer-email", "EMAIL_SMTP_HOST") == "smtp.office365.com"
+    assert run.secret_data("agent-baron-mailer-email", "EMAIL_IMAP_HOST") == "outlook.office365.com"
     # The model credential is untouched by any of this.
     assert run.secret_data("agent-baron-mailer-email", "OPENAI_API_KEY") is None
 
@@ -145,7 +146,7 @@ def test_nothing_ever_reads_the_mailbox_password_back(tmp_path):
 
     Asserted against the recorded argv rather than by reading the script, because the
     failure this guards is a future `kubectl get secret …-email -o jsonpath={.data.
-    AGENT_EMAIL_PASSWORD}` added for a plausible reason — an idempotence check, a
+    EMAIL_PASSWORD}` added for a plausible reason — an idempotence check, a
     validation step — which would put the credential into a shell variable and from there
     into any error the script later printed.
     """
@@ -160,13 +161,13 @@ def test_nothing_ever_reads_the_mailbox_password_back(tmp_path):
 
     for run in (supplied, rerun):
         for line in reads_of_the_mail_secret(run):
-            assert "AGENT_EMAIL_PASSWORD" not in line, (
+            assert "EMAIL_PASSWORD" not in line, (
                 f"the provisioner read the mailbox password back out of the cluster: {line}"
             )
 
     # The one thing it IS allowed to read back is the hash beside the credential, and only
     # on the path where it has to decide whether a mailbox already exists.
-    assert any("AGENT_EMAIL_CONFIG_SUM" in line for line in reads_of_the_mail_secret(rerun)), (
+    assert any("EMAIL_CONFIG_SUM" in line for line in reads_of_the_mail_secret(rerun)), (
         "the provisioner never checked for an existing mailbox, so a re-run cannot tell "
         "an agent that has one from an agent that does not."
     )
@@ -232,7 +233,7 @@ def test_reprovisioning_an_agent_with_a_mailbox_does_not_roll_it(tmp_path):
     """
     supplied = harness.provision(tmp_path / "a", "baron", "mailer",
                                  "--email-config-file", _config_file(tmp_path / "a"))
-    sum_written = supplied.secret_data("agent-baron-mailer-email", "AGENT_EMAIL_CONFIG_SUM")
+    sum_written = supplied.secret_data("agent-baron-mailer-email", "EMAIL_CONFIG_SUM")
     assert sum_written and sum_written != "none"
     assert _annotations(supplied)["checksum/email"] == sum_written
 
@@ -245,7 +246,7 @@ def test_reprovisioning_an_agent_with_a_mailbox_does_not_roll_it(tmp_path):
     )
     # And it did not rewrite the Secret, so it cannot have clobbered the credential with
     # anything — including an empty one.
-    assert rerun.secret_data("agent-baron-mailer-email", "AGENT_EMAIL_PASSWORD") is None
+    assert rerun.secret_data("agent-baron-mailer-email", "EMAIL_PASSWORD") is None
     assert "kept" in rerun.output
 
 
@@ -253,7 +254,7 @@ def test_an_agent_provisioned_without_a_mailbox_is_unchanged_and_says_so(tmp_pat
     run = harness.provision(tmp_path, "baron", "plain")
     assert run.returncode == 0, run.output
     assert _annotations(run)["checksum/email"] == "none"
-    assert run.secret_data("agent-baron-plain-email", "AGENT_EMAIL_PASSWORD") is None
+    assert run.secret_data("agent-baron-plain-email", "EMAIL_PASSWORD") is None
     assert "no mailbox" in run.output
     # The pod still declares the optional source, so adding a mailbox later is one
     # `--email-config-file` and one rollout, not a template change.
@@ -281,9 +282,32 @@ def test_a_mail_config_cannot_smuggle_a_non_mail_variable_into_the_pod(tmp_path,
         "the provisioner refused but had already applied the Secret"
 
 
+@pytest.mark.parametrize("field", [
+    "EMAIL_USERNAME",
+    "EMAIL_SMTP_PORT", "EMAIL_SMTP_SECURITY",
+    "EMAIL_IMAP_PORT", "EMAIL_IMAP_SECURITY",
+    "EMAIL_CA_FILE",
+])
+def test_a_dropped_opencode_email_field_is_now_refused(tmp_path, field):
+    """The connector retarget dropped the opencode mail fields Hermes does not use.
+
+    opencode's `agent-email` took an explicit username, SMTP/IMAP ports and security modes;
+    Hermes auto-detects ports and TLS from the host, so those keys left the allowlist. A
+    config file that still carries one (an operator's old file, or a copy of the pre-retarget
+    docs) must be REFUSED rather than silently written into the pod's environment — the
+    allowlist is exact, and a stale key is a setting the operator believes took effect.
+    """
+    stale = MAILBOX + f"{field}=whatever\n"
+    run = harness.provision(tmp_path, "baron", "mailer",
+                            "--email-config-file", _config_file(tmp_path, stale))
+    assert run.returncode != 0, run.output
+    assert field in run.output and "not a mail setting" in run.output
+    assert "agent-baron-mailer-email" not in run.applied
+
+
 @pytest.mark.parametrize("missing", [
-    "AGENT_EMAIL_IMAP_HOST", "AGENT_EMAIL_SMTP_HOST",
-    "AGENT_EMAIL_PASSWORD", "AGENT_EMAIL_ADDRESS",
+    "EMAIL_IMAP_HOST", "EMAIL_SMTP_HOST",
+    "EMAIL_PASSWORD", "EMAIL_ADDRESS",
 ])
 def test_half_a_mailbox_is_refused_rather_than_provisioned(tmp_path, missing):
     """Send-only or read-only is not a configuration this surface offers.
@@ -343,7 +367,7 @@ def test_comments_and_blank_lines_are_allowed_in_a_mail_config(tmp_path):
     run = harness.provision(tmp_path, "baron", "mailer",
                             "--email-config-file", _config_file(tmp_path, annotated))
     assert run.returncode == 0, run.output
-    assert run.secret_data("agent-baron-mailer-email", "AGENT_EMAIL_PASSWORD") == MAILBOX_PASSWORD
+    assert run.secret_data("agent-baron-mailer-email", "EMAIL_PASSWORD") == MAILBOX_PASSWORD
 
 
 def test_the_mailbox_is_orthogonal_to_the_model_credential(tmp_path):
@@ -357,7 +381,7 @@ def test_the_mailbox_is_orthogonal_to_the_model_credential(tmp_path):
     )
     assert run.returncode == 0, run.output
     assert run.secret_data("agent-baron-mailer-byo", "OPENAI_API_KEY") == "sk-users-own-provider-key"
-    assert run.secret_data("agent-baron-mailer-email", "AGENT_EMAIL_PASSWORD") == MAILBOX_PASSWORD
+    assert run.secret_data("agent-baron-mailer-email", "EMAIL_PASSWORD") == MAILBOX_PASSWORD
     labels = run.deployment()["spec"]["template"]["metadata"]["labels"]
     assert labels["agent.enterprise-ai/model-source"] == "byo"
 

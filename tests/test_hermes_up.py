@@ -49,14 +49,14 @@ SLACK_APP_TOKEN = "xapp-1-A999-8888-HeRmEsApPtOkEn-4d5e6f"
 DISCORD_BOT_TOKEN = "MTk4NzY1.HeRmEsDiScOrDtOkEn.7g8h9i"
 
 SLACK_CONFIG = f"""\
-AGENT_SLACK_BOT_TOKEN={SLACK_BOT_TOKEN}
-AGENT_SLACK_APP_TOKEN={SLACK_APP_TOKEN}
-AGENT_SLACK_DEFAULT_CHANNEL=C0123ABCD
+SLACK_BOT_TOKEN={SLACK_BOT_TOKEN}
+SLACK_APP_TOKEN={SLACK_APP_TOKEN}
+SLACK_HOME_CHANNEL=C0123ABCD
 """
 
 DISCORD_CONFIG = f"""\
-AGENT_DISCORD_BOT_TOKEN={DISCORD_BOT_TOKEN}
-AGENT_DISCORD_DEFAULT_CHANNEL=555000111222333444
+DISCORD_BOT_TOKEN={DISCORD_BOT_TOKEN}
+DISCORD_HOME_CHANNEL=555000111222333444
 """
 
 USER, NAME = "baron", "hermes"
@@ -162,16 +162,16 @@ class TestTheOneCommand:
         assert _ready(run), run.output
 
         # The Slack credential reached the cluster...
-        assert run.secret_data(f"{OBJ}-slack", "AGENT_SLACK_BOT_TOKEN") == SLACK_BOT_TOKEN
-        assert run.secret_data(f"{OBJ}-slack", "AGENT_SLACK_APP_TOKEN") == SLACK_APP_TOKEN
+        assert run.secret_data(f"{OBJ}-slack", "SLACK_BOT_TOKEN") == SLACK_BOT_TOKEN
+        assert run.secret_data(f"{OBJ}-slack", "SLACK_APP_TOKEN") == SLACK_APP_TOKEN
         # ...and Discord's did not. A default that provisions both is not a default.
-        assert run.secret_data(f"{OBJ}-discord", "AGENT_DISCORD_BOT_TOKEN") is None
+        assert run.secret_data(f"{OBJ}-discord", "DISCORD_BOT_TOKEN") is None
 
         # The in-pod validation probed SLACK's connector env vars, not Discord's. (The
         # probe reads the AGENT_* names the connector Secret injects; see the header NOTE on
         # the Hermes unprefixed-env translation still outstanding.)
-        assert "AGENT_SLACK_BOT_TOKEN" in run.calls
-        assert "AGENT_DISCORD_BOT_TOKEN" not in run.calls
+        assert "SLACK_BOT_TOKEN" in run.calls
+        assert "DISCORD_BOT_TOKEN" not in run.calls
 
     def test_the_default_inference_path_is_integrated_forge_not_byo(self, tmp_path):
         """Contract 4's default, all the way through to the rendered pod.
@@ -212,10 +212,10 @@ class TestTheOneCommand:
         assert _ready(run), run.output
 
         assert run.secret_data(f"{OBJ}-discord",
-                               "AGENT_DISCORD_BOT_TOKEN") == DISCORD_BOT_TOKEN
-        assert run.secret_data(f"{OBJ}-slack", "AGENT_SLACK_BOT_TOKEN") is None
-        assert "AGENT_DISCORD_BOT_TOKEN" in run.calls
-        assert "AGENT_SLACK_BOT_TOKEN" not in run.calls
+                               "DISCORD_BOT_TOKEN") == DISCORD_BOT_TOKEN
+        assert run.secret_data(f"{OBJ}-slack", "SLACK_BOT_TOKEN") is None
+        assert "DISCORD_BOT_TOKEN" in run.calls
+        assert "SLACK_BOT_TOKEN" not in run.calls
 
     def test_the_ready_summary_answers_the_five_questions_it_promises(self, tmp_path):
         """name, status, chat, the Forge path, and the console URL.
@@ -261,10 +261,10 @@ class TestItRefusesAFalseReady:
         # The connector Secret exists but its credential is not in the pod's environment —
         # the pod predates the Secret, because envFrom is injected at pod start and never
         # updated afterwards. The probe names the missing variable.
-        ({"chat-missing": "AGENT_SLACK_BOT_TOKEN"}, "AGENT_SLACK_BOT_TOKEN"),
+        ({"chat-missing": "SLACK_BOT_TOKEN"}, "SLACK_BOT_TOKEN"),
         # Slack posts with the bot token and RECEIVES over Socket Mode with the app token.
         # An agent missing the app token can talk and can never listen — not a wired agent.
-        ({"chat-missing": "AGENT_SLACK_APP_TOKEN"}, "AGENT_SLACK_APP_TOKEN"),
+        ({"chat-missing": "SLACK_APP_TOKEN"}, "SLACK_APP_TOKEN"),
         # `kubectl exec` itself failed — the connector environment could not be read at all.
         ({"chat-missing-rc": "3"}, "could not read the connector environment"),
         # The pod cannot reach the gateway at all — curl's connection failure.
@@ -453,10 +453,10 @@ class TestPreflightRefusals:
             _config_file(tmp_path, "discord", DISCORD_CONFIG))
         assert run.returncode == 0, run.output
         assert _ready(run)
-        assert "AGENT_DISCORD_BOT_TOKEN" in run.calls
-        assert "AGENT_SLACK_BOT_TOKEN" not in run.calls
+        assert "DISCORD_BOT_TOKEN" in run.calls
+        assert "SLACK_BOT_TOKEN" not in run.calls
         assert run.secret_data(f"{OBJ}-discord",
-                               "AGENT_DISCORD_BOT_TOKEN") == DISCORD_BOT_TOKEN
+                               "DISCORD_BOT_TOKEN") == DISCORD_BOT_TOKEN
 
 
 # ---------------------------------------------------------------------------------------
@@ -493,7 +493,7 @@ class TestRerunning:
         """
         first = _up(tmp_path / "first")
         assert first.returncode == 0, first.output
-        slack_sum = first.secret_data(f"{OBJ}-slack", "AGENT_SLACK_CONFIG_SUM")
+        slack_sum = first.secret_data(f"{OBJ}-slack", "SLACK_CONFIG_SUM")
         assert slack_sum, "the provisioner stored no slack sum to keep"
 
         second = harness.hermes_up(
