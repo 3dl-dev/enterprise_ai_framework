@@ -1563,6 +1563,64 @@ the concatenation the way the shell does, `deploy/bin/deploy.sh` puts all of the
 the trap: the control-plane image is built from `control-plane/` alone, so a file the
 deploy does not hand it is one it cannot ship even when it means to.
 
+### 50. The workshop could only build a single hand-written `index.html`, so the agent refused a 3D game
+
+A user asked the terminal agent for a 3D voxel game. The agent reached for Godot, then
+bounced: *everything has to be in `index.html`, there is no godot, there is no internet.*
+Every clause traces to the camp house rules, not the machine. The pod has had unrestricted
+internet since its first commit (finding 37 / `enterpriseaiframework-644`), and the preview
+and share have always served a whole directory — but `AGENTS.md` told the agent, in order:
+"one file: `index.html` … no build step, no bundler, no framework", "never start a server",
+and "never run `npm install` or `pip install`". An agent that obeys those cannot use an
+engine, cannot run a build, and cannot install a dependency, so it correctly concluded a 3D
+game was out of scope and said so.
+
+Finding 37 had kept those two rules deliberately — "good camp rules", only their false
+*network* justification removed. That was half right. Inlining a small canvas game keeps a
+share link robust, which is real. But read as a hard limit the same rules also wall off an
+entire class of project the machine can do easily, and the failure mode is the worst kind:
+the agent doesn't say "the machine can't", it says nothing and quietly refuses, and a child
+hears "you can't make that here." The founder's ruling: **no restrictions** — Godot, WebGL,
+or a hand-rolled engine are all fine, and the agent should be able to install its own
+dependencies.
+
+**Fixed** in `enterpriseaiframework-7832`, which reverses the "both rules kept" half of
+`-644`:
+
+- **`AGENTS.md` now grants what it used to forbid** — install dependencies, use an engine or
+  a framework, use as many files and a build step as the project needs. The two rules that
+  survive are the two that are actually true: the sandboxed preview throws on
+  `localStorage`/`sessionStorage`, and **what ships must stand on its own at view time** (a
+  live CDN reference can blank a shared page on venue wifi — a rule about the *published
+  output*, not about what you may use while building; an engine passes it because its export
+  bundles its own runtime).
+- **The preview serves a real WebAssembly build.** `shell-server.py` returns `.wasm` as
+  `application/wasm` (which `WebAssembly.instantiateStreaming` requires, or the game is a
+  blank canvas) plus the pack/data/model/font types an export emits, and sets
+  `Cross-Origin-Resource-Policy: cross-origin`. Godot's single-threaded web export — the
+  engine's own default since 4.3 — needs no `SharedArrayBuffer` and therefore no
+  cross-origin isolation, so it runs inside the existing sandboxed opaque-origin iframe and
+  on an iPad without touching the terminal iframe's headers.
+- **The engine path is turnkey but not baked.** `install-godot` and `godot-web-export` ship
+  on `PATH`; Godot (pinned 4.7.1, SHA512-verified like ttyd/opencode) installs on demand
+  onto the per-user PVC — the 1.3GB export-template download would bloat every pod, and most
+  projects never touch it. `godot-web-export` absorbs the two headless-export footguns
+  (imports first; writes a single-threaded Web preset when the project has none) so the
+  agent gets a working build instead of a stack trace. `publish`'s size cap moved from 20MB
+  to 256MB to fit an export.
+- **Big builds get a progress file, not a ticket system.** A multi-turn game needs the agent
+  to remember the thread across turns; `AGENTS.md` now asks it to keep a plain-language
+  `PLAN.md` (Done / Next, in words a nine-year-old reads) and narrate progress each turn.
+  Deliberately *not* `rd` or any ported practice tooling — hex IDs and a dependency DAG are
+  veteran instruments and the wrong altitude for the user. How much further to take
+  work-tracking (a rendered progress panel in the shell; a consumable subset of the practice
+  kit) is an open product decision, teed up on `-7832`.
+
+Covered by `tests/test_workspace_engine_support.py` (the house-rule grant, a regression
+guard that pins each retired prohibition out, the helpers' checksums, the Dockerfile, the
+`publish` cap) and a live `test_preview_serves_a_wasm_engine_build` against the running
+server. What is NOT yet covered hermetically: an end-to-end Godot export, because no Godot
+binary is present in the build/CI image — that wants a live smoke test on a provisioned pod.
 ### 51. The portal was published on port 8443, which venue wifi blocks, so an off-tailnet laptop got a connection timeout
 
 A user could not reach the portal from a laptop that was not on the tailnet: every load

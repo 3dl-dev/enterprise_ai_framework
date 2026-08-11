@@ -459,6 +459,35 @@ def test_preview_without_an_index_explains_itself(shell):
     assert b"index.html" in r.content
 
 
+def test_preview_serves_a_wasm_engine_build(shell):
+    """A WebAssembly engine export (Godot, Unity, a hand-rolled emscripten runtime) is only
+    reachable through this route, and it only RUNS if the .wasm comes back as exactly
+    application/wasm — `WebAssembly.instantiateStreaming` refuses anything else and the game
+    is a blank canvas. It also has to serve a multi-file build from subfolders, not just a
+    lone root index.html. This is the server half of "you can build a 3D game here".
+    """
+    game = shell.root / "alpha"
+    (game / "index.html").write_text("<canvas id=c></canvas><script src=game.js></script>")
+    (game / "game.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")  # the wasm magic bytes
+    (game / "game.pck").write_bytes(b"GDPC\x00\x00")             # a Godot data pack
+    (game / "assets").mkdir()
+    (game / "assets" / "world.glb").write_bytes(b"glTF\x02")
+
+    w = shell.get("/preview/game.wasm")
+    assert w.status_code == 200
+    assert w.headers["Content-Type"] == "application/wasm"
+    assert w.content.startswith(b"\x00asm")
+    # Lets a cross-origin-isolated (threaded) embedder load the module; harmless for the
+    # single-threaded default. Its silent absence is exactly how a threaded build fails.
+    assert w.headers.get("Cross-Origin-Resource-Policy") == "cross-origin"
+
+    assert shell.get("/preview/game.pck").headers["Content-Type"] == "application/octet-stream"
+
+    nested = shell.get("/preview/assets/world.glb")
+    assert nested.status_code == 200
+    assert nested.headers["Content-Type"] == "model/gltf-binary"
+
+
 @pytest.mark.parametrize("path", ["/preview/.git/config", "/preview/.meta/alpha.json"])
 def test_preview_refuses_repo_internals(shell, path):
     (shell.root / "alpha" / ".git").mkdir(exist_ok=True)
@@ -848,6 +877,32 @@ def test_the_booting_state_clears_once_an_agent_is_actually_running(page, tmp_pa
     finally:
         proc.kill()
         proc.wait(timeout=TIMEOUT)
+
+
+def test_pressing_enter_in_the_name_field_creates_the_project(page, shell):
+    """Enter is how a person submits a one-field form, and it must MAKE the project.
+
+    The bug: in `<form method="dialog">`, Enter triggers implicit submission, which fires
+    the form's FIRST submit button. "Cancel" was authored before "Make it", so a typed
+    name plus Enter closed the dialog with returnValue "cancel" — newProjectDialog resolved
+    null and createProject bailed. The dialog vanished and nothing was ever made, which is
+    exactly the reported symptom. The click-based _make_project helper never exercised this
+    path, so the whole browser suite passed while a name-and-Enter did nothing.
+    """
+    page.click("#project-button")
+    page.click("#project-menu button.new")
+    page.fill("#new-name", "enter game")
+    page.press("#new-name", "Enter")
+
+    # The booting overlay naming the project is proof the create path ran, not the cancel
+    # path. Before the fix this times out: the dialog closed to nothing.
+    page.wait_for_selector("#booting", state="visible", timeout=PAGE_TIMEOUT)
+    page.wait_for_function(
+        """() => document.getElementById('booting-text').textContent.includes('enter game')""",
+        timeout=PAGE_TIMEOUT,
+    )
+    # And the project really exists, under its slug, as the active one.
+    shell.wait_for(lambda p: p["project"] == "enter-game", "the new project to be active")
 
 
 def test_a_rejected_name_puts_the_terminal_back(page, shell):
