@@ -64,16 +64,19 @@ const api = {
 const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 /* Whole prompts, not vague ones. A vague ask gets a vague program and the child concludes
- * the tool is bad — the phrasing here is doing real work. Every one ends in
- * "One index.html." because the preview cannot reveal anything else, and this is the one
- * place that guarantee can be made. */
+ * the tool is bad — the phrasing here is doing real work. These used to each end in
+ * "One index.html.", from when a project could only be a single hand-written file. It can
+ * now be an engine build too (the agent's house rules cover how the output stays
+ * openable), so the suffix is dropped — a starter a child clicks must not re-impose the
+ * old limit as their literal words. The last one advertises that a real 3D game is on the
+ * table now, not just canvas toys. */
 const IDEAS = [
-  "Make a game where a unicorn runs and jumps over rocks. Put it all in one index.html.",
-  "Make a drawing app with rainbow paint and a button to clear it. One index.html.",
-  "Make a memory card game with animal emojis that I can actually play. One index.html.",
-  "Make a quiz that asks me questions and tells me which dinosaur I am. One index.html.",
-  "Make a maze I can walk through with the arrow keys. One index.html.",
-  "Make a music toy where every key plays a different sound. One index.html.",
+  "Make a game where a unicorn runs and jumps over rocks.",
+  "Make a drawing app with rainbow paint and a button to clear it.",
+  "Make a memory card game with animal emojis that I can actually play.",
+  "Make a quiz that asks me questions and tells me which dinosaur I am.",
+  "Make a maze I can walk through with the arrow keys.",
+  "Make a 3D world made of blocks I can walk around and build in.",
 ];
 
 let STATE = { projects: [], project: "", models: [], has_index: false };
@@ -774,6 +777,20 @@ function openStuck(reason) {
   $("dlg-stuck").showModal();
 }
 $("terminal-frame").addEventListener("load", refitTerminal);
+
+// The load + drawer-transition nudges above miss the case that actually bites a fresh
+// visit: the pane settles its FINAL size a beat after load — fonts, the preview drawer
+// arriving, the portal's own iframe laying out — and by then ttyd has already measured the
+// wrong row count and will only re-fit on a real window resize. That is the
+// maximize/unmaximize dance users discover. A ResizeObserver on the terminal's own box
+// catches every one of those late settles and re-fits, so the terminal is right on first
+// paint without anyone resizing anything. Dispatching the synthetic 'resize' does not
+// change the iframe element's size, so this cannot feed back into itself.
+if (window.ResizeObserver) {
+  const tf = $("terminal-frame");
+  if (tf) new ResizeObserver(() => refitTerminal()).observe(tf);
+}
+
 $("btn-new-session").addEventListener("click", async () => {
   if (!await confirmDialog({
     title: "Start a fresh chat?",
@@ -939,6 +956,16 @@ async function createProject() {
   // needs to be told which project they are now waiting on.
   await load(); reloadPanes(`Starting the agent in "${name}"…`); toast(data.message);
 }
+
+// Enter in this one-field form must MAKE the project. A <form method="dialog"> fires its
+// FIRST submit button on implicit (Enter) submission, and "Cancel" is authored before
+// "Make it", so a typed name plus Enter used to close the dialog with returnValue "cancel"
+// — newProjectDialog resolved null and createProject bailed, so the dialog just vanished
+// and nothing was ever made. Route Enter to the primary action; Cancel stays visually
+// first without being the keyboard default. isComposing guards an IME's own Enter.
+$("new-name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); $("new-go").click(); }
+});
 
 $("reset-project").addEventListener("click", async () => {
   $("dlg-settings").close();

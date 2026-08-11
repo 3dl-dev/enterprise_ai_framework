@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# godot-web-export — build a Godot project into a browser-ready folder in one step.
+#
+#   godot-web-export <project-dir> <output-dir>
+#
+# Godot's own headless export is famously fiddly, and each footgun looks to a child (and
+# to a model) like "the machine can't do this":
+#
+#   * it fails on a project that has never been imported (no .godot/ cache), and
+#   * it does nothing useful without a "Web" export preset in export_presets.cfg.
+#
+# So this wrapper imports first and writes a sane SINGLE-THREADED Web preset if the
+# project has none. Single-threaded (variant/thread_support=false) is Godot's own default
+# for the web since 4.3: it needs no SharedArrayBuffer and therefore no cross-origin
+# isolation, so the build runs inside the workshop preview's sandboxed iframe and on an
+# iPad, which the threaded build does not.
+set -euo pipefail
+
+usage() { echo "usage: godot-web-export <project-dir> <output-dir>" >&2; exit 2; }
+PROJECT="${1:-}"; OUT="${2:-}"
+[[ -n "$PROJECT" && -n "$OUT" ]] || usage
+
+TOOLS="${WS_TOOLS:-/workspace/.tools}"
+GODOT_BIN="${TOOLS}/bin/godot"
+if [[ ! -x "$GODOT_BIN" ]]; then
+    if command -v godot >/dev/null 2>&1; then
+        GODOT_BIN="$(command -v godot)"
+    else
+        echo "godot is not installed yet. Run 'install-godot' first." >&2
+        exit 1
+    fi
+fi
+
+[[ -d "$PROJECT" ]] || { echo "godot-web-export: no such directory: $PROJECT" >&2; exit 1; }
+PROJECT="$(cd "$PROJECT" && pwd)"
+if [[ ! -f "$PROJECT/project.godot" ]]; then
+    echo "godot-web-export: $PROJECT has no project.godot — that is not a Godot project." >&2
+    exit 1
+fi
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
+
+PRESETS="$PROJECT/export_presets.cfg"
+if [[ ! -f "$PRESETS" ]] || ! grep -q 'platform="Web"' "$PRESETS"; then
+    echo "==> no Web export preset found; writing a single-threaded one"
+    # Presets are numbered [preset.N]; pick the next free index so this does not collide
+    # with any preset the project already has (a Linux/Android preset, say).
+    LAST="$(grep -oE '^\[preset\.[0-9]+\]' "$PRESETS" 2>/dev/null \
+            | grep -oE '[0-9]+' | sort -rn | head -1 || true)"
+    IDX=$(( ${LAST:--1} + 1 ))
+    # The full key set Godot's exporter requires. include_filter / exclude_filter and the
+    # encryption/patches/seed keys have NO defaults in headless export — omit any one and the
+    # export aborts with "Couldn't find the given section/key". Verified live in a pod.
+    cat >> "$PRESETS" <<EOF
+
+[preset.${IDX}]
+
+name="Web"
+platform="Web"
+runnable=true
+advanced_options=false
+dedicated_server=false
+custom_features=""
+export_filter="all_resources"
+include_filter=""
+exclude_filter=""
+export_path="index.html"
+patches=PackedStringArray()
+encryption_include_filters=""
+encryption_exclude_filters=""
+seed=0
+encrypt_pck=false
+encrypt_directory=false
+script_export_mode=2
+
+[preset.${IDX}.options]
+
+custom_template/debug=""
+custom_template/release=""
+variant/extensions_support=false
+variant/thread_support=false
+vram_texture_compression/for_desktop=true
+# for_mobile MUST stay false: when true, Godot's export gate demands the mobile
+# (ETC2/ASTC) texture-import support a plain project has not configured, and the web
+# export then aborts with a BLANK "configuration errors" message. Verified live: flipping
+# only this key is the difference between a produced index.html+wasm and a silent failure.
+vram_texture_compression/for_mobile=false
+html/export_icon=true
+html/custom_html_shell=""
+html/head_include=""
+html/canvas_resize_policy=2
+html/focus_canvas_on_start=true
+html/experimental_virtual_keyboard=false
+progressive_web_app/enabled=false
+EOF
+fi
+
+echo "==> importing project (first build only; this is the slow part)"
+# --import builds the resource cache a headless export needs. Tolerate a non-zero exit:
+# some project setups report import warnings as errors but still produce a usable cache,
+# and the export below is the real success check.
+"$GODOT_BIN" --headless --path "$PROJECT" --import >/dev/null 2>&1 || true
+
+echo "==> exporting Web build to $OUT"
+"$GODOT_BIN" --headless --path "$PROJECT" --export-release "Web" "$OUT/index.html"
+
+if [[ ! -f "$OUT/index.html" ]]; then
+    echo "godot-web-export: the export ran but produced no index.html in $OUT." >&2
+    echo "                  Check the messages above; the most common cause is missing" >&2
+    echo "                  export templates — run 'install-godot' to (re)install them." >&2
+    exit 1
+fi
+
+echo
+echo "Done. Point the child at $OUT — it has an index.html the preview can open,"
+echo "and 'publish' (from inside it) will share it."

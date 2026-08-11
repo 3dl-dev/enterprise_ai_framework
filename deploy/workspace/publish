@@ -61,10 +61,17 @@ if [[ ! -f "$SRC/index.html" ]]; then
     exit 1
 fi
 
+# node_modules and .git are excluded (they never belong in a published folder); the cap
+# is on what actually ships. 20MB fit a single hand-written index.html with inlined art,
+# but a real engine export does not: a Godot or Unity WebAssembly build is a ~30-60MB
+# .wasm plus a packed-data blob, all of it legitimately part of the game. The cap exists
+# so a whole source tree does not get shipped by accident, not to rule out engines — so it
+# sits above a normal engine export and below "you published the wrong directory".
 SIZE_KB=$(du -sk --exclude=.git --exclude=node_modules "$SRC" | cut -f1)
-if (( SIZE_KB > 20480 )); then
-    echo "publish: that folder is ${SIZE_KB}KB, larger than this is meant for." >&2
-    echo "         Publish a built folder rather than the whole project." >&2
+if (( SIZE_KB > 262144 )); then
+    echo "publish: that folder is ${SIZE_KB}KB (over 256MB), larger than a share is meant for." >&2
+    echo "         If this is an engine project, publish the exported build folder" >&2
+    echo "         (e.g. 'publish dist') rather than the whole project with its source." >&2
     exit 1
 fi
 
