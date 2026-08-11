@@ -19,10 +19,10 @@ and they are the only things worth a test here:
 
   2. THE REFUSAL TO PRINT READY OVER SOMETHING THAT WAS NOT OBSERVED. This is the half that
      can only be proven by breaking it, so most of this file injects a real failure — a
-     Deployment that is not Available, a pod that is not Running, a chat tool whose tokens
-     are missing, an opencode that was never told the tool exists, a gateway that answers
-     000 — and asserts the word READY does not appear and the exit is non-zero. A validator
-     nobody has watched refuse is a validator nobody has evidence works.
+     Deployment that is not Available, a pod that is not Running, a connector credential
+     missing from the pod's environment, a gateway that answers 000 — and asserts the word
+     READY does not appear and the exit is non-zero. A validator nobody has watched refuse
+     is a validator nobody has evidence works.
 
 EXPECTED VALUES COME FROM THE OTHER SIDE OF THE SEAM, NOT FROM THE SCRIPT UNDER TEST.
 The integrated gateway base is read out of provision-agent.sh (which defines it) rather
@@ -66,10 +66,10 @@ OBJ = f"agent-{USER}-{NAME}"
 def _gateway_base_from_the_provisioner() -> str:
     """The integrated base, read from the script that DEFINES it.
 
-    provision-agent.sh sets GATEWAY_BASE and points OPENAI_API_BASE at it in integrated
-    mode; hermes-up.sh only asserts that the pod really ended up there. Taking the expected
-    value from the definition means a change to one side is a test failure rather than a
-    matched pair of edits nobody notices.
+    provision-agent.sh sets GATEWAY_BASE and seeds it as the config.yaml base_url in
+    integrated mode; hermes-up.sh only asserts that the pod really ended up there. Taking
+    the expected value from the definition means a change to one side is a test failure
+    rather than a matched pair of edits nobody notices.
     """
     text = (REPO / "deploy/bin/provision-agent.sh").read_text()
     match = re.search(r'^GATEWAY_BASE="([^"]+)"', text, re.M)
@@ -131,6 +131,19 @@ def _env(dep: dict) -> dict:
     return out
 
 
+def _config_yaml(run) -> str:
+    """The seeded config.yaml out of the per-agent config ConfigMap the template renders.
+
+    The Hermes retarget moved the provider base_url and the model out of the pod's env and
+    into `$HERMES_HOME/config.yaml`, seeded from `agent-<user>-<name>-config`. So "where does
+    inference go" is read from the ConfigMap now, not from an OPENAI_API_BASE env var.
+    """
+    for doc in yaml.safe_load_all(run.applied):
+        if doc and doc.get("kind") == "ConfigMap" and doc["metadata"]["name"] == f"{OBJ}-config":
+            return doc["data"]["config.yaml"]
+    raise AssertionError(f"no per-agent config ConfigMap {OBJ}-config was applied")
+
+
 # ---------------------------------------------------------------------------------------
 # 1. The defaults: one command, and it is the integrated Forge path with Slack.
 # ---------------------------------------------------------------------------------------
@@ -154,11 +167,11 @@ class TestTheOneCommand:
         # ...and Discord's did not. A default that provisions both is not a default.
         assert run.secret_data(f"{OBJ}-discord", "AGENT_DISCORD_BOT_TOKEN") is None
 
-        # The in-pod validation asked SLACK's tool, and about SLACK's instructions doc.
-        assert "agent-slack config" in run.calls
-        assert "agent-discord config" not in run.calls
-        assert "/etc/agent/SLACK.md" in run.calls
-        assert "/etc/agent/DISCORD.md" not in run.calls
+        # The in-pod validation probed SLACK's connector env vars, not Discord's. (The
+        # probe reads the AGENT_* names the connector Secret injects; see the header NOTE on
+        # the Hermes unprefixed-env translation still outstanding.)
+        assert "AGENT_SLACK_BOT_TOKEN" in run.calls
+        assert "AGENT_DISCORD_BOT_TOKEN" not in run.calls
 
     def test_the_default_inference_path_is_integrated_forge_not_byo(self, tmp_path):
         """Contract 4's default, all the way through to the rendered pod.
@@ -175,10 +188,10 @@ class TestTheOneCommand:
         labels = dep["spec"]["template"]["metadata"]["labels"]
         assert labels["agent.enterprise-ai/model-source"] == "integrated"
 
+        # The seeded config.yaml routes inference at our gateway (integrated), and the pod's
+        # env carries the minted-virtual-key Secret, not the BYO one.
+        assert f"base_url: {GATEWAY_BASE}" in _config_yaml(run)
         env = _env(dep)
-        assert env["OPENAI_API_BASE"] == GATEWAY_BASE
-        assert env["OPENAI_BASE_URL"] == GATEWAY_BASE
-        # The key comes from the minted-virtual-key Secret, not the BYO one.
         assert env["OPENAI_API_KEY"]["secretKeyRef"]["name"] == f"{OBJ}-key"
 
         # And the key really was minted through the control plane, under Contract 1's
@@ -201,9 +214,8 @@ class TestTheOneCommand:
         assert run.secret_data(f"{OBJ}-discord",
                                "AGENT_DISCORD_BOT_TOKEN") == DISCORD_BOT_TOKEN
         assert run.secret_data(f"{OBJ}-slack", "AGENT_SLACK_BOT_TOKEN") is None
-        assert "agent-discord config" in run.calls
-        assert "/etc/agent/DISCORD.md" in run.calls
-        assert "agent-slack config" not in run.calls
+        assert "AGENT_DISCORD_BOT_TOKEN" in run.calls
+        assert "AGENT_SLACK_BOT_TOKEN" not in run.calls
 
     def test_the_ready_summary_answers_the_five_questions_it_promises(self, tmp_path):
         """name, status, chat, the Forge path, and the console URL.
@@ -246,20 +258,15 @@ class TestItRefusesAFalseReady:
         # looks; CrashLoopBackOff presents as a phase that is not Running.
         ({"pod-phase": "Pending"}, "not Running"),
         ({"pod-name": ""}, "no pod found"),
-        # The tool is on PATH and cannot see its credential — the pod predates the Secret,
-        # because envFrom is injected at pod start and never updated afterwards.
-        ({"chat-config": '{"bot_token_set": false, "app_token_set": true}'},
-         "bot_token_set"),
+        # The connector Secret exists but its credential is not in the pod's environment —
+        # the pod predates the Secret, because envFrom is injected at pod start and never
+        # updated afterwards. The probe names the missing variable.
+        ({"chat-missing": "AGENT_SLACK_BOT_TOKEN"}, "AGENT_SLACK_BOT_TOKEN"),
         # Slack posts with the bot token and RECEIVES over Socket Mode with the app token.
-        # An agent that can talk and can never listen is not a wired agent.
-        ({"chat-config": '{"bot_token_set": true, "app_token_set": false}'},
-         "app_token_set"),
-        # The tool is not on PATH at all: the entrypoint ConfigMap did not roll.
-        ({"chat-config": "", "chat-config-rc": "3"}, "did not report a configuration"),
-        # opencode was never told the tool exists. entrypoint.sh falls back to the image
-        # config rather than CrashLooping every agent over a documentation file, so this
-        # failure is SILENT on the cluster: the agent simply never reaches for chat.
-        ({"doc-state": "DOC_MISSING"}, "never told about"),
+        # An agent missing the app token can talk and can never listen — not a wired agent.
+        ({"chat-missing": "AGENT_SLACK_APP_TOKEN"}, "AGENT_SLACK_APP_TOKEN"),
+        # `kubectl exec` itself failed — the connector environment could not be read at all.
+        ({"chat-missing-rc": "3"}, "could not read the connector environment"),
         # The pod cannot reach the gateway at all — curl's connection failure.
         ({"gateway-out": f"000 {GATEWAY_BASE} glm-5.2@deepinfra"}, "'000'"),
         # The minted key is not live at the gateway.
@@ -301,7 +308,10 @@ class TestItRefusesAFalseReady:
         run = _up(tmp_path)
         assert run.returncode == 0, run.output
         execs = [line for line in run.calls.splitlines() if " exec " in line]
-        assert len(execs) == 3, execs
+        # Two in-pod checks under Hermes: the connector env presence probe and the real
+        # inference. (opencode had a third — the opencode.json instructions-doc check — which
+        # the retarget removed with the doc-composition entrypoint.)
+        assert len(execs) == 2, execs
         assert "unrecognised in-pod script" not in run.output
 
 
@@ -443,8 +453,8 @@ class TestPreflightRefusals:
             _config_file(tmp_path, "discord", DISCORD_CONFIG))
         assert run.returncode == 0, run.output
         assert _ready(run)
-        assert "agent-discord config" in run.calls
-        assert "agent-slack config" not in run.calls
+        assert "AGENT_DISCORD_BOT_TOKEN" in run.calls
+        assert "AGENT_SLACK_BOT_TOKEN" not in run.calls
         assert run.secret_data(f"{OBJ}-discord",
                                "AGENT_DISCORD_BOT_TOKEN") == DISCORD_BOT_TOKEN
 

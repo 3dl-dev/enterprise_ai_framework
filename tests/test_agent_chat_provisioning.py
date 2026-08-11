@@ -27,7 +27,6 @@ including the ones that would look redundant if the implementation were three co
 """
 
 import base64
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -80,13 +79,6 @@ def _provision(tmp_path: Path, label: str, content: str | None = None, **kwargs)
 
 def _annotations(run) -> dict:
     return run.deployment()["spec"]["template"]["metadata"]["annotations"]
-
-
-def _configmap(run, name: str) -> dict | None:
-    for doc in yaml.safe_load_all(run.applied):
-        if doc and doc.get("kind") == "ConfigMap" and doc["metadata"]["name"] == name:
-            return doc
-    return None
 
 
 # ---------------------------------------------------------------- the credential lands
@@ -222,69 +214,14 @@ def test_the_pod_takes_every_connector_as_optional_env(tmp_path):
         assert source["secretRef"]["optional"] is True, source
 
     # `env` must still win over `envFrom`, which is what stops a chat config file from
-    # overriding the spendable model credential or the daemon's own password. Kubernetes
-    # guarantees the precedence; this asserts we did not move them into envFrom and lose it.
+    # overriding the spendable model credential. Kubernetes guarantees the precedence; this
+    # asserts we did not move it into envFrom and lose it. The opencode daemon's
+    # OPENCODE_SERVER_PASSWORD is gone — `hermes gateway run` opens no inbound port.
     explicit = {e["name"] for e in container["env"]}
-    assert {"OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD"} <= explicit
-
-
-def test_the_chat_tools_are_delivered_to_the_pod_and_are_executable(tmp_path):
-    """The CLIs travel in the entrypoint ConfigMap, mounted 0755.
-
-    The image is the workspace image byte-for-byte (Contract 6), so they cannot be baked in;
-    they arrive the same way the entrypoint does. 0644 would leave them present, on PATH,
-    and "permission denied" — the most confusing possible way for a tool to be missing.
-    """
-    run = _provision(tmp_path, "slack")
-    configmap = _configmap(run, "agent-entrypoint")
-    assert configmap is not None, "the entrypoint ConfigMap was never applied"
-
-    for key, source in (("agent-slack", "deploy/agent/agent-slack"),
-                        ("agent-discord", "deploy/agent/agent-discord"),
-                        ("agentws.py", "deploy/agent/agentws.py"),
-                        ("SLACK.md", "deploy/agent/SLACK.md"),
-                        ("DISCORD.md", "deploy/agent/DISCORD.md")):
-        assert key in configmap["data"], f"{key} never reaches the pod"
-        assert base64.b64decode(configmap["data"][key]).decode() == \
-            (REPO / source).read_text(), \
-            f"the ConfigMap does not carry the {key} in this checkout"
-
-    volume = next(v for v in run.deployment()["spec"]["template"]["spec"]["volumes"]
-                  if v["name"] == "entrypoint")
-    assert volume["configMap"]["defaultMode"] == 0o755
-
-
-def test_the_websocket_module_ships_beside_the_tools_that_import_it(tmp_path):
-    """agentws.py is not a command, it is the RFC 6455 client both tools import.
-
-    They add their own directory to sys.path, so it has to land in the SAME ConfigMap and
-    therefore the same /etc/agent mount. Shipping one without the other is an ImportError at
-    the moment an unattended agent tries to use Slack — which is the moment nobody is
-    watching.
-    """
-    run = _provision(tmp_path, "discord")
-    data = _configmap(run, "agent-entrypoint")["data"]
-    assert {"agent-slack", "agent-discord", "agentws.py"} <= set(data)
-    for tool in ("agent-slack", "agent-discord"):
-        source = base64.b64decode(data[tool]).decode()
-        assert "import agentws" in source
-
-
-def test_editing_a_chat_tool_rolls_the_agents(tmp_path):
-    """The rollout annotation covers every file in the ConfigMap, not just the mail ones.
-
-    Expected value derived here from the source files directly, so a provisioner that kept
-    hashing only entrypoint.sh + agent-email + EMAIL.md — leaving a changed agent-slack
-    sitting in a ConfigMap that no pod ever re-read — fails this rather than passing quietly.
-    """
-    run = _provision(tmp_path, "slack")
-    expected = subprocess.run(
-        "cat deploy/agent/entrypoint.sh deploy/agent/agent-email deploy/agent/EMAIL.md "
-        "deploy/agent/agent-slack deploy/agent/SLACK.md deploy/agent/agent-discord "
-        "deploy/agent/DISCORD.md deploy/agent/agentws.py | sha256sum | cut -c1-16",
-        shell=True, capture_output=True, text=True, cwd=str(REPO), timeout=60,
-    ).stdout.strip()
-    assert _annotations(run)["checksum/entrypoint"] == expected
+    assert "OPENAI_API_KEY" in explicit
+    assert "OPENCODE_SERVER_PASSWORD" not in explicit, (
+        "the opencode server password is retired; there is no inbound port to guard"
+    )
 
 
 @pytest.mark.parametrize("label", list(CONNECTORS))

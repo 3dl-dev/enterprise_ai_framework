@@ -26,7 +26,6 @@ catch its absence.
 """
 
 import base64
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -60,13 +59,6 @@ def _config_file(tmp_path: Path, content: str = MAILBOX) -> str:
     path.write_text(content)
     path.chmod(0o600)
     return str(path)
-
-
-def _configmap(run, name: str) -> dict | None:
-    for doc in yaml.safe_load_all(run.applied):
-        if doc and doc.get("kind") == "ConfigMap" and doc["metadata"]["name"] == name:
-            return doc
-    return None
 
 
 def _annotations(run) -> dict:
@@ -204,70 +196,14 @@ def test_the_pod_takes_the_mailbox_as_optional_env_so_agents_without_one_still_s
         )
 
     # `env` must still win over `envFrom`, which is what stops a mail config file from
-    # overriding the spendable model credential or the daemon's own password. Kubernetes
-    # guarantees the precedence; this asserts we did not move them into envFrom and lose
-    # it.
+    # overriding the spendable model credential. Kubernetes guarantees the precedence; this
+    # asserts we did not move it into envFrom and lose it. The opencode daemon's
+    # OPENCODE_SERVER_PASSWORD is gone — `hermes gateway run` opens no inbound port.
     explicit = {e["name"] for e in container["env"]}
-    assert {"OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD"} <= explicit
-
-
-def test_the_mail_tool_is_delivered_to_the_pod_and_is_executable(tmp_path):
-    """The CLI travels in the entrypoint ConfigMap, mounted 0755.
-
-    The image is the workspace image byte-for-byte (Contract 6), so the tool cannot be
-    baked in; it arrives the same way the entrypoint does. 0644 would leave it present, on
-    PATH, and "permission denied" — the most confusing possible way for a tool to be
-    missing.
-    """
-    run = harness.provision(tmp_path, "baron", "mailer",
-                            "--email-config-file", _config_file(tmp_path))
-
-    configmap = _configmap(run, "agent-entrypoint")
-    assert configmap is not None, "the entrypoint ConfigMap was never applied"
-    assert set(configmap["data"]) == {
-        "entrypoint.sh",
-        "agent-email", "EMAIL.md",
-        # enterpriseaiframework-783 added the chat connectors to the same ConfigMap, for
-        # the reason the provisioner records: they roll together with the entrypoint that
-        # puts them on PATH.
-        "agent-slack", "SLACK.md",
-        "agent-discord", "DISCORD.md",
-        "agentws.py",
-    }
-
-    shipped = base64.b64decode(configmap["data"]["agent-email"]).decode()
-    assert shipped == (REPO / "deploy/agent/agent-email").read_text(), \
-        "the ConfigMap does not carry the agent-email in this checkout"
-
-    volume = next(v for v in run.deployment()["spec"]["template"]["spec"]["volumes"]
-                  if v["name"] == "entrypoint")
-    assert volume["configMap"]["defaultMode"] == 0o755, (
-        "the entrypoint volume is not executable, so `agent-email` on PATH is a "
-        "permission error rather than a tool."
+    assert "OPENAI_API_KEY" in explicit
+    assert "OPENCODE_SERVER_PASSWORD" not in explicit, (
+        "the opencode server password is retired; there is no inbound port to guard"
     )
-
-    entrypoint = base64.b64decode(configmap["data"]["entrypoint.sh"]).decode()
-    assert "/etc/agent" in entrypoint and "PATH=" in entrypoint, \
-        "the entrypoint does not put the mail tool on PATH"
-
-
-def test_editing_the_mail_tool_rolls_the_agents(tmp_path):
-    """The rollout annotation covers all three files in the ConfigMap, not just one.
-
-    Expected value derived here from the source files directly, so a provisioner that went
-    back to hashing entrypoint.sh alone — leaving a changed agent-email sitting in a
-    ConfigMap that no pod ever re-read — fails this rather than passing quietly.
-    """
-    run = harness.provision(tmp_path, "baron", "mailer",
-                            "--email-config-file", _config_file(tmp_path))
-    expected = subprocess.run(
-        "cat deploy/agent/entrypoint.sh deploy/agent/agent-email deploy/agent/EMAIL.md "
-        "deploy/agent/agent-slack deploy/agent/SLACK.md deploy/agent/agent-discord "
-        "deploy/agent/DISCORD.md deploy/agent/agentws.py "
-        "| sha256sum | cut -c1-16",
-        shell=True, capture_output=True, text=True, cwd=str(REPO), timeout=60,
-    ).stdout.strip()
-    assert _annotations(run)["checksum/entrypoint"] == expected
 
 
 def test_a_resupplied_mailbox_rolls_the_pod(tmp_path):
