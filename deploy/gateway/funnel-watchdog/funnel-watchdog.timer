@@ -1,0 +1,10 @@
+[Unit]
+Description=Probe the public Tailscale Funnel path every 30s
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=30
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Recover the public Tailscale Funnel path if it wedges (interim; see enterpriseaiframework-b66)
+After=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/funnel-watchdog
