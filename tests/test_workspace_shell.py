@@ -770,6 +770,41 @@ def test_an_unknown_model_is_refused_and_changes_nothing(shell):
     assert shell.get("/api/state").json()["model"] == before
 
 
+def test_every_offered_model_is_declared_in_opencode_config(shell):
+    """A model the picker offers must exist in opencode.json's provider block, or opencode
+    cannot resolve it and the session fails on that pick. This is the invariant that keeps
+    shell-server.py's MODELS list and the baked agent config from drifting apart — adding a
+    picker entry without declaring the model is exactly the mistake it catches."""
+    offered = {m["id"] for m in shell.get("/api/state").json()["models"]}
+    config = json.loads((SERVER.parent / "opencode.json").read_text())
+    declared = set(config["provider"]["enterprise-ai"]["models"])
+    missing = offered - declared
+    assert not missing, (
+        f"the picker offers {sorted(missing)} but opencode.json declares no such "
+        f"model — opencode cannot resolve it and the session would fail to start"
+    )
+
+
+def test_glm_5_2_remains_the_default_model(shell):
+    """Switching models is opt-in and per-project, so adding alternates to the picker must
+    not move the default: a new project — and every running session — stays on GLM 5.2
+    unless someone actively picks otherwise."""
+    config = json.loads((SERVER.parent / "opencode.json").read_text())
+    assert config["model"] == "enterprise-ai/glm-5.2@deepinfra", (
+        "the baked default model changed — adding alternates must stay additive"
+    )
+    assert shell.get("/api/state").json()["models"][0]["id"] == "glm-5.2@deepinfra"
+
+
+def test_switching_to_an_added_alternate_is_accepted(shell):
+    """An added alternate is selectable end to end, not merely listed — this exercises the
+    allow-list gate in _set_agent_model for a model beyond the original two."""
+    alt = "qwen3-coder-480b-a35b-instruct@deepinfra"
+    r = shell.post("/api/model", {"model": alt})
+    assert r.status_code == 200, r.text
+    assert shell.get("/api/state").json()["model"] == alt
+
+
 # ------------------------------------------------------------------ booting state
 #
 # These drive the REAL page in a real browser rather than asserting on the source, because
