@@ -112,11 +112,20 @@ PORT = int(os.environ.get("WS_SHELL_PORT", "7682"))
 # network is worse than a workshop that will not load.
 INTERNAL_TOKEN = os.environ.get("WS_INTERNAL_TOKEN", "")
 
-# Offered in Settings. Kept in step with the gateway catalogue; the agent config declares
-# the same two with their real context and output limits.
+# Offered in Settings. GLM 5.2 stays first so it remains the default a new project starts
+# on — switching is opt-in and per-project, so adding alternates here never touches a
+# running session. Every id MUST also be declared in opencode.json's
+# `provider.enterprise-ai.models` block with its real context and output limits, or
+# opencode cannot resolve it. Kept in step with the gateway catalogue.
 MODELS = [
     {"id": "glm-5.2@deepinfra", "label": "GLM 5.2 — better at hard things"},
     {"id": "glm-4.7@deepinfra", "label": "GLM 4.7 — faster and cheaper"},
+    {"id": "qwen3-coder-480b-a35b-instruct@deepinfra",
+     "label": "Qwen3 Coder — fast, coding-tuned, no reasoning stall"},
+    {"id": "deepseek-v4-pro@deepinfra",
+     "label": "DeepSeek V4 Pro — hardest tasks, 1M context"},
+    {"id": "deepseek-v4-flash@deepinfra",
+     "label": "DeepSeek V4 Flash — cheapest, huge context"},
 ]
 
 

@@ -22,6 +22,27 @@
             "context": 128000,
             "output": 32768
           }
+        },
+        "qwen3-coder-480b-a35b-instruct@deepinfra": {
+          "name": "Qwen3 Coder 480B",
+          "limit": {
+            "context": 262144,
+            "output": 32768
+          }
+        },
+        "deepseek-v4-pro@deepinfra": {
+          "name": "DeepSeek V4 Pro",
+          "limit": {
+            "context": 1048576,
+            "output": 32768
+          }
+        },
+        "deepseek-v4-flash@deepinfra": {
+          "name": "DeepSeek V4 Flash",
+          "limit": {
+            "context": 1048576,
+            "output": 32768
+          }
         }
       }
     }
