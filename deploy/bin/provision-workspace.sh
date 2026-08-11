@@ -162,7 +162,7 @@ KEYSUM=$(printf '%s' "$VKEY" | sha256sum | cut -c1-16)
 # Where a published page can be opened from. Deliberately NOT behind oauth2-proxy: the
 # audience is parents, who have no account. Override to a funnel-fronted URL when one
 # exists; the LAN NodePort is the honest default.
-PUBLISH_URL="${PUBLISH_URL:-https://gateway.tailcb6ef9.ts.net:8443}"
+PUBLISH_URL="${PUBLISH_URL:-https://gateway.tailcb6ef9.ts.net}"
 
 # ---------------------------------------------------------------- apply
 kubectl apply -f deploy/k8s/60-workspace-common.yaml >/dev/null

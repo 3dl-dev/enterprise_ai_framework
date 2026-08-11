@@ -5,7 +5,7 @@
 # changes cannot be made by editing the realm Secret and redeploying. They go through the
 # admin API instead, which works on a running cluster and is idempotent.
 #
-#   PUBLIC_BASE_URL=https://host:8443 deploy/bin/post-deploy.sh
+#   PUBLIC_BASE_URL=https://host deploy/bin/post-deploy.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

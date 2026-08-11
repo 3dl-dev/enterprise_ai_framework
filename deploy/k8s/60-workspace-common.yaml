@@ -129,13 +129,14 @@ spec:
       ports:
         - { protocol: TCP, port: 8080 }
 
-    # The public TLS edge, for the oauth2-proxy sidecar's OIDC backchannel. The sidecar
-    # shares this network namespace with the shell, so the shell can reach it too — it is
-    # the same endpoint any browser on the internet can reach, and it needs credentials.
+    # The public TLS edge, for the OIDC backchannel. The public origin moved from the
+    # nonstandard :8443 to :443 (enterpriseaiframework-e32: venue wifi blocks 8443), so the
+    # issuer — and this egress — is now :443. It is the same endpoint any browser on the
+    # internet can reach, and it needs credentials.
     - to:
         - ipBlock: { cidr: 192.168.2.42/32 }
       ports:
-        - { protocol: TCP, port: 8443 }
+        - { protocol: TCP, port: 443 }
 
     # The internet, for pip / npm / git clone. Every private range is excluded, which is
     # what closes the routes that matter:
