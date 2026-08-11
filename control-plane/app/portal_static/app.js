@@ -631,34 +631,44 @@ async function deleteAgent(name) {
    endpoint that returns a credential, so the only place these values ever exist on this
    page is between the keystroke and the POST. */
 
+// The keys are Hermes's own env var names (SLACK_BOT_TOKEN, not AGENT_SLACK_BOT_TOKEN) —
+// the same names `hermes gateway run` reads. test_portal_connectors.py checks this list,
+// the endpoint's allowlist and provision-agent.sh all agree.
 const CONNECTOR_FIELDS = {
   slack: [
-    { key: "AGENT_SLACK_BOT_TOKEN", label: "Bot token", hint: "starts xoxb-",
+    { key: "SLACK_BOT_TOKEN", label: "Bot token", hint: "starts xoxb-",
       secret: true, required: true },
     // Both, always. The bot token posts; the app-level token opens the Socket Mode
     // connection the agent LISTENS on. With only the first it can talk and never hear an
     // answer, which is not a state worth letting somebody create.
-    { key: "AGENT_SLACK_APP_TOKEN", label: "App-level token", hint: "starts xapp-",
+    { key: "SLACK_APP_TOKEN", label: "App-level token", hint: "starts xapp-",
       secret: true, required: true },
-    { key: "AGENT_SLACK_DEFAULT_CHANNEL", label: "Default channel",
+    { key: "SLACK_HOME_CHANNEL", label: "Home channel",
       hint: "optional — a channel id like C0123ABCD" },
+    // Deny-by-default: without this the bot connects but answers no one. Comma-separated
+    // Slack user ids (Uxxxx). Leave blank to keep it silent until you add someone.
+    { key: "SLACK_ALLOWED_USERS", label: "Allowed users",
+      hint: "optional but needed to get replies — comma-separated Slack user ids (Uxxxx)" },
   ],
   discord: [
-    { key: "AGENT_DISCORD_BOT_TOKEN", label: "Bot token", secret: true, required: true },
-    { key: "AGENT_DISCORD_DEFAULT_CHANNEL", label: "Default channel",
+    { key: "DISCORD_BOT_TOKEN", label: "Bot token", secret: true, required: true },
+    { key: "DISCORD_HOME_CHANNEL", label: "Home channel",
       hint: "optional — a channel id" },
+    { key: "DISCORD_ALLOWED_USERS", label: "Allowed users",
+      hint: "optional but needed to get replies — comma-separated Discord user ids" },
+    { key: "DISCORD_ALLOWED_ROLES", label: "Allowed roles",
+      hint: "optional — comma-separated Discord role ids" },
   ],
   email: [
-    { key: "AGENT_EMAIL_ADDRESS", label: "Address", required: true,
-      hint: "the address it sends from" },
-    { key: "AGENT_EMAIL_USERNAME", label: "Username", hint: "optional — defaults to the address" },
-    { key: "AGENT_EMAIL_PASSWORD", label: "Password", secret: true, required: true },
-    { key: "AGENT_EMAIL_SMTP_HOST", label: "SMTP host", required: true },
-    { key: "AGENT_EMAIL_SMTP_PORT", label: "SMTP port", hint: "optional" },
-    { key: "AGENT_EMAIL_SMTP_SECURITY", label: "SMTP security", hint: "starttls or ssl" },
-    { key: "AGENT_EMAIL_IMAP_HOST", label: "IMAP host", required: true },
-    { key: "AGENT_EMAIL_IMAP_PORT", label: "IMAP port", hint: "optional" },
-    { key: "AGENT_EMAIL_IMAP_SECURITY", label: "IMAP security", hint: "ssl or starttls" },
+    { key: "EMAIL_ADDRESS", label: "Address", required: true,
+      hint: "the mailbox it sends and receives as" },
+    { key: "EMAIL_PASSWORD", label: "Password", secret: true, required: true,
+      hint: "an app password, not your login password" },
+    // Hermes auto-detects ports and TLS, so there is no port/security/username to set.
+    { key: "EMAIL_SMTP_HOST", label: "SMTP host", required: true, hint: "e.g. smtp.office365.com" },
+    { key: "EMAIL_IMAP_HOST", label: "IMAP host", required: true, hint: "e.g. outlook.office365.com" },
+    { key: "EMAIL_ALLOW_ALL_USERS", label: "Reply to anyone",
+      hint: "optional — set to true to answer any sender; blank keeps it deny-by-default" },
   ],
 };
 

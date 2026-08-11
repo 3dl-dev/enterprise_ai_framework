@@ -354,26 +354,12 @@ fi
 # tests/test_agent_no_chat_server.py asserts it against every deploy manifest rather than
 # trusting this comment.
 #
-# TODO(enterpriseaiframework-8a9): Hermes env-var mapping. The Secret KEYS below are still
-# the opencode `AGENT_*` names, kept deliberately so the shell stays byte-for-byte in step
-# with control-plane/app/agents.py's CONNECTORS allowlist — the two are bound by
-# control-plane/tests/test_portal_connectors.py::test_the_python_schema_matches_the_shell
-# _provisioners_allowlists, which is part of the frozen-green control-plane suite. But
-# `hermes gateway run` reads its NATIVE messaging connectors from UNPREFIXED env vars
-# (discovered live from nousresearch/hermes-agent:v2026.8.3):
-#
-#     email   : EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_IMAP_HOST, EMAIL_SMTP_HOST
-#               (+ EMAIL_HOME_ADDRESS, EMAIL_ALLOW_ALL_USERS; ports/SSL auto-detected —
-#                Hermes has NO EMAIL_USERNAME / _SMTP_PORT / _IMAP_PORT / _*_SECURITY env)
-#     slack   : SLACK_BOT_TOKEN, SLACK_APP_TOKEN (+ SLACK_HOME_CHANNEL, SLACK_ALLOWED_USERS)
-#     discord : DISCORD_BOT_TOKEN (+ DISCORD_HOME_CHANNEL, DISCORD_ALLOWED_USERS,
-#               DISCORD_ALLOWED_ROLES; GATEWAY_ALLOW_ALL_USERS is the deny-by-default opt-out)
-#
-# So a translation step (rename `AGENT_SLACK_BOT_TOKEN` -> `SLACK_BOT_TOKEN` etc. before
-# `hermes gateway run` reads the environment, or write both key names) is the open item
-# before these connectors actually drive Hermes. Renaming the Secret keys here without it
-# would break the control-plane parity test; that is a control-plane decision reserved to
-# Baron, raised rather than made in this operator-path retarget.
+# The Secret KEYS are Hermes's OWN native env var names (verified against
+# nousresearch/hermes-agent:v2026.8.3), so `hermes gateway run` reads them directly with no
+# translation. They match control-plane/app/agents.py CONNECTORS exactly — the two are bound
+# by test_the_python_schema_matches_the_shell_provisioners_allowlists. Hermes denies unknown
+# senders by default, so a connector with no *_ALLOWED_USERS connects but answers no one;
+# that is the secure default, and the allow-list keys below are how you open it.
 #
 # Each credential is handled EXACTLY like the BYO key above, for the same reason: it is the
 # user's own external credential, we cannot revoke it, and it buys real authority — a
@@ -392,25 +378,23 @@ fi
 # Each config file is `KEY=value` per line, the shape `kubectl create secret
 # --from-env-file` takes. Worked examples:
 #
-#     # --email-config-file (an M365 mailbox)
-#     AGENT_EMAIL_ADDRESS=ops-agent@contoso.com
-#     AGENT_EMAIL_USERNAME=ops-agent@contoso.com
-#     AGENT_EMAIL_PASSWORD=<app password>
-#     AGENT_EMAIL_SMTP_HOST=smtp.office365.com
-#     AGENT_EMAIL_SMTP_PORT=587
-#     AGENT_EMAIL_SMTP_SECURITY=starttls
-#     AGENT_EMAIL_IMAP_HOST=outlook.office365.com
-#     AGENT_EMAIL_IMAP_PORT=993
-#     AGENT_EMAIL_IMAP_SECURITY=ssl
+#     # --email-config-file (an M365 mailbox; Hermes auto-detects ports and TLS)
+#     EMAIL_ADDRESS=ops-agent@contoso.com
+#     EMAIL_PASSWORD=<app password>
+#     EMAIL_SMTP_HOST=smtp.office365.com
+#     EMAIL_IMAP_HOST=outlook.office365.com
+#     EMAIL_ALLOW_ALL_USERS=true            # optional; blank = deny-by-default
 #
 #     # --slack-config-file (a Slack app with Socket Mode enabled)
-#     AGENT_SLACK_BOT_TOKEN=xoxb-...
-#     AGENT_SLACK_APP_TOKEN=xapp-...
-#     AGENT_SLACK_DEFAULT_CHANNEL=C0123ABCD
+#     SLACK_BOT_TOKEN=xoxb-...
+#     SLACK_APP_TOKEN=xapp-...
+#     SLACK_HOME_CHANNEL=C0123ABCD          # optional
+#     SLACK_ALLOWED_USERS=U0123ABCD         # optional; without it the bot answers no one
 #
 #     # --discord-config-file (a Discord application's bot)
-#     AGENT_DISCORD_BOT_TOKEN=...
-#     AGENT_DISCORD_DEFAULT_CHANNEL=123456789012345678
+#     DISCORD_BOT_TOKEN=...
+#     DISCORD_HOME_CHANNEL=123456789012345678   # optional
+#     DISCORD_ALLOWED_USERS=987654321098765432  # optional; without it the bot answers no one
 #
 # Values are taken literally — kubectl does not strip quotes — so a token wrapped in quotes
 # becomes a token WITH quotes, which is a 401 nobody diagnoses.
@@ -531,34 +515,38 @@ provision_connector() {
     printf '    %-8s credential stored in %s (not shown, not readable back)\n' "$label" "$secret"
 }
 
+# The allowlists are Hermes's OWN env var names (the retarget), in the SAME order as
+# control-plane/app/agents.py CONNECTORS — the two are bound by
+# test_the_python_schema_matches_the_shell_provisioners_allowlists. Hermes auto-detects mail
+# ports and TLS, so there is no username/port/security key; EMAIL_ALLOW_ALL_USERS opts out of
+# deny-by-default.
 provision_connector email "--email-config-file" "$EMAIL_CONFIG_FILE" \
-    "mail setting" AGENT_EMAIL_CONFIG_SUM "none — this agent has no mailbox" \
-"AGENT_EMAIL_ADDRESS AGENT_EMAIL_USERNAME AGENT_EMAIL_PASSWORD
-AGENT_EMAIL_SMTP_HOST AGENT_EMAIL_SMTP_PORT AGENT_EMAIL_SMTP_SECURITY
-AGENT_EMAIL_IMAP_HOST AGENT_EMAIL_IMAP_PORT AGENT_EMAIL_IMAP_SECURITY
-AGENT_EMAIL_CA_FILE" \
-    "AGENT_EMAIL_ADDRESS AGENT_EMAIL_PASSWORD AGENT_EMAIL_SMTP_HOST AGENT_EMAIL_IMAP_HOST"
+    "mail setting" EMAIL_CONFIG_SUM "none — this agent has no mailbox" \
+"EMAIL_ADDRESS EMAIL_PASSWORD EMAIL_IMAP_HOST
+EMAIL_SMTP_HOST EMAIL_HOME_ADDRESS EMAIL_ALLOW_ALL_USERS" \
+    "EMAIL_ADDRESS EMAIL_PASSWORD EMAIL_SMTP_HOST EMAIL_IMAP_HOST"
 EMAILSUM="$CONNECTOR_SUM"
 
 # BOTH Slack tokens are required. The bot token (`xoxb-`) posts; the app-level token
 # (`xapp-`) is what opens the Socket Mode websocket, and Socket Mode is how the agent
 # RECEIVES without anyone publishing an inbound internet route into a pod that holds a
 # spendable model key. An agent with only the bot token can talk and can never listen.
+# SLACK_ALLOWED_USERS gates who it answers (Hermes denies unknown senders by default).
 provision_connector slack "--slack-config-file" "$SLACK_CONFIG_FILE" \
-    "Slack setting" AGENT_SLACK_CONFIG_SUM "none — this agent has no Slack workspace" \
-"AGENT_SLACK_BOT_TOKEN AGENT_SLACK_APP_TOKEN AGENT_SLACK_DEFAULT_CHANNEL
-AGENT_SLACK_API_BASE AGENT_SLACK_CA_FILE" \
-    "AGENT_SLACK_BOT_TOKEN AGENT_SLACK_APP_TOKEN"
+    "Slack setting" SLACK_CONFIG_SUM "none — this agent has no Slack workspace" \
+"SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL
+SLACK_ALLOWED_USERS" \
+    "SLACK_BOT_TOKEN SLACK_APP_TOKEN"
 SLACKSUM="$CONNECTOR_SUM"
 
 # Discord needs ONE token for both directions — the same bot token authenticates the REST
-# call that posts and the Gateway websocket that listens — which is the only structural
-# difference between the two chat connectors.
+# call that posts and the Gateway websocket that listens. DISCORD_ALLOWED_USERS / _ROLES
+# gate who it answers (deny-by-default without them).
 provision_connector discord "--discord-config-file" "$DISCORD_CONFIG_FILE" \
-    "Discord setting" AGENT_DISCORD_CONFIG_SUM "none — this agent has no Discord guild" \
-"AGENT_DISCORD_BOT_TOKEN AGENT_DISCORD_DEFAULT_CHANNEL AGENT_DISCORD_API_BASE
-AGENT_DISCORD_API_VERSION AGENT_DISCORD_INTENTS AGENT_DISCORD_CA_FILE" \
-    "AGENT_DISCORD_BOT_TOKEN"
+    "Discord setting" DISCORD_CONFIG_SUM "none — this agent has no Discord guild" \
+"DISCORD_BOT_TOKEN DISCORD_HOME_CHANNEL DISCORD_ALLOWED_USERS
+DISCORD_ALLOWED_ROLES" \
+    "DISCORD_BOT_TOKEN"
 DISCORDSUM="$CONNECTOR_SUM"
 
 # ---------------------------------------------------------------- apply

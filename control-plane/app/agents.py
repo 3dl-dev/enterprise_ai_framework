@@ -192,43 +192,48 @@ class Connector:
         return f"checksum/{self.kind}"
 
 
+# THE KEYS ARE HERMES'S OWN ENV VAR NAMES, not the opencode `AGENT_*` names. This is the
+# retarget's connector fix and the whole reason a browser-wired connector works: envFrom
+# injects these into the pod, and `hermes gateway run` reads exactly these names. The
+# opencode surface named them `AGENT_SLACK_BOT_TOKEN` etc.; Hermes never looked at those, so
+# a wired connector connected to nothing (found live on agent rudi's Discord). Confirmed
+# against nousresearch/hermes-agent:v2026.8.3.
 CONNECTORS: dict[str, Connector] = {
-    # BOTH Slack tokens are required, for the reason provision-agent.sh states: the bot
-    # token posts, the app-level token opens the Socket Mode websocket that RECEIVES. An
-    # agent given only the first can talk and can never listen, which presents as "it
-    # ignores me" long after the configuration that caused it.
+    # BOTH Slack tokens are required: the bot token (xoxb-) posts, the app-level token
+    # (xapp-) opens the Socket Mode websocket that RECEIVES. An agent given only the first
+    # can talk and can never listen, which presents as "it ignores me". SLACK_ALLOWED_USERS
+    # is optional but load-bearing: Hermes denies unknown senders by default, so with no
+    # allow-list the bot connects and answers no one — the exact "it's set up but silent"
+    # symptom. Left blank, that is the SECURE default; fill it to let specific users talk.
     "slack": Connector(
         "slack",
-        allowed=("AGENT_SLACK_BOT_TOKEN", "AGENT_SLACK_APP_TOKEN",
-                 "AGENT_SLACK_DEFAULT_CHANNEL", "AGENT_SLACK_API_BASE",
-                 "AGENT_SLACK_CA_FILE"),
-        required=("AGENT_SLACK_BOT_TOKEN", "AGENT_SLACK_APP_TOKEN"),
-        sum_key="AGENT_SLACK_CONFIG_SUM",
+        allowed=("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN",
+                 "SLACK_HOME_CHANNEL", "SLACK_ALLOWED_USERS"),
+        required=("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"),
+        sum_key="SLACK_CONFIG_SUM",
         noun="Slack setting",
     ),
     # Discord needs ONE token for both directions — the same bot token authenticates the
-    # REST call that posts and the Gateway websocket that listens.
+    # REST post and the Gateway websocket that listens. DISCORD_ALLOWED_USERS / _ROLES gate
+    # who it answers (deny-by-default without them).
     "discord": Connector(
         "discord",
-        allowed=("AGENT_DISCORD_BOT_TOKEN", "AGENT_DISCORD_DEFAULT_CHANNEL",
-                 "AGENT_DISCORD_API_BASE", "AGENT_DISCORD_API_VERSION",
-                 "AGENT_DISCORD_INTENTS", "AGENT_DISCORD_CA_FILE"),
-        required=("AGENT_DISCORD_BOT_TOKEN",),
-        sum_key="AGENT_DISCORD_CONFIG_SUM",
+        allowed=("DISCORD_BOT_TOKEN", "DISCORD_HOME_CHANNEL",
+                 "DISCORD_ALLOWED_USERS", "DISCORD_ALLOWED_ROLES"),
+        required=("DISCORD_BOT_TOKEN",),
+        sum_key="DISCORD_CONFIG_SUM",
         noun="Discord setting",
     ),
-    # A mailbox that could send and not read, or read and not send, is not a configuration
-    # this surface offers — hence four required keys rather than one.
+    # Address + password + the two hosts. Hermes auto-detects ports and TLS, so unlike the
+    # opencode tool there are no port/security/username knobs. EMAIL_ALLOW_ALL_USERS opts
+    # out of deny-by-default for a mailbox anyone may write to.
     "email": Connector(
         "email",
-        allowed=("AGENT_EMAIL_ADDRESS", "AGENT_EMAIL_USERNAME", "AGENT_EMAIL_PASSWORD",
-                 "AGENT_EMAIL_SMTP_HOST", "AGENT_EMAIL_SMTP_PORT",
-                 "AGENT_EMAIL_SMTP_SECURITY", "AGENT_EMAIL_IMAP_HOST",
-                 "AGENT_EMAIL_IMAP_PORT", "AGENT_EMAIL_IMAP_SECURITY",
-                 "AGENT_EMAIL_CA_FILE"),
-        required=("AGENT_EMAIL_ADDRESS", "AGENT_EMAIL_PASSWORD",
-                  "AGENT_EMAIL_SMTP_HOST", "AGENT_EMAIL_IMAP_HOST"),
-        sum_key="AGENT_EMAIL_CONFIG_SUM",
+        allowed=("EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_IMAP_HOST",
+                 "EMAIL_SMTP_HOST", "EMAIL_HOME_ADDRESS", "EMAIL_ALLOW_ALL_USERS"),
+        required=("EMAIL_ADDRESS", "EMAIL_PASSWORD",
+                  "EMAIL_SMTP_HOST", "EMAIL_IMAP_HOST"),
+        sum_key="EMAIL_CONFIG_SUM",
         noun="mail setting",
     ),
 }
