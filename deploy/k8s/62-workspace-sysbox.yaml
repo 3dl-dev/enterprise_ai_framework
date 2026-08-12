@@ -1,0 +1,26 @@
+# Sysbox runtime for workspace pods — NOT applied by deploy.sh, and NOT usable until the
+# node work in docs/ops/workspace-docker-runtime.md is done on every node that schedules
+# workspaces (today: k3s-worker only). A RuntimeClass whose `handler` has no matching
+# containerd runtime entry does not fail closed quietly — pods that reference it stay in
+# ContainerCreating forever. So this file is deliberately inert until the handler exists.
+#
+# Purpose: let an UNPRIVILEGED workspace pod run a real, self-contained dockerd inside
+# (build + run + compose, and qemu when /dev/kvm is exposed), without a privileged pod and
+# without weakening multi-tenant workspace isolation — Sysbox maps the container's root to
+# an unprivileged host UID range via a user namespace, so "root inside" is more isolated
+# than today's uid-1000-sharing-the-host-userns, not less.
+#
+# See enterpriseaiframework-ee4 for the decision, the licensing verdict (Sysbox CE is
+# Apache-2.0 and clears the OSI-default constraint), and the operator-boundary escalation.
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: sysbox-runc
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: workspace
+# Must match the runtime handler name configured in the k3s containerd config template on
+# the node (config.toml.tmpl) — see the runbook. handler != metadata.name is legal but
+# needlessly confusing; keep them identical.
+handler: sysbox-runc
