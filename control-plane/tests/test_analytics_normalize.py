@@ -187,6 +187,37 @@ def _assert_no_text(node, path=""):
             _assert_no_text(v, f"{path}[{i}]")
 
 
+def test_read_raw_messages_coerces_mongo_types_to_json_safe():
+    """pymongo hands back ObjectId + datetime; the records must serialize into the store.
+    Regression: the collector's first live run lost every tick to a datetime TypeError."""
+    import datetime
+
+    class _Oid:
+        def __init__(self, h):
+            self.h = h
+
+        def __str__(self):
+            return self.h
+
+    class _Coll:
+        def find(self, query, projection):
+            return [{
+                "messageId": "m1", "conversationId": "c1", "isCreatedByUser": False,
+                "text": "a reply", "model": "x", "tokenCount": 5,
+                "user": _Oid("deadbeef"),
+                "createdAt": datetime.datetime(2026, 8, 1, 10, 0, 0),
+            }]
+
+    class _DB:
+        messages = _Coll()
+
+    docs = librechat.read_raw_messages(_DB())
+    assert docs[0]["user"] == "deadbeef"
+    assert docs[0]["createdAt"] == "2026-08-01T10:00:00"
+    recs = librechat.normalize(docs, tenant="t")
+    json.dumps(recs)  # must not raise
+
+
 def test_records_are_content_free():
     """No transcript text survives as a value — the tenant-safety invariant. Only a fixed
     set of label fields may be strings; everything else is a count."""

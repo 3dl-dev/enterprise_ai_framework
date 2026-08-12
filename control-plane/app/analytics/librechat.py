@@ -136,4 +136,15 @@ def read_raw_messages(db, *, tenant_filter=None) -> list[dict]:
         "createdAt": 1, "unfinished": 1, "error": 1,
     }
     query = {} if tenant_filter is None else tenant_filter
-    return list(db.messages.find(query, projection))
+    docs = list(db.messages.find(query, projection))
+    # Coerce Mongo-native types to JSON-safe ones at the boundary: `user` is an ObjectId
+    # (must match the str(_id) identity map), `createdAt` a datetime (must land in the
+    # content-free record and serialize into the store). Without this the collector's
+    # json.dump of the records throws and the whole tick is lost.
+    for d in docs:
+        if d.get("user") is not None:
+            d["user"] = str(d["user"])
+        ca = d.get("createdAt")
+        if hasattr(ca, "isoformat"):
+            d["createdAt"] = ca.isoformat()
+    return docs
