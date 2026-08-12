@@ -215,15 +215,27 @@ Per normalized session (and optionally per turn): sum `SpendLogs.spend` for
 | cost = estimated from a price table | **real `SpendLogs.spend`, joined by alias** |
 | single machine, transcripts rotate ~30d | per-user PVCs, node-local, non-durable → incremental pull |
 
-## Downstream items, unblocked by this record
+## Implementation status
 
-- `-1a8` Normalizer — build per-surface readers to the schema above; fixtures = redacted
-  real samples (opencode db copy, Mongo export). Resolve `config_fingerprint` capture.
-- `-0e90` Ledger join — reuse `metering.ledger_attribution_sql`; window + skew as above.
-- `-e32c` Metric extraction — port `model-behavior-report.py` over normalized records.
-- `-2df` Slicing — model / config_fingerprint / surface / tenant / effort.
-- `-130` Golden fixtures — one redacted sample per surface + adversarial cases (interrupted
-  turn, missing model, mid-session model switch, subagent-heavy session).
-- `-d27` In-product report surface — control-plane page, `metrics.json`-shaped payload.
-</content>
-</invoke>
+Built and tested under `control-plane/app/analytics/` + `control-plane/tests/test_analytics_*`:
+
+- **`-1a8` Normalizer** — DONE. `measure.py` (prose/escalation primitives), `schema.py` (turn
+  close + coding aggregate), `opencode.py` (SQLite), `librechat.py` (Mongo). Content-free.
+- **`-e32c` Metric extraction** — DONE. `metrics.py` → the five-array `metrics.json` + persist
+  & code indices; `build_metrics(key=…)` groups by any dimension.
+- **`-0e90` Ledger join** — DONE. `ledger.py` stamps real billed cost by alias + turn window,
+  reusing `metering.ledger_attribution_sql`; no-match → `source:"none"`, never $0.
+- **`-2df` Slicing** — DONE. `slicing.py` — model / surface / tenant / principal / effort,
+  tenant-isolated. `config` wired but pending the fingerprint (below).
+- **`-130` Golden + adversarial fixtures** — DONE, wired into `make test`.
+- **`-d27` In-product report surface** — DONE. `report.py` + portal routes
+  `/portal/analytics` (page) and `/portal/api/analytics` (data), operator-only;
+  `portal_static/analytics.html` renders the comparison with a dimension switch.
+
+Follow-ups (filed):
+
+- **`-5de` Ingestion collector** — the scheduled job that reads the live opencode PVC sqlite +
+  LibreChat Mongo, normalizes, joins the ledger, and writes the durable records store the
+  report reads. Until it lands the page shows "No data yet".
+- **`-6b1` config_fingerprint** — stamp the harness config on records so the `config` slice has
+  data (needs the pod's mounted config at ingest).
