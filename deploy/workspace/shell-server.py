@@ -36,7 +36,9 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -111,6 +113,14 @@ PORT = int(os.environ.get("WS_SHELL_PORT", "7682"))
 # everything rather than allow everything — an unauthenticated shell API on the pod
 # network is worse than a workshop that will not load.
 INTERNAL_TOKEN = os.environ.get("WS_INTERNAL_TOKEN", "")
+
+# opencode's own session store, for the behavioural-analytics collector. It lives under
+# XDG_DATA_HOME (pointed at the PVC), deliberately outside /workspace/projects, so the
+# preview/file routes cannot reach it — this dedicated, token-guarded route is the only
+# door. Read-only: we take a consistent snapshot and never write the child's db.
+OPENCODE_DB = Path(
+    os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))
+) / "opencode" / "opencode.db"
 
 # Offered in Settings. Kept in step with the gateway catalogue; the agent config declares
 # the same two with their real context and output limits.
@@ -534,6 +544,40 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, payload: dict):
         self._send(code, json.dumps(payload).encode(), "application/json")
 
+    def _serve_opencode_db(self):
+        """Stream a consistent snapshot of opencode's session db for the analytics collector.
+
+        opencode runs the db in WAL mode with a live wal, so a raw file read is torn/stale.
+        We use SQLite's online backup API from a read-only connection: it copies committed
+        pages into a fresh single file (wal already applied), coexisting with opencode's
+        writers, and never touches the child's store. 200 with the db bytes, or 404 when the
+        user has not started opencode yet."""
+        if not OPENCODE_DB.is_file():
+            self._send(404, b"no opencode db yet", "text/plain; charset=utf-8")
+            return
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        try:
+            src = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True, timeout=30)
+            try:
+                dst = sqlite3.connect(tmp.name)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+            with open(tmp.name, "rb") as f:
+                body = f.read()
+            self._send(200, body, "application/octet-stream")
+        except Exception as exc:  # noqa: BLE001 - report a clean 500, never a stack to the caller
+            self._send(500, f"snapshot failed: {exc}".encode(), "text/plain; charset=utf-8")
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
     def _serve_file(self, path: Path, fallback_ctype="application/octet-stream", extra=None):
         if not path.is_file():
             self._send(404, b"not found", "text/plain; charset=utf-8")
@@ -595,6 +639,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if not self._authorised():
             self._send(403, b"denied", "text/plain; charset=utf-8")
+            return
+
+        if route == "/api/opencode-db":
+            self._serve_opencode_db()
             return
 
         if route in ("/", "/index.html"):
