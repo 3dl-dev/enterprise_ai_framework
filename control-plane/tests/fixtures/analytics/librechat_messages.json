@@ -1,0 +1,10 @@
+[
+  {"messageId": "m1", "conversationId": "conv1", "parentMessageId": null, "isCreatedByUser": true,  "text": "how do I sort a list?", "user": "hexbaron", "createdAt": "2026-08-01T10:00:00Z"},
+  {"messageId": "m2", "conversationId": "conv1", "parentMessageId": "m1", "isCreatedByUser": false, "model": "gpt-fake", "tokenCount": 120, "user": "hexbaron", "createdAt": "2026-08-01T10:00:05Z",
+   "text": "You can use sorted(). Here is a longer explanation that runs beyond two hundred characters so the prose style metrics compute cleanly: sorted() returns a new list and likely does what you want here. Want me to show the in-place variant as well?"},
+  {"messageId": "m3", "conversationId": "conv1", "parentMessageId": "m2", "isCreatedByUser": true,  "text": "continue", "user": "hexbaron", "createdAt": "2026-08-01T10:00:10Z"},
+  {"messageId": "m4", "conversationId": "conv1", "parentMessageId": "m3", "isCreatedByUser": false, "model": "gpt-fake", "tokenCount": 40, "user": "hexbaron", "createdAt": "2026-08-01T10:00:12Z", "text": "Sure."},
+
+  {"messageId": "m5", "conversationId": "conv2", "parentMessageId": null, "isCreatedByUser": true,  "text": "translate hello", "user": "hexclaire", "createdAt": "2026-08-01T11:00:00Z"},
+  {"messageId": "m6", "conversationId": "conv2", "parentMessageId": "m5", "isCreatedByUser": false, "model": "gpt-fake", "tokenCount": 15, "user": "hexclaire", "createdAt": "2026-08-01T11:00:03Z", "text": "Hola.", "unfinished": true}
+]

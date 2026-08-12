@@ -61,9 +61,11 @@ real db.
   - `tool` → `{tool: "<name>", callID, state:{status: "completed"|"error", input, output,
     metadata:{exit, truncated}}}` — **tool-call counts, failures (`status=error` or nonzero
     `exit`), test-runner detection (bash `command`)**.
-  - `patch` → `{hash, files:[<path>...]}` — **the coding signal**: edits = patch parts,
-    files edited, rework = repeat paths. (opencode's `edit`/`write` tools also surface as
-    `tool` parts; `patch` is the authoritative file-change record.)
+  - `patch` → `{hash, files:[<path>...]}`. **Correction (item -1a8, verified against a
+    live db):** `patch` parts are *sparse and not one-per-edit* — the real coding signal is
+    the `edit`/`write` **tool** part, which carries the written content, target path and
+    status. The normalizer counts edits from tool parts, not patch parts. This record's
+    earlier "patch is authoritative" was the plan; the implementation corrects it.
   - `text` / `reasoning` → assistant prose and thinking (prose metrics run on the final
     `text` part of the turn).
 
