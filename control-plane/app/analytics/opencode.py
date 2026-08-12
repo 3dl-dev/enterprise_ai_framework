@@ -318,4 +318,7 @@ def _apply_part(part: dict, acc: TurnAccumulator | None, code: CodeAggregate) ->
             if isinstance(v, str) and v:
                 path = v
                 break
-        code.note_edit([path] if path else [], chars=len(content), failed=failed)
+        # acc is None only for a subagent's message, so its edits are the delegated ones.
+        code.note_edit(
+            [path] if path else [], chars=len(content), failed=failed, by_worker=acc is None
+        )

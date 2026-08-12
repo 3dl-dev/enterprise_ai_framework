@@ -155,6 +155,7 @@ class CodeAggregate:
     """
 
     edits: int = 0
+    worker_edits: int = 0  # edits made inside a subagent — for the delegation metric
     chars_written: int = 0
     edit_failures: int = 0
     tool_errors: int = 0
@@ -163,8 +164,12 @@ class CodeAggregate:
     reverts: int = 0
     _files: list[str] = field(default_factory=list)  # for rework (repeat edits)
 
-    def note_edit(self, files: list[str], chars: int = 0, failed: bool = False) -> None:
+    def note_edit(
+        self, files: list[str], chars: int = 0, failed: bool = False, by_worker: bool = False
+    ) -> None:
         self.edits += 1
+        if by_worker:
+            self.worker_edits += 1
         self.chars_written += max(0, int(chars))
         if failed:
             self.edit_failures += 1
@@ -192,6 +197,7 @@ class CodeAggregate:
                 seen.add(f)
         return {
             "edits": self.edits,
+            "worker_edits": self.worker_edits,
             "chars_written": self.chars_written,
             "edit_failures": self.edit_failures,
             "tool_errors": self.tool_errors,
