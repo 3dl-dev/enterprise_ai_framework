@@ -234,8 +234,48 @@ Built and tested under `control-plane/app/analytics/` + `control-plane/tests/tes
 
 Follow-ups (filed):
 
-- **`-5de` Ingestion collector** — the scheduled job that reads the live opencode PVC sqlite +
-  LibreChat Mongo, normalizes, joins the ledger, and writes the durable records store the
-  report reads. Until it lands the page shows "No data yet".
+- **`-5de` Ingestion collector** — re-aimed to gateway capture (see the posture ruling below).
+  Primary source is the gateway capture store, not per-surface PVC/Mongo scraping; the opencode
+  SQLite / LibreChat readers stay as the enrichment for local-only detail the gateway can't see.
 - **`-6b1` config_fingerprint** — stamp the harness config on records so the `config` slice has
   data (needs the pod's mounted config at ingest).
+
+## Capture posture and the canonical store (Baron's ruling, 2026-08-12)
+
+**This platform captures everything, by design.** The operator↔user relationship is
+employer↔employee or school↔student — a corporate job, a camp. The user has **no expectation of
+privacy from the operator**: users are captured subjects, not privacy-bearing customers. The only
+confidentiality wall is the standing constraint — nothing egresses to 3DL, no 3DL service in any
+data path, air-gap capable. Full request/response capture that stays in the operator's own store
+is **inside** that wall, not across it, so there is no per-deployment consent gate: capture is
+default-on and the operator configures retention. (My earlier framing of full-content capture as a
+reserved switch was over-cautious and is withdrawn.)
+
+**Consequence — the gateway is the canonical capture point, not the per-surface stores.** Every
+request from every surface already transits the gateway (dogfood outcome 3), so one LiteLLM
+logging callback persists prompt→completion per request into the operator's Postgres (welded,
+tank-backed) — one integration for all surfaces, durable where the per-user `local-path` PVCs are
+**not** (the durability gap this record flags). That one store is the **capture ledger**, and it
+feeds three consumers at once:
+
+  1. behavioral analytics (this feature),
+  2. the training corpus (Axolotl target),
+  3. shadow-eval / paired-reference.
+
+This is the "one chokepoint" thesis applied to data capture, and it unifies this feature with the
+trainer concept.
+
+**Two things the gateway stream still needs, and one thing that survives unchanged:**
+
+- A **correlation id** (session/turn) propagated from each harness into request metadata, so
+  requests group into turns/sessions in the capture store. opencode does not send its session id
+  today — the same gap the ledger-join caveat records. Without it, turn/subagent boundaries are
+  timing-heuristic only.
+- **Local-only detail** (opencode `patch`/edit success, `bash` exit) that never returns to the
+  model stays a harness-side enrichment, joined by the correlation id — a thin signal, not a full
+  scraper.
+- The extraction logic already built (`measure`/`schema`/`metrics`/`ledger`/`slicing`/`report`)
+  is **source-agnostic**: it consumes normalized records regardless of origin, so it ports onto
+  the gateway capture store unchanged. Only ingestion (`-5de`) is re-aimed; nothing else moves.
+
+The full capture-ledger + correlation-id design is `enterpriseaiframework-dee` (decision).
