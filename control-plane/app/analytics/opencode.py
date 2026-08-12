@@ -49,15 +49,21 @@ def _iso(ms: int | None) -> str | None:
 # ------------------------------------------------------------------ the SQLite layer
 
 
-def read_raw_sessions(db_path: str) -> list[dict]:
-    """Read one opencode db into raw session dicts. Opens READ-ONLY over a live db.
+def read_raw_sessions(db_path: str, *, immutable: bool = True) -> list[dict]:
+    """Read one opencode db into raw session dicts.
 
-    The db is WAL-mode and live (a user may be mid-session), so it is opened immutable —
-    we never take a write lock on a store the user is using. Messages and their parts come
-    back in wall-clock order, which is the order a turn is walked in.
+    `immutable=True` opens `immutable=1&mode=ro` — no lock, safe against a db nobody else is
+    writing, but it IGNORES the -wal file. opencode runs in WAL mode with a large live wal
+    (tens of MB of un-checkpointed commits), so an immutable read of a LIVE db silently
+    returns stale data. The collector therefore COPIES the db + `-wal` + `-shm` to scratch
+    and calls this with `immutable=False`, a plain wal-aware connection over the copy —
+    never a write lock on the store the user is using. `immutable=True` stays the default
+    for a quiescent db with no wal (the fixtures / a checkpointed export).
     """
-    uri = f"file:{db_path}?immutable=1&mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    if immutable:
+        conn = sqlite3.connect(f"file:{db_path}?immutable=1&mode=ro", uri=True)
+    else:
+        conn = sqlite3.connect(db_path)  # plain, wal-aware; use only on a copy
     try:
         conn.row_factory = sqlite3.Row
         sessions = [
