@@ -134,7 +134,7 @@ spec:
     # issuer — and this egress — is now :443. It is the same endpoint any browser on the
     # internet can reach, and it needs credentials.
     - to:
-        - ipBlock: { cidr: 192.168.2.42/32 }
+        - ipBlock: { cidr: 192.168.2.45/32 }
       ports:
         - { protocol: TCP, port: 443 }
 
