@@ -200,21 +200,68 @@ Per agent, matching the live hermes agents' naming and extending it:
 
 ---
 
-## Verify against the real binaries before manifests land (ground-source gates)
+## Verify against the real binaries — CONFIRMED 2026-08-13 (`enterpriseaiframework-2ba`)
 
-Docs-grounded; the following are binary-/tag-specific and are confirmed in the build step against a
-**throwaway** test pod (never the live agents):
+Ran against **throwaway** pods off the real images (`nousresearch/hermes-agent:v2026.8.3` — the live
+agents' own tag — and `ghcr.io/openclaw/openclaw` = `2026.7.1`), exec/inspected their own binaries
+and installed source, then torn down. The **live agents `agent-baron-athena`/`agent-baron-rudi`
+were never touched.** Facts below are confirmed; **deltas** correct the contracts above.
 
-1. **hermes v2026.8.3:** `hermes dashboard --help` — the `--host`/`--port` flags and default :9119;
-   that the dashboard binds `0.0.0.0` and engages the auth gate; the exact `/api/model/*`,
-   `/api/config`, `/api/gateway/*` routes and their request shapes; the OIDC env keys.
-2. **hermes config:** that `config.yaml` model persistence is targeted (a `set` preserves other
-   keys) and that the dashboard's `/api/model/set` reloads the gateway without a full pod restart
-   (or that `POST /api/gateway/restart` is the intended reload).
-3. **openclaw:** `openclaw gateway` port 18789, `controlUi.basePath`, `trusted-proxy`, and the
-   config path for the model, against the real `ghcr.io/openclaw/openclaw` image.
-4. **`HERMES_HOME`:** the live pod sets `HERMES_HOME=/opt/data` and it resolves there; keep using
-   it rather than the docs' `~/.hermes`, which is the same directory by another name.
+**hermes (`v0.20.0 (2026.8.3)`), dashboard + model/config API:**
+
+1. `hermes dashboard --help`: `--port` default **9119** ✓, `--host` default **`127.0.0.1`** — bind
+   `0.0.0.0` explicitly. **`--insecure` is now a NO-OP** (June-2026 hardening): a non-loopback bind
+   **always** requires an auth provider — the fail-closed gate is automatic ✓.
+   **Delta — npm build step:** the dashboard builds a web UI at launch; a container without npm must
+   pass **`--skip-build`** (serve prebuilt `web/dist`) or ship a prebuilt dist. Load-bearing for
+   `-f55`/`-8e4`.
+2. Routes CONFIRMED in `hermes_cli/web_server.py`: `GET /api/model/options` (6238),
+   `POST /api/model/set` (6501), `GET/PUT /api/config` (6092/6879), `POST /api/gateway/restart`
+   (3983), plus `GET/PUT/DELETE /api/env`, `/api/gateway/{start,stop,drain}`, `/api/config/raw`.
+3. **`POST /api/model/set` body** = `ModelAssignment` (`hermes_cli/web_models.py:122`):
+   `{scope:"main"|"auxiliary", provider, model, base_url?, api_key?, confirm_expensive_model:bool,
+   profile?}`. For `scope:"main"` it writes **`model.provider` + `model.default`** (same key the CLI
+   `hermes config set model.default X` writes). For our integrated provider send
+   `base_url=http://gateway:4000/v1` + `api_key=<vkey>`.
+   **Delta — expensive-model gate:** without `confirm_expensive_model:true` a costly model returns
+   `{"ok":false,"confirm_required":true,"confirm_message":…}` and does **not** apply; the picker
+   (`-840`) must send the confirm or surface it.
+   **Delta — provider must NOT be named `nous`:** provider=="nous" triggers `apply_nous_managed_defaults`
+   (auto-routes unconfigured tools through the Nous Tool Gateway). Name our provider anything else.
+4. **Delta — `/api/model/set` applies to NEW sessions only** (its docstring: writes config, "the
+   currently running chat PTY is not affected"). Resolves the open question in Contract D: a resident
+   `gateway run` picks up the new `model.default` on its **next** session; to force an in-flight
+   swap, `POST /api/gateway/restart`. Neither party's other config keys are wiped (targeted write).
+5. `hermes config set model.default X` **is a targeted write preserving other keys** ✓ (verified:
+   a sibling `foo.bar` survived two `model.default` writes). Config at **`/opt/data/config.yaml`**
+   (`HERMES_HOME=/opt/data`) ✓.
+6. **OIDC env keys confirmed, with a source note:** hermes has **4 pluggable** `dashboard_auth`
+   providers — `basic`, `drain`, `nous`, `self_hosted`. The record's
+   `HERMES_DASHBOARD_OIDC_ISSUER`/`_CLIENT_ID` (+ `_CLIENT_SECRET`, `_SCOPES`) are real and belong to
+   the **`self_hosted`** provider — that is the "point at the platform Keycloak realm" path. The
+   `nous` provider instead uses `HERMES_DASHBOARD_OAUTH_CLIENT_ID` + `HERMES_DASHBOARD_PORTAL_URL`.
+   Base-path via **`HERMES_DASHBOARD_PUBLIC_URL`** + `X-Forwarded-Prefix` (`dashboard_auth/prefix.py`)
+   ✓; `basic` provider adds `HERMES_DASHBOARD_BASIC_AUTH_USERNAME`.
+7. **`HERMES_HOME=/opt/data`** resolves as expected; the docstrings' `~/.hermes` is the same dir by
+   another name — keep `/opt/data`.
+
+**openclaw (`2026.7.1`, entrypoint `/app/openclaw.mjs`):**
+
+8. **Delta — run command is `openclaw gateway run`** (record said bare `gateway`; `gateway` has
+   subcommands `run/start/stop/…`, foreground is `gateway run`, per its own examples
+   `openclaw gateway run --force`).
+9. **Control UI is served by the gateway on the SAME port, default `18789`** (HTTP + WS), confirmed
+   in `/app/docs/concepts/architecture.md` ✓. So one Service port fronts both the UI and its WS.
+10. **`gateway.controlUi.basePath`** = "Optional URL prefix where the Control UI is served
+    (e.g. `/openclaw`)" ✓ — set to `/agents/<name>` for the proxy mount. Auth via `--auth <mode>`
+    (`none|token|password|**trusted-proxy**`) ✓, shared token via `--token`/`OPENCLAW_GATEWAY_TOKEN`.
+11. Config at **`~/.openclaw/openclaw.json`** (`$HOME=/home/node`); model via
+    **`agents.defaults.model.primary`** = `"provider/model"`. `openclaw config set <path> <value>`
+    is a targeted write.
+    **Delta — custom provider is a config entry, not an env var:** an OpenAI-compatible upstream is a
+    `providers.<id>` map entry (`baseUrl` + `models`, "custom providers must include baseUrl and
+    models") — set `providers.<id>.baseUrl = http://gateway:4000/v1`. The record's `OPENAI_BASE_URL`
+    note is a hermes-ism; openclaw reads the config-file `baseUrl`, not that env var.
 
 ---
 
