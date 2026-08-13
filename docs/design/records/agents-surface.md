@@ -1,5 +1,17 @@
 # Design record — the resident "Agents" surface
 
+> **⚠ PARTIALLY SUPERSEDED — read `agents-gateway-console.md` first.** This record built the
+> Agents surface on **`opencode serve`**, conflating two pillars: opencode is the **Code** pillar
+> (a terminal coding harness); the **Agents** pillar runs **gateway agents** — **hermes**
+> (`nousresearch/hermes-agent`, deployed) and **openclaw** (being added), each with its **own
+> native web console**. `docs/design/records/agents-gateway-console.md` corrects this record's
+> **Contract 2 (residency → gateway agent + native console, two-container pod)** and its
+> **console-attach** model (→ proxy the agent's native console: hermes dashboard :9119 / openclaw
+> Control UI :18789, owner-scoped, Keycloak-OIDC, native base-path — not opencode's SPA shim), and
+> the model-config path (→ the native console API, not a config-file clobber). Contracts **1
+> (alias), 3 (metering), 4 (integrated vs BYO), 5 (email), 6 (Code-untouched)** below remain
+> normative and are pillar-agnostic.
+
 **Status:** design record for epic `enterpriseaiframework-da7`. Normative for the six
 contracts below; two rulings inside them were RESERVED to Baron and marked as such — the
 email default (Contract 5) is still open, and the resident-metering cost basis (Contract 3b)

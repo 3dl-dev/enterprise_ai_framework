@@ -1521,16 +1521,18 @@ Stated plainly rather than papered over. Each names what would close it.
 
 ## 12. The resident "Agents" surface
 
-Full design record: **`docs/design/records/agents-surface.md`**. This section states the
-binding contracts every downstream item consumes; the record carries the reasoning, the
-losing arguments, and the two RESERVED rulings. Epic `enterpriseaiframework-da7`.
+Full design records: **`docs/design/records/agents-surface.md`** (Contracts 1/3/4/5/6, normative)
+and **`docs/design/records/agents-gateway-console.md`**, which **corrects** the residency and
+console model below. Epic `enterpriseaiframework-da7`.
 
 A fourth portal tab beside Chat and Code that lets a user fire up and manage named,
-persistent *hermes* agents — each a long-running opencode process on its own PVC that keeps
-working after the browser closes and lives until intentional shutdown. It generalises the
-per-user Code/workspace surface, and its defining difference is finding 43: Code **spawns**
-opencode per websocket and the agent **dies on disconnect**; an Agent is a **resident**
-daemon the console **attaches** to. This is a new surface, not a workspace flag.
+persistent **gateway agents** — the Agents pillar is **hermes** (`nousresearch/hermes-agent`,
+deployed) and **openclaw** (being added), long-lived multi-channel agents on their own PVC that
+keep working after the browser closes and live until intentional shutdown. **This is a different
+pillar from Code:** opencode is the Code pillar (a terminal coding harness, spawned per websocket,
+dies on disconnect — finding 43); a gateway agent is a **resident** daemon whose **own native web
+console** the surface **attaches** to (hermes `dashboard` :9119, openclaw Control UI :18789). It is
+a new surface, not a workspace flag, and it does not run opencode.
 
 **Hard invariant (outranks the rest of this section):** the Code/workspace surface stays
 **byte-unchanged and green** — the camp runs on it 2026-08-11. Contract 6 makes that
@@ -1547,13 +1549,16 @@ The six binding contracts:
    `/admin/spend` with no query change. The only edit is an additive `agent_key_alias` +
    one `parse_alias` clause in `gateway.py`; `key_alias`/`SURFACES` are untouched.
 
-2. **Residency.** A resident **`opencode serve`** daemon is the pod's main process; the
-   console attaches (ttyd → client on loopback), and a disconnect never ends the session
-   (tmux-attach is the documented fallback). Session state on the PVC via `XDG_DATA_HOME`
-   (finding 30). Lifecycle: **created → running → stopped → deleted**, mechanised as
-   Deployment `replicas: 1` (running) / **`replicas: 0`, PVC retained** (stopped) / delete
-   Deployment+Service+Secret then PVC (deleted). *Stopped accrues no resident cost* because
-   there is no pod to meter — not a "stopped rate".
+2. **Residency (corrected by `agents-gateway-console.md`).** The pod runs **two containers over
+   one PVC**: the resident **gateway agent** (hermes `gateway run` / openclaw `gateway`) and its
+   **native web console** (hermes `dashboard` :9119 / openclaw Control UI :18789). The console
+   **attaches** to the resident gateway; a disconnect never ends the session. State on the PVC
+   (hermes `/opt/data`, openclaw `~/.openclaw`), seeded **first-boot only** so the agent's own
+   settings persist across restarts — never re-clobbered. Lifecycle: **created → running →
+   stopped → deleted**, mechanised as Deployment `replicas: 1` (running) / **`replicas: 0`, PVC
+   retained** (stopped) / delete Deployment+Service+Secret then PVC (deleted). *Stopped accrues no
+   resident cost* because there is no pod to meter — not a "stopped rate". (The prior
+   `opencode serve` + ttyd-attach form was the Code-pillar conflation; opencode is not here.)
 
 3. **Two metering dimensions.** (a) **Inference tokens** ride the existing virtual-key path
    gateway→Forge, unchanged. (b) **Net-new resident-time + compute**: wall-clock from pod
