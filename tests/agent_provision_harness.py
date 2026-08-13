@@ -104,11 +104,12 @@ exec)
     script="${args[$(( ${#args[@]} - 1 ))]}"
     rc=0
     case "$script" in
-        *"agent-slack config"*|*"agent-discord config"*)
-            cat "$STUB_DIR/state/chat-config" 2>/dev/null || echo '{}'
-            rc=$(cat "$STUB_DIR/state/chat-config-rc" 2>/dev/null || echo 0) ;;
-        *opencode.json*)
-            cat "$STUB_DIR/state/doc-state" 2>/dev/null || echo DOC_WIRED ;;
+        *_BOT_TOKEN*)
+            # The Hermes connector env-presence probe: prints the space-joined NAMES of any
+            # connector env var that is empty/unset (empty output = all present). Its
+            # non-zero rc models `kubectl exec` itself failing.
+            cat "$STUB_DIR/state/chat-missing" 2>/dev/null || echo ""
+            rc=$(cat "$STUB_DIR/state/chat-missing-rc" 2>/dev/null || echo 0) ;;
         *chat/completions*)
             cat "$STUB_DIR/state/gateway-out" 2>/dev/null || echo "200 http://gateway:4000/v1 m"
             rc=$(cat "$STUB_DIR/state/gateway-rc" 2>/dev/null || echo 0) ;;
@@ -308,8 +309,10 @@ def _install_stubs(tmp_path: Path, obj: str, *, existing_key: str | None = None,
     for label, value in (("email", existing_email_sum), ("slack", existing_slack_sum),
                          ("discord", existing_discord_sum)):
         if value is not None:
+            # Hermes-native sum key: `<LABEL>_CONFIG_SUM` (the opencode `AGENT_` prefix was
+            # dropped in the connector retarget). Matches provision-agent.sh's sum_key.
             (stub_dir / "state"
-             / f"{obj}-{label}.AGENT_{label.upper()}_CONFIG_SUM").write_text(value)
+             / f"{obj}-{label}.{label.upper()}_CONFIG_SUM").write_text(value)
     for name, value in (cluster or {}).items():
         if value is not None:
             (stub_dir / "state" / name).write_text(value)
@@ -363,13 +366,13 @@ def _integrated_gateway_base() -> str:
 
 # What a healthy cluster answers. Every hermes_up() test starts from these and overrides
 # exactly the one that is the subject, so an injected failure is visible as a one-line diff
-# from "everything is fine".
+# from "everything is fine". `chat-missing` empty = every connector env var is present in
+# the pod; `gateway-out` is what the in-pod inference probe prints (code, base_url, model,
+# the last two read from the pod's own config.yaml).
 HEALTHY = {
     "deployment-available": "True",
     "pod-phase": "Running",
-    "chat-config": '{"bot_token_set": true, "app_token_set": true, '
-                   '"default_channel": "C0123ABCD"}',
-    "doc-state": "DOC_WIRED",
+    "chat-missing": "",
     "gateway-out": f"200 {_integrated_gateway_base()} glm-5.2@deepinfra",
     "gateway-rc": "0",
 }

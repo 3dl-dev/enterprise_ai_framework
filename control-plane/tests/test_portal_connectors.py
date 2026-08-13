@@ -62,16 +62,16 @@ STATIC = ROOT / "app" / "portal_static"
 # token that appears in a public repository, which is the correct behaviour and a very
 # annoying way to find out that a fixture was too realistic.
 SLACK = {
-    "AGENT_SLACK_BOT_TOKEN": "xoxb-0000-fixture-not-a-real-token",
-    "AGENT_SLACK_APP_TOKEN": "xapp-0000-fixture-not-a-real-token",
-    "AGENT_SLACK_DEFAULT_CHANNEL": "C0123ABCD",
+    "SLACK_BOT_TOKEN": "xoxb-0000-fixture-not-a-real-token",
+    "SLACK_APP_TOKEN": "xapp-0000-fixture-not-a-real-token",
+    "SLACK_HOME_CHANNEL": "C0123ABCD",
 }
-DISCORD = {"AGENT_DISCORD_BOT_TOKEN": "discord-fixture-not-a-real-token"}
+DISCORD = {"DISCORD_BOT_TOKEN": "discord-fixture-not-a-real-token"}
 EMAIL = {
-    "AGENT_EMAIL_ADDRESS": "helper@contoso.example",
-    "AGENT_EMAIL_PASSWORD": "fixture-not-a-real-password",
-    "AGENT_EMAIL_SMTP_HOST": "smtp.contoso.example",
-    "AGENT_EMAIL_IMAP_HOST": "imap.contoso.example",
+    "EMAIL_ADDRESS": "helper@contoso.example",
+    "EMAIL_PASSWORD": "fixture-not-a-real-password",
+    "EMAIL_SMTP_HOST": "smtp.contoso.example",
+    "EMAIL_IMAP_HOST": "imap.contoso.example",
 }
 
 
@@ -191,10 +191,11 @@ def test_a_user_wires_slack_from_the_browser_and_the_pod_is_rolled(cluster):
 
     The expected Secret name, its keys and the annotation that rolls the pod are not read
     off this endpoint — they are the ones `deploy/k8s/64-agent.template.yaml` mounts by
-    name and `deploy/agent/agent-slack` reads by name. If this endpoint wrote
-    `agent-alice-scraper-chat`, or `SLACK_BOT_TOKEN`, every assertion below would still
-    pass against a self-consistent implementation and the agent would come up with no
-    Slack at all.
+    name and `hermes gateway run` reads from the environment by name. If this endpoint
+    wrote `agent-alice-scraper-chat`, or the opencode `AGENT_SLACK_BOT_TOKEN` name Hermes
+    never looks at, every assertion below would still pass against a self-consistent
+    implementation and the agent would come up with no Slack at all — which is exactly the
+    bug that shipped and had to be fixed live on a real agent's Discord.
     """
     cluster.add_agent("alice", "scraper")
     before = json.dumps(cluster.get("deployments", "agent-alice-scraper"))
@@ -204,10 +205,10 @@ def test_a_user_wires_slack_from_the_browser_and_the_pod_is_rolled(cluster):
 
     # The name the template mounts, spelled out rather than derived from the code.
     stored = secret_data(cluster, "agent-alice-scraper-slack")
-    assert stored["AGENT_SLACK_BOT_TOKEN"] == SLACK["AGENT_SLACK_BOT_TOKEN"]
-    assert stored["AGENT_SLACK_APP_TOKEN"] == SLACK["AGENT_SLACK_APP_TOKEN"]
-    assert stored["AGENT_SLACK_DEFAULT_CHANNEL"] == "C0123ABCD"
-    assert set(stored) == set(SLACK) | {"AGENT_SLACK_CONFIG_SUM"}, (
+    assert stored["SLACK_BOT_TOKEN"] == SLACK["SLACK_BOT_TOKEN"]
+    assert stored["SLACK_APP_TOKEN"] == SLACK["SLACK_APP_TOKEN"]
+    assert stored["SLACK_HOME_CHANNEL"] == "C0123ABCD"
+    assert set(stored) == set(SLACK) | {"SLACK_CONFIG_SUM"}, (
         "the Secret carries something other than the supplied settings and the checksum "
         "the shell path stores beside them — every key here becomes an environment "
         "variable in a pod holding a spendable model key"
@@ -216,13 +217,13 @@ def test_a_user_wires_slack_from_the_browser_and_the_pod_is_rolled(cluster):
     # The roll. `envFrom` is injected at pod start and never updated, so a credential
     # stored without this reaches a running agent never.
     annos = annotations(cluster, "agent-alice-scraper")
-    assert annos["checksum/slack"] == stored["AGENT_SLACK_CONFIG_SUM"], (
+    assert annos["checksum/slack"] == stored["SLACK_CONFIG_SUM"], (
         "the pod-template annotation does not match the checksum stored beside the "
         "credential; a later re-render would roll the agent for a credential that did "
         "not change"
     )
     assert annos["checksum/slack"] not in ("", "none"), "the pod was not rolled"
-    assert SLACK["AGENT_SLACK_BOT_TOKEN"] not in json.dumps(annos), (
+    assert SLACK["SLACK_BOT_TOKEN"] not in json.dumps(annos), (
         "the annotation carries the credential rather than a hash of it — annotations are "
         "world-readable to anything that can read the Deployment"
     )
@@ -276,10 +277,10 @@ def test_email_and_discord_write_their_own_secret_and_their_own_annotation(clust
     assert configure(alice, "scraper", "discord", DISCORD).status_code == 200
     assert configure(alice, "scraper", "email", EMAIL).status_code == 200
 
-    assert secret_data(cluster, "agent-alice-scraper-discord")["AGENT_DISCORD_BOT_TOKEN"] \
-        == DISCORD["AGENT_DISCORD_BOT_TOKEN"]
-    assert secret_data(cluster, "agent-alice-scraper-email")["AGENT_EMAIL_ADDRESS"] \
-        == EMAIL["AGENT_EMAIL_ADDRESS"]
+    assert secret_data(cluster, "agent-alice-scraper-discord")["DISCORD_BOT_TOKEN"] \
+        == DISCORD["DISCORD_BOT_TOKEN"]
+    assert secret_data(cluster, "agent-alice-scraper-email")["EMAIL_ADDRESS"] \
+        == EMAIL["EMAIL_ADDRESS"]
 
     annos = annotations(cluster, "agent-alice-scraper")
     assert annos["checksum/slack"] == slack_sum, (
@@ -312,7 +313,7 @@ def test_resupplying_the_same_credential_does_not_roll_a_healthy_agent(cluster):
         "agent, ending its session, for no change"
     )
 
-    rotated = {**SLACK, "AGENT_SLACK_BOT_TOKEN": "xoxb-0000-rotated"}
+    rotated = {**SLACK, "SLACK_BOT_TOKEN": "xoxb-0000-rotated"}
     configure(alice, "scraper", "slack", rotated)
     assert annotations(cluster, "agent-alice-scraper")["checksum/slack"] != first, (
         "a ROTATED token did not roll the pod — the agent would keep presenting the old "
@@ -355,28 +356,29 @@ def test_a_created_agent_gets_every_tool_its_connectors_need(cluster):
     repository — because two different values from one repository means provisioning by
     either route restarts every agent created by the other, ending resident sessions.
     """
-    cluster.add_workspace_pod()
+    # THE HERMES RETARGET changes how a connector credential reaches the program that reads
+    # it. opencode read connectors as shell tools mounted from a deployment-wide
+    # `agent-entrypoint` ConfigMap (force-applied — finding 49's clobber). `hermes gateway
+    # run` reads its messaging connectors from the ENVIRONMENT instead, so there is no shared
+    # tool ConfigMap at all, and the per-agent connector Secrets are injected with envFrom.
     assert client_as("alice").post(
         "/portal/api/agents", json={"name": "helper"}).status_code == 201
 
-    shipped = cluster.get("configmaps", "agent-entrypoint")["data"]
-    agent_dir = REPO / "deploy" / "agent"
-    expected = _shell_agent_files()
-    assert set(shipped) == set(expected), (
-        f"the portal ships {sorted(shipped)} but provision-agent.sh ships "
-        f"{sorted(expected)}; the ConfigMap is shared and written with force=true, so the "
-        "shorter list deletes the difference from every agent in the namespace"
+    assert cluster.get("configmaps", "agent-entrypoint") is None, (
+        "the opencode agent-entrypoint tool ConfigMap is retired — a shared, force-applied "
+        "tool ConfigMap was finding 49's clobber, and Hermes needs no such thing"
     )
-    for name in expected:
-        assert shipped[name] == (agent_dir / name).read_text(), f"{name} was altered"
-
-    concatenated = b"".join((agent_dir / name).read_bytes() for name in expected)
     dep = cluster.get("deployments", "agent-alice-helper")
-    annos = dep["spec"]["template"]["metadata"]["annotations"]
-    assert annos["checksum/entrypoint"] == \
-        hashlib.sha256(concatenated).hexdigest()[:16], (
-        "the portal's entrypoint checksum is not the one provision-agent.sh computes over "
-        "the same files, so the two paths would roll each other's agents"
+    env_from = dep["spec"]["template"]["spec"]["containers"][0]["envFrom"]
+    referenced = {e["secretRef"]["name"] for e in env_from}
+    for kind in ("email", "slack", "discord"):
+        assert f"agent-alice-helper-{kind}" in referenced, (
+            f"the {kind} connector Secret is not injected via envFrom, so hermes gateway "
+            "run could never read its credential from the environment"
+        )
+    assert all(e["secretRef"].get("optional") for e in env_from), (
+        "every connector Secret must be optional — an agent with none configured must start "
+        "exactly as it did before"
     )
 
 
@@ -458,8 +460,8 @@ def test_configuring_an_agent_that_does_not_exist_creates_nothing(cluster):
     "LD_PRELOAD",
     "OPENAI_API_KEY",           # the agent's spendable key
     "OPENCODE_SERVER_PASSWORD",  # the console credential
-    "AGENT_SLACK_CONFIG_SUM",   # suppress the roll, leave the pod on the old credential
-    "AGENT_EMAIL_PASSWORD",     # a real key, but not one this connector owns
+    "SLACK_CONFIG_SUM",   # suppress the roll, leave the pod on the old credential
+    "EMAIL_PASSWORD",     # a real key, but not one this connector owns
     "agent_slack_bot_token",    # the allowlist is exact, not case-insensitive
 ])
 def test_a_key_outside_the_connectors_allowlist_is_refused(cluster, key):
@@ -480,7 +482,7 @@ def test_a_key_outside_the_connectors_allowlist_is_refused(cluster, key):
 
 
 @pytest.mark.parametrize("value", [
-    "xoxb-good\nAGENT_SLACK_APP_TOKEN=smuggled",  # a second setting inside one value
+    "xoxb-good\nSLACK_APP_TOKEN=smuggled",  # a second setting inside one value
     "xoxb\r\nPATH=/tmp/evil",
     "xoxb-\rgood",                                # a bare CR in the middle
     "xoxb\x00truncated",
@@ -496,7 +498,7 @@ def test_a_value_carrying_a_line_break_or_control_character_is_refused(cluster, 
     """
     cluster.add_agent("alice", "scraper")
     resp = configure(client_as("alice"), "scraper", "slack",
-                     {**SLACK, "AGENT_SLACK_BOT_TOKEN": value})
+                     {**SLACK, "SLACK_BOT_TOKEN": value})
     assert resp.status_code == 400, f"{value!r} was accepted ({resp.status_code})"
     assert cluster.get("secrets", "agent-alice-scraper-slack") is None
 
@@ -516,17 +518,17 @@ def test_the_whitespace_a_paste_leaves_behind_is_trimmed_not_stored(cluster):
     padded = {k: f"  {v}\t\r\n" for k, v in SLACK.items()}
     assert configure(client_as("alice"), "scraper", "slack", padded).status_code == 200
     stored = secret_data(cluster, "agent-alice-scraper-slack")
-    assert stored["AGENT_SLACK_BOT_TOKEN"] == SLACK["AGENT_SLACK_BOT_TOKEN"]
-    assert stored["AGENT_SLACK_APP_TOKEN"] == SLACK["AGENT_SLACK_APP_TOKEN"]
+    assert stored["SLACK_BOT_TOKEN"] == SLACK["SLACK_BOT_TOKEN"]
+    assert stored["SLACK_APP_TOKEN"] == SLACK["SLACK_APP_TOKEN"]
 
 
 @pytest.mark.parametrize("kind,values,missing", [
-    ("slack", {"AGENT_SLACK_BOT_TOKEN": "xoxb-x"}, "AGENT_SLACK_APP_TOKEN"),
-    ("slack", {"AGENT_SLACK_APP_TOKEN": "xapp-x"}, "AGENT_SLACK_BOT_TOKEN"),
-    ("slack", {**SLACK, "AGENT_SLACK_BOT_TOKEN": "   "}, "AGENT_SLACK_BOT_TOKEN"),
-    ("discord", {"AGENT_DISCORD_DEFAULT_CHANNEL": "1"}, "AGENT_DISCORD_BOT_TOKEN"),
-    ("email", {k: v for k, v in EMAIL.items() if k != "AGENT_EMAIL_IMAP_HOST"},
-     "AGENT_EMAIL_IMAP_HOST"),
+    ("slack", {"SLACK_BOT_TOKEN": "xoxb-x"}, "SLACK_APP_TOKEN"),
+    ("slack", {"SLACK_APP_TOKEN": "xapp-x"}, "SLACK_BOT_TOKEN"),
+    ("slack", {**SLACK, "SLACK_BOT_TOKEN": "   "}, "SLACK_BOT_TOKEN"),
+    ("discord", {"DISCORD_HOME_CHANNEL": "1"}, "DISCORD_BOT_TOKEN"),
+    ("email", {k: v for k, v in EMAIL.items() if k != "EMAIL_IMAP_HOST"},
+     "EMAIL_IMAP_HOST"),
 ])
 def test_a_half_configured_connector_is_refused_rather_than_stored(cluster, kind, values,
                                                                    missing):
@@ -559,7 +561,7 @@ def test_a_value_that_is_not_a_string_is_refused(cluster):
     """JSON can carry a list or an object; a Secret cannot, and a coerced one is a lie."""
     cluster.add_agent("alice", "scraper")
     resp = configure(client_as("alice"), "scraper", "slack",
-                     {**SLACK, "AGENT_SLACK_DEFAULT_CHANNEL": ["C1", "C2"]})
+                     {**SLACK, "SLACK_HOME_CHANNEL": ["C1", "C2"]})
     assert resp.status_code == 400, resp.text
 
 
@@ -567,7 +569,7 @@ def test_an_overlong_value_is_refused(cluster):
     """An unbounded string from a request body is a pod that cannot start, from a browser."""
     cluster.add_agent("alice", "scraper")
     resp = configure(client_as("alice"), "scraper", "slack",
-                     {**SLACK, "AGENT_SLACK_BOT_TOKEN": "x" * 9000})
+                     {**SLACK, "SLACK_BOT_TOKEN": "x" * 9000})
     assert resp.status_code == 400, resp.text
 
 
@@ -625,8 +627,8 @@ def test_the_flat_body_shape_the_wizard_may_send_is_accepted(cluster):
     resp = client_as("alice").post("/portal/api/agents/scraper/connectors",
                                    json={"kind": "slack", **SLACK})
     assert resp.status_code == 200, resp.text
-    assert secret_data(cluster, "agent-alice-scraper-slack")["AGENT_SLACK_BOT_TOKEN"] \
-        == SLACK["AGENT_SLACK_BOT_TOKEN"]
+    assert secret_data(cluster, "agent-alice-scraper-slack")["SLACK_BOT_TOKEN"] \
+        == SLACK["SLACK_BOT_TOKEN"]
 
 
 def test_the_wizard_creates_through_the_627_endpoint_and_then_configures():

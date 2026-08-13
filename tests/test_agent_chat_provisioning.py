@@ -27,7 +27,6 @@ including the ones that would look redundant if the implementation were three co
 """
 
 import base64
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -44,21 +43,21 @@ SLACK_APP_TOKEN = "xapp-1-A012-3456-ApPlEvElToKeN-7c03e1"
 DISCORD_BOT_TOKEN = "MTIzNDU2Nzg5.DiScOrDbOtToKeN.9b7f2c1e"
 
 SLACK = f"""\
-AGENT_SLACK_BOT_TOKEN={SLACK_BOT_TOKEN}
-AGENT_SLACK_APP_TOKEN={SLACK_APP_TOKEN}
-AGENT_SLACK_DEFAULT_CHANNEL=C0123ABCD
+SLACK_BOT_TOKEN={SLACK_BOT_TOKEN}
+SLACK_APP_TOKEN={SLACK_APP_TOKEN}
+SLACK_HOME_CHANNEL=C0123ABCD
 """
 
 DISCORD = f"""\
-AGENT_DISCORD_BOT_TOKEN={DISCORD_BOT_TOKEN}
-AGENT_DISCORD_DEFAULT_CHANNEL=555000111222333444
+DISCORD_BOT_TOKEN={DISCORD_BOT_TOKEN}
+DISCORD_HOME_CHANNEL=555000111222333444
 """
 
 # label -> (flag, config text, the secret's required key, every token in that config)
 CONNECTORS = {
-    "slack": ("--slack-config-file", SLACK, "AGENT_SLACK_BOT_TOKEN",
+    "slack": ("--slack-config-file", SLACK, "SLACK_BOT_TOKEN",
               (SLACK_BOT_TOKEN, SLACK_APP_TOKEN)),
-    "discord": ("--discord-config-file", DISCORD, "AGENT_DISCORD_BOT_TOKEN",
+    "discord": ("--discord-config-file", DISCORD, "DISCORD_BOT_TOKEN",
                 (DISCORD_BOT_TOKEN,)),
 }
 
@@ -82,13 +81,6 @@ def _annotations(run) -> dict:
     return run.deployment()["spec"]["template"]["metadata"]["annotations"]
 
 
-def _configmap(run, name: str) -> dict | None:
-    for doc in yaml.safe_load_all(run.applied):
-        if doc and doc.get("kind") == "ConfigMap" and doc["metadata"]["name"] == name:
-            return doc
-    return None
-
-
 # ---------------------------------------------------------------- the credential lands
 
 def test_the_slack_tokens_are_written_to_their_own_per_agent_secret(tmp_path):
@@ -99,18 +91,18 @@ def test_the_slack_tokens_are_written_to_their_own_per_agent_secret(tmp_path):
     # different lifecycles (a Slack token is rotated in Slack's admin UI, a mail password in
     # M365's, a virtual key by minting at the gateway) and merging them would mean rotating
     # any one of them rewrites — and rolls the pod for — all three.
-    assert run.secret_data("agent-baron-chatter-slack", "AGENT_SLACK_BOT_TOKEN") == SLACK_BOT_TOKEN
-    assert run.secret_data("agent-baron-chatter-slack", "AGENT_SLACK_APP_TOKEN") == SLACK_APP_TOKEN
+    assert run.secret_data("agent-baron-chatter-slack", "SLACK_BOT_TOKEN") == SLACK_BOT_TOKEN
+    assert run.secret_data("agent-baron-chatter-slack", "SLACK_APP_TOKEN") == SLACK_APP_TOKEN
     assert run.secret_data("agent-baron-chatter-slack",
-                           "AGENT_SLACK_DEFAULT_CHANNEL") == "C0123ABCD"
-    assert run.secret_data("agent-baron-chatter-email", "AGENT_SLACK_BOT_TOKEN") is None
+                           "SLACK_HOME_CHANNEL") == "C0123ABCD"
+    assert run.secret_data("agent-baron-chatter-email", "SLACK_BOT_TOKEN") is None
 
 
 def test_the_discord_token_is_written_to_its_own_per_agent_secret(tmp_path):
     run = _provision(tmp_path, "discord")
     assert run.returncode == 0, run.output
     assert run.secret_data("agent-baron-chatter-discord",
-                           "AGENT_DISCORD_BOT_TOKEN") == DISCORD_BOT_TOKEN
+                           "DISCORD_BOT_TOKEN") == DISCORD_BOT_TOKEN
     assert run.secret_data("agent-baron-chatter-discord", "OPENAI_API_KEY") is None
 
 
@@ -171,12 +163,12 @@ def test_nothing_ever_reads_a_bot_token_back(tmp_path, label):
 
     Asserted against the recorded argv rather than by reading the script, because the
     failure this guards is a future `kubectl get secret …-slack -o jsonpath={.data.
-    AGENT_SLACK_BOT_TOKEN}` added for a plausible reason — an idempotence check, a
+    SLACK_BOT_TOKEN}` added for a plausible reason — an idempotence check, a
     validation step — which would put the credential into a shell variable and from there
     into any error the script later printed.
     """
     _flag, _content, required, _tokens = CONNECTORS[label]
-    sum_key = f"AGENT_{label.upper()}_CONFIG_SUM"
+    sum_key = f"{label.upper()}_CONFIG_SUM"
 
     supplied = _provision(tmp_path / "a", label)
     rerun = harness.provision(tmp_path / "b", "baron", "chatter",
@@ -222,69 +214,14 @@ def test_the_pod_takes_every_connector_as_optional_env(tmp_path):
         assert source["secretRef"]["optional"] is True, source
 
     # `env` must still win over `envFrom`, which is what stops a chat config file from
-    # overriding the spendable model credential or the daemon's own password. Kubernetes
-    # guarantees the precedence; this asserts we did not move them into envFrom and lose it.
+    # overriding the spendable model credential. Kubernetes guarantees the precedence; this
+    # asserts we did not move it into envFrom and lose it. The opencode daemon's
+    # OPENCODE_SERVER_PASSWORD is gone — `hermes gateway run` opens no inbound port.
     explicit = {e["name"] for e in container["env"]}
-    assert {"OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD"} <= explicit
-
-
-def test_the_chat_tools_are_delivered_to_the_pod_and_are_executable(tmp_path):
-    """The CLIs travel in the entrypoint ConfigMap, mounted 0755.
-
-    The image is the workspace image byte-for-byte (Contract 6), so they cannot be baked in;
-    they arrive the same way the entrypoint does. 0644 would leave them present, on PATH,
-    and "permission denied" — the most confusing possible way for a tool to be missing.
-    """
-    run = _provision(tmp_path, "slack")
-    configmap = _configmap(run, "agent-entrypoint")
-    assert configmap is not None, "the entrypoint ConfigMap was never applied"
-
-    for key, source in (("agent-slack", "deploy/agent/agent-slack"),
-                        ("agent-discord", "deploy/agent/agent-discord"),
-                        ("agentws.py", "deploy/agent/agentws.py"),
-                        ("SLACK.md", "deploy/agent/SLACK.md"),
-                        ("DISCORD.md", "deploy/agent/DISCORD.md")):
-        assert key in configmap["data"], f"{key} never reaches the pod"
-        assert base64.b64decode(configmap["data"][key]).decode() == \
-            (REPO / source).read_text(), \
-            f"the ConfigMap does not carry the {key} in this checkout"
-
-    volume = next(v for v in run.deployment()["spec"]["template"]["spec"]["volumes"]
-                  if v["name"] == "entrypoint")
-    assert volume["configMap"]["defaultMode"] == 0o755
-
-
-def test_the_websocket_module_ships_beside_the_tools_that_import_it(tmp_path):
-    """agentws.py is not a command, it is the RFC 6455 client both tools import.
-
-    They add their own directory to sys.path, so it has to land in the SAME ConfigMap and
-    therefore the same /etc/agent mount. Shipping one without the other is an ImportError at
-    the moment an unattended agent tries to use Slack — which is the moment nobody is
-    watching.
-    """
-    run = _provision(tmp_path, "discord")
-    data = _configmap(run, "agent-entrypoint")["data"]
-    assert {"agent-slack", "agent-discord", "agentws.py"} <= set(data)
-    for tool in ("agent-slack", "agent-discord"):
-        source = base64.b64decode(data[tool]).decode()
-        assert "import agentws" in source
-
-
-def test_editing_a_chat_tool_rolls_the_agents(tmp_path):
-    """The rollout annotation covers every file in the ConfigMap, not just the mail ones.
-
-    Expected value derived here from the source files directly, so a provisioner that kept
-    hashing only entrypoint.sh + agent-email + EMAIL.md — leaving a changed agent-slack
-    sitting in a ConfigMap that no pod ever re-read — fails this rather than passing quietly.
-    """
-    run = _provision(tmp_path, "slack")
-    expected = subprocess.run(
-        "cat deploy/agent/entrypoint.sh deploy/agent/agent-email deploy/agent/EMAIL.md "
-        "deploy/agent/agent-slack deploy/agent/SLACK.md deploy/agent/agent-discord "
-        "deploy/agent/DISCORD.md deploy/agent/agentws.py | sha256sum | cut -c1-16",
-        shell=True, capture_output=True, text=True, cwd=str(REPO), timeout=60,
-    ).stdout.strip()
-    assert _annotations(run)["checksum/entrypoint"] == expected
+    assert "OPENAI_API_KEY" in explicit
+    assert "OPENCODE_SERVER_PASSWORD" not in explicit, (
+        "the opencode server password is retired; there is no inbound port to guard"
+    )
 
 
 @pytest.mark.parametrize("label", list(CONNECTORS))
@@ -315,7 +252,7 @@ def test_reprovisioning_an_agent_with_a_connector_does_not_roll_it(tmp_path, lab
     _flag, _content, required, _tokens = CONNECTORS[label]
     supplied = _provision(tmp_path / "a", label)
     written = supplied.secret_data(f"agent-baron-chatter-{label}",
-                                   f"AGENT_{label.upper()}_CONFIG_SUM")
+                                   f"{label.upper()}_CONFIG_SUM")
     assert written and written != "none"
     assert _annotations(supplied)[f"checksum/{label}"] == written
 
@@ -335,7 +272,7 @@ def test_an_agent_provisioned_without_chat_is_unchanged_and_says_so(tmp_path):
     assert run.returncode == 0, run.output
     assert _annotations(run)["checksum/slack"] == "none"
     assert _annotations(run)["checksum/discord"] == "none"
-    assert run.secret_data("agent-baron-plain-slack", "AGENT_SLACK_BOT_TOKEN") is None
+    assert run.secret_data("agent-baron-plain-slack", "SLACK_BOT_TOKEN") is None
     assert "no Slack workspace" in run.output and "no Discord guild" in run.output
 
 
@@ -358,10 +295,10 @@ def test_each_connector_is_independent_of_the_others(tmp_path):
 def test_a_mailbox_and_both_chat_connectors_coexist_on_one_agent(tmp_path):
     """The turnkey shape (enterpriseaiframework-e5ca depends on it): all three at once."""
     mail = _config_file(tmp_path, "mailbox", """\
-AGENT_EMAIL_ADDRESS=ops@contoso.com
-AGENT_EMAIL_PASSWORD=mailbox-app-password
-AGENT_EMAIL_SMTP_HOST=smtp.office365.com
-AGENT_EMAIL_IMAP_HOST=outlook.office365.com
+EMAIL_ADDRESS=ops@contoso.com
+EMAIL_PASSWORD=mailbox-app-password
+EMAIL_SMTP_HOST=smtp.office365.com
+EMAIL_IMAP_HOST=outlook.office365.com
 """)
     run = harness.provision(
         tmp_path, "baron", "chatter",
@@ -370,11 +307,11 @@ AGENT_EMAIL_IMAP_HOST=outlook.office365.com
         "--discord-config-file", _config_file(tmp_path, "discord", DISCORD),
     )
     assert run.returncode == 0, run.output
-    assert run.secret_data("agent-baron-chatter-email", "AGENT_EMAIL_PASSWORD") == \
+    assert run.secret_data("agent-baron-chatter-email", "EMAIL_PASSWORD") == \
         "mailbox-app-password"
-    assert run.secret_data("agent-baron-chatter-slack", "AGENT_SLACK_BOT_TOKEN") == SLACK_BOT_TOKEN
+    assert run.secret_data("agent-baron-chatter-slack", "SLACK_BOT_TOKEN") == SLACK_BOT_TOKEN
     assert run.secret_data("agent-baron-chatter-discord",
-                           "AGENT_DISCORD_BOT_TOKEN") == DISCORD_BOT_TOKEN
+                           "DISCORD_BOT_TOKEN") == DISCORD_BOT_TOKEN
     annotations = _annotations(run)
     # Three DIFFERENT checksums. One shared value would mean rotating any credential rolls
     # the pod for all of them and `kubectl describe` cannot say which one changed.
@@ -395,14 +332,14 @@ def test_the_template_has_no_unsubstituted_placeholders_left(tmp_path):
 
 @pytest.mark.parametrize("label", list(CONNECTORS))
 @pytest.mark.parametrize("key", ["PATH", "LD_PRELOAD", "OPENAI_API_KEY", "AGENT_USER",
-                                 "AGENT_EMAIL_PASSWORD"])
+                                 "EMAIL_PASSWORD"])
 def test_a_chat_config_cannot_smuggle_a_non_chat_variable_into_the_pod(tmp_path, label, key):
     """Every key in this file becomes an environment variable in the agent container.
 
     That container holds a spendable API key and runs unattended. `PATH=/tmp/evil` in a file
     called "Slack settings" is arbitrary code execution wearing a disguise, and the
     template's `env`-beats-`envFrom` precedence only defends the two names somebody happened
-    to think of. AGENT_EMAIL_PASSWORD is in the list on purpose: each connector's allowlist
+    to think of. EMAIL_PASSWORD is in the list on purpose: each connector's allowlist
     must be ITS OWN, or one shared function silently lets a Slack file write the mailbox.
     """
     _flag, content, _required, _tokens = CONNECTORS[label]
@@ -420,23 +357,23 @@ def test_a_slack_config_with_only_a_bot_token_is_refused(tmp_path):
     """Socket Mode needs the app-level token. Without it the agent can post and can never
     hear an answer, which reads as "Slack is broken" long after the provisioning that caused
     it, with nothing connecting the two."""
-    partial = f"AGENT_SLACK_BOT_TOKEN={SLACK_BOT_TOKEN}\n"
+    partial = f"SLACK_BOT_TOKEN={SLACK_BOT_TOKEN}\n"
     run = _provision(tmp_path, "slack", partial)
     assert run.returncode != 0, run.output
-    assert "AGENT_SLACK_APP_TOKEN" in run.output
+    assert "SLACK_APP_TOKEN" in run.output
     assert SLACK_BOT_TOKEN not in run.output
 
 
 def test_a_slack_config_with_only_an_app_token_is_refused(tmp_path):
-    run = _provision(tmp_path, "slack", f"AGENT_SLACK_APP_TOKEN={SLACK_APP_TOKEN}\n")
+    run = _provision(tmp_path, "slack", f"SLACK_APP_TOKEN={SLACK_APP_TOKEN}\n")
     assert run.returncode != 0, run.output
-    assert "AGENT_SLACK_BOT_TOKEN" in run.output
+    assert "SLACK_BOT_TOKEN" in run.output
 
 
 def test_a_discord_config_with_no_token_is_refused(tmp_path):
-    run = _provision(tmp_path, "discord", "AGENT_DISCORD_DEFAULT_CHANNEL=555\n")
+    run = _provision(tmp_path, "discord", "DISCORD_HOME_CHANNEL=555\n")
     assert run.returncode != 0, run.output
-    assert "AGENT_DISCORD_BOT_TOKEN" in run.output
+    assert "DISCORD_BOT_TOKEN" in run.output
 
 
 @pytest.mark.parametrize("label", list(CONNECTORS))
@@ -502,6 +439,6 @@ def test_chat_is_orthogonal_to_the_model_credential(tmp_path):
     )
     assert run.returncode == 0, run.output
     assert run.secret_data("agent-baron-chatter-byo", "OPENAI_API_KEY") == "sk-users-own-provider-key"
-    assert run.secret_data("agent-baron-chatter-slack", "AGENT_SLACK_BOT_TOKEN") == SLACK_BOT_TOKEN
+    assert run.secret_data("agent-baron-chatter-slack", "SLACK_BOT_TOKEN") == SLACK_BOT_TOKEN
     labels = run.deployment()["spec"]["template"]["metadata"]["labels"]
     assert labels["agent.enterprise-ai/model-source"] == "byo"

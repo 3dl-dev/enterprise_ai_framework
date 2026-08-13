@@ -7,7 +7,7 @@
 # the workspace objects are not touched. The duplication is the point: a future change to
 # an agent's egress must not be able to reach a workspace pod by editing one shared rule.
 #
-# What these objects make true: an agent pod runs a RESIDENT `opencode serve` next to a
+# What these objects make true: an agent pod runs a RESIDENT `hermes gateway run` next to a
 # spendable virtual key, on a node that is also running live GPU training. It must be able
 # to reach the gateway and the named tool servers, and nothing else we run.
 #
@@ -47,26 +47,16 @@ spec:
       app.kubernetes.io/component: agent
   policyTypes: [Ingress, Egress]
 
-  ingress:
-    # The portal, attaching a console to a living agent (enterpriseaiframework-0e7).
-    # ONLY the control-plane pod, and only the opencode server port.
-    #
-    # There is deliberately NO LAN/tailnet ingress rule here — the workspace has one for
-    # its per-user oauth2-proxy NodePort, which this surface does not have and must not
-    # grow. An agent has exactly one front door and it is the portal.
-    #
-    # The `from` selector is the entire control, and the reason is the CNI, recorded at
-    # length in 60-workspace-common.yaml: kube-router accepts a packet as soon as the
-    # DESTINATION pod's ingress rules allow it, WITHOUT consulting the source pod's egress
-    # rules. So an ingress rule with an empty `from` would open every agent's opencode
-    # server to every other agent and to every workspace, in spite of the egress section
-    # below excluding the whole pod CIDR. Naming the one allowed source is what actually
-    # closes agent-to-agent traffic.
-    - from:
-        - podSelector:
-            matchLabels: { app: control-plane }
-      ports:
-        - { protocol: TCP, port: 4096 }
+  # NO ingress rules, DELIBERATELY. The Hermes retarget removed the agent's inbound port:
+  # `hermes gateway run` is outbound-only, and the console attaches over the Kubernetes
+  # API server's pods/exec subresource (streamed by the kubelet, authenticated by RBAC +
+  # the owner-label re-check), NOT through the pod's Service. The opencode surface admitted
+  # TCP 4096 from the control-plane pod for its HTTP server; there is no such server now, so
+  # there is nothing to admit. With policyType Ingress present and no rules, every inbound
+  # connection to an agent pod is denied — which is exactly right for an unattended process
+  # holding a spendable key, and closes agent-to-agent and workspace-to-agent traffic
+  # outright rather than by naming an allowed source.
+  ingress: []
 
   egress:
     # DNS.

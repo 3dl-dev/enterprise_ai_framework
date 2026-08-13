@@ -66,6 +66,19 @@ def _env(container: dict) -> dict:
     return out
 
 
+def _config_yaml(run) -> str:
+    """The seeded config.yaml out of the per-agent config ConfigMap the template renders.
+
+    The Hermes retarget moved base_url and the model out of the pod env and into
+    `$HERMES_HOME/config.yaml`, seeded from `agent-<user>-<name>-config`. Where inference
+    goes (Contract 4) is read from the ConfigMap now, not from an OPENAI_API_BASE env var.
+    """
+    for doc in yaml.safe_load_all(run.applied):
+        if doc and doc.get("kind") == "ConfigMap" and doc["metadata"]["name"] == f"{OBJ}-config":
+            return doc["data"]["config.yaml"]
+    raise AssertionError(f"no per-agent config ConfigMap {OBJ}-config was applied")
+
+
 # ---------------------------------------------------------------- integrated
 
 @pytest.fixture(scope="module")
@@ -106,9 +119,12 @@ def test_integrated_replaces_the_sentinel_with_the_real_key(integrated):
 
 
 def test_integrated_points_the_pod_at_our_gateway_with_that_key(integrated):
+    # base_url lives in the seeded config.yaml (Hermes reads its provider from HERMES_HOME),
+    # and key_env names the env var the pod's -key Secret injects.
+    config = _config_yaml(integrated)
+    assert "base_url: http://gateway:4000/v1" in config
+    assert "key_env: OPENAI_API_KEY" in config
     env = _env(integrated.deployment()["spec"]["template"]["spec"]["containers"][0])
-    assert env["OPENAI_API_BASE"] == "http://gateway:4000/v1"
-    assert env["OPENAI_BASE_URL"] == "http://gateway:4000/v1"
     assert env["OPENAI_API_KEY"] == f"secret:{OBJ}-key/OPENAI_API_KEY"
 
 
@@ -246,10 +262,12 @@ def test_byo_mints_no_virtual_key_at_all(byo):
 
 
 def test_byo_points_the_pod_at_the_external_provider(byo):
+    # BYO swaps the config.yaml base_url to the user's provider and the pod's key Secret to
+    # -byo — the same two edits, one in the ConfigMap and one in the env secretKeyRef.
+    config = _config_yaml(byo)
+    assert f"base_url: {BYO_BASE}" in config
+    assert "gateway:4000" not in config
     env = _env(byo.deployment()["spec"]["template"]["spec"]["containers"][0])
-    assert env["OPENAI_API_BASE"] == BYO_BASE
-    assert env["OPENAI_BASE_URL"] == BYO_BASE
-    assert "gateway:4000" not in env["OPENAI_API_BASE"]
     assert env["OPENAI_API_KEY"] == f"secret:{OBJ}-byo/OPENAI_API_KEY"
 
 
@@ -404,14 +422,23 @@ def test_no_rendered_manifest_carries_an_unsubstituted_placeholder(integrated, b
 
 
 def test_the_template_has_no_hardcoded_gateway_url_left():
-    """The gateway address must come from the mode, or BYO silently routes through us."""
+    """The gateway address must come from the mode, or BYO silently routes through us.
+
+    In the Hermes template the base_url lives in the seeded config.yaml ConfigMap, as the
+    `__API_BASE__` placeholder — mode-driven. A literal gateway URL in that block would send
+    every BYO agent's inference through us on the user's own credential.
+    """
     body = TEMPLATE.read_text()
-    env_block = body[body.index("OPENAI_API_BASE"):body.index("OPENCODE_MODEL")]
-    assert "gateway:4000" not in env_block, env_block
+    config_block = body[body.index("config.yaml: |"):body.index("PersistentVolumeClaim")]
+    assert "base_url: __API_BASE__" in config_block, config_block
+    assert "gateway:4000" not in config_block, config_block
 
 
 def test_the_rendered_template_is_valid_yaml_in_both_modes(integrated, byo):
     for run in (integrated, byo):
         docs = [d for d in yaml.safe_load_all(run.applied) if d]
         kinds = {d["kind"] for d in docs}
-        assert {"Deployment", "Service", "PersistentVolumeClaim", "Secret"} <= kinds, kinds
+        # The Hermes template has no Service (no inbound port); it carries the per-agent
+        # config ConfigMap instead, and the -key Secret is applied beside it.
+        assert {"Deployment", "ConfigMap", "PersistentVolumeClaim", "Secret"} <= kinds, kinds
+        assert "Service" not in kinds, kinds

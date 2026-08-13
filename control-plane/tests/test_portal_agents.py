@@ -454,7 +454,8 @@ def test_a_user_lists_stops_starts_and_deletes_their_own_agent(cluster):
 
     body = alice.request("DELETE", "/portal/api/agents/scraper").json()
     assert body["deleted"] is True
-    for kind in ("deployments", "services", "secrets", "persistentvolumeclaims"):
+    for kind in ("deployments", "services", "secrets", "persistentvolumeclaims",
+                 "configmaps"):
         assert cluster.names(kind) == [], f"{kind} survived the delete: {cluster.names(kind)}"
     assert body["key_revoked"] == "alice::agents/scraper", (
         "deleting the pod without revoking the key leaves a spendable credential at the "
@@ -480,11 +481,28 @@ def test_creating_an_agent_applies_the_real_template_with_every_placeholder_fill
     )
     assert labels["agent.enterprise-ai/name"] == "helper"
     container = dep["spec"]["template"]["spec"]["containers"][0]
-    assert container["image"] == "registry.invalid/enterprise-ai-workspace:xyz", (
-        "an agent runs the image the Code surface is actually running, read off a live "
-        "workspace pod rather than computed from a tag"
+    assert container["image"] == agents.HERMES_IMAGE, (
+        "an agent runs the Hermes Agent image (named configuration), not the workspace "
+        "image — reusing the workspace artefact was the opencode conflation this retarget "
+        "removes"
+    )
+    assert container["args"] == ["gateway", "run"], (
+        "the resident daemon is `hermes gateway run`; the console attaches `hermes --tui` "
+        "over exec and never spawns the daemon"
+    )
+    # The seeded config.yaml routes the agent through our gateway on the chosen model — the
+    # integrated path (Contract 4), rendered into the per-agent config ConfigMap.
+    cfg = cluster.get("configmaps", "agent-alice-helper-config")
+    assert cfg is not None, "the per-agent config ConfigMap was not applied"
+    config_yaml = cfg["data"]["config.yaml"]
+    assert "http://gateway:4000/v1" in config_yaml and agents.DEFAULT_MODEL in config_yaml, (
+        "config.yaml must route the agent through our gateway on the chosen model"
     )
     secret = cluster.get("secrets", "agent-alice-helper-key")
+    assert "OPENCODE_SERVER_PASSWORD" not in secret["data"], (
+        "the opencode server password is retired — `hermes gateway run` opens no port, and "
+        "the console authenticates by exec RBAC + the owner guard, not a per-agent password"
+    )
     key = base64.b64decode(secret["data"]["OPENAI_API_KEY"]).decode()
     assert key == "sk-fake-alice-agents/helper", "the minted key must reach the pod's Secret"
     assert key != agents.KEY_SENTINEL, (

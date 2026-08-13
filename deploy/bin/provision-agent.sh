@@ -6,24 +6,29 @@
 #
 # A PARALLEL script to deploy/bin/provision-workspace.sh, not a generalisation of it.
 # Contract 6 of docs/design/records/agents-surface.md freezes the Code/workspace surface
-# byte-for-byte — the camp runs on it — so this file, deploy/k8s/63-agent-common.yaml,
-# deploy/k8s/64-agent.template.yaml and deploy/agent/entrypoint.sh sit BESIDE the frozen
-# set and never edit it. tests/test_agents_code_untouched.py makes that mechanical.
+# byte-for-byte — the camp runs on it — so this file, deploy/k8s/63-agent-common.yaml and
+# deploy/k8s/64-agent.template.yaml sit BESIDE the frozen set and never edit it.
+# tests/test_agents_code_untouched.py makes that mechanical.
+#
+# THIS IS THE HERMES RETARGET (docs/design/records/agents-surface-hermes-retarget.md). An
+# Agent is a long-lived autonomous Hermes Agent (NousResearch), not an opencode coding
+# session — the two surfaces were conflated and are now separate. The resident process is
+# `hermes gateway run`, the console attaches `hermes --tui` over the Kubernetes pods/exec
+# subresource, and the pod runs the Hermes image, not the workspace artefact.
 #
 # What it guarantees, in the order the guarantees matter:
 #
-#   1. RESIDENCY. The pod's own process is `opencode serve` — a headless daemon that holds
-#      a session with NO console attached and keeps holding it across every connect and
-#      disconnect. This is the entire difference from Code, where ttyd spawns a fresh
-#      opencode per websocket and it dies with the connection (finding 43). An agent that
-#      needed a browser open would be a workspace with a different tab.
+#   1. RESIDENCY. The pod's own process is `hermes gateway run` — the foreground messaging
+#      gateway + cron scheduler, supervised by the image's s6-overlay, holding its session
+#      with NO console attached and keeping it across every connect and disconnect. An
+#      agent that needed a browser open would be a workspace with a different tab.
 #   2. Object names are `agent-<user>-<name>` (Contract 1): the PVC, the Deployment, the
-#      Service and the Secret. One greppable family, mirroring `ws-<user>`.
-#   3. The opencode server is not published. The Service is ClusterIP with no NodePort,
-#      the NetworkPolicy admits 4096 only from the control-plane pod, and the daemon
-#      itself demands HTTP Basic. The portal decides WHICH agent you reach from your
-#      authenticated name (enterpriseaiframework-0e7), so a request cannot name someone
-#      else's.
+#      per-agent config ConfigMap and the Secret. One greppable family, mirroring `ws-<user>`.
+#   3. The agent publishes NO inbound port. `hermes gateway run` is outbound-only; the
+#      console attaches over the API server's pods/exec subresource, not a pod Service, so
+#      there is no server to guard with a password. The portal decides WHICH agent you
+#      reach from your authenticated name (enterpriseaiframework-0e7), re-checked against
+#      the owner label, so a request cannot name someone else's.
 #   4. The pod cannot reach the Kubernetes API, a workspace, another agent, the control
 #      plane, Postgres or identity. Its in-cluster egress is an allowlist of NAMED
 #      services — kube-dns, the gateway, and the MCP tool servers — never the namespace
@@ -33,7 +38,8 @@
 # IDEMPOTENT, AND DELIBERATELY NON-DISRUPTIVE. Re-running this for a healthy agent must
 # not restart it: restarting an agent ends the resident session that is the whole product.
 # So, unlike provision-workspace.sh, this does NOT rotate a credential on every run, and
-# the pod template's rollout annotation tracks the entrypoint rather than the key.
+# the pod template's rollout annotations track the config inputs and the credential hashes
+# rather than the credential values.
 #
 # THE MODEL API IS CONFIGURABLE (Contract 4, enterpriseaiframework-39d). Two modes, and
 # the difference between them is where the agent's inference goes and whose money it is:
@@ -64,24 +70,21 @@
 #
 # STILL DELIBERATELY NON-DISRUPTIVE. An integrated agent that already holds a real key
 # does NOT get it rotated on a re-run: rotation deletes the old key at the gateway, and
-# because the pod template's rollout annotation tracks the entrypoint rather than the key
-# (see 64-agent.template.yaml), the running daemon would keep presenting a credential that
-# no longer exists and start 401ing with nothing on screen to say why. Minting happens
-# when there is no usable key — first provision, or -055's sentinel.
+# because the pod template's rollout annotation tracks the credential's hash rather than
+# the key itself (see 64-agent.template.yaml), the running daemon would keep presenting a
+# credential that no longer exists and start 401ing with nothing on screen to say why.
+# Minting happens when there is no usable key — first provision, or -055's sentinel.
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
 NS=enterprise-ai
-REGISTRY="${RAIL_REGISTRY:-192.168.2.43:30500}"
-IMAGE_NAME="enterprise-ai-workspace"
-# The SAME image the Code surface runs, derived the same way provision-workspace.sh
-# derives it — including the WORKSPACE_TAG/WORKSPACE_IMAGE overrides, because the tag that
-# is actually deployed on a cluster is frequently not this checkout's HEAD. Reusing the
-# artefact rather than building an agent image is how this surface gets a pinned opencode
-# without touching one byte of deploy/workspace/.
-WORKSPACE_TAG="${WORKSPACE_TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo latest)}"
-IMAGE="${AGENT_IMAGE:-${WORKSPACE_IMAGE:-${REGISTRY}/${IMAGE_NAME}:${WORKSPACE_TAG}}}"
+# The Hermes Agent image. Named configuration, NOT the workspace artefact: an Agent runs
+# Hermes (a different product from opencode), so its image is a pinned date tag rather than
+# something read off a workspace pod. `0.8.0` does not exist on Docker Hub; the tags are
+# date-based (vYYYY.M.D). Overridable per deployment via AGENT_IMAGE, matching
+# control-plane/app/agents.py's HERMES_IMAGE default so the two renderers agree.
+IMAGE="${AGENT_IMAGE:-nousresearch/hermes-agent:v2026.8.3}"
 
 USAGE="usage: provision-agent.sh <keycloak-username> <agent-name> [--model NAME]
                                  [--byo-key-file FILE] [--byo-api-base URL]
@@ -114,6 +117,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 GATEWAY_BASE="http://gateway:4000/v1"
+
+# The model's context window and output cap, seeded into the per-agent config.yaml. Both
+# REQUIRED and both, when wrong, surface as a misleading "context length exceeded": Hermes
+# cannot read a window from our gateway's /v1/models (assumes ~0 without this), and an
+# over-cap max_tokens 400s at the provider (deepinfra caps some models at 32768). Same
+# defaults as control-plane/app/agents.py so the two renderers agree byte-for-byte.
+CONTEXT_LENGTH="${AGENT_CONTEXT_LENGTH:-128000}"
+MAX_TOKENS="${AGENT_MAX_TOKENS:-8000}"
 
 # The mode is derived from what was supplied rather than from a --mode flag that could
 # disagree with it. Both halves are required together: a BYO key with no base URL would
@@ -195,47 +206,31 @@ echo "    api      ${MODEL_SOURCE} -> ${API_BASE}"
 # to exist before the policy that fences it does.
 kubectl apply -f deploy/k8s/63-agent-common.yaml >/dev/null
 
-# The resident entrypoint, deployment-wide (one control plane), delivered as a ConfigMap
-# because the image is the workspace image and Contract 6 forbids rebuilding it.
+# NO deployment-wide entrypoint ConfigMap any more. The opencode surface delivered its
+# entrypoint plus every outside-world tool as a shared `agent-entrypoint` ConfigMap mounted
+# at /etc/agent; the Hermes image carries its own entrypoint (s6-overlay), and its
+# messaging connectors are read by `hermes gateway run` from the ENVIRONMENT, not from shell
+# tools on a mounted PATH — so there is nothing deployment-wide to ship. The per-agent
+# config.yaml is seeded from the ConfigMap the template renders inline (agent-<user>-<name>-
+# config), copied onto the PVC by the init container in 64-agent.template.yaml.
 #
-# It carries the entrypoint, every outside-world tool the entrypoint puts on PATH, and the
-# instructions file that tells opencode each tool exists (enterpriseaiframework-a4e for
-# mail, -783 for Slack and Discord). ONE ConfigMap rather than one per tool because they
-# roll together — a new agent-slack with an old entrypoint is a tool nothing has put on
-# PATH — and because the pod's rollout annotation is a single checksum over all of them.
-#
-# agentws.py is a MODULE, not a command: it is the RFC 6455 client both chat tools import,
-# and it has to sit in the same directory as them because that directory is what they add
-# to sys.path. Shipping it here rather than baking it into the image is forced by Contract
-# 6, which freezes deploy/workspace/ including the Dockerfile.
-AGENT_FILES=(entrypoint.sh agent-email EMAIL.md agent-slack SLACK.md
-             agent-discord DISCORD.md agentws.py)
-CONFIGMAP_ARGS=()
-for f in "${AGENT_FILES[@]}"; do
-    CONFIGMAP_ARGS+=("--from-file=${f}=deploy/agent/${f}")
-done
-kubectl -n "$NS" create configmap agent-entrypoint \
-    "${CONFIGMAP_ARGS[@]}" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
-# Over EVERY file, so editing any tool actually rolls the agents. It used to hash
-# entrypoint.sh alone; a checksum that covers only some of the files in a ConfigMap is a
-# rollout trigger that quietly stops firing for the rest. Derived from the same array the
-# ConfigMap is built from, so a file can never be shipped without being hashed.
-CFGSUM=$(for f in "${AGENT_FILES[@]}"; do cat "deploy/agent/${f}"; done \
+# checksum/config over the inputs that DEFINE that seeded config.yaml, so a change to the
+# model, the window, the cap or the gateway rolls the pod (env is injected at start and
+# never updated). It MUST match control-plane/app/agents.py's CFGSUM over the same canonical
+# string — sha256("<api_base>|<model>|<context_length>|<max_tokens>")[:16] — or provisioning
+# by either route would needlessly roll the other's agents. `printf %s` (no trailing
+# newline) so the bytes hashed are exactly the Python f-string's.
+CFGSUM=$(printf '%s' "${API_BASE}|${MODEL}|${CONTEXT_LENGTH}|${MAX_TOKENS}" \
          | sha256sum | cut -c1-16)
 
 # ---------------------------------------------------------------- the pod's secret
 # Read what is already there FIRST. Re-provisioning must not roll a credential out from
-# under a running console, and must not silently replace a real key with the sentinel.
+# under a running agent, and must not silently replace a real key with the sentinel.
 existing() { existing_in "${OBJ}-key" "$1"; }
 existing_in() {
     kubectl -n "$NS" get secret "$1" -o "jsonpath={.data.$2}" 2>/dev/null \
         | base64 -d 2>/dev/null || true
 }
-SERVER_PASSWORD="$(existing OPENCODE_SERVER_PASSWORD)"
-if [[ -z "$SERVER_PASSWORD" ]]; then
-    SERVER_PASSWORD="$(head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-32)"
-fi
 
 # -055's sentinel, spelled so that anyone who greps a 401 finds the item that fixed it.
 # It is still the value written when no key can be minted, and it is what this script
@@ -257,11 +252,11 @@ if [[ "$MODEL_SOURCE" == "byo" ]]; then
         echo "  first, then re-run with --byo-key-file." >&2
         exit 1
     fi
-    # The pod's own Secret still carries the console password, and its OPENAI_API_KEY stays
-    # the sentinel — the pod does not read it in this mode, and a real key sitting unused
-    # in a Secret is a credential with no owner.
+    # The pod's own Secret holds ONLY OPENAI_API_KEY, and it stays the sentinel — the pod
+    # does not read it in this mode, and a real key sitting unused in a Secret is a
+    # credential with no owner. There is no console password: `hermes gateway run` opens no
+    # inbound port, so the OPENCODE_SERVER_PASSWORD the opencode surface stored is retired.
     kubectl -n "$NS" create secret generic "${OBJ}-key" \
-        --from-literal=OPENCODE_SERVER_PASSWORD="$SERVER_PASSWORD" \
         --from-literal=OPENAI_API_KEY="$KEY_SENTINEL" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
@@ -340,8 +335,9 @@ else
     fi
 
     KEYSUM=$(printf '%s' "$API_KEY" | sha256sum | cut -c1-16)
+    # ONLY OPENAI_API_KEY (the OPENCODE_SERVER_PASSWORD is retired — no inbound port to
+    # guard; the console authenticates over pods/exec by RBAC + the owner-label re-check).
     kubectl -n "$NS" create secret generic "${OBJ}-key" \
-        --from-literal=OPENCODE_SERVER_PASSWORD="$SERVER_PASSWORD" \
         --from-literal=OPENAI_API_KEY="$API_KEY" \
         --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 fi
@@ -355,8 +351,15 @@ fi
 # THERE IS NO MAIL SERVER AND NO CHAT SERVER IN THIS DEPLOYMENT AND THERE MUST NEVER BE
 # ONE: no Maddy, no Stalwart, no Postfix, no Mattermost, no Rocket.Chat, no Zulip, no chat
 # or mail component in any manifest. That is Baron's ruling on -a4e and -783, and
-# tests/test_agent_email.py, tests/test_agent_slack.py and tests/test_agent_discord.py
-# assert it against every deploy manifest rather than trusting this comment.
+# tests/test_agent_no_chat_server.py asserts it against every deploy manifest rather than
+# trusting this comment.
+#
+# The Secret KEYS are Hermes's OWN native env var names (verified against
+# nousresearch/hermes-agent:v2026.8.3), so `hermes gateway run` reads them directly with no
+# translation. They match control-plane/app/agents.py CONNECTORS exactly — the two are bound
+# by test_the_python_schema_matches_the_shell_provisioners_allowlists. Hermes denies unknown
+# senders by default, so a connector with no *_ALLOWED_USERS connects but answers no one;
+# that is the secure default, and the allow-list keys below are how you open it.
 #
 # Each credential is handled EXACTLY like the BYO key above, for the same reason: it is the
 # user's own external credential, we cannot revoke it, and it buys real authority — a
@@ -375,25 +378,23 @@ fi
 # Each config file is `KEY=value` per line, the shape `kubectl create secret
 # --from-env-file` takes. Worked examples:
 #
-#     # --email-config-file (an M365 mailbox)
-#     AGENT_EMAIL_ADDRESS=ops-agent@contoso.com
-#     AGENT_EMAIL_USERNAME=ops-agent@contoso.com
-#     AGENT_EMAIL_PASSWORD=<app password>
-#     AGENT_EMAIL_SMTP_HOST=smtp.office365.com
-#     AGENT_EMAIL_SMTP_PORT=587
-#     AGENT_EMAIL_SMTP_SECURITY=starttls
-#     AGENT_EMAIL_IMAP_HOST=outlook.office365.com
-#     AGENT_EMAIL_IMAP_PORT=993
-#     AGENT_EMAIL_IMAP_SECURITY=ssl
+#     # --email-config-file (an M365 mailbox; Hermes auto-detects ports and TLS)
+#     EMAIL_ADDRESS=ops-agent@contoso.com
+#     EMAIL_PASSWORD=<app password>
+#     EMAIL_SMTP_HOST=smtp.office365.com
+#     EMAIL_IMAP_HOST=outlook.office365.com
+#     EMAIL_ALLOW_ALL_USERS=true            # optional; blank = deny-by-default
 #
 #     # --slack-config-file (a Slack app with Socket Mode enabled)
-#     AGENT_SLACK_BOT_TOKEN=xoxb-...
-#     AGENT_SLACK_APP_TOKEN=xapp-...
-#     AGENT_SLACK_DEFAULT_CHANNEL=C0123ABCD
+#     SLACK_BOT_TOKEN=xoxb-...
+#     SLACK_APP_TOKEN=xapp-...
+#     SLACK_HOME_CHANNEL=C0123ABCD          # optional
+#     SLACK_ALLOWED_USERS=U0123ABCD         # optional; without it the bot answers no one
 #
 #     # --discord-config-file (a Discord application's bot)
-#     AGENT_DISCORD_BOT_TOKEN=...
-#     AGENT_DISCORD_DEFAULT_CHANNEL=123456789012345678
+#     DISCORD_BOT_TOKEN=...
+#     DISCORD_HOME_CHANNEL=123456789012345678   # optional
+#     DISCORD_ALLOWED_USERS=987654321098765432  # optional; without it the bot answers no one
 #
 # Values are taken literally — kubectl does not strip quotes — so a token wrapped in quotes
 # becomes a token WITH quotes, which is a 401 nobody diagnoses.
@@ -430,8 +431,8 @@ provision_connector() {
     # with `envFrom`, so every key in it becomes an environment variable in a container that
     # holds a spendable API key — a file containing `PATH=/tmp/evil` or `LD_PRELOAD=...`
     # would be an arbitrary-code-execution channel dressed up as a chat setting. The
-    # template's explicit `env:` already wins over `envFrom` for OPENAI_API_KEY and
-    # OPENCODE_SERVER_PASSWORD, but that only defends the two names anyone thought of.
+    # template's explicit `env:` already wins over `envFrom` for OPENAI_API_KEY, but that
+    # only defends the one name anyone thought of.
     #
     # Parsed for VALIDATION only, and kubectl reads the file itself — nothing here is passed
     # on. Be precise about what that does and does not mean: `$line` DOES hold the
@@ -514,34 +515,38 @@ provision_connector() {
     printf '    %-8s credential stored in %s (not shown, not readable back)\n' "$label" "$secret"
 }
 
+# The allowlists are Hermes's OWN env var names (the retarget), in the SAME order as
+# control-plane/app/agents.py CONNECTORS — the two are bound by
+# test_the_python_schema_matches_the_shell_provisioners_allowlists. Hermes auto-detects mail
+# ports and TLS, so there is no username/port/security key; EMAIL_ALLOW_ALL_USERS opts out of
+# deny-by-default.
 provision_connector email "--email-config-file" "$EMAIL_CONFIG_FILE" \
-    "mail setting" AGENT_EMAIL_CONFIG_SUM "none — this agent has no mailbox" \
-"AGENT_EMAIL_ADDRESS AGENT_EMAIL_USERNAME AGENT_EMAIL_PASSWORD
-AGENT_EMAIL_SMTP_HOST AGENT_EMAIL_SMTP_PORT AGENT_EMAIL_SMTP_SECURITY
-AGENT_EMAIL_IMAP_HOST AGENT_EMAIL_IMAP_PORT AGENT_EMAIL_IMAP_SECURITY
-AGENT_EMAIL_CA_FILE" \
-    "AGENT_EMAIL_ADDRESS AGENT_EMAIL_PASSWORD AGENT_EMAIL_SMTP_HOST AGENT_EMAIL_IMAP_HOST"
+    "mail setting" EMAIL_CONFIG_SUM "none — this agent has no mailbox" \
+"EMAIL_ADDRESS EMAIL_PASSWORD EMAIL_IMAP_HOST
+EMAIL_SMTP_HOST EMAIL_HOME_ADDRESS EMAIL_ALLOW_ALL_USERS" \
+    "EMAIL_ADDRESS EMAIL_PASSWORD EMAIL_SMTP_HOST EMAIL_IMAP_HOST"
 EMAILSUM="$CONNECTOR_SUM"
 
 # BOTH Slack tokens are required. The bot token (`xoxb-`) posts; the app-level token
 # (`xapp-`) is what opens the Socket Mode websocket, and Socket Mode is how the agent
 # RECEIVES without anyone publishing an inbound internet route into a pod that holds a
 # spendable model key. An agent with only the bot token can talk and can never listen.
+# SLACK_ALLOWED_USERS gates who it answers (Hermes denies unknown senders by default).
 provision_connector slack "--slack-config-file" "$SLACK_CONFIG_FILE" \
-    "Slack setting" AGENT_SLACK_CONFIG_SUM "none — this agent has no Slack workspace" \
-"AGENT_SLACK_BOT_TOKEN AGENT_SLACK_APP_TOKEN AGENT_SLACK_DEFAULT_CHANNEL
-AGENT_SLACK_API_BASE AGENT_SLACK_CA_FILE" \
-    "AGENT_SLACK_BOT_TOKEN AGENT_SLACK_APP_TOKEN"
+    "Slack setting" SLACK_CONFIG_SUM "none — this agent has no Slack workspace" \
+"SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL
+SLACK_ALLOWED_USERS" \
+    "SLACK_BOT_TOKEN SLACK_APP_TOKEN"
 SLACKSUM="$CONNECTOR_SUM"
 
 # Discord needs ONE token for both directions — the same bot token authenticates the REST
-# call that posts and the Gateway websocket that listens — which is the only structural
-# difference between the two chat connectors.
+# call that posts and the Gateway websocket that listens. DISCORD_ALLOWED_USERS / _ROLES
+# gate who it answers (deny-by-default without them).
 provision_connector discord "--discord-config-file" "$DISCORD_CONFIG_FILE" \
-    "Discord setting" AGENT_DISCORD_CONFIG_SUM "none — this agent has no Discord guild" \
-"AGENT_DISCORD_BOT_TOKEN AGENT_DISCORD_DEFAULT_CHANNEL AGENT_DISCORD_API_BASE
-AGENT_DISCORD_API_VERSION AGENT_DISCORD_INTENTS AGENT_DISCORD_CA_FILE" \
-    "AGENT_DISCORD_BOT_TOKEN"
+    "Discord setting" DISCORD_CONFIG_SUM "none — this agent has no Discord guild" \
+"DISCORD_BOT_TOKEN DISCORD_HOME_CHANNEL DISCORD_ALLOWED_USERS
+DISCORD_ALLOWED_ROLES" \
+    "DISCORD_BOT_TOKEN"
 DISCORDSUM="$CONNECTOR_SUM"
 
 # ---------------------------------------------------------------- apply
@@ -549,6 +554,8 @@ sed -e "s|__USER__|${USER_NAME}|g" \
     -e "s|__NAME__|${AGENT_NAME}|g" \
     -e "s|__IMAGE__|${IMAGE}|g" \
     -e "s|__MODEL__|${MODEL}|g" \
+    -e "s|__CONTEXT_LENGTH__|${CONTEXT_LENGTH}|g" \
+    -e "s|__MAX_TOKENS__|${MAX_TOKENS}|g" \
     -e "s|__CFGSUM__|${CFGSUM}|g" \
     -e "s|__KEYSUM__|${KEYSUM}|g" \
     -e "s|__MODEL_SOURCE__|${MODEL_SOURCE}|g" \
@@ -562,7 +569,8 @@ sed -e "s|__USER__|${USER_NAME}|g" \
 kubectl -n "$NS" rollout status "deployment/${OBJ}" --timeout=600s
 
 echo
-echo "  ${OBJ}: resident. \`opencode serve\` holds the session with nothing attached;"
+echo "  ${OBJ}: resident. \`hermes gateway run\` holds the session with nothing attached;"
+echo "  console in with \`kubectl -n ${NS} exec -it deploy/${OBJ} -c agent -- hermes --tui\`;"
 echo "  stop it with \`kubectl -n ${NS} scale deploy/${OBJ} --replicas=0\` (PVC kept)."
 if [[ "$MODEL_SOURCE" == "byo" ]]; then
     echo

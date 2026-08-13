@@ -21,14 +21,13 @@
 # ===========================================
 # Every mechanism it uses already exists and is already tested on its own:
 #
-#   * deploy/bin/provision-agent.sh — residency, object naming, the NetworkPolicy, the
-#     integrated key mint through /admin/keys/issue, and the connector credential
-#     handling (set-once, from a FILE, never argv, never read back).
-#   * deploy/agent/agent-slack, agent-discord — the chat tools, including their own
-#     `config` subcommand, which is what this script asks the pod rather than inventing a
-#     second opinion about whether chat is wired.
-#   * deploy/agent/entrypoint.sh — putting those tools on PATH and composing SLACK.md /
-#     DISCORD.md into opencode's `instructions` so the model knows they exist.
+#   * deploy/bin/provision-agent.sh — residency (`hermes gateway run`), object naming, the
+#     NetworkPolicy, the integrated key mint through /admin/keys/issue, and the connector
+#     credential handling (set-once, from a FILE, never argv, never read back).
+#   * the Hermes image's own entrypoint (s6-overlay) — supervising `hermes gateway run`,
+#     which reads its native messaging connectors from the environment. There are no shell
+#     tools to put on PATH and no opencode config to compose; the connector Secret being
+#     injected into the pod's environment is the whole of "chat is wired".
 #
 # What is genuinely NEW here is only two things: a default (integrated Forge + Slack), and
 # a REFUSAL TO CLAIM SUCCESS THAT HAS NOT BEEN OBSERVED.
@@ -38,24 +37,28 @@
 # A turnkey command's failure mode is not that it errors. It is that it prints a
 # reassuring summary over a half-built thing, and the operator finds out days later that
 # the agent has been 401ing into a channel nobody reads. `kubectl rollout status` returning
-# 0 does not mean the agent can infer, and a Secret existing does not mean the tool inside
-# the pod can see it. So READY is printed only after all four of these were OBSERVED, each
-# from inside the running pod where the claim actually has to be true:
+# 0 does not mean the agent can infer, and a Secret existing does not mean the running pod
+# actually has it in its environment. So READY is printed only after all of these were
+# OBSERVED, each from inside the running pod where the claim actually has to be true:
 #
 #   1. the Deployment reports Available=True and the pod's phase is Running;
-#   2. `agent-<chat> config` inside the pod reports its tokens present — the TOOL's own
-#      report, not our inference from the Secret we applied;
-#   3. the composed opencode config in the pod carries the connector's instructions doc,
-#      because entrypoint.sh falls back to the image config on a compose failure and an
-#      agent that has Slack but was never told so is a silently mute agent;
-#   4. a REAL POST to /chat/completions from inside the pod returns 200 — through
-#      $OPENAI_API_BASE with $OPENAI_API_KEY, both read from the pod's own environment.
-#      That one call proves the egress allowlist, the minted virtual key, the gateway, the
-#      upstream (Forge) and the model name all at once, and nothing short of it does.
+#   2. the connector's credential is present in the pod's ENVIRONMENT — the envFrom the
+#      Secret is injected through, read back from inside the container rather than inferred
+#      from the Secret we applied (envFrom is injected at pod start and never updated, so a
+#      pod that predates the Secret has the roll not yet taken effect);
+#   3. a REAL POST to /chat/completions from inside the pod returns 200 — to the base_url
+#      and model in the pod's own $HERMES_HOME/config.yaml, with $OPENAI_API_KEY from the
+#      pod's own environment. That one call proves the egress allowlist, the minted virtual
+#      key, the gateway, the upstream (Forge) and the model name all at once, and nothing
+#      short of it does.
 #
-# Step 4 also asserts the base is OUR gateway. That is what makes the word "Forge" in the
+# Step 3 also asserts the base is OUR gateway. That is what makes the word "Forge" in the
 # summary true rather than assumed: a BYO agent (Contract 4) would answer with the user's
 # own provider here, produce no ledger row, and must not be reported as metered.
+#
+# The connector Secret keys are Hermes's OWN env var names (SLACK_BOT_TOKEN, DISCORD_BOT_
+# TOKEN, EMAIL_ADDRESS, ...), which `hermes gateway run` reads directly — so step 2 probing
+# their presence in the pod's environment proves the credential is where the gateway looks.
 #
 # INTEGRATED IS NOT A DEFAULT THIS SCRIPT WILL LET YOU SLIP OUT OF. provision-agent.sh
 # derives BYO mode from the environment as well as from flags, so `AGENT_BYO_API_BASE` set
@@ -137,13 +140,19 @@ if [[ "$CHAT" == discord && -n "$SLACK_CONFIG_FILE" ]]; then
     exit 1
 fi
 
+# The env vars the connector Secret injects that PROVE it reached the pod. These are
+# Hermes's OWN env var names — the ones `hermes gateway run` reads and provision-agent.sh
+# now writes: Slack needs BOTH (the bot token posts, the app token opens Socket Mode that
+# RECEIVES), Discord needs its one bot token.
 if [[ "$CHAT" == slack ]]; then
     CHAT_FLAG="--slack-config-file"; CHAT_FILE="$SLACK_CONFIG_FILE"
-    CHAT_SUM_KEY=AGENT_SLACK_CONFIG_SUM; CHAT_DOC=/etc/agent/SLACK.md
+    CHAT_SUM_KEY=SLACK_CONFIG_SUM
+    CHAT_ENV_VARS="SLACK_BOT_TOKEN SLACK_APP_TOKEN"
     CHAT_NOUN="Slack workspace"
 else
     CHAT_FLAG="--discord-config-file"; CHAT_FILE="$DISCORD_CONFIG_FILE"
-    CHAT_SUM_KEY=AGENT_DISCORD_CONFIG_SUM; CHAT_DOC=/etc/agent/DISCORD.md
+    CHAT_SUM_KEY=DISCORD_CONFIG_SUM
+    CHAT_ENV_VARS="DISCORD_BOT_TOKEN"
     CHAT_NOUN="Discord guild"
 fi
 
@@ -192,7 +201,7 @@ echo
 # ---------------------------------------------------------------- 1. provision
 # The composition. No --byo-* flags, so provision-agent.sh takes its INTEGRATED default:
 # a virtual key minted through the control plane with the alias `<user>::agents/<name>`,
-# and OPENAI_API_BASE pointed at our gateway. The chat flag is the one that already exists.
+# and the seeded config.yaml's base_url pointed at our gateway. The chat flag already exists.
 PROVISION_ARGS=("$USER_NAME" "$AGENT_NAME")
 [[ -n "$MODEL" ]] && PROVISION_ARGS+=(--model "$MODEL")
 [[ -n "$CHAT_FILE" ]] && PROVISION_ARGS+=("$CHAT_FLAG" "$CHAT_FILE")
@@ -230,49 +239,28 @@ echo "    pod      ${POD} Running, deployment Available"
 
 in_pod() { kubectl -n "$NS" exec "$POD" -c agent -- bash -c "$1"; }
 
-# ---------------------------------------------------------------- 3. chat, per the tool
-# The TOOL's own `config` subcommand, from inside the pod. Deliberately not our own
-# re-derivation from the Secret we just applied: what has to be true is that the process
-# which will post to ${CHAT_NOUN} can see its tokens, and the only thing that can answer
-# that is that process. `config` prints presence booleans and never a token — that is its
-# entire contract, asserted by tests/test_agent_slack.py and test_agent_discord.py.
-CHAT_JSON="$(in_pod "command -v agent-${CHAT} >/dev/null || { echo not-on-path >&2; exit 3; }; agent-${CHAT} config" 2>/dev/null || true)"
-if [[ -z "$CHAT_JSON" ]]; then
-    fail "agent-${CHAT} did not report a configuration inside ${POD}.
-  The tool should be on PATH from the agent-entrypoint ConfigMap; check:
-  kubectl -n ${NS} exec ${POD} -c agent -- bash -lc 'command -v agent-${CHAT}'"
+# ---------------------------------------------------------------- 3. chat, in the pod env
+# The connector Secret is injected with envFrom, so what has to be true is that the running
+# `hermes gateway run` process can SEE the credential in its environment. Read back from
+# inside the container rather than inferred from the Secret we applied: envFrom is injected
+# at pod start and never updated, so a pod that predates the Secret has the credential in
+# the Secret and NOT in its environment — the exact false-ready this catches.
+#
+# Presence only, never the value: the probe prints the NAME of any variable that is empty
+# or unset, and nothing about the ones that are set. Slack needs both tokens (post + Socket
+# Mode receive); Discord needs its one. These are Hermes's own env var names, the ones the
+# gateway reads.
+CHAT_MISSING="$(in_pod "missing=; for v in ${CHAT_ENV_VARS}; do [ -n \"\${!v:-}\" ] || missing=\"\${missing} \${v}\"; done; echo \"\${missing# }\"" 2>/dev/null || echo "probe-failed")"
+if [[ "$CHAT_MISSING" == "probe-failed" ]]; then
+    fail "could not read the connector environment inside ${POD}.
+  kubectl -n ${NS} exec ${POD} -c agent -- env | grep -i ${CHAT^^}_"
 fi
-# The required presence flags per platform: Slack needs BOTH tokens (the bot token posts,
-# the app token opens the Socket Mode websocket that RECEIVES); Discord's one bot token
-# does both. An agent that can talk and cannot listen is the failure this catches.
-CHAT_MISSING="$(printf '%s' "$CHAT_JSON" | python3 -c '
-import json, sys
-required = {"slack": ["bot_token_set", "app_token_set"], "discord": ["bot_token_set"]}
-cfg = json.load(sys.stdin)
-print(" ".join(k for k in required[sys.argv[1]] if not cfg.get(k)))
-' "$CHAT" 2>/dev/null || echo "unparseable")"
 if [[ -n "$CHAT_MISSING" ]]; then
-    fail "agent-${CHAT} inside ${POD} reports its credentials are not present: ${CHAT_MISSING}.
+    fail "the ${CHAT} credential is not in ${POD}'s environment: ${CHAT_MISSING}.
   The Secret ${OBJ}-${CHAT} exists but the pod is not seeing it — most often a pod that
   predates the credential, since envFrom is injected at pod start and never updated."
 fi
-echo "    chat     agent-${CHAT} reports its tokens present in-pod"
-
-# The instructions doc, composed into opencode's config by entrypoint.sh. This is a
-# separate failure from the one above and has to be checked separately: entrypoint.sh
-# deliberately FALLS BACK to the image config when the compose fails, rather than
-# CrashLoopBackOff-ing every agent in the deployment over a documentation file. The tool
-# still works — but the model was never told it exists, so it will never reach for it, and
-# an agent that silently never uses its chat connector is exactly the false READY this
-# whole section exists to prevent.
-DOC_STATE="$(in_pod "$(printf 'f="${XDG_DATA_HOME:-/workspace/.agent-state}/opencode.json"; if [ -f "$f" ] && grep -qF %q "$f"; then echo DOC_WIRED; else echo DOC_MISSING; fi' "$CHAT_DOC")" 2>/dev/null || true)"
-if [[ "$DOC_STATE" != "DOC_WIRED" ]]; then
-    fail "opencode in ${POD} was never told about ${CHAT_DOC}.
-  The tool is on PATH and works, but the model has no instructions for it, so it will
-  never use it. entrypoint.sh says why in the pod's log:
-  kubectl -n ${NS} logs ${POD} | grep -i '^tools:'"
-fi
-echo "    tools    ${CHAT_DOC} composed into opencode's instructions"
+echo "    chat     ${CHAT} credential present in the pod's environment (${CHAT_ENV_VARS})"
 
 # ---------------------------------------------------------------- 4. real inference
 # ONE REAL REQUEST. Everything else above is a statement about configuration; this is the
@@ -280,19 +268,22 @@ echo "    tools    ${CHAT_DOC} composed into opencode's instructions"
 # one call: the NetworkPolicy egress allowlist admits the gateway, the minted virtual key
 # authenticates, the gateway routes to the upstream (Forge), and the model name resolves.
 #
-# FROM INSIDE THE POD, using the pod's OWN $OPENAI_API_KEY and $OPENAI_API_BASE. That is
-# not a convenience: it means this script never reads the key, never holds it, and never
-# puts it in argv on the node — the outer command is single-quoted, so what `ps` shows on
-# the host is the literal text `${OPENAI_API_KEY}`. It also makes the test STRONGER, since
-# it exercises the exact credential and route the agent itself will use rather than a
-# separate one that happens to work.
+# FROM INSIDE THE POD, using the pod's OWN $OPENAI_API_KEY and the base_url/model in its
+# own $HERMES_HOME/config.yaml (the seed the init container copied). That is not a
+# convenience: it means this script never reads the key, never holds it, and never puts it
+# in argv on the node — the outer command is single-quoted, so what `ps` shows on the host
+# is the literal text `${OPENAI_API_KEY}`. It also makes the test STRONGER, since it
+# exercises the exact credential and route the agent itself will use rather than a separate
+# one that happens to work. The model id is bare (no `enterprise-ai/` prefix — Hermes and
+# the gateway both take it bare).
 #
 # max_tokens 1 — a fraction of a cent, and it lands a real ledger row under
 # `<user>::agents/<name>`, which is the point.
 GW_SCRIPT='
 set -u
-base="${OPENAI_API_BASE:-}"
-model="${OPENCODE_MODEL#enterprise-ai/}"
+cfg="${HERMES_HOME:-/opt/data}/config.yaml"
+base="$(sed -n "s/^[[:space:]]*base_url:[[:space:]]*//p" "$cfg" | head -1)"
+model="$(sed -n "s/^[[:space:]]*default:[[:space:]]*//p" "$cfg" | head -1)"
 code=$(curl -sS -o /dev/null -w "%{http_code}" -m 60 \
     -X POST "${base}/chat/completions" \
     -H "Authorization: Bearer ${OPENAI_API_KEY}" \
@@ -332,9 +323,9 @@ CONSOLE="${PUBLIC_BASE_URL}/agents/${AGENT_NAME}/"
 echo
 echo "READY"
 echo "  agent    ${AGENT_NAME}  (objects: ${OBJ})"
-echo "  status   Running — \`opencode serve\` is resident, holding the session with no"
+echo "  status   Running — \`hermes gateway run\` is resident, holding the session with no"
 echo "           console attached; it survives every connect and disconnect."
-echo "  chat     ${CHAT} — agent-${CHAT} configured in-pod, instructions loaded"
+echo "  chat     ${CHAT} — credential present in the pod's environment"
 echo "  forge    integrated: ${GW_BASE} -> Forge, model ${GW_MODEL}, verified 200"
 echo "           metered, budgeted and audited as ${USER_NAME}::agents/${AGENT_NAME}"
 echo "  console  ${CONSOLE}"
