@@ -85,7 +85,7 @@
 # :8443 is kept as a second address for a transition window and is harmless. tailscaled
 # binds the funnel ports only on the tailnet addresses, so the LAN IP is free for both.
 https://gateway.tailcb6ef9.ts.net:443, https://gateway.tailcb6ef9.ts.net:8443 {
-    bind 192.168.2.42
+    bind 192.168.2.45
     tls /etc/caddy/certs/ts.crt /etc/caddy/certs/ts.key
     handle /realms/* {
         reverse_proxy 192.168.2.44:30382
