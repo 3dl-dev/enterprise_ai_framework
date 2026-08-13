@@ -314,7 +314,15 @@ def serving():
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
 
-    config = uvicorn.Config(_api(), host="127.0.0.1", port=port, log_level="warning")
+    # loop="asyncio", NOT uvloop. This server's whole reason to exist is the fake-DNS map
+    # in the `world` fixture, which stubs `socket.getaddrinfo` so `agent-<user>-<name>`
+    # resolves to loopback. uvloop (pulled in by uvicorn[standard]) resolves names through
+    # its own getaddrinfo and never calls socket.getaddrinfo, so under it the proxy's
+    # upstream dial hits the real resolver, gets NXDOMAIN, and the route 502s — which is a
+    # property of the loop implementation, not of the code under test. Forcing asyncio keeps
+    # the stub authoritative on any host, whether or not uvloop is installed.
+    config = uvicorn.Config(_api(), host="127.0.0.1", port=port, log_level="warning",
+                            loop="asyncio")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -595,8 +603,18 @@ def test_the_console_websocket_is_bridged_to_the_owners_daemon(world):
     seen: dict = {}
 
     async def handler(conn):
-        seen["auth"] = conn.request_headers.get("Authorization")
-        seen["path"] = conn.path
+        # websockets>=14 moved the handshake request under `conn.request` (a Request with
+        # `.headers`/`.path`); <=13 (the version control-plane/requirements.txt pins, and
+        # what the image runs) exposes `conn.request_headers`/`conn.path` directly. Read
+        # whichever exists so the fake daemon drives the bridge on either — the bridge
+        # itself is what is under test, not the version of the server standing in for it.
+        req = getattr(conn, "request", None)
+        if req is not None:
+            seen["auth"] = req.headers.get("Authorization")
+            seen["path"] = req.path
+        else:
+            seen["auth"] = conn.request_headers.get("Authorization")
+            seen["path"] = conn.path
         async for message in conn:
             await conn.send(f"echo:{message}")
 
