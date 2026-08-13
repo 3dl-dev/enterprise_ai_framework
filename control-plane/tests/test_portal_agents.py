@@ -207,7 +207,8 @@ class FakeCluster:
     def names(self, kind: str) -> list[str]:
         return sorted(n for (k, n) in self.store if k == kind)
 
-    def agent_deployment(self, user: str, name: str, *, replicas: int = 1) -> dict:
+    def agent_deployment(self, user: str, name: str, *, replicas: int = 1,
+                         agent_type: str = "hermes") -> dict:
         """One agent's Deployment as the cluster would hold it, labels and all."""
         obj_name = f"agent-{user}-{name}"
         labels = {
@@ -215,6 +216,7 @@ class FakeCluster:
             "agent.enterprise-ai/user": user,
             "agent.enterprise-ai/name": name,
             "agent.enterprise-ai/model-source": "integrated",
+            "agent.enterprise-ai/type": agent_type,
         }
         return {
             "apiVersion": "apps/v1", "kind": "Deployment",
@@ -223,8 +225,9 @@ class FakeCluster:
             "spec": {"replicas": replicas},
         }
 
-    def add_agent(self, user: str, name: str, *, replicas: int = 1, running: bool = True):
-        dep = self.agent_deployment(user, name, replicas=replicas)
+    def add_agent(self, user: str, name: str, *, replicas: int = 1, running: bool = True,
+                  agent_type: str = "hermes"):
+        dep = self.agent_deployment(user, name, replicas=replicas, agent_type=agent_type)
         self.put("deployments", dep)
         self.put("services", {"apiVersion": "v1", "kind": "Service",
                               "metadata": {"name": f"agent-{user}-{name}",
@@ -433,8 +436,14 @@ def test_a_user_lists_stops_starts_and_deletes_their_own_agent(cluster):
 
     listed = alice.get("/portal/api/agents").json()
     assert [a["name"] for a in listed["agents"]] == ["scraper"]
+    assert listed["types"] == ["hermes", "openclaw"], (
+        "the wizard builds its type select from this list; hermes leads because it is the "
+        "default the create form preselects"
+    )
+    assert listed["default_type"] == "hermes"
     row = listed["agents"][0]
     assert row["status"] == "running", row
+    assert row["type"] == "hermes", "list_agents reports the type dimension off the label"
     assert row["surface"] == "agents/scraper", "the join key to spend and usage"
     assert row["console_url"] == "/agents/scraper/", (
         "the console entry must not carry the owner in the path — Contract 1 resolves the "
@@ -497,6 +506,55 @@ def test_creating_an_agent_applies_the_real_template_with_every_placeholder_fill
         "parameter"
     )
     assert ("alice", "agent.create", "alice/helper") in AUDIT
+
+
+def test_creating_an_agent_defaults_the_type_to_hermes(cluster):
+    """No `type` in the body → the incumbent hermes, carried on BOTH label placements.
+
+    The Deployment label is what `list_agents` reads; the pod-template label is what a
+    per-type console/model selector reads off the running pod. Contract A says the type
+    mirrors model-source, which the template carries in both places.
+    """
+    cluster.add_workspace_pod(image="registry.invalid/enterprise-ai-workspace:xyz")
+    created = client_as("alice").post("/portal/api/agents", json={"name": "helper"})
+    assert created.status_code == 201, created.text
+    assert created.json()["type"] == "hermes"
+
+    dep = cluster.get("deployments", "agent-alice-helper")
+    assert dep["metadata"]["labels"]["agent.enterprise-ai/type"] == "hermes"
+    assert (dep["spec"]["template"]["metadata"]["labels"]["agent.enterprise-ai/type"]
+            == "hermes"), "the pod must carry the type, not only the Deployment object"
+
+    row = client_as("alice").get("/portal/api/agents").json()["agents"][0]
+    assert row["type"] == "hermes", "the list reports the type it was created with"
+
+
+def test_creating_an_agent_honours_an_explicit_openclaw_type(cluster):
+    cluster.add_workspace_pod(image="registry.invalid/enterprise-ai-workspace:xyz")
+    created = client_as("alice").post(
+        "/portal/api/agents", json={"name": "sidekick", "type": "openclaw"})
+    assert created.status_code == 201, created.text
+    assert created.json()["type"] == "openclaw"
+
+    dep = cluster.get("deployments", "agent-alice-sidekick")
+    assert dep["metadata"]["labels"]["agent.enterprise-ai/type"] == "openclaw"
+    assert (dep["spec"]["template"]["metadata"]["labels"]["agent.enterprise-ai/type"]
+            == "openclaw")
+
+
+def test_an_unknown_agent_type_is_refused_not_passed_through(cluster):
+    """A type from a request body reaches a pod label verbatim and a per-type selector
+    trusts it, so it is checked against the allowlist exactly as the model name is."""
+    cluster.add_workspace_pod(image="registry.invalid/enterprise-ai-workspace:xyz")
+    rejected = client_as("alice").post(
+        "/portal/api/agents", json={"name": "helper", "type": "opencode"})
+    assert rejected.status_code == 400, rejected.text
+    assert "opencode" in rejected.text, (
+        "opencode is the Code pillar, not an Agents-pillar type — the refusal should say so"
+    )
+    assert cluster.get("deployments", "agent-alice-helper") is None, (
+        "a refused type must apply nothing — a half-created agent is worse than none"
+    )
 
 
 # ---------------------------------------------------------------- reject

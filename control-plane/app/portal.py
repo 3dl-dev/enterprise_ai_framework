@@ -411,6 +411,10 @@ async def my_agents(user: str = Depends(require_user)):
         "username": user,
         "agents": out,
         "models": list(agents.allowed_models()),
+        # The Agents-pillar type dimension (Contract A) the wizard offers, and its default,
+        # kept beside `models` so the create form is built entirely from this one response.
+        "types": list(agents.AGENT_TYPES),
+        "default_type": agents.DEFAULT_AGENT_TYPE,
         **({"usage_error": usage_error} if usage_error else {}),
     }
 
@@ -420,7 +424,10 @@ async def create_my_agent(body: dict, user: str = Depends(require_user)):
     """Create one agent for the caller. The name is theirs to choose; the owner is not."""
     name = ((body or {}).get("name") or "").strip()
     model = ((body or {}).get("model") or "").strip() or None
-    return await agents.create(user, name, model=model)
+    # Contract A's type. None → agents.create defaults it to the incumbent `hermes`; an
+    # unknown value is refused there, not here, so the one allowlist lives with the render.
+    agent_type = ((body or {}).get("type") or "").strip() or None
+    return await agents.create(user, name, model=model, agent_type=agent_type)
 
 
 @router.post("/portal/api/agents/{name}/stop")

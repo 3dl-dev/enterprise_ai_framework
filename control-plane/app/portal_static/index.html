@@ -78,6 +78,7 @@
           <input id="agent-name" name="name" placeholder="new agent name"
                  aria-label="New agent name" autocomplete="off"
                  pattern="[a-z0-9][a-z0-9-]{0,38}" required>
+          <select id="agent-type" aria-label="Agent type"></select>
           <select id="agent-model" aria-label="Model"></select>
           <button class="btn primary" id="agent-create" type="submit">Create</button>
           <!-- The same create, plus the step that used to need an operator. It is a
@@ -204,6 +205,9 @@
         <label class="field"><span>Name</span>
           <input id="setup-name" autocomplete="off" pattern="[a-z0-9][a-z0-9-]{0,38}"
                  placeholder="helper">
+        </label>
+        <label class="field" id="setup-type-field"><span>Type</span>
+          <select id="setup-type"></select>
         </label>
         <label class="field" id="setup-model-field"><span>Model</span>
           <select id="setup-model"></select>

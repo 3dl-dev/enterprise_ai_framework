@@ -111,6 +111,14 @@ COMPONENT_SELECTOR = "app.kubernetes.io/component=agent"
 USER_LABEL = "agent.enterprise-ai/user"
 NAME_LABEL = "agent.enterprise-ai/name"
 MODEL_SOURCE_LABEL = "agent.enterprise-ai/model-source"
+# The Agents-pillar type dimension (agents-gateway-console.md Contract A): the harness
+# an instance runs. Carried as a pod label exactly like model-source above, so the console
+# proxy (-8e4) and model API (-840) can select the per-type native port/API shape from the
+# label rather than re-deriving it. `hermes` is the incumbent default; `openclaw` is the
+# sibling. `opencode` is deliberately NOT a value — that is the Code pillar, not an agent.
+TYPE_LABEL = "agent.enterprise-ai/type"
+AGENT_TYPES = ("hermes", "openclaw")
+DEFAULT_AGENT_TYPE = "hermes"
 
 CPU_METRIC = "container_cpu_usage_seconds_total"
 MEMORY_METRIC = "container_memory_working_set_bytes"

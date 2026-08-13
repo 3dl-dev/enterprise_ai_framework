@@ -487,6 +487,23 @@ async function loadAgents() {
     sel.hidden = models.length < 2;
   }
 
+  // The Agents-pillar type (Contract A). Same shape as the model select — hidden when
+  // there is only one type so the one-click create the camp uses is unchanged — and the
+  // default is preselected so a submit that never touches it still sends `hermes`.
+  const types = d.types || [];
+  const tsel = $("agent-type");
+  if (tsel.dataset.filled !== String(types.length)) {
+    tsel.innerHTML = "";
+    for (const t of types) {
+      const opt = document.createElement("option");
+      opt.value = t; opt.textContent = t;
+      if (t === d.default_type) opt.selected = true;
+      tsel.appendChild(opt);
+    }
+    tsel.dataset.filled = String(types.length);
+    tsel.hidden = types.length < 2;
+  }
+
   const list = $("agentlist");
   list.innerHTML = "";
   const rows = d.agents || [];
@@ -779,9 +796,13 @@ function openSetup(name) {
   $("setup-progress").hidden = true;
   connectorFields($("setup-chat-fields"), "slack");
   connectorFields($("setup-email-fields"), "email");
-  // The model list is already loaded for the inline form; mirror it rather than fetching.
+  // The model and type lists are already loaded for the inline form; mirror them rather
+  // than fetching. The type field only shows in create mode — an existing agent's type is
+  // fixed at creation (it selects the image), so configuring connectors never re-picks it.
   $("setup-model").innerHTML = $("agent-model").innerHTML;
   $("setup-model-field").hidden = $("agent-model").hidden;
+  $("setup-type").innerHTML = $("agent-type").innerHTML;
+  $("setup-type-field").hidden = $("agent-type").hidden || SETUP_MODE !== "create";
   $("dlg-agent-setup").showModal();
 }
 
@@ -840,7 +861,8 @@ $("setup-form").addEventListener("submit", async (e) => {
     if (SETUP_MODE === "create") {
       $("setup-progress").textContent = `Creating ${name}…`;
       const { ok, data } = await post("/portal/api/agents",
-        { name, model: $("setup-model").value || undefined });
+        { name, model: $("setup-model").value || undefined,
+          type: $("setup-type").value || undefined });
       if (!ok) {
         $("setup-error").hidden = false;
         $("setup-error").textContent = data.detail || "Could not create that agent.";
@@ -882,7 +904,8 @@ $("agent-new").addEventListener("submit", async (e) => {
   $("agent-create").disabled = true;
   try {
     const { ok, data } = await post("/portal/api/agents",
-      { name, model: $("agent-model").value || undefined });
+      { name, model: $("agent-model").value || undefined,
+        type: $("agent-type").value || undefined });
     if (!ok) { toast(data.detail || "Could not create that agent.", false); return; }
     input.value = "";
     toast(`${name} is starting. It takes about a minute to be ready.`);

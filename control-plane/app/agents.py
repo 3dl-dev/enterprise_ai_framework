@@ -68,6 +68,9 @@ COMPONENT_SELECTOR = agent_usage.COMPONENT_SELECTOR
 USER_LABEL = agent_usage.USER_LABEL
 NAME_LABEL = agent_usage.NAME_LABEL
 MODEL_SOURCE_LABEL = agent_usage.MODEL_SOURCE_LABEL
+TYPE_LABEL = agent_usage.TYPE_LABEL
+AGENT_TYPES = agent_usage.AGENT_TYPES
+DEFAULT_AGENT_TYPE = agent_usage.DEFAULT_AGENT_TYPE
 
 # The k8s object-name budget. `agent-<user>-<name>` must fit inside RFC 1123's 63
 # characters, and the answer to overflow is REFUSAL, never truncation: a truncated name
@@ -526,6 +529,11 @@ async def list_agents(user: str) -> list[dict]:
             "status": _status_of(dep, phases.get(name)),
             "pod_phase": phases.get(name, ""),
             "model_source": labels.get(MODEL_SOURCE_LABEL, ""),
+            # The Agents-pillar type (Contract A): reported straight off the label, empty
+            # for an agent minted before the dimension existed — read as raw as
+            # model_source above rather than defaulted, so the listing never claims a type
+            # the pod was not labelled with.
+            "type": labels.get(TYPE_LABEL, ""),
             "replicas": (dep.get("spec") or {}).get("replicas", 0),
             "created_at": (dep.get("metadata") or {}).get("creationTimestamp", ""),
             # Where -0e7 will attach a console. The portal renders the entry now so the
@@ -637,6 +645,36 @@ def render(user: str, name: str, *, image: str, model: str, api_base: str,
     if not docs:
         raise HTTPException(500, "the agent template rendered to nothing")
     return docs
+
+
+def _stamp_agent_type(docs: list[dict], agent_type: str) -> None:
+    """Carry `agent.enterprise-ai/type` on the Deployment and its pod template.
+
+    Both placements mirror `agent.enterprise-ai/model-source` exactly
+    (deploy/k8s/64-agent.template.yaml lines 92 and 129): the object label is what
+    `list_agents` reads, and the pod-template label is what a per-type console/model
+    selector reads off the running pod.
+
+    Stamped here in Python, NOT as a `__TYPE__` placeholder, on purpose. The interim
+    renderer is the opencode-based `64-agent.template.yaml` — the Code pillar's harness —
+    and the design record (agents-gateway-console.md, Contract A) is explicit that this
+    template is NOT extended for gateway agents. The per-type hermes/openclaw templates
+    (enterpriseaiframework-f55 / -ff7) carry the label natively and select the image, run
+    command and native-console port by it; until they land, this stamps the dimension so
+    the create/list/wizard plumbing is real and testable. Additive — it only adds a label,
+    never removes one the template already set.
+    """
+    for doc in docs:
+        if doc.get("kind") != "Deployment":
+            continue
+        meta = doc.setdefault("metadata", {})
+        meta.setdefault("labels", {})[TYPE_LABEL] = agent_type
+        pod_meta = (
+            doc.setdefault("spec", {})
+            .setdefault("template", {})
+            .setdefault("metadata", {})
+        )
+        pod_meta.setdefault("labels", {})[TYPE_LABEL] = agent_type
 
 
 async def _workspace_image(client: httpx.AsyncClient) -> str:
@@ -879,7 +917,9 @@ async def configure_connector(user: str, name: str, kind: str, values: dict) -> 
     }
 
 
-async def create(user: str, name: str, *, model: str | None = None) -> dict:
+async def create(
+    user: str, name: str, *, model: str | None = None, agent_type: str | None = None
+) -> dict:
     """Contract 2's `created` transition, for the authenticated caller and nobody else.
 
     The order is the one provision-agent.sh uses and it is not arbitrary:
@@ -905,6 +945,16 @@ async def create(user: str, name: str, *, model: str | None = None) -> dict:
             f"unknown model {model!r}. A model name from a request body ends up verbatim "
             "in a pod spec, so it is checked against the deployment's list rather than "
             "passed through.",
+        )
+    # The Agents-pillar type (Contract A). Default is the incumbent `hermes`; an unknown
+    # value is refused rather than passed through for the same reason `model` is — it ends
+    # up verbatim in a pod label, and a per-type console/model selector trusts it.
+    agent_type = (agent_type or DEFAULT_AGENT_TYPE).strip() or DEFAULT_AGENT_TYPE
+    if agent_type not in AGENT_TYPES:
+        raise HTTPException(
+            400,
+            f"unknown agent type {agent_type!r}. The Agents pillar carries "
+            f"{', '.join(AGENT_TYPES)}; `opencode` is the Code pillar, not an agent type.",
         )
 
     async with _client() as client:
@@ -961,7 +1011,7 @@ async def create(user: str, name: str, *, model: str | None = None) -> dict:
         # annotation claiming there is nothing there.
         sums = await _existing_connector_sums(client, obj)
 
-        for doc in render(
+        docs = render(
             user, name, image=image, model=model, api_base=GATEWAY_BASE,
             connector_sums=sums,
             # Integrated only from the portal. BYO takes a provider credential that must
@@ -970,15 +1020,19 @@ async def create(user: str, name: str, *, model: str | None = None) -> dict:
             # `provision-agent.sh --byo-key-file` is what does it today.
             model_source="integrated", key_secret=f"{obj}-key",
             cfgsum=cfgsum, keysum=keysum,
-        ):
+        )
+        _stamp_agent_type(docs, agent_type)
+        for doc in docs:
             await _apply(client, doc)
 
     await db.audit(user, "agent.create", f"{user}/{name}",
-                   surface=gateway.agent_surface(name), alias=issued["key_alias"])
+                   surface=gateway.agent_surface(name), alias=issued["key_alias"],
+                   agent_type=agent_type)
     return {
         "name": name,
         "surface": gateway.agent_surface(name),
         "status": STARTING,
+        "type": agent_type,
         "alias": issued["key_alias"],
         "console_url": console_url(name),
     }
