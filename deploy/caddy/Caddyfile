@@ -22,11 +22,27 @@
 :8081 {
     # Identity and the chat surface must share one public origin, or the OIDC issuer
     # check fails. Keycloak owns these paths; the chat surface owns everything else.
+    #
+    # This block is plain HTTP — Tailscale Funnel terminated the browser's TLS on :8443
+    # before it reached here, so Caddy would otherwise forward `X-Forwarded-Proto: http`.
+    # Keycloak then treats the request as non-secure and strips Secure/SameSite=None from
+    # its SSO cookies (AUTH_SESSION_ID, KEYCLOAK_IDENTITY, ...). Those cookies are then not
+    # sent in the account console's redirect-based re-auth, so check-sso never finds a
+    # session and the console reloads itself forever (enterpriseaiframework-4f1). LibreChat
+    # and the portal oauth2-proxy dodged this by turning Secure off app-side, but the
+    # account console *needs* SameSite=None (which requires Secure), so the only correct fix
+    # for it is to assert the real public scheme here. The browser's connection to Funnel
+    # really is TLS, so this header is truthful. Only the :8081 block needs it; the :8443
+    # LAN block below terminates its own TLS and already reports https.
     handle /realms/* {
-        reverse_proxy 192.168.2.44:30382
+        reverse_proxy 192.168.2.44:30382 {
+            header_up X-Forwarded-Proto https
+        }
     }
     handle /resources/* {
-        reverse_proxy 192.168.2.44:30382
+        reverse_proxy 192.168.2.44:30382 {
+            header_up X-Forwarded-Proto https
+        }
     }
     # Published work. Deliberately NOT behind any auth: the audience is parents, who have
     # no account. Static files only, served by a plain web server with no interpreter and
@@ -80,11 +96,8 @@
 # cluster, and the cluster is not on the tailnet: it resolves the funnel host to the
 # public ingress and the connection is reset. Pods reach this listener directly over the
 # LAN instead (via hostAliases), using the same hostname and port so the OIDC issuer still
-# matches. The public origin moved to :443 (venue wifi blocks the nonstandard :8443 —
-# enterpriseaiframework-e32), so the issuer is now port-less and this listener serves :443.
-# :8443 is kept as a second address for a transition window and is harmless. tailscaled
-# binds the funnel ports only on the tailnet addresses, so the LAN IP is free for both.
-https://gateway.tailcb6ef9.ts.net:443, https://gateway.tailcb6ef9.ts.net:8443 {
+# matches. tailscaled binds 8443 only on the tailnet addresses, so the LAN IP is free.
+https://gateway.tailcb6ef9.ts.net:8443, https://gateway.tailcb6ef9.ts.net:443 {
     bind 192.168.2.45
     tls /etc/caddy/certs/ts.crt /etc/caddy/certs/ts.key
     handle /realms/* {
@@ -143,4 +156,38 @@ https://gateway.tailcb6ef9.ts.net:443, https://gateway.tailcb6ef9.ts.net:8443 {
 # workspace NodePorts live on 192.168.2.x and the operator is on another subnet.
 :8083 {
     reverse_proxy 192.168.2.44:30440
+}
+
+# ai.3dl.one - real public domain + Let's Encrypt cert (DNS-01 via Azure), superseding the
+# Tailscale Funnel path. Same routes/origin as the ts.net LAN block. Served over the LAN
+# (camp) and via the USG :443 port-forward (off-site). OIDC issuer migrates to this host next.
+https://ai.3dl.one:443 {
+    bind 192.168.2.45
+    tls /etc/caddy/certs/ai.3dl.one.crt /etc/caddy/certs/ai.3dl.one.key
+    handle /realms/* {
+        reverse_proxy 192.168.2.44:30382
+    }
+    handle /resources/* {
+        reverse_proxy 192.168.2.44:30382
+    }
+    handle /live/* {
+        reverse_proxy 192.168.2.44:30450
+    }
+    handle /portal/* {
+        reverse_proxy 192.168.2.44:30460
+    }
+    handle /workshop/* {
+        reverse_proxy 192.168.2.44:30460
+    }
+    handle /agents/* {
+        reverse_proxy 192.168.2.44:30460
+    }
+    handle / {
+        @not_iframe not header Sec-Fetch-Dest iframe
+        redir @not_iframe /portal/ 302
+        reverse_proxy 192.168.2.44:30380
+    }
+    handle {
+        reverse_proxy 192.168.2.44:30380
+    }
 }
