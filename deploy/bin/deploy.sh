@@ -161,6 +161,7 @@ echo "==> agent assets -> configmap/agent-assets"
 # tests/test_agent_assets.py fails if the three disagree.
 kubectl -n "$NS" create configmap agent-assets \
     --from-file=64-agent.template.yaml=deploy/k8s/64-agent.template.yaml \
+    --from-file=65-agent-hermes.template.yaml=deploy/k8s/65-agent-hermes.template.yaml \
     --from-file=entrypoint.sh=deploy/agent/entrypoint.sh \
     --from-file=agent-email=deploy/agent/agent-email \
     --from-file=EMAIL.md=deploy/agent/EMAIL.md \
@@ -214,6 +215,11 @@ skip_manifest() {
         # NetworkPolicy are namespace-wide objects and must land on every deploy, so an
         # agent can never exist before the policy that fences it.
         64-agent.template.yaml) return 0 ;;
+        # The hermes gateway agent template (agents-gateway-console.md), rendered one agent
+        # at a time by control-plane/app/agents.py. 66-agent-console-common.yaml (the
+        # namespace-wide :9119 policy that fences its dashboard) is NOT a template and IS
+        # applied, for the same reason 63-agent-common.yaml is.
+        65-agent-hermes.template.yaml) return 0 ;;
         *) return 1 ;;
     esac
 }

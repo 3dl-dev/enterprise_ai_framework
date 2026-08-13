@@ -356,8 +356,12 @@ def test_a_created_agent_gets_every_tool_its_connectors_need(cluster):
     either route restarts every agent created by the other, ending resident sessions.
     """
     cluster.add_workspace_pod()
+    # The `agent-entrypoint` tooling ConfigMap belongs to the opencode render (the shell
+    # tools its entrypoint puts on PATH). A hermes agent handles connectors natively and
+    # ships no such ConfigMap, so this Code-pillar assertion targets the interim opencode
+    # path explicitly (type=openclaw, pending enterpriseaiframework-ff7).
     assert client_as("alice").post(
-        "/portal/api/agents", json={"name": "helper"}).status_code == 201
+        "/portal/api/agents", json={"name": "helper", "type": "openclaw"}).status_code == 201
 
     shipped = cluster.get("configmaps", "agent-entrypoint")["data"]
     agent_dir = REPO / "deploy" / "agent"

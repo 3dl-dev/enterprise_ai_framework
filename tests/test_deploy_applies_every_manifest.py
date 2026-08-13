@@ -40,6 +40,12 @@ EXPECTED_SKIPS = {
     # is deliberately NOT here: the ServiceAccount and NetworkPolicy that fence an agent
     # must be applied by every deploy.
     "64-agent.template.yaml",
+    # The hermes gateway agent template (enterpriseaiframework-f55). Same reason as
+    # 64-agent: __USER__/__NAME__ placeholders, rendered one agent at a time by
+    # control-plane/app/agents.py. Its namespace-wide companion, 66-agent-console-common.yaml
+    # (the :9119 dashboard admission), is deliberately NOT here — it must be applied every
+    # deploy, exactly as 63-agent-common.yaml is.
+    "65-agent-hermes.template.yaml",
 }
 
 

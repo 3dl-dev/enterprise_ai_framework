@@ -85,6 +85,17 @@ DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "glm-5.2@deepinfra")
 
 GATEWAY_BASE = os.environ.get("AGENT_GATEWAY_BASE", "http://gateway:4000/v1")
 
+# The hermes image a gateway agent runs (agents-gateway-console.md). NOT the workspace
+# image — a gateway agent is the Agents pillar, not opencode — so it is a fixed, overridable
+# tag rather than read off a live workspace pod. Defaults to the tag the live hand-applied
+# agents run, verified on the cluster by enterpriseaiframework-2ba.
+HERMES_IMAGE = os.environ.get("AGENT_HERMES_IMAGE", "nousresearch/hermes-agent:v2026.8.3")
+
+# The dashboard's basic-auth username, seeded into config.yaml (Contract D). Fixed, not
+# per-agent: the control-plane console proxy (enterpriseaiframework-8e4) authenticates with
+# it, and the per-agent secret is the password, never the username.
+DASHBOARD_USERNAME = "console"
+
 # The object set and the resident entrypoint, delivered to this pod as a ConfigMap because
 # the control-plane image is built from `control-plane/` alone and these files live under
 # `deploy/`. Rendering the SAME bytes provision-agent.sh renders is the point: a second
@@ -117,6 +128,7 @@ AGENT_FILES = (
 
 _ASSET_FALLBACK = {
     "64-agent.template.yaml": _REPO / "deploy" / "k8s" / "64-agent.template.yaml",
+    "65-agent-hermes.template.yaml": _REPO / "deploy" / "k8s" / "65-agent-hermes.template.yaml",
     **{name: _REPO / "deploy" / "agent" / name for name in AGENT_FILES},
 }
 
@@ -677,6 +689,94 @@ def _stamp_agent_type(docs: list[dict], agent_type: str) -> None:
         pod_meta.setdefault("labels", {})[TYPE_LABEL] = agent_type
 
 
+# ---------------------------------------------------------------- hermes (Agents pillar)
+
+# scrypt parameters, IDENTICAL to hermes's plugins/dashboard_auth/basic.hash_password
+# (verified against the real image by enterpriseaiframework-2ba): n=2**14, r=8, p=1,
+# dklen=32, 16-byte salt, hash string `scrypt$16384$8$1$<salt_b64>$<dk_b64>`. The control
+# plane computes the hash with stdlib scrypt so the seed carries only the HASH; the
+# plaintext lives in the agent's key Secret for the console proxy (enterpriseaiframework-8e4).
+_SCRYPT_N, _SCRYPT_R, _SCRYPT_P, _SCRYPT_DKLEN, _SCRYPT_SALT_BYTES = 2**14, 8, 1, 32, 16
+
+
+def dashboard_password_hash(password: str) -> str:
+    """A hermes-compatible scrypt hash string for the dashboard basic_auth password.
+
+    Reproduces hermes's own ``hash_password`` byte-for-byte so the value seeded into
+    ``dashboard.basic_auth.password_hash`` verifies against the plaintext the console proxy
+    presents. Format and parameters are pinned to the real binary; a drift here would fail
+    closed (the dashboard would reject a correct password) rather than open.
+    """
+    salt = secrets.token_bytes(_SCRYPT_SALT_BYTES)
+    dk = hashlib.scrypt(
+        password.encode(), salt=salt,
+        n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, dklen=_SCRYPT_DKLEN, maxmem=0,
+    )
+    return (
+        f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}$"
+        f"{base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+    )
+
+
+def hermes_seed_config(model: str, password_hash: str) -> str:
+    """The FIRST-BOOT-ONLY config.yaml for a hermes agent (Contract B).
+
+    Mirrors the shape the live agents run (verified by -2ba): the integrated gateway
+    provider, the default model, and the dashboard's basic-auth so a non-loopback bind
+    satisfies hermes's fail-closed auth gate. After first boot this is never re-applied —
+    the agent's own config on the PVC is authoritative and settings change through the
+    dashboard API (Contract D), so this seed is a starting point, not a source of truth.
+    """
+    return yaml.safe_dump(
+        {
+            "providers": {
+                "gateway": {
+                    "base_url": GATEWAY_BASE,
+                    "key_env": "OPENAI_API_KEY",
+                    "discover_models": True,
+                },
+            },
+            "model": {"provider": "gateway", "default": model},
+            "dashboard": {
+                "basic_auth": {
+                    "username": DASHBOARD_USERNAME,
+                    "password_hash": password_hash,
+                },
+            },
+            "terminal": {"backend": "local"},
+        },
+        default_flow_style=False,
+        sort_keys=False,
+    )
+
+
+def render_hermes(user: str, name: str, *, image: str, model_source: str,
+                  key_secret: str, cfgsum: str, keysum: str,
+                  connector_sums: dict[str, str] | None = None) -> list[dict]:
+    """Render 65-agent-hermes.template.yaml, exactly as render() renders the opencode one.
+
+    Literal replacement of the placeholders, then a YAML parse — the template is the design
+    (Contract B's two-container/first-boot-seed shape) and this is its renderer. The
+    ``agent.enterprise-ai/type: hermes`` label is written into the template itself, so no
+    post-render stamp is needed for this type.
+    """
+    sums = connector_sums or {}
+    text = asset("65-agent-hermes.template.yaml")
+    for placeholder, value in (
+        ("__USER__", user), ("__NAME__", name), ("__IMAGE__", image),
+        ("__MODEL_SOURCE__", model_source), ("__KEY_SECRET__", key_secret),
+        ("__CFGSUM__", cfgsum), ("__KEYSUM__", keysum),
+        ("__EMAILSUM__", sums.get("email") or NO_CONNECTOR),
+        ("__SLACKSUM__", sums.get("slack") or NO_CONNECTOR),
+        ("__DISCORDSUM__", sums.get("discord") or NO_CONNECTOR),
+    ):
+        text = text.replace(placeholder, value)
+    docs = [d for d in yaml.safe_load_all(text) if d]
+    if not docs:
+        raise HTTPException(500, "the hermes agent template rendered to nothing")
+    return docs
+
+
 async def _workspace_image(client: httpx.AsyncClient) -> str:
     """The image a new agent runs: whatever the Code surface is ACTUALLY running now.
 
@@ -917,6 +1017,88 @@ async def configure_connector(user: str, name: str, kind: str, values: dict) -> 
     }
 
 
+async def _provision_hermes(client: httpx.AsyncClient, user: str, name: str, obj: str,
+                            model: str, api_key: str, keysum: str) -> None:
+    """Apply the object set for a hermes gateway agent (agents-gateway-console.md B/D).
+
+    Differs from the opencode path by design: no deployment-wide entrypoint ConfigMap and
+    no OPENCODE_SERVER_PASSWORD — a gateway agent runs its own image and authenticates its
+    console through the seeded ``dashboard.basic_auth``. The key Secret carries the
+    integrated key plus the console credential (plaintext, for the -8e4 proxy); the seed
+    ConfigMap carries only the password HASH.
+    """
+    console_password = secrets.token_urlsafe(24)
+    seed = hermes_seed_config(model, dashboard_password_hash(console_password))
+    cfgsum = hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+    await _apply(client, _secret_object(f"{obj}-key", {
+        "OPENAI_API_KEY": api_key,
+        # The console credential the -8e4 proxy presents to the dashboard. The dashboard
+        # verifies the plaintext against the seeded scrypt hash; the plaintext never enters
+        # the ConfigMap, only this Secret.
+        "DASHBOARD_USERNAME": DASHBOARD_USERNAME,
+        "DASHBOARD_PASSWORD": console_password,
+    }))
+    # The FIRST-BOOT seed. The initContainer copies it onto the PVC iff there is none; after
+    # that the agent's own config wins (Contract B — this is the clobber the record fixes).
+    await _apply(client, {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": f"{obj}-config", "namespace": namespace(),
+                     "labels": {USER_LABEL: user, NAME_LABEL: name}},
+        "data": {"config.yaml": seed},
+    })
+
+    sums = await _existing_connector_sums(client, obj)
+    docs = render_hermes(
+        user, name, image=HERMES_IMAGE, model_source="integrated",
+        key_secret=f"{obj}-key", cfgsum=cfgsum, keysum=keysum, connector_sums=sums,
+    )
+    for doc in docs:
+        await _apply(client, doc)
+
+
+async def _provision_opencode_interim(client: httpx.AsyncClient, user: str, name: str,
+                                      obj: str, model: str, agent_type: str,
+                                      api_key: str, keysum: str) -> None:
+    """The pre-gateway opencode render, kept as the interim path for a non-default type
+    until its real provisioner lands (openclaw = enterpriseaiframework-ff7). Identical to
+    the original create() body; the type label is stamped post-render since the opencode
+    template does not carry it."""
+    image = await _workspace_image(client)
+
+    # The resident entrypoint AND every tool it puts on PATH, deployment-wide (one control
+    # plane). The checksum is over ALL of them in AGENT_FILES order — byte for byte the
+    # value provision-agent.sh produces, so provisioning by either route restarts nothing
+    # the other created.
+    files = {fname: asset(fname) for fname in AGENT_FILES}
+    cfgsum = hashlib.sha256(
+        "".join(files[fname] for fname in AGENT_FILES).encode()
+    ).hexdigest()[:16]
+    await _apply(client, {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": "agent-entrypoint", "namespace": namespace()},
+        "data": files,
+    })
+
+    # HTTP Basic on the opencode server: entrypoint.sh refuses to start without it.
+    password = secrets.token_urlsafe(24)
+    await _apply(client, _secret_object(f"{obj}-key", {
+        "OPENCODE_SERVER_PASSWORD": password,
+        "OPENAI_API_KEY": api_key,
+    }))
+
+    sums = await _existing_connector_sums(client, obj)
+    docs = render(
+        user, name, image=image, model=model, api_base=GATEWAY_BASE,
+        connector_sums=sums,
+        model_source="integrated", key_secret=f"{obj}-key",
+        cfgsum=cfgsum, keysum=keysum,
+    )
+    _stamp_agent_type(docs, agent_type)
+    for doc in docs:
+        await _apply(client, doc)
+
+
 async def create(
     user: str, name: str, *, model: str | None = None, agent_type: str | None = None
 ) -> dict:
@@ -971,59 +1153,23 @@ async def create(
         if existing is not None:
             raise HTTPException(409, f"you already have an agent called {name!r}")
 
-        image = await _workspace_image(client)
-
-        # The resident entrypoint AND every tool it puts on PATH, deployment-wide (one
-        # control plane). Applied here for the same reason provision-agent.sh applies it:
-        # the pod mounts the ConfigMap by name, and an agent must never be able to exist
-        # before the things it runs do.
-        #
-        # The checksum is over ALL of them, concatenated in AGENT_FILES order — byte for
-        # byte the value `CFGSUM=$(for f in "${AGENT_FILES[@]}"; do cat ...; done |
-        # sha256sum)` produces in the shell. That equality is the point: the two paths
-        # must render the SAME annotation from the same repository, or provisioning an
-        # agent by either route would restart every agent created by the other.
-        files = {name: asset(name) for name in AGENT_FILES}
-        cfgsum = hashlib.sha256(
-            "".join(files[name] for name in AGENT_FILES).encode()
-        ).hexdigest()[:16]
-        await _apply(client, {
-            "apiVersion": "v1", "kind": "ConfigMap",
-            "metadata": {"name": "agent-entrypoint", "namespace": namespace()},
-            "data": files,
-        })
-
+        # Mint the virtual key BEFORE the pod exists, so the agent never starts holding
+        # -055's sentinel and 401ing with nothing on screen to say why. Type-agnostic: both
+        # pillars run on the integrated <user>::agents/<name> key (agents-surface Contract
+        # 1/3, one bill).
         issued = await issuance.issue(user, gateway.agent_surface(name), actor=user)
         api_key = issued["key"]
         keysum = hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
-        # HTTP Basic on the opencode server: entrypoint.sh refuses to start without it,
-        # so an agent can never come up reachable and unauthenticated.
-        password = secrets.token_urlsafe(24)
-        await _apply(client, _secret_object(f"{obj}-key", {
-            "OPENCODE_SERVER_PASSWORD": password,
-            "OPENAI_API_KEY": api_key,
-        }))
-
-        # A connector credential can outlive the agent it was written for — an operator
-        # who ran provision-agent.sh --slack-config-file before the Deployment existed,
-        # for instance. Rendering "none" over it would leave the Secret mounted and the
-        # annotation claiming there is nothing there.
-        sums = await _existing_connector_sums(client, obj)
-
-        docs = render(
-            user, name, image=image, model=model, api_base=GATEWAY_BASE,
-            connector_sums=sums,
-            # Integrated only from the portal. BYO takes a provider credential that must
-            # be handled set-once and never read back (Contract 4); accepting one through
-            # a JSON body on a page is a different item's design, and the operator path
-            # `provision-agent.sh --byo-key-file` is what does it today.
-            model_source="integrated", key_secret=f"{obj}-key",
-            cfgsum=cfgsum, keysum=keysum,
-        )
-        _stamp_agent_type(docs, agent_type)
-        for doc in docs:
-            await _apply(client, doc)
+        if agent_type == "hermes":
+            await _provision_hermes(client, user, name, obj, model, api_key, keysum)
+        else:
+            # openclaw has no provisioner yet (enterpriseaiframework-ff7). Until it lands,
+            # the interim path is the opencode render + type stamp that -5c9 established —
+            # NOT the default (hermes is), so the Code-pillar template is only reached by an
+            # explicit non-default type, exactly as the design record permits temporarily.
+            await _provision_opencode_interim(
+                client, user, name, obj, model, agent_type, api_key, keysum)
 
     await db.audit(user, "agent.create", f"{user}/{name}",
                    surface=gateway.agent_surface(name), alias=issued["key_alias"],
@@ -1089,6 +1235,11 @@ async def delete(user: str, name: str) -> dict:
         for api_version, kind, target in (
             ("apps/v1", "Deployment", obj),
             ("v1", "Service", obj),
+            # The hermes agent's first-boot seed ConfigMap (agents-gateway-console.md B). A
+            # delete that left it behind would leak an orphan; a no-op for an opencode agent,
+            # which has none. The :9119 NetworkPolicy is namespace-wide (66-agent-console-
+            # common.yaml), not per-agent, so there is nothing agent-scoped to delete.
+            ("v1", "ConfigMap", f"{obj}-config"),
             ("v1", "Secret", f"{obj}-key"),
             ("v1", "Secret", f"{obj}-byo"),
             # The connector credentials, for exactly the reason the virtual key is

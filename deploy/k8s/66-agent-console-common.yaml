@@ -1,0 +1,45 @@
+# Namespace-wide ingress for the Agents-pillar (hermes/openclaw) native consoles — the
+# sibling of 63-agent-common.yaml's :4096 rule, for the gateway agents' dashboard port.
+#
+# WHY A SEPARATE COMMON POLICY, NOT A PER-AGENT ONE. The design record
+# (docs/design/records/agents-gateway-console.md, Deployment shape) describes the console
+# admission as a per-agent NetworkPolicy. It is a namespace-wide policy here instead, on
+# purpose: the control-plane ServiceAccount deliberately holds NO `networkpolicies`
+# authority (deploy/k8s/39-control-plane-rbac.yaml — "NO networkpolicies"), so the
+# provisioner in control-plane/app/agents.py cannot create one per agent, and widening that
+# Role is an explicit security decision this feature does not need to make. A single policy
+# admitting the dashboard port from the control-plane pod to every `component: agent` pod
+# gives the identical "the proxy is the only door" outcome. NetworkPolicies are additive, so
+# this stacks with 63-agent-common.yaml (which admits :4096 and all the egress a gateway
+# agent needs — dns, gateway:4000, and the 0.0.0.0/0-except-private external-messaging rule
+# the agents reach Discord/Slack over); it adds ONLY the console ingress and nothing else.
+#
+# It selects the same `component: agent` label, so it neither selects workspace pods nor is
+# affected by the workspace policy — additive exactly as 63-agent-common.yaml is.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-console-isolation
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: agent
+  policyTypes: [Ingress]
+  ingress:
+    # The portal proxy, attaching a console to a living gateway agent
+    # (enterpriseaiframework-8e4). ONLY the control-plane pod, and only the native console
+    # ports: hermes's dashboard on :9119, openclaw's Control UI on :18789. Naming the one
+    # allowed source is the entire control — kube-router admits a packet as soon as the
+    # DESTINATION's ingress allows it, without consulting the source's egress (the reason
+    # spelled out in 60-workspace-common.yaml / 63-agent-common.yaml), so an empty `from`
+    # would open every agent's console to every other agent.
+    - from:
+        - podSelector:
+            matchLabels: { app: control-plane }
+      ports:
+        - { protocol: TCP, port: 9119 }
+        - { protocol: TCP, port: 18789 }

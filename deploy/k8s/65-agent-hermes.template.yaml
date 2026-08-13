@@ -1,0 +1,257 @@
+# One named, resident HERMES agent instance — the Agents pillar (gateway agents), NOT the
+# Code pillar (opencode). Rendered by control-plane/app/agents.py render_hermes(); the
+# placeholders are substituted literally, so this file is not applyable on its own.
+#
+#   __USER__      Keycloak username; with __NAME__ it forms every object name
+#   __NAME__      the user-chosen agent slug
+#   __IMAGE__     the hermes image (nousresearch/hermes-agent:<tag>) — NOT the workspace
+#                 image; a gateway agent does not share the Code pillar's opencode artefact
+#   __MODEL_SOURCE__  `integrated` or `byo` (agents-surface Contract 4) — provenance label
+#   __KEY_SECRET__    the Secret holding OPENAI_API_KEY: `agent-<user>-<name>-key` (the
+#                     integrated virtual key, alias <user>::agents/<name>)
+#   __CFGSUM__    checksum of the first-boot seed ConfigMap (agent-<user>-<name>-config)
+#   __KEYSUM__    checksum of the integrated key, so a real rotation rolls the pod
+#   __EMAILSUM__/__SLACKSUM__/__DISCORDSUM__  connector-credential checksums, or `none`
+#
+# This is a SIBLING of 64-agent.template.yaml, not an extension of it: the design record
+# docs/design/records/agents-gateway-console.md (Contracts A/B/C/D) is explicit that the
+# opencode template/entrypoint/provisioner are the conflated Code-pillar path and are not
+# reused for gateway agents. The differences from the opencode template ARE the design:
+#
+#   * TWO containers over ONE PVC (Contract B): `agent` = `hermes gateway run` (resident,
+#     keeps working with nobody watching), `console` = `hermes dashboard` on :9119 (the
+#     agent's OWN native web UI, which the portal proxies — it is NOT a terminal).
+#   * a FIRST-BOOT-ONLY seed initContainer (Contract B): the live hand-applied agents seed
+#     config.yaml with an UNCONDITIONAL `cp` on every boot, which wipes every setting the
+#     agent or its dashboard persisted. This copies the seed IFF the PVC has none.
+#   * state at /opt/data (`HERMES_HOME`), not opencode's /workspace; no ttyd, no
+#     OPENCODE_* env, no tenant/skill mounts (those are the Code surface's).
+#   * a per-agent NetworkPolicy admitting :9119 from the control-plane pod (the common
+#     63-agent-common.yaml admits only opencode's :4096; NetworkPolicies union, so this
+#     ADDS the dashboard port and inherits the common egress — dns, gateway:4000, and the
+#     external-messaging 0.0.0.0/0-except-private rule the live agents reach Discord over).
+#
+# `agent.enterprise-ai/type: hermes` (Contract A) is stamped by render(); it is not a
+# placeholder here so this one template can be the parametrised base a future type reuses.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-__USER__-__NAME__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+spec:
+  accessModes: [ReadWriteOnce]
+  # local-path (node disk), NON-DURABLE exactly as the workspace/opencode-agent PVCs are;
+  # Contract 2's promise that `stopped` keeps state and only `deleted` destroys it holds
+  # across scale-to-zero, not across a node rebuild. The state that matters lives here:
+  # config.yaml, sessions/, memories/ and the kanban db, all under /opt/data.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-__USER__-__NAME__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+spec:
+  # ClusterIP. There is no NodePort and there must not be one — the dashboard is the
+  # agent's control surface holding a spendable key. The portal proxies it at
+  # /agents/__NAME__/ on the chat origin, resolving __USER__ from the authenticated
+  # identity and never from the path (Contract 1); enterpriseaiframework-8e4 builds that.
+  selector:
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+  ports:
+    # The hermes dashboard's native port (agents-gateway-console.md Contract B/C). The
+    # `gateway run` container has NO web port of its own — that split is exactly why the
+    # live agents have no console today and adding the dashboard container is what gives
+    # them one.
+    - name: dashboard
+      port: 9119
+      targetPort: 9119
+# The :9119 admission is a NAMESPACE-WIDE policy in 66-agent-console-common.yaml, applied at
+# deploy time — NOT a per-agent object here. The control-plane ServiceAccount deliberately
+# has no `networkpolicies` authority (deploy/k8s/39-control-plane-rbac.yaml: "NO
+# networkpolicies"), so the provisioner cannot create one per agent; a single common policy
+# admitting :9119 from the control-plane pod to every `component: agent` pod gives the
+# identical "the proxy is the only door" posture with no RBAC widening. This DEVIATES from
+# the record's per-agent wording for that reason; the security outcome is unchanged.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-__USER__-__NAME__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+    agent.enterprise-ai/model-source: "__MODEL_SOURCE__"
+    # The type is read from HERE by list_agents (the object label), and from the pod
+    # template below by a per-type selector — model-source's two placements exactly.
+    agent.enterprise-ai/type: hermes
+spec:
+  # `created`/`running` is replicas: 1; `stopped` is replicas: 0 with the PVC retained;
+  # `deleted` removes these objects then the PVC (Contract 2, unchanged from the opencode
+  # path). Scale-to-zero is what makes "stopped costs nothing" literally true.
+  replicas: 1
+  # ReadWriteOnce PVC shared by two containers, and a live gateway session: a rolling
+  # update would try to start a second pod against the same volume. Recreate never runs
+  # two.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: agent
+      agent.enterprise-ai/user: "__USER__"
+      agent.enterprise-ai/name: "__NAME__"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: enterprise-ai-framework
+        app.kubernetes.io/component: agent
+        # Contract 3's attribution key for the resident-time/compute meter
+        # (enterpriseaiframework-914) is read from THESE labels, not the virtual key, so a
+        # BYO agent that produces no gateway row still bills for the hours it is resident.
+        agent.enterprise-ai/user: "__USER__"
+        agent.enterprise-ai/name: "__NAME__"
+        # Provenance, Contract 4 (integrated vs byo). Deliberately not in the selector.
+        agent.enterprise-ai/model-source: "__MODEL_SOURCE__"
+        # The Agents-pillar type, Contract A — the harness this pod runs, so a per-type
+        # console/model selector reads it off the pod.
+        agent.enterprise-ai/type: hermes
+      annotations:
+        # The first-boot seed's checksum. Unlike the opencode entrypoint checksum this is
+        # NOT a lever to reconfigure a running agent — the seed applies once and the PVC
+        # config is authoritative after (Contract B). It rolls a NEW agent whose seed
+        # content changed and is a truthful record of what a first boot was given; live
+        # settings are changed through the dashboard API (Contract D), never by re-seeding.
+        checksum/config: "__CFGSUM__"
+        # The integrated key's checksum — rolls the pod when the key actually changes
+        # (sentinel replaced by a real key, a deliberate rotation), because a secretKeyRef
+        # env is injected at pod start and never updated, so a running agent would keep
+        # presenting the old key and 401 silently. A hash, never the key.
+        checksum/api-key: "__KEYSUM__"
+        # The connector credentials' checksums (email/slack/discord), each rolling the pod
+        # when that credential is re-supplied, for the same envFrom-injected-once reason.
+        # "none" when the agent has no such connector. Hashes the provisioner stores beside
+        # the credential it cannot read back — a re-run that supplies nothing is a no-op.
+        checksum/email: "__EMAILSUM__"
+        checksum/slack: "__SLACKSUM__"
+        checksum/discord: "__DISCORDSUM__"
+    spec:
+      serviceAccountName: agent
+      automountServiceAccountToken: false
+      securityContext:
+        # The hermes image is an s6-based image: PID 1 starts as root and drops to the app
+        # user (uid 10000) via s6-applyuidgid, which needs CAP_SETUID/SETGID — so this pod
+        # deliberately does NOT drop capabilities or force runAsNonRoot (verified: dropping
+        # ALL caps crashes s6 with "unable to set supplementary group list", which is why
+        # the live agents run with a minimal securityContext too). fsGroup makes the RWO PVC
+        # group-writable by uid 10000 so the agent creates its sessions/memories/kanban db
+        # on a fresh volume with no manual chown; seccompProfile keeps the syscall filter.
+        fsGroup: 10000
+        seccompProfile: { type: RuntimeDefault }
+      # FIRST-BOOT-ONLY seed (Contract B, the defect this record fixes). The live agents'
+      # init runs `cp /seed/config.yaml /opt/data/config.yaml` UNCONDITIONALLY on every
+      # boot, wiping every setting the agent or dashboard persisted. This copies the seed
+      # IFF the PVC has none; after first boot the agent's own config is authoritative and
+      # the platform never overwrites it. Operator control comes from the dashboard API
+      # (Contract D), not from re-seeding.
+      initContainers:
+        - name: config-seed
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          # The command overrides the s6 entrypoint, so it runs as the image's root user and
+          # writes onto the fsGroup-owned volume; no s6, no capability handling needed here.
+          command:
+            - sh
+            - -c
+            - '[ -f /opt/data/config.yaml ] || cp /seed/config.yaml /opt/data/config.yaml'
+          volumeMounts:
+            - { name: data, mountPath: /opt/data }
+            - { name: seed, mountPath: /seed, readOnly: true }
+      containers:
+        # THE GATEWAY — resident, multi-channel, keeps working with nobody watching. No web
+        # port of its own; the dashboard container is its console. Runs the image's s6
+        # entrypoint (which drops root -> uid 10000), so it carries no capability overrides.
+        - name: agent
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          args: ["gateway", "run"]
+          env:
+            - { name: HERMES_HOME, value: "/opt/data" }
+            # INTEGRATED inference (Contract 4): the agent's provider is configured in the
+            # seeded config.yaml as `providers.gateway` (base_url http://gateway:4000/v1,
+            # key_env OPENAI_API_KEY, discover_models true), so inference goes through the
+            # __USER__::agents/__NAME__ virtual key on our gateway and lands on the one
+            # bill. The pod holds no provider credential of its own beyond this key.
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
+          # The tenant's own Slack/Discord/mailbox, reached with the tenant's own tokens.
+          # There is no chat or mail server in this deployment — the same posture, Secrets
+          # and `optional: true` additivity as the opencode agent. envFrom is applied
+          # before `env`, so a connector Secret cannot override OPENAI_API_KEY / HERMES_HOME.
+          envFrom:
+            - secretRef: { name: agent-__USER__-__NAME__-email, optional: true }
+            - secretRef: { name: agent-__USER__-__NAME__-slack, optional: true }
+            - secretRef: { name: agent-__USER__-__NAME__-discord, optional: true }
+          volumeMounts:
+            - { name: data, mountPath: /opt/data }
+          resources:
+            requests: { cpu: "500m", memory: "1Gi", ephemeral-storage: "1Gi" }
+            limits:   { cpu: "1",    memory: "2Gi", ephemeral-storage: "4Gi" }
+        # THE CONSOLE — the agent's OWN native web UI (Contract C). Binds 0.0.0.0:9119; the
+        # June-2026 hardening means a non-loopback bind ALWAYS requires an auth provider
+        # (--insecure is a no-op), and that provider is the dashboard.basic_auth seeded into
+        # config.yaml. --skip-build serves the prebuilt dist (no npm in the container).
+        - name: console
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["hermes", "dashboard", "--host", "0.0.0.0", "--port", "9119", "--skip-build", "--no-open"]
+          env:
+            - { name: HERMES_HOME, value: "/opt/data" }
+            # The dashboard's /api/model/options queries the gateway catalogue with this
+            # key, and Contract D's model set/get run over the same config — so the console
+            # holds the same integrated key as the gateway container.
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
+          ports:
+            - { name: dashboard, containerPort: 9119 }
+          volumeMounts:
+            - { name: data, mountPath: /opt/data }
+          resources:
+            requests: { cpu: "100m", memory: "256Mi", ephemeral-storage: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi", ephemeral-storage: "1Gi" }
+          # The dashboard is up when it answers on 9119. Its unauthenticated responses are
+          # 401/302 (the auth gate), which is still proof the process holds the port.
+          startupProbe:
+            httpGet: { path: /, port: 9119 }
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            httpGet: { path: /, port: 9119 }
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: agent-__USER__-__NAME__ }
+        # The first-boot seed, mounted read-only. The initContainer copies config.yaml off
+        # it once; the running agent never reads it again.
+        - name: seed
+          configMap: { name: agent-__USER__-__NAME__-config, defaultMode: 0444 }

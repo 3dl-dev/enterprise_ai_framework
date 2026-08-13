@@ -471,9 +471,14 @@ def test_a_user_lists_stops_starts_and_deletes_their_own_agent(cluster):
     )
 
 
-def test_creating_an_agent_applies_the_real_template_with_every_placeholder_filled(cluster):
+def test_creating_an_opencode_interim_agent_fills_every_placeholder(cluster):
+    """The interim opencode render, reached now only by an explicit non-default type
+    (openclaw, until its own provisioner lands in enterpriseaiframework-ff7). It still runs
+    the workspace image read off a live pod, which is what makes it the Code-pillar render.
+    The default create path is hermes and is covered by the hermes render test below."""
     cluster.add_workspace_pod(image="registry.invalid/enterprise-ai-workspace:xyz")
-    created = client_as("alice").post("/portal/api/agents", json={"name": "helper"})
+    created = client_as("alice").post(
+        "/portal/api/agents", json={"name": "helper", "type": "openclaw"})
     assert created.status_code == 201, created.text
 
     dep = cluster.get("deployments", "agent-alice-helper")
@@ -506,6 +511,70 @@ def test_creating_an_agent_applies_the_real_template_with_every_placeholder_fill
         "parameter"
     )
     assert ("alice", "agent.create", "alice/helper") in AUDIT
+
+
+def test_creating_a_hermes_agent_renders_the_two_container_first_boot_seed_pod(cluster):
+    """The default create path (Contracts A/B/D). A hermes agent is a two-container pod over
+    one PVC — `hermes gateway run` plus the `hermes dashboard` console — seeded FIRST-BOOT
+    ONLY, on the hermes image, with the integrated key and the console credential in place."""
+    created = client_as("alice").post("/portal/api/agents", json={"name": "athena"})
+    assert created.status_code == 201, created.text
+    assert created.json()["type"] == "hermes"
+
+    dep = cluster.get("deployments", "agent-alice-athena")
+    assert dep is not None, f"no Deployment applied; store holds {list(cluster.store)}"
+    rendered = json.dumps(dep)
+    assert "__" not in rendered, f"unsubstituted placeholder reached the cluster: {rendered[:400]}"
+
+    spec = dep["spec"]["template"]["spec"]
+    names = {c["name"]: c for c in spec["containers"]}
+    assert set(names) == {"agent", "console"}, "hermes is a two-container pod (gateway + console)"
+    assert names["agent"]["args"] == ["gateway", "run"]
+    assert names["agent"]["image"] == agents.HERMES_IMAGE, "the hermes image, not the workspace image"
+    assert names["console"]["command"][:2] == ["hermes", "dashboard"]
+    assert "--host" in names["console"]["command"] and "0.0.0.0" in names["console"]["command"]
+    assert {"name": "dashboard", "containerPort": 9119} in names["console"]["ports"]
+
+    # FIRST-BOOT-ONLY seed (Contract B — the defect the record fixes): the init copies the
+    # seed IFF the PVC has none, never an unconditional cp that clobbers persisted settings.
+    seed_init = next(c for c in spec["initContainers"] if c["name"] == "config-seed")
+    seed_cmd = " ".join(seed_init["command"])
+    assert "[ -f /opt/data/config.yaml ]" in seed_cmd and "||" in seed_cmd, (
+        "the seed must be conditional; an unconditional cp wipes the agent's own config"
+    )
+
+    # The seed ConfigMap holds the gateway provider, the model, and the dashboard basic-auth
+    # HASH (never the plaintext).
+    cm = cluster.get("configmaps", "agent-alice-athena-config")
+    seed_yaml = cm["data"]["config.yaml"]
+    assert "http://gateway:4000/v1" in seed_yaml and "discover_models: true" in seed_yaml
+    assert "password_hash: scrypt$" in seed_yaml
+
+    # The key Secret carries the integrated key AND the console credential (plaintext here,
+    # verified against the seeded hash by the dashboard) — never in the ConfigMap.
+    secret = cluster.get("secrets", "agent-alice-athena-key")
+    assert base64.b64decode(secret["data"]["OPENAI_API_KEY"]).decode() == "sk-fake-alice-agents/athena"
+    assert "DASHBOARD_PASSWORD" in secret["data"] and "DASHBOARD_USERNAME" in secret["data"]
+    assert "DASHBOARD_PASSWORD" not in seed_yaml, "the console plaintext must not be in the ConfigMap"
+
+    # No opencode ConfigMap and no OPENCODE_SERVER_PASSWORD — that is the Code pillar.
+    assert cluster.get("configmaps", "agent-entrypoint") is None
+    assert "OPENCODE_SERVER_PASSWORD" not in secret["data"]
+
+    assert ISSUED == [("alice", "agents/athena", "alice")]
+    assert ("alice", "agent.create", "alice/athena") in AUDIT
+
+
+def test_deleting_a_hermes_agent_removes_its_seed_configmap(cluster):
+    """The hermes-specific first-boot seed ConfigMap must not survive a delete."""
+    created = client_as("alice").post("/portal/api/agents", json={"name": "athena"})
+    assert created.status_code == 201, created.text
+    assert cluster.get("configmaps", "agent-alice-athena-config") is not None
+    body = client_as("alice").request("DELETE", "/portal/api/agents/athena").json()
+    assert body["deleted"] is True
+    assert cluster.get("configmaps", "agent-alice-athena-config") is None, (
+        "the seed ConfigMap leaked past delete — an orphan the user cannot see or clean up"
+    )
 
 
 def test_creating_an_agent_defaults_the_type_to_hermes(cluster):
