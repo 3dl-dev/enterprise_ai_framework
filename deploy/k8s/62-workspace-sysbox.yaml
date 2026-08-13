@@ -12,6 +12,12 @@
 #
 # See enterpriseaiframework-ee4 for the decision, the licensing verdict (Sysbox CE is
 # Apache-2.0 and clears the OSI-default constraint), and the operator-boundary escalation.
+#
+# OWNERSHIP (pending): the k3s nodes are shared portfolio cattle built by projects/mainframe.
+# A RuntimeClass is cluster infra, not tenant infra, so its real home is mainframe's k3s
+# server-manifests auto-deploy (mainframe PR #49 / beads mainframe-oyr proposes exactly this).
+# Once that lands, DELETE this file so one cluster object has one owner. It is kept here,
+# inert, only so this repo documents the runtime its workspace pods will require.
 ---
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass

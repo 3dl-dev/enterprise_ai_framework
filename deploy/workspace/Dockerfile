@@ -31,6 +31,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         fontconfig libfontconfig1 \
     && rm -rf /var/lib/apt/lists/*
 
+# A self-contained container engine and a hypervisor, so a workspace can BUILD images and
+# BOOT VMs the way any real dev box does. The forcing case is OVMX (`docker build -o dist`,
+# then qemu boots the kernel), but this is deliberately generic: `docker` and `qemu` just
+# work, for any tenant's project — nothing here is OVMX-specific.
+#
+# Everything is Debian main, so the header's "the rest is Debian main / no component with a
+# paid tier" still holds: docker.io + docker-buildx are the Moby/BuildKit stack (Apache-2.0),
+# qemu is GPL-2.0, gosu is MIT. docker-buildx (BuildKit) is what makes `docker build -o`
+# local-export work; it is not optional for the OVMX build.
+#
+# THE DAEMON IS INERT BY DEFAULT. This image only INSTALLS the toolchain — entrypoint.sh
+# starts dockerd solely when WS_DOCKER=1, which the pod sets only under the Sysbox runtime,
+# where the container's root is user-namespace-mapped to an unprivileged host UID so a real
+# in-pod dockerd is safe (enterpriseaiframework-ee4). In the default hardened pod (non-root,
+# caps dropped, no Sysbox) these binaries are present but never started and nothing about
+# the workspace changes. uidmap/slirp4netns/fuse-overlayfs are the rootless-docker path for
+# nodes that never get Sysbox; iptables is dockerd's bridge-networking dependency.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        docker.io docker-cli docker-buildx \
+        qemu-system-x86 qemu-utils \
+        gosu uidmap iptables slirp4netns fuse-overlayfs \
+    && rm -rf /var/lib/apt/lists/* \
+    && dockerd --version && docker buildx version && qemu-system-x86_64 --version | head -1
+
 RUN curl -fsSL -o /usr/local/bin/ttyd \
         "https://github.com/tsl0922/ttyd/releases/download/${TTYD_VERSION}/ttyd.${TTYD_ARCH}" \
     && echo "${TTYD_SHA256}  /usr/local/bin/ttyd" | sha256sum -c - \

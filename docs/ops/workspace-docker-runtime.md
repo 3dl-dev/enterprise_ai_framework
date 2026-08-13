@@ -122,21 +122,39 @@ k3s-worker (present on `workshop`; unverified on the worker). Then install a KVM
 plugin (e.g. kubevirt `device-plugin-kvm`, Apache-2.0) so pods request the device without
 `privileged`, and the workspace pod requests `devices.kubevirt.io/kvm: "1"`.
 
-### A7. Workspace pod-spec + image changes (staged, NOT yet written — see below)
+### A7. Workspace image + pod-spec
 
-The `deploy/k8s/61-workspace.template.yaml` pod needs, for the Sysbox variant:
-`runtimeClassName: sysbox-runc`, `hostUsers: false` (enables the userns isolation), a
-securityContext that lets `dockerd` start (the current `drop: ["ALL"]` +
-`allowPrivilegeEscalation: false` + `runAsNonRoot`/uid-1000 must relax — safe under Sysbox
-because the caps are userns-scoped), and the `/dev/kvm` device request from A6. The image
-(`deploy/workspace/Dockerfile`) needs `docker-ce`/`docker-ce-cli` + `docker-buildx-plugin` +
-`qemu-system-x86` + `qemu-utils`, and dockerd started at boot (systemd-in-Sysbox, or
-launched from `entrypoint.sh`). These edits are **deliberately not committed yet**: they
-change the hardened workspace security posture and depend on behaviour that can only be
-verified against a live Sysbox node (does dockerd come up with this exact cap set? does
-`/dev/kvm` pass through? does the root→coder restructure break existing hardening?).
-Per "verify end-to-end, not just unit tests," they land in the kaniko-build + reprovision
-loop once the node runs Sysbox, not blind.
+**Image — DONE and verified** (`deploy/workspace/Dockerfile`, `entrypoint.sh`). The image
+now ships the toolchain (`docker.io` + `docker-buildx` + `qemu-system-x86` + `qemu-utils` +
+`gosu`, all Debian trixie main) and a conditional-startup contract, covered by
+`tests/test_workspace_docker_runtime.py`. The daemon is **inert** unless the pod opts in:
+`entrypoint.sh` starts `dockerd` only when `WS_DOCKER=1` **and** it started as container-root,
+then drops to the unprivileged `coder` user via `gosu` before serving the shell (the shell
+never runs as root, docker or not). So the same image is safe in the default hardened pod
+(WS_DOCKER unset → nothing starts) and functional under Sysbox.
+
+**Pod-spec — the exact delta the Sysbox variant of `deploy/k8s/61-workspace.template.yaml`
+must add** (NOT yet applied to the shared template — it must not go live before a node runs
+Sysbox, or the pod stays in ContainerCreating; wire it behind a provisioner `--docker` opt-in
+or a variant file, and verify in the kaniko-build + reprovision loop):
+
+- `spec.runtimeClassName: sysbox-runc`
+- `spec.hostUsers: false` — turns on the user-namespace isolation Sysbox maps root through.
+- pod `securityContext`: drop `runAsNonRoot: true`; set `runAsUser: 0` / `runAsGroup: 0`
+  (container-root, userns-mapped to an unprivileged host UID under Sysbox — *more* isolated
+  than today's shared-userns uid-1000, not less). Keep `seccompProfile: RuntimeDefault`.
+- container `securityContext`: the current `capabilities: { drop: ["ALL"] }` +
+  `allowPrivilegeEscalation: false` must relax enough for `dockerd` (Sysbox scopes those
+  caps to the userns, so this is not host privilege). Start from Sysbox's documented default
+  and tighten against a real boot — this is the one line that can only be settled on-node.
+- env: `WS_DOCKER: "1"` (and optionally `WS_DOCKER_DATA_ROOT`).
+- volumes: back the docker data-root with a **sized** volume. The image defaults data-root to
+  `/var/lib/docker`; the project PVC is only 5Gi and an OVMX build is larger, so mount an
+  emptyDir (or a dedicated PVC) at `WS_DOCKER_DATA_ROOT` sized for a real image build.
+- resources: request `devices.kubevirt.io/kvm: "1"` (from A6) for accelerated qemu.
+
+Only the container-`securityContext` cap set and the `/dev/kvm` passthrough genuinely need a
+live Sysbox node to finalize; everything else above is settled by the image contract.
 
 ### A8. Prove it (definition of done for ee4)
 
