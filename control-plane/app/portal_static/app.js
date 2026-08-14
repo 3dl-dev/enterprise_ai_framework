@@ -456,6 +456,7 @@ function hours(n) {
 }
 
 let AGENTS_BUSY = false;
+let MODELS = [];   // allowed_models(), stashed by loadAgents for the per-agent picker
 
 async function loadAgents() {
   let d;
@@ -475,6 +476,9 @@ async function loadAgents() {
   }
 
   const models = d.models || [];
+  // Stashed for the per-agent model picker in each row (Contract D / -840): the same
+  // allowed_models() list the create form uses.
+  MODELS = models;
   const sel = $("agent-model");
   if (sel.dataset.filled !== String(models.length)) {
     sel.innerHTML = "";
@@ -575,6 +579,26 @@ function agentRow(a) {
   wire.addEventListener("click", () => openSetup(a.name));
   controls.appendChild(wire);
 
+  // Change the model from the control plane (Contract D / -840), for gateway agents whose
+  // console API this drives. It rewrites the model through the agent's own dashboard and
+  // restarts it, so a model a user picks can never brick the agent — the control plane, not
+  // the agent, is what sets it. Only for hermes and only when there is more than one choice.
+  if (a.type === "hermes" && MODELS.length > 1) {
+    const msel = document.createElement("select");
+    msel.className = "agent-model-pick";
+    msel.setAttribute("aria-label", `Model for ${a.name}`);
+    for (const m of MODELS) {
+      const opt = document.createElement("option");
+      opt.value = m; opt.textContent = m;
+      if (m === a.model) opt.selected = true;
+      msel.appendChild(opt);
+    }
+    const setm = document.createElement("button");
+    setm.className = "btn small ghost"; setm.textContent = "Set model";
+    setm.addEventListener("click", () => setAgentModel(a.name, msel.value));
+    controls.append(msel, setm);
+  }
+
   const drop = document.createElement("button");
   drop.className = "btn small danger"; drop.textContent = "Delete";
   drop.addEventListener("click", () => deleteAgent(a.name));
@@ -582,6 +606,18 @@ function agentRow(a) {
 
   li.append(head, meta, controls);
   return li;
+}
+
+async function setAgentModel(name, model) {
+  if (AGENTS_BUSY || !model) return;
+  AGENTS_BUSY = true;
+  try {
+    const { ok, data } = await post(
+      `/portal/api/agents/${encodeURIComponent(name)}/model`, { model });
+    if (!ok) { toast(data.detail || "Could not change the model.", false); return; }
+    toast(`${name} is switching to ${model} and restarting.`);
+    await loadAgents();
+  } finally { AGENTS_BUSY = false; }
 }
 
 async function act(path, okMsg) {

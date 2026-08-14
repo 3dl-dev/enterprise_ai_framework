@@ -175,6 +175,33 @@ async def _cookie_for(base: str, host: str, target: dict, *, force: bool = False
         return cookie
 
 
+async def call(target: dict, method: str, path: str, *, json=None) -> httpx.Response:
+    """One authenticated JSON call to the agent's dashboard API (Contract D).
+
+    The server-to-server path the control plane uses to drive an agent's own console —
+    change its model, restart its gateway — WITHOUT pods/exec and without touching the seed
+    (enterpriseaiframework-840). Reuses the cached console session and re-logins once on a
+    stale 401, exactly as the proxy does. `target` is owner-scoped by `console_target`, so
+    there is no path here that reaches a dashboard the caller does not own.
+    """
+    base = f"http://{target['host']}:{target['port']}"
+
+    async def _do(cookie: str) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            try:
+                return await client.request(
+                    method, f"{base}{path}", json=json, headers={"Cookie": cookie})
+            except httpx.HTTPError as exc:
+                raise _unreachable(target.get("host", "?"), exc)
+
+    cookie = await _cookie_for(base, target["host"], target)
+    resp = await _do(cookie)
+    if resp.status_code == 401:
+        cookie = await _cookie_for(base, target["host"], target, force=True)
+        resp = await _do(cookie)
+    return resp
+
+
 async def proxy_http(user: str, name: str, path: str, request: Request,
                      target: dict) -> Response:
     """Forward one HTTP request to the caller's own hermes dashboard.

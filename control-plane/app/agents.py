@@ -1249,6 +1249,72 @@ async def scale(user: str, name: str, replicas: int) -> dict:
     return {"name": name, "status": STOPPED if replicas == 0 else STARTING}
 
 
+async def set_model(user: str, name: str, model: str) -> dict:
+    """Change a running agent's model from the control plane (Contract D, -840).
+
+    The bug this fixes: the model persists in a config file on the PVC that outlives a
+    restart, and before this its only editor was the (possibly braindead) agent itself — so
+    an agent that set itself to a model that could not set itself back was bricked. Because
+    this is driven THROUGH the agent's own console API, reached by the control plane rather
+    than by asking the agent to act, a bricked agent is always recoverable; and because it
+    writes through the dashboard (not by re-seeding, which is first-boot-only now), the
+    change persists and coexists with everything else the agent manages. No pods/exec — the
+    control-plane SA does not have it.
+    """
+    model = (model or "").strip()
+    if model not in allowed_models():
+        raise HTTPException(
+            400,
+            f"unknown model {model!r}. A model name from a request body is checked against "
+            "the deployment's list rather than passed through to the agent verbatim.",
+        )
+    # Owner-scoping and the upstream target are the SAME guard the console uses — a caller
+    # can only ever reach an agent they own, and only its dashboard.
+    target = await console_target(user, name)
+    if target.get("type") != "hermes":
+        raise HTTPException(
+            501,
+            "changing the model from the control plane is implemented for hermes agents; "
+            "openclaw's openclaw.json path lands with enterpriseaiframework-ff7.",
+        )
+
+    from . import agent_gateway_console
+
+    # Write the model through the dashboard's own writer: model.provider=gateway (the seeded
+    # integrated provider) + model.default=<model>. confirm_expensive_model bypasses the
+    # dashboard's price-guard prompt (the platform already gates spend); provider is NOT
+    # "nous", so the Tool-Gateway auto-defaults side effect never fires (verified -2ba).
+    resp = await agent_gateway_console.call(
+        target, "POST", "/api/model/set",
+        json={"scope": "main", "provider": "gateway", "model": model,
+              "confirm_expensive_model": True},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(
+            502,
+            f"the agent {name!r}'s console refused the model change (HTTP "
+            f"{resp.status_code}). It may be mid-restart — try again in a moment.",
+        )
+    payload = resp.json() if resp.content else {}
+    if payload.get("ok") is False:
+        raise HTTPException(409, payload.get("confirm_message")
+                            or "the agent's console did not apply the model change.")
+
+    # /api/model/set applies to NEW sessions only (-2ba); restart so the resident gateway
+    # picks the model up now rather than on its next message. Best-effort: the model is
+    # already persisted, so a failed restart delays the change, it does not lose it.
+    restarted = True
+    try:
+        r2 = await agent_gateway_console.call(target, "POST", "/api/gateway/restart", json={})
+        restarted = r2.status_code == 200
+    except HTTPException:
+        restarted = False
+
+    await db.audit(user, "agent.model.set", f"{user}/{name}", model=model,
+                   restarted=restarted)
+    return {"name": name, "model": model, "restarted": restarted}
+
+
 # ---------------------------------------------------------------- delete
 
 

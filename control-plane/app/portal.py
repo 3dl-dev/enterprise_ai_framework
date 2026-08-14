@@ -430,6 +430,20 @@ async def create_my_agent(body: dict, user: str = Depends(require_user)):
     return await agents.create(user, name, model=model, agent_type=agent_type)
 
 
+@router.post("/portal/api/agents/{name}/model")
+async def set_my_agent_model(name: str, body: dict, user: str = Depends(require_user)):
+    """Change the caller's OWN agent's model, control-plane-driven (Contract D, -840).
+
+    Model config must be easy AND un-brickable: before this the model could only be changed
+    from inside the agent, so an agent that set itself to a model it could not undo was
+    stuck. This drives the change through the agent's console API from the control plane, so
+    it is always recoverable, and it persists on the PVC without a re-seed. The name is the
+    caller's own (owner-scoped in agents.set_model), never a body field.
+    """
+    model = ((body or {}).get("model") or "").strip()
+    return await agents.set_model(user, name, model)
+
+
 @router.post("/portal/api/agents/{name}/stop")
 async def stop_my_agent(name: str, user: str = Depends(require_user)):
     """`replicas: 0`. The PVC is kept, the session is on it, and the meter freezes."""

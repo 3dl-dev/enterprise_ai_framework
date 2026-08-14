@@ -43,6 +43,8 @@ class FakeDashboard:
         self.address = address
         self.port = agents.DASHBOARD_PORT
         self.logins = 0
+        self.model_sets: list[dict] = []   # bodies POSTed to /api/model/set
+        self.restarts = 0
         self.requests: list[tuple[str, str, bool]] = []  # (method, path, authenticated)
         self.fail_next_authed = threading.Event()  # forces one 401 to test re-login
         self._token = "sess-" + uuid.uuid4().hex
@@ -86,6 +88,18 @@ class FakeDashboard:
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length)
                 path = urlparse(self.path).path
+                # Contract D API the model picker (-840) drives, authenticated by cookie.
+                if path in ("/api/model/set", "/api/gateway/restart"):
+                    if not self._has_session():
+                        self._send(401, "application/json", b"{}")
+                        return
+                    if path == "/api/model/set":
+                        dash.model_sets.append(json.loads(raw or b"{}"))
+                        self._send(200, "application/json", b'{"ok":true}')
+                    else:
+                        dash.restarts += 1
+                        self._send(200, "application/json", b'{"ok":true}')
+                    return
                 if path == "/auth/password-login":
                     body = json.loads(raw or b"{}")
                     ok = (body.get("username") == dash.username
@@ -267,3 +281,44 @@ def test_a_stopped_agent_reads_as_unreachable_not_as_a_broken_page(world):
     r = app_client("alice").get("/agents/athena/api/config")
     assert r.status_code in (502, 504), r.status_code
     assert "athena" in r.text
+
+
+# ---- model picker (-840), driving the dashboard's Contract D API -----------------------
+
+def test_setting_the_model_drives_the_console_api_and_restarts(world):
+    world.add_agent("alice", "athena")
+    r = app_client("alice").post(
+        "/portal/api/agents/athena/model", json={"model": agents.DEFAULT_MODEL})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["model"] == agents.DEFAULT_MODEL and body["restarted"] is True
+    # The change goes through the dashboard's OWN writer (not a config clobber, not exec),
+    # as a ModelAssignment — the endpoint constructs the shape, it does not pass the user
+    # body through. provider is the seeded integrated gateway, NOT "nous".
+    assert len(world.dash.model_sets) == 1
+    sent = world.dash.model_sets[0]
+    assert sent == {
+        "scope": "main", "provider": "gateway",
+        "model": agents.DEFAULT_MODEL, "confirm_expensive_model": True,
+    }
+    # /api/model/set applies to new sessions only, so the gateway is restarted to pick it up.
+    assert world.dash.restarts == 1
+
+
+def test_an_unknown_model_is_refused_and_never_reaches_the_agent(world):
+    world.add_agent("alice", "athena")
+    r = app_client("alice").post(
+        "/portal/api/agents/athena/model", json={"model": "totally-made-up-model"})
+    assert r.status_code == 400, r.text
+    assert world.dash.model_sets == [], (
+        "an unvalidated model must never be written to the agent — it is checked against "
+        "allowed_models() before the console is touched"
+    )
+
+
+def test_a_non_owner_cannot_change_another_users_model(world):
+    world.add_agent("alice", "athena")
+    r = app_client("bob").post(
+        "/portal/api/agents/athena/model", json={"model": agents.DEFAULT_MODEL})
+    assert r.status_code == 404, r.text
+    assert world.dash.model_sets == [] and world.dash.logins == 0
