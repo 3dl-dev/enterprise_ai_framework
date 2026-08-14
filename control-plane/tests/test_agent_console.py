@@ -252,7 +252,11 @@ def world(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
     def add_agent(user: str, name: str, *, reachable: bool = True):
-        cluster.add_agent(user, name)
+        # This suite exercises the opencode/interim console (Basic-auth + entry-document
+        # shim), which is the console an openclaw-typed agent uses; a hermes agent has its
+        # own native-dashboard adapter (test_agent_gateway_console.py). Typing the fixture
+        # openclaw is what routes console_target to this path.
+        cluster.add_agent(user, name, agent_type="openclaw")
         obj = f"agent-{user}-{name}"
         cluster.put("secrets", {
             "apiVersion": "v1", "kind": "Secret",

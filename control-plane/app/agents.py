@@ -96,6 +96,10 @@ HERMES_IMAGE = os.environ.get("AGENT_HERMES_IMAGE", "nousresearch/hermes-agent:v
 # it, and the per-agent secret is the password, never the username.
 DASHBOARD_USERNAME = "console"
 
+# The hermes dashboard's native port (agents-gateway-console.md Contract C), the port the
+# per-agent Service publishes and the console proxy targets. Confirmed :9119 by -2ba.
+DASHBOARD_PORT = int(os.environ.get("AGENT_DASHBOARD_PORT", "9119"))
+
 # The object set and the resident entrypoint, delivered to this pod as a ConfigMap because
 # the control-plane image is built from `control-plane/` alone and these files live under
 # `deploy/`. Rendering the SAME bytes provision-agent.sh renders is the point: a second
@@ -597,10 +601,43 @@ async def console_target(user: str, name: str) -> dict:
     """
     obj = object_name(user, name)
     async with _client() as client:
-        await _owned_deployment(client, user, name)
+        deployment = await _owned_deployment(client, user, name)
         secret = await _get(client, "v1", "Secret", f"{obj}-key")
 
-    encoded = ((secret or {}).get("data") or {}).get("OPENCODE_SERVER_PASSWORD")
+    data = (secret or {}).get("data") or {}
+    labels = (deployment.get("metadata") or {}).get("labels") or {}
+    # Read the type as raw as list_agents does — NOT defaulted to hermes. This resolves an
+    # EXISTING agent's console: only an explicit `hermes` label selects the gateway console;
+    # a missing label is a pre-dimension opencode agent and takes the Basic-auth path below.
+    agent_type = labels.get(TYPE_LABEL, "")
+
+    def _decode(key: str) -> str:
+        raw = data.get(key)
+        return base64.b64decode(raw).decode() if raw else ""
+
+    if agent_type == "hermes":
+        # The Agents-pillar console: the agent's OWN hermes dashboard (Contract C). The
+        # proxy authenticates to it with the console credential -f55 seeded into the key
+        # Secret (form-login -> session cookie; the dashboard's basic-auth gate is not HTTP
+        # Basic), so the user reaches it through the portal's Keycloak session and never the
+        # dashboard's own login. `host` is the per-agent Service; `port` its native 9119.
+        password = _decode("DASHBOARD_PASSWORD")
+        if not password:
+            raise HTTPException(
+                503,
+                f"the hermes agent {name!r} has no console credential in Secret {obj}-key. "
+                "It is written at create time; re-provision the agent rather than attaching.",
+            )
+        return {
+            "type": "hermes",
+            "host": obj,
+            "port": DASHBOARD_PORT,
+            "username": (_decode("DASHBOARD_USERNAME") or DASHBOARD_USERNAME),
+            "password": password,
+        }
+
+    # The opencode/interim path: HTTP Basic on the resident daemon. Unchanged.
+    encoded = data.get("OPENCODE_SERVER_PASSWORD")
     if not encoded:
         # The daemon refuses to start without this (deploy/agent/entrypoint.sh), so a
         # missing one means the Secret was replaced or hand-edited. Attaching without it
@@ -612,6 +649,7 @@ async def console_target(user: str, name: str) -> dict:
             "re-provision the agent rather than attaching to it.",
         )
     return {
+        "type": agent_type,
         "host": obj,
         "port": SERVE_PORT,
         "username": CONSOLE_BASIC_USER,

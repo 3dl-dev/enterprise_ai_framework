@@ -221,6 +221,14 @@ async def agent_console_proxy(name: str, path: str, request: Request,
     else's agent.
     """
     target = await agents.console_target(user, name)
+    # The Agents pillar (hermes/openclaw gateway agents) has its OWN native console, proxied
+    # by a separate adapter that authenticates with a session cookie and needs no SPA shim
+    # (agents-gateway-console.md Contract C). Only the opencode/interim path below runs
+    # through this module's Basic-auth + entry-document rewrite.
+    if target.get("type") == "hermes":
+        from . import agent_gateway_console
+        return await agent_gateway_console.proxy_http(user, name, path, request, target)
+
     url = (f"http://{target['host']}:{target['port']}"
            f"{_upstream_path(request.scope, name, path)}")
 
@@ -309,6 +317,11 @@ async def agent_console_ws(ws: WebSocket, name: str, path: str):
         # for the reason console_target answers 404 rather than 403.
         await ws.close(code=1008)
         return
+
+    # Gateway agents (hermes) bridge through their own adapter — cookie auth, no shim.
+    if target.get("type") == "hermes":
+        from . import agent_gateway_console
+        return await agent_gateway_console.proxy_ws(ws, user, name, path, target)
 
     import asyncio
     import inspect
