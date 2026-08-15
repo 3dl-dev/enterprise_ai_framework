@@ -1,0 +1,30 @@
+{
+  "_comment": "arlo LOM configuration for enterprise_ai_framework. The LOM is a gradient resolved in situ (SKILL.md §1), not a pinned model (invariant #4). This host had no ollama/llama-server, no sentence-transformers, and no local /v1 endpoint at setup, so the default is arlo's offline lexical floor. `embedder` is intentionally null; set it only if you provision a CPU embedder.",
+  "embedder": null,
+  "ladder": [
+    {
+      "rung": "default",
+      "what": "offline lexical floor — deterministic bag-of-words over the harvested cards (arlo.translate). No dependency, always available, weakest ranking, honestly labeled '[lexical match, no model]'.",
+      "reachable_when": "always"
+    },
+    {
+      "rung": "climb-1",
+      "what": "the model running the arlo skill itself (the agent that invoked /arlo:start ranks cards directly, no embedder). This is the setup-time LOM and the strongest reader when the agent is up.",
+      "reachable_when": "the coding agent / frontier is up (i.e. NOT the lights-out case, but the fast path when it is)"
+    },
+    {
+      "rung": "climb-2",
+      "what": "the platform's OWN gateway — vLLM/Forge serving an open model through this bundle's LiteLLM gateway. The customer's layer calling the customer's own providers is not phone-home (standing constraint). Reach it at the gateway origin recorded in bundle/.env.",
+      "reachable_when": "the bundle (`make up`) or the k3s cluster is running"
+    },
+    {
+      "rung": "optional",
+      "what": "a CPU sentence-transformers embedder for better lexical ranking. Not installed here and not a default. Install `sentence-transformers`, then set `embedder` above to a model name (e.g. 'all-MiniLM-L6-v2'); arlo.cli auto-falls-back to the lexical floor if it is ever unreachable.",
+      "reachable_when": "if the operator installs it"
+    }
+  ],
+  "escalation_policy": "Run the default (lexical floor). Escalate up the ladder only when a goal is a novel multi-step inference the distilled runbooks don't cover, or the top card scores below the confidence floor. The operator's budget decides how far to climb; abstain rather than guess if no rung is reachable.",
+  "harvested_at": "2026-08-15",
+  "harvest_root": "enterprise_ai_framework (worktree)",
+  "invariant": "arlo never emits a command that is not real ground truth. At worst it surfaces the wrong REAL command, always labeled with its confidence and alternatives."
+}

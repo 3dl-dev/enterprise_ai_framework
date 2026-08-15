@@ -1,0 +1,350 @@
+[
+  {
+    "id": "make-up",
+    "purpose": "Start / bring up / launch the whole bundle stack from one command on a single host, no GPU (scope item 8). Renders env, makes certs, renders gateway config, starts core then all services, waits healthy, post-up reconcile.",
+    "command": "make up",
+    "source": "Makefile:up"
+  },
+  {
+    "id": "make-down",
+    "purpose": "Stop the bundle stack (docker compose down). State volumes are retained.",
+    "command": "make down",
+    "source": "Makefile:down"
+  },
+  {
+    "id": "make-logs",
+    "purpose": "Follow the bundle's logs (docker compose logs -f --tail=100).",
+    "command": "make logs",
+    "source": "Makefile:logs"
+  },
+  {
+    "id": "make-ps",
+    "purpose": "List the bundle's running services and their health (docker compose ps).",
+    "command": "make ps",
+    "source": "Makefile:ps"
+  },
+  {
+    "id": "make-test",
+    "purpose": "Run the scope-item test suite against the running bundle. These are the adjudication evidence for the nine outcomes.",
+    "command": "make test",
+    "source": "Makefile:test"
+  },
+  {
+    "id": "make-sync",
+    "purpose": "Reconcile identity into virtual keys. Idempotent. (POST /admin/sync)",
+    "command": "make sync",
+    "source": "Makefile:sync"
+  },
+  {
+    "id": "make-spend",
+    "purpose": "The one bill. Show spend across every provider. (GET /admin/spend)",
+    "command": "make spend",
+    "source": "Makefile:spend"
+  },
+  {
+    "id": "make-audit",
+    "purpose": "The one audit trail, plus a chain verification. (GET /admin/audit/verify)",
+    "command": "make audit",
+    "source": "Makefile:audit"
+  },
+  {
+    "id": "make-export",
+    "purpose": "Export the ledger and verify it. Non-destructive — run it whenever.",
+    "command": "make export",
+    "source": "Makefile:export"
+  },
+  {
+    "id": "make-exit-direct",
+    "purpose": "Write the direct-provider configuration for each surface (so surfaces can run on direct provider keys instead of the gateway).",
+    "command": "make exit-direct",
+    "source": "Makefile:exit-direct"
+  },
+  {
+    "id": "make-exit",
+    "purpose": "Leave the platform: export, verify, write direct config, then revoke every virtual key. DESTRUCTIVE — surfaces stop working until they hold direct provider keys.",
+    "command": "make exit",
+    "source": "Makefile:exit"
+  },
+  {
+    "id": "make-nuke",
+    "purpose": "Destroy all state including the databases. NOT reversible (docker compose down -v + removes realm export).",
+    "command": "make nuke",
+    "source": "Makefile:nuke"
+  },
+  {
+    "id": "make-forge-config",
+    "purpose": "Reload Forge credentials from 1Password and regenerate the gateway model catalog.",
+    "command": "make forge-config",
+    "source": "Makefile:forge-config"
+  },
+  {
+    "id": "make-test-forge",
+    "purpose": "Live smoke tests against Forge. Spends real money (fractions of a cent). Kept out of `make test`.",
+    "command": "make test-forge",
+    "source": "Makefile:test-forge"
+  },
+  {
+    "id": "make-test-e2e",
+    "purpose": "Full browser journey against the live k3s cluster: login, chat, agent writes a file, run gate, publish, fetch published link with no session. Needs workspaces provisioned.",
+    "command": "make test-e2e",
+    "source": "Makefile:test-e2e"
+  },
+  {
+    "id": "make-test-browser",
+    "purpose": "Drive both UIs in a real Chromium against the live cluster; fails on any console error.",
+    "command": "make test-browser",
+    "source": "Makefile:test-browser"
+  },
+  {
+    "id": "make-test-chat-login",
+    "purpose": "Sign in to CHAT (not the portal) from a fresh browser context against the real public origin, reload, and assert the session survives (cookie-policy defect).",
+    "command": "make test-chat-login",
+    "source": "Makefile:test-chat-login"
+  },
+  {
+    "id": "make-test-workspace",
+    "purpose": "Drive both browser-terminal workspaces as a person would, against the live cluster. Needs workspaces provisioned first.",
+    "command": "make test-workspace",
+    "source": "Makefile:test-workspace"
+  },
+  {
+    "id": "make-test-first-conversation",
+    "purpose": "A never-signed-in Keycloak account through the documented front door: a real assistant reply grounded in a real tool call, read back from the persisted message.",
+    "command": "make test-first-conversation",
+    "source": "Makefile:test-first-conversation"
+  },
+  {
+    "id": "api",
+    "purpose": "Thin wrapper for calling the control-plane admin API from the host. e.g. api.sh GET /admin/spend | api.sh POST /admin/sync '{...}'",
+    "command": "bundle/bin/api.sh METHOD PATH [json]",
+    "source": "bundle/bin/api.sh:3"
+  },
+  {
+    "id": "exit-export",
+    "purpose": "Export the ledger and verify it (safe, non-destructive).",
+    "command": "bundle/bin/exit.sh export",
+    "source": "bundle/bin/exit.sh:8"
+  },
+  {
+    "id": "exit-direct",
+    "purpose": "Write the direct-provider configuration for each surface.",
+    "command": "bundle/bin/exit.sh direct",
+    "source": "bundle/bin/exit.sh:9"
+  },
+  {
+    "id": "exit-revoke",
+    "purpose": "Revoke every virtual key at the gateway. DESTRUCTIVE — requires --confirm.",
+    "command": "bundle/bin/exit.sh revoke --confirm",
+    "source": "bundle/bin/exit.sh:10"
+  },
+  {
+    "id": "exit-full",
+    "purpose": "The full exit: all three (export, direct, revoke) in the order that keeps surfaces working. DESTRUCTIVE — requires --confirm.",
+    "command": "bundle/bin/exit.sh full --confirm",
+    "source": "bundle/bin/exit.sh:11"
+  },
+  {
+    "id": "ensure-user",
+    "purpose": "Create or update a realm user in the local bundle via the admin API. Idempotent.",
+    "command": "bundle/bin/ensure-user.sh <username> [password] [email]",
+    "source": "bundle/bin/ensure-user.sh:4"
+  },
+  {
+    "id": "make-certs",
+    "purpose": "Generate a self-signed TLS certificate for the identity provider. Required, not cosmetic: the chat OIDC client refuses plaintext discovery. Idempotent.",
+    "command": "bundle/bin/make-certs.sh",
+    "source": "bundle/bin/make-certs.sh:2"
+  },
+  {
+    "id": "post-up",
+    "purpose": "First-run reconcile, then print where everything is. Called automatically by `make up`.",
+    "command": "bundle/bin/post-up.sh",
+    "source": "bundle/bin/post-up.sh:2"
+  },
+  {
+    "id": "provision-chat-key",
+    "purpose": "Mint the chat surface's virtual key and write it into .env. Idempotent.",
+    "command": "bundle/bin/provision-chat-key.sh",
+    "source": "bundle/bin/provision-chat-key.sh:2"
+  },
+  {
+    "id": "provision-rag-key",
+    "purpose": "Mint rag-api's virtual key and write it into .env. Idempotent.",
+    "command": "bundle/bin/provision-rag-key.sh",
+    "source": "bundle/bin/provision-rag-key.sh:2"
+  },
+  {
+    "id": "render-env",
+    "purpose": "Ensure .env exists and every required secret has a value, then render config templates that need a secret. Fills gaps rather than regenerating. Called first by `make up`.",
+    "command": "bundle/bin/render-env.sh",
+    "source": "bundle/bin/render-env.sh:2"
+  },
+  {
+    "id": "render-gateway-config",
+    "purpose": "Render the gateway model catalog from Forge's live catalog and price list into litellm/config.generated.yaml. (Same as `make forge-config`.)",
+    "command": "bundle/bin/render-gateway-config.py",
+    "source": "bundle/bin/render-gateway-config.py:1"
+  },
+  {
+    "id": "render-codeapi-keys",
+    "purpose": "Generate/fill the codeapi Ed25519 keypairs that .env needs, in place.",
+    "command": "bundle/bin/render-codeapi-keys.py",
+    "source": "bundle/bin/render-codeapi-keys.py:1"
+  },
+  {
+    "id": "run-tests",
+    "purpose": "Run the scope-item test suite against the running bundle (creates .venv-test on first use). Same as `make test`.",
+    "command": "bundle/bin/run-tests.sh",
+    "source": "bundle/bin/run-tests.sh:2"
+  },
+  {
+    "id": "verify-export",
+    "purpose": "Verify an exported ledger. Standalone: stdlib only, talks to no running service.",
+    "command": "bundle/bin/verify-export.py <export-dir>",
+    "source": "bundle/bin/verify-export.py:1"
+  },
+  {
+    "id": "wait-healthy",
+    "purpose": "Block until every service with a healthcheck reports healthy, or fail loudly.",
+    "command": "bundle/bin/wait-healthy.sh",
+    "source": "bundle/bin/wait-healthy.sh:2"
+  },
+  {
+    "id": "deploy",
+    "purpose": "Deploy the bundle to the k3s cluster. Reuses bundle/.env as the source of secrets so cluster and local compose can't drift. PUBLIC_BASE_URL must be the URL a browser will use (https, or login fails).",
+    "command": "PUBLIC_BASE_URL=https://ai.3dl.network deploy/bin/deploy.sh",
+    "source": "deploy/bin/deploy.sh:8"
+  },
+  {
+    "id": "post-deploy",
+    "purpose": "Post-deploy reconcile for the cluster — the k8s equivalent of post-up.sh (realm redirect URIs, bootstrap user, key sync via Keycloak admin API). Idempotent.",
+    "command": "PUBLIC_BASE_URL=https://host deploy/bin/post-deploy.sh",
+    "source": "deploy/bin/post-deploy.sh:8"
+  },
+  {
+    "id": "smoke",
+    "purpose": "Prove the deployment can actually serve a prompt (exercises the real credential path with a live inference call). Run at the end of every deploy — 'pods Running' is not the same claim.",
+    "command": "deploy/bin/smoke.sh",
+    "source": "deploy/bin/smoke.sh:2"
+  },
+  {
+    "id": "setup-portal",
+    "purpose": "Register the portal's Keycloak client and put its secrets where the pod can read them. Idempotent; re-run after changing PUBLIC_BASE_URL.",
+    "command": "deploy/bin/setup-portal.sh",
+    "source": "deploy/bin/setup-portal.sh:4"
+  },
+  {
+    "id": "ensure-second-user",
+    "purpose": "Create a realm user on the cluster so multi-user isolation can be demonstrated. Password stored only in that user's own workspace-user-<username> Secret.",
+    "command": "deploy/bin/ensure-second-user.sh [username] [email]",
+    "source": "deploy/bin/ensure-second-user.sh:5"
+  },
+  {
+    "id": "provision-workspace",
+    "purpose": "Create / make / set up / onboard one user's new browser-terminal (IDE) workspace on the cluster. Repeatable/idempotent; rotates a fresh <username>::ide virtual key each run.",
+    "command": "deploy/bin/provision-workspace.sh <keycloak-username> [--model NAME] [--instructions FILE]",
+    "source": "deploy/bin/provision-workspace.sh:4"
+  },
+  {
+    "id": "provision-agent",
+    "purpose": "Provision one named RESIDENT agent instance (INTEGRATED mode — gateway-metered per-agent virtual key).",
+    "command": "deploy/bin/provision-agent.sh <keycloak-username> <agent-name> [--model NAME]",
+    "source": "deploy/bin/provision-agent.sh:4"
+  },
+  {
+    "id": "provision-agent-byo",
+    "purpose": "Provision a resident agent in BYO mode: the user's own provider credential, no gateway ledger row.",
+    "command": "deploy/bin/provision-agent.sh <user> <name> --byo-key-file FILE --byo-api-base URL",
+    "source": "deploy/bin/provision-agent.sh:5"
+  },
+  {
+    "id": "hermes-up",
+    "purpose": "ONE COMMAND: a resident agent, on the metered Forge path, talking in the company's chat (Slack or Discord). Composes provision-agent + the pod's chat tools.",
+    "command": "deploy/bin/hermes-up.sh <keycloak-username> <agent-name> [--chat slack|discord] [--slack-config-file FILE] [--discord-config-file FILE] [--model NAME]",
+    "source": "deploy/bin/hermes-up.sh:4"
+  },
+  {
+    "id": "hermes-up-slack-example",
+    "purpose": "Worked example: bring up a Slack-connected resident agent 'hermes' for user baron.",
+    "command": "deploy/bin/hermes-up.sh baron hermes --slack-config-file ~/.secrets/hermes-slack.env",
+    "source": "deploy/bin/hermes-up.sh:11"
+  },
+  {
+    "id": "kaniko-build",
+    "purpose": "Build an image in the cluster with kaniko and push it to the rail registry (no Docker socket; context carried as a gzipped tar in a ConfigMap). For small contexts.",
+    "command": "deploy/bin/kaniko-build.sh <context-dir> <image-ref> [--build-arg K=V ...]",
+    "source": "deploy/bin/kaniko-build.sh:4"
+  },
+  {
+    "id": "watch-and-deploy",
+    "purpose": "Continuous deployment: one pass; deploys the cluster if main went green, exits 0 if nothing to do. Intended to run on a timer on a host that can reach the cluster.",
+    "command": "deploy/bin/watch-and-deploy.sh",
+    "source": "deploy/bin/watch-and-deploy.sh:4"
+  },
+  {
+    "id": "watch-and-deploy-force",
+    "purpose": "Force a cluster deploy even if this SHA was already deployed.",
+    "command": "deploy/bin/watch-and-deploy.sh --force",
+    "source": "deploy/bin/watch-and-deploy.sh:5"
+  },
+  {
+    "id": "op-signin",
+    "purpose": "PRECONDITION: restore the 1Password session so Forge credentials load. Run this first on a cold shell, then `direnv reload`.",
+    "command": "op signin",
+    "source": ".envrc:22"
+  },
+  {
+    "id": "direnv-allow",
+    "purpose": "PRECONDITION: allow this repo's .envrc once so direnv loads the Forge env references.",
+    "command": "direnv allow",
+    "source": ".envrc:10"
+  },
+  {
+    "id": "direnv-reload",
+    "purpose": "PRECONDITION: reload the repo env after `op signin` so the FORGE_* vars populate in the shell.",
+    "command": "direnv reload",
+    "source": "deploy/README.md:9"
+  },
+  {
+    "id": "kubectl-uninstall-namespace",
+    "purpose": "Complete uninstall of the cluster deployment: delete the whole enterprise-ai namespace.",
+    "command": "kubectl delete namespace enterprise-ai",
+    "source": "deploy/README.md:18"
+  },
+  {
+    "id": "kubectl-portforward-control-plane",
+    "purpose": "Reach the unpublished control-plane admin API from your machine (then call /admin/spend, /admin/sync, etc against localhost:8081).",
+    "command": "kubectl -n enterprise-ai port-forward svc/control-plane 8081:8000",
+    "source": "deploy/README.md:30"
+  },
+  {
+    "id": "kubectl-delete-workspace",
+    "purpose": "DELETE / reclaim / tear down one user's existing workspace objects on the cluster (deploy, svc, pvc, secret for that user).",
+    "command": "kubectl -n enterprise-ai delete deploy,svc,pvc,secret -l workspace.enterprise-ai/user=<name>",
+    "source": "deploy/README.md:172"
+  },
+  {
+    "id": "kubectl-agent-stop",
+    "purpose": "Stop a resident agent (scale to zero); its PVC is retained so it can resume.",
+    "command": "kubectl scale deploy/agent-<user>-<name> --replicas=0",
+    "source": "docs/design/records/agents-surface.md:205"
+  },
+  {
+    "id": "kubectl-agent-start",
+    "purpose": "Start / resume a resident agent (scale back to one replica).",
+    "command": "kubectl scale deploy/agent-<user>-<name> --replicas=1",
+    "source": "docs/design/records/agents-surface.md:203"
+  },
+  {
+    "id": "caddy-stage",
+    "purpose": "Stage a gateway-VM Caddy edge-config change: copy the repo Caddyfile to the gateway host.",
+    "command": "scp deploy/caddy/Caddyfile baron@gateway:/tmp/Caddyfile.new",
+    "source": "deploy/caddy/README.md:42"
+  },
+  {
+    "id": "caddy-validate-install-reload",
+    "purpose": "Validate, back up, install and reload the gateway VM's Caddy config over ssh (edge/ingress change).",
+    "command": "ssh baron@gateway ' sudo caddy validate --adapter caddyfile --config /tmp/Caddyfile.new && sudo cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak-$(date +%Y%m%d-%H%M%S) && sudo cp /tmp/Caddyfile.new /etc/caddy/Caddyfile && sudo systemctl reload caddy'",
+    "source": "deploy/caddy/README.md:43"
+  }
+]
