@@ -29,6 +29,7 @@ from . import (
     portal,
     workshop,
 )
+from .analytics import collector as analytics_collector
 
 bearer = HTTPBearer(auto_error=True)
 
@@ -57,10 +58,15 @@ async def lifespan(app: FastAPI):
     # page while an agent runs overnight. It is a no-op where there is no cluster
     # credential to read pods with, which is every compose deployment.
     collector = agent_usage.start_collector()
+    # The behavioural-analytics collector: rebuilds the content-free records store from chat
+    # Mongo + each workspace's opencode db + the gateway ledger on a timer. Same no-op
+    # discipline — disabled without an in-cluster credential (every compose deployment).
+    analytics = analytics_collector.start_collector()
     try:
         yield
     finally:
         await agent_usage.stop_collector(collector)
+        await analytics_collector.stop_collector(analytics)
 
 
 app = FastAPI(title="control-plane", lifespan=lifespan)

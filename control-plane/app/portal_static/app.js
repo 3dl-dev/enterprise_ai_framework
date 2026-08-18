@@ -80,6 +80,9 @@ async function loadMe() {
   if (L.signout) $("signout").href = L.signout;
   LINKS = L;
   IS_ADMIN = me.is_admin === true;
+  // Operator-only entry to the behavioural-analytics report. Hidden for everyone else, who
+  // gets a 404 from the endpoint anyway — no point advertising a door they can't open.
+  if (IS_ADMIN) { const mi = $("mi-analytics"); if (mi) mi.hidden = false; }
   mountFrames();
   return me;
 }

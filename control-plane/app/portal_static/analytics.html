@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Behavioural analytics</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#111; --muted:#666; --line:#e2e2e2;
+          --accent:#1a6feb; --best:#0a7d33; --thin:#b26a00; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161a; --fg:#e8e8e8; --muted:#9aa0a6; --line:#2a2e35;
+            --accent:#5b9dff; --best:#4ec26f; --thin:#e0a53a; } }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  header { padding:18px 22px; border-bottom:1px solid var(--line); }
+  h1 { font-size:18px; margin:0 0 2px; }
+  .sub { color:var(--muted); font-size:13px; }
+  main { padding:18px 22px; max-width:1100px; }
+  .controls { display:flex; gap:12px; align-items:center; margin-bottom:16px; flex-wrap:wrap; }
+  label { color:var(--muted); font-size:13px; }
+  select, input { background:var(--bg); color:var(--fg); border:1px solid var(--line);
+                  border-radius:6px; padding:5px 8px; font:inherit; }
+  .idx { display:flex; gap:22px; margin:6px 0 20px; flex-wrap:wrap; }
+  .idxcard { border:1px solid var(--line); border-radius:8px; padding:10px 14px; min-width:160px; }
+  .idxcard h3 { margin:0 0 6px; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .idxrow { display:flex; justify-content:space-between; gap:14px; }
+  .idxrow b { font-variant-numeric:tabular-nums; }
+  section { margin-bottom:26px; }
+  section h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted);
+               border-bottom:1px solid var(--line); padding-bottom:4px; }
+  .scroll { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
+  th, td { text-align:right; padding:5px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  thead th { color:var(--muted); font-weight:600; }
+  td.best { color:var(--best); font-weight:600; }
+  .note { color:var(--muted); font-size:12px; }
+  .thin { color:var(--thin); }
+  .empty { color:var(--muted); padding:40px 0; text-align:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Behavioural analytics</h1>
+  <div class="sub">Coding vs orchestration &mdash; how each model, surface and config behaves, priced from the real ledger.</div>
+</header>
+<main>
+  <div class="controls">
+    <label for="dimension">Compare by</label>
+    <select id="dimension">
+      <option value="model">Model</option>
+      <option value="surface">Surface</option>
+      <option value="config">Harness config</option>
+      <option value="tenant">Tenant</option>
+      <option value="principal">User</option>
+      <option value="effort">Reasoning effort</option>
+    </select>
+    <label for="since">Since</label><input id="since" type="date">
+    <label for="until">Until</label><input id="until" type="date">
+  </div>
+  <div id="report" class="empty">Loading&hellip;</div>
+</main>
+<script>
+const ARRAYS = [
+  ["orch", "Orchestration"], ["esc", "Escalation & handback"],
+  ["prose", "Prose"], ["code", "Coding"], ["corpus", "Corpus"],
+];
+
+function bestGroup(row, groups) {
+  // which group holds the best value for this row's direction; ties -> none highlighted
+  let best = null, bestv = null, tie = false;
+  for (const g of groups) {
+    const v = row.v[g];
+    if (typeof v !== "number") continue;
+    if (bestv === null) { best = g; bestv = v; tie = false; continue; }
+    const better = row.better === "high" ? v > bestv : v < bestv;
+    const equal = v === bestv;
+    if (better) { best = g; bestv = v; tie = false; }
+    else if (equal) { tie = true; }
+  }
+  return tie ? null : best;
+}
+
+function fmt(v, unit) {
+  if (typeof v !== "number") return "—";
+  if (unit === "%" || unit === "ratio") return v.toFixed(1);
+  if (unit === "$") return "$" + v.toFixed(4);
+  return Number.isInteger(v) ? String(v) : v.toFixed(2);
+}
+
+function renderTable(arr, groups) {
+  const rows = arr.map(row => {
+    const best = bestGroup(row, groups);
+    const cells = groups.map(g =>
+      `<td class="${g === best ? "best" : ""}">${fmt(row.v[g], row.unit)}</td>`).join("");
+    const note = row.note ? `<div class="note">${row.note}</div>` : "";
+    return `<tr><td>${row.label} <span class="note">${row.unit}</span>${note}</td>${cells}</tr>`;
+  }).join("");
+  const head = groups.map(g => `<th>${g}</th>`).join("");
+  return `<div class="scroll"><table><thead><tr><th>metric</th>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function render(m) {
+  const el = document.getElementById("report");
+  const groups = (m.meta && m.meta.groups) || [];
+  if (!groups.length) {
+    el.className = "empty";
+    el.textContent = "No data yet — nothing has been ingested for this slice.";
+    return;
+  }
+  el.className = "";
+  const thin = new Set((m.meta && m.meta.thin) || []);
+  const counts = (m.meta && m.meta.turn_counts) || {};
+  const idx = m.index || {};
+  const idxCards = (idx.members || []).map(name => {
+    const rows = groups.map(g =>
+      `<div class="idxrow"><span>${g}</span><b>${idx[name] && idx[name][g] != null ? idx[name][g] : "—"}</b></div>`).join("");
+    return `<div class="idxcard"><h3>${name} index</h3>${rows}</div>`;
+  }).join("");
+
+  const win = (m.meta.since || m.meta.until)
+    ? ` &middot; ${m.meta.since || "start"} to ${m.meta.until || "now"}` : "";
+  const thinNote = groups.filter(g => thin.has(g)).length
+    ? `<div class="note thin">Thin (&lt;300 turns), read as directional: ${
+        groups.filter(g => thin.has(g)).map(g => `${g} (${counts[g]})`).join(", ")}</div>` : "";
+
+  const sections = ARRAYS
+    .filter(([k]) => m[k] && m[k].length)
+    .map(([k, title]) => `<section><h2>${title}</h2>${renderTable(m[k], groups)}</section>`).join("");
+
+  el.innerHTML =
+    `<div class="note">Comparing <b>${groups.length}</b> ${m.meta.dimension}(s)${win}. Best per row in green.</div>` +
+    thinNote + `<div class="idx">${idxCards}</div>` + sections;
+}
+
+async function load() {
+  const dim = document.getElementById("dimension").value;
+  const since = document.getElementById("since").value;
+  const until = document.getElementById("until").value;
+  const qs = new URLSearchParams({ dimension: dim });
+  if (since) qs.set("since", since);
+  if (until) qs.set("until", until);
+  const el = document.getElementById("report");
+  el.className = "empty"; el.textContent = "Loading…";
+  try {
+    const r = await fetch(`/portal/api/analytics?${qs}`, { headers: { Accept: "application/json" } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    render(await r.json());
+  } catch (e) {
+    el.className = "empty";
+    el.textContent = `Could not load analytics: ${e.message}`;
+  }
+}
+
+for (const id of ["dimension", "since", "until"])
+  document.getElementById(id).addEventListener("change", load);
+load();
+</script>
+</body>
+</html>

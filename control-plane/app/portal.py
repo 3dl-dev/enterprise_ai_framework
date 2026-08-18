@@ -36,6 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 from . import agent_usage, agents, chat_identity, db, gateway, issuance, metering
+from .analytics import report as analytics_report
 
 router = APIRouter()
 
@@ -146,6 +147,44 @@ def require_admin_user(request: Request, user: str = Depends(require_user)) -> s
         # console exists at this path.
         raise HTTPException(404, "not found")
     return user
+
+
+# ---------------------------------------------------------------- behavioural analytics
+#
+# The coding-vs-orchestration report, in-product: how each model / surface / config behaves,
+# priced from the real ledger. Operator-only and strictly READ-ONLY, like the rest of the
+# console — a non-operator gets the same 404 that hides the console's existence. The data is
+# content-free aggregates read from the durable records store (app/analytics/report.py); no
+# database or live-pod access is on this request path.
+
+
+@router.get("/portal/analytics")
+async def analytics_page(user: str = Depends(require_admin_user)):
+    """The report page. Self-contained; it fetches its data from the API route below."""
+    return HTMLResponse(
+        (STATIC / "analytics.html").read_text(),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.get("/portal/api/analytics")
+async def analytics_data(
+    dimension: str = "model",
+    since: str | None = None,
+    until: str | None = None,
+    tenant: str | None = None,
+    min_n: int = analytics_report.metrics.MIN_N,
+    user: str = Depends(require_admin_user),
+):
+    """Sliced metrics.json for the page. `dimension` picks the comparison axis; `min_n`
+    lets an operator lower the suppression floor to inspect thin groups (the page then
+    flags anything under the line-drawing threshold)."""
+    try:
+        return analytics_report.report(
+            dimension=dimension, since=since, until=until, tenant=tenant, min_n=min_n
+        )
+    except KeyError:
+        raise HTTPException(400, f"unknown dimension: {dimension}")
 
 
 # ---------------------------------------------------------------- me

@@ -128,6 +128,14 @@ spec:
             # and disappears entirely between two samples.
             - name: AGENT_USAGE_SAMPLE_SECONDS
               value: "60"
+            # Behavioural-analytics collector: where the content-free records store lives
+            # (on a PVC, so it survives restarts and the operator report is not blank after
+            # a roll), and how often the collector rebuilds it from chat Mongo + the gateway
+            # ledger + each workspace's opencode db.
+            - name: ANALYTICS_RECORDS_PATH
+              value: /var/lib/enterprise-ai/analytics/records.jsonl
+            - name: ANALYTICS_COLLECT_SECONDS
+              value: "1800"
           ports: [{ containerPort: 8000 }]
           volumeMounts:
             # The agent object set and the resident entrypoint, so the portal's Agents tab
@@ -143,6 +151,9 @@ spec:
             # still starts and serves chat, code, spend and keys; only agent CREATION
             # fails, and app/agents.py names this ConfigMap in the error when it does.
             - { name: agent-assets, mountPath: /etc/agent-assets, readOnly: true }
+            # Writable, durable store for the behavioural-analytics records the collector
+            # produces and the /portal/analytics report reads.
+            - { name: analytics-records, mountPath: /var/lib/enterprise-ai/analytics }
           readinessProbe:
             httpGet: { path: /health, port: 8000 }
             initialDelaySeconds: 10
@@ -215,3 +226,19 @@ spec:
         # would notice going stale.
         - name: agent-assets
           configMap: { name: agent-assets, optional: true }
+        - name: analytics-records
+          persistentVolumeClaim: { claimName: analytics-records }
+---
+# Durable store for the behavioural-analytics records (content-free turn/session metrics +
+# real ledger cost). RWO is fine — the control plane is single-replica. local-path like the
+# rest of this cluster: a worker rebuild loses it, and the collector simply rebuilds it on
+# its next tick from the canonical sources, so nothing is permanently lost.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: analytics-records
+  namespace: enterprise-ai
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 1Gi } }
