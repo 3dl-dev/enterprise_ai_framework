@@ -51,26 +51,36 @@ two.
 
 ## Contract B — residency: a gateway agent plus its native console (supersedes Contract 2)
 
-An Agents-pillar pod runs **two containers sharing one PVC**, because a gateway agent and its
-console are two processes over one state directory, and the state volume is ReadWriteOnce so both
-must live in the same pod:
+An Agents-pillar pod runs **one container** — the harness image, which runs the gateway AND its
+own native console together — over one PVC:
 
-| Container | hermes | openclaw |
+| | hermes | openclaw |
 |---|---|---|
-| **agent** (the gateway) | `hermes gateway run` | `openclaw gateway` |
-| **console** (native web UI) | `hermes dashboard --host 0.0.0.0` (:9119) | *served by the gateway itself* on :18789 |
-| **shared state PVC** | `/opt/data` (`HERMES_HOME`) | `~/.openclaw` (+ `~/.config/openclaw`) |
+| **container** | `hermes gateway run` + the image's s6 dashboard on :9119 (`HERMES_DASHBOARD=1`) | `openclaw gateway` + Control UI on :18789 |
+| **state PVC** | `/opt/data` (`HERMES_HOME`) | `~/.openclaw` (+ `~/.config/openclaw`) |
 
 The distinction from Code is the same one Contract 2 drew, but the mechanism is the harness's own:
 the gateway is resident and keeps running with nothing connected; the console **attaches** to it
 (hermes: the dashboard drives the gateway over `/api/gateway/*` and the shared config; openclaw:
 the Control UI is the gateway's own port). A browser disconnect is a disconnect, never a shutdown.
 
-**openclaw is the simpler case** — its gateway serves the Control UI on one port (:18789) with a
-`controlUi.basePath` and a WebSocket on the same port. **hermes splits them** — `gateway run` has
-**no** web port; the dashboard is a **separate** `hermes dashboard` process on :9119. This split is
-exactly why the live agents (which run `gateway run` alone) have **no console today**, and adding
-the dashboard container is what gives them one.
+**openclaw** serves the Control UI on the gateway's own port (:18789) with a `controlUi.basePath`
+and a same-port WebSocket. **hermes** ships the same way when driven as its container image is
+designed to: `gateway run` under s6, with the s6 **dashboard** service on :9119 switched on by
+`HERMES_DASHBOARD=1` and its auth registered from `HERMES_DASHBOARD_BASIC_AUTH_*` env. Both run in
+one container so the dashboard shares the gateway's process space and can report its status and
+restart it (Contract D).
+
+> **Correction (2026-08-18, verified live).** An earlier draft of this record split hermes into
+> **two containers** (a separate `hermes dashboard`), on the reasoning that `gateway run` "has no web
+> port." That shipped and worked for serving the console, but the dashboard sat in its own PID
+> namespace: it reported the sibling gateway as `gateway_running: false`, listed no messaging
+> platforms, and its `POST /api/gateway/restart` (the model-change restart, `-840`) hit nothing.
+> The image is built to run **both under one s6** — co-locating them fixes the status/restart and is
+> simpler. The single-container shape is the contract; the two-container split is retired.
+
+This is exactly why the live agents (which run `gateway run` **without** `HERMES_DASHBOARD`) have
+**no console today**, and turning the dashboard on in the same container is what gives them one.
 
 ### Config persistence — the seed must not clobber (the defect this record fixes)
 
@@ -188,11 +198,14 @@ Per agent, matching the live hermes agents' naming and extending it:
 - **ConfigMap** `agent-<user>-<name>-config` — the **first-boot** seed only (Contract B).
 - **initContainer** `config-seed` — `[ -f <config> ] || cp /seed/<config> <config>`; never
   unconditional.
-- **Deployment**, `strategy: Recreate`, `replicas: 1`, **two containers** (agent gateway + native
-  console) sharing the PVC; `agent.enterprise-ai/type` + the existing labels.
+- **Deployment**, `strategy: Recreate`, `replicas: 1`, **one container** (the harness image running
+  the gateway + its own dashboard on the console port); `agent.enterprise-ai/type` + the existing
+  labels.
 - **Service** `agent-<user>-<name>` exposing the console port (hermes 9119 / openclaw 18789).
-- **NetworkPolicy** admitting that port from the control-plane pod only; egress to gateway:4000,
-  kube-dns, and the tenant's own messaging/tool endpoints — no NodePort.
+- **NetworkPolicy** admitting that port from the control-plane pod only — a **namespace-wide**
+  common policy (`66-agent-console-common.yaml`), because the control-plane SA has no
+  `networkpolicies` authority to create one per agent; egress (gateway:4000, kube-dns, the tenant's
+  own messaging/tool endpoints) is already covered by `63-agent-common.yaml`. No NodePort.
 - **New files** beside the frozen set: a `65-agent-hermes.template.yaml` / `66-agent-openclaw.template.yaml`
   (or one parametrised template), a hermes/openclaw provisioner, new portal proxy adapters. The
   opencode-based `64-agent.template.yaml` / `provision-agent.sh` / `agent_console.py` are the

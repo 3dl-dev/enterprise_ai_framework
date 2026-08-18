@@ -756,14 +756,16 @@ def dashboard_password_hash(password: str) -> str:
     )
 
 
-def hermes_seed_config(model: str, password_hash: str) -> str:
+def hermes_seed_config(model: str) -> str:
     """The FIRST-BOOT-ONLY config.yaml for a hermes agent (Contract B).
 
     Mirrors the shape the live agents run (verified by -2ba): the integrated gateway
-    provider, the default model, and the dashboard's basic-auth so a non-loopback bind
-    satisfies hermes's fail-closed auth gate. After first boot this is never re-applied —
-    the agent's own config on the PVC is authoritative and settings change through the
-    dashboard API (Contract D), so this seed is a starting point, not a source of truth.
+    provider and the default model. The dashboard's auth is NOT here — the image's s6
+    dashboard registers the basic provider from HERMES_DASHBOARD_BASIC_AUTH_* env
+    (set from the key Secret in 65-agent-hermes.template.yaml), so config and credential
+    stay separate. After first boot this is never re-applied — the agent's own config on the
+    PVC is authoritative and settings change through the dashboard API (Contract D), so this
+    seed is a starting point, not a source of truth.
     """
     return yaml.safe_dump(
         {
@@ -775,12 +777,6 @@ def hermes_seed_config(model: str, password_hash: str) -> str:
                 },
             },
             "model": {"provider": "gateway", "default": model},
-            "dashboard": {
-                "basic_auth": {
-                    "username": DASHBOARD_USERNAME,
-                    "password_hash": password_hash,
-                },
-            },
             "terminal": {"backend": "local"},
         },
         default_flow_style=False,
@@ -1060,20 +1056,20 @@ async def _provision_hermes(client: httpx.AsyncClient, user: str, name: str, obj
     """Apply the object set for a hermes gateway agent (agents-gateway-console.md B/D).
 
     Differs from the opencode path by design: no deployment-wide entrypoint ConfigMap and
-    no OPENCODE_SERVER_PASSWORD — a gateway agent runs its own image and authenticates its
-    console through the seeded ``dashboard.basic_auth``. The key Secret carries the
-    integrated key plus the console credential (plaintext, for the -8e4 proxy); the seed
-    ConfigMap carries only the password HASH.
+    no OPENCODE_SERVER_PASSWORD — a gateway agent runs its own image, and its s6 dashboard
+    registers the basic auth provider from HERMES_DASHBOARD_BASIC_AUTH_* env fed from the key
+    Secret (65-agent-hermes.template.yaml). The key Secret carries the integrated key plus
+    the console credential; the seed ConfigMap carries only provider+model (no credential).
     """
     console_password = secrets.token_urlsafe(24)
-    seed = hermes_seed_config(model, dashboard_password_hash(console_password))
+    seed = hermes_seed_config(model)
     cfgsum = hashlib.sha256(seed.encode()).hexdigest()[:16]
 
     await _apply(client, _secret_object(f"{obj}-key", {
         "OPENAI_API_KEY": api_key,
-        # The console credential the -8e4 proxy presents to the dashboard. The dashboard
-        # verifies the plaintext against the seeded scrypt hash; the plaintext never enters
-        # the ConfigMap, only this Secret.
+        # The console credential. It feeds the dashboard's own basic-auth (via
+        # HERMES_DASHBOARD_BASIC_AUTH_* env) AND is what the -8e4 proxy form-logs-in with on
+        # the user's behalf — one secret, never in the ConfigMap.
         "DASHBOARD_USERNAME": DASHBOARD_USERNAME,
         "DASHBOARD_PASSWORD": console_password,
     }))

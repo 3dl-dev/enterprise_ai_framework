@@ -7,8 +7,9 @@
 #   __IMAGE__     the hermes image (nousresearch/hermes-agent:<tag>) — NOT the workspace
 #                 image; a gateway agent does not share the Code pillar's opencode artefact
 #   __MODEL_SOURCE__  `integrated` or `byo` (agents-surface Contract 4) — provenance label
-#   __KEY_SECRET__    the Secret holding OPENAI_API_KEY: `agent-<user>-<name>-key` (the
-#                     integrated virtual key, alias <user>::agents/<name>)
+#   __KEY_SECRET__    the Secret holding OPENAI_API_KEY + the console credential:
+#                     `agent-<user>-<name>-key` (the integrated virtual key, alias
+#                     <user>::agents/<name>, plus DASHBOARD_USERNAME/DASHBOARD_PASSWORD)
 #   __CFGSUM__    checksum of the first-boot seed ConfigMap (agent-<user>-<name>-config)
 #   __KEYSUM__    checksum of the integrated key, so a real rotation rolls the pod
 #   __EMAILSUM__/__SLACKSUM__/__DISCORDSUM__  connector-credential checksums, or `none`
@@ -18,21 +19,25 @@
 # opencode template/entrypoint/provisioner are the conflated Code-pillar path and are not
 # reused for gateway agents. The differences from the opencode template ARE the design:
 #
-#   * TWO containers over ONE PVC (Contract B): `agent` = `hermes gateway run` (resident,
-#     keeps working with nobody watching), `console` = `hermes dashboard` on :9119 (the
-#     agent's OWN native web UI, which the portal proxies — it is NOT a terminal).
+#   * ONE container over one PVC (Contract B, corrected). The hermes s6 image runs BOTH the
+#     gateway AND its own dashboard on :9119 under one s6 supervisor when `HERMES_DASHBOARD`
+#     is set — so the dashboard SEES and CONTROLS the gateway (gateway status, restart on a
+#     model change) instead of being blind to a sibling container. An earlier two-container
+#     split (a separate `hermes dashboard`) put the dashboard in its own PID namespace where
+#     it reported the gateway as "stopped" and its restart hit nothing; co-locating them is
+#     the image's intended design and is simpler.
 #   * a FIRST-BOOT-ONLY seed initContainer (Contract B): the live hand-applied agents seed
 #     config.yaml with an UNCONDITIONAL `cp` on every boot, which wipes every setting the
 #     agent or its dashboard persisted. This copies the seed IFF the PVC has none.
 #   * state at /opt/data (`HERMES_HOME`), not opencode's /workspace; no ttyd, no
 #     OPENCODE_* env, no tenant/skill mounts (those are the Code surface's).
-#   * a per-agent NetworkPolicy admitting :9119 from the control-plane pod (the common
-#     63-agent-common.yaml admits only opencode's :4096; NetworkPolicies union, so this
-#     ADDS the dashboard port and inherits the common egress — dns, gateway:4000, and the
-#     external-messaging 0.0.0.0/0-except-private rule the live agents reach Discord over).
+#   * the console port (:9119) is admitted from the control-plane pod alone by the
+#     namespace-wide 66-agent-console-common.yaml (the control-plane SA has no
+#     `networkpolicies` authority, so admission is a deploy-time common policy, not a
+#     per-agent object — same "the proxy is the only door" posture, no RBAC widening).
 #
-# `agent.enterprise-ai/type: hermes` (Contract A) is stamped by render(); it is not a
-# placeholder here so this one template can be the parametrised base a future type reuses.
+# `agent.enterprise-ai/type: hermes` (Contract A) is baked in here, not a placeholder, so
+# this one template can be the parametrised base a future type reuses.
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -69,26 +74,17 @@ spec:
   # ClusterIP. There is no NodePort and there must not be one — the dashboard is the
   # agent's control surface holding a spendable key. The portal proxies it at
   # /agents/__NAME__/ on the chat origin, resolving __USER__ from the authenticated
-  # identity and never from the path (Contract 1); enterpriseaiframework-8e4 builds that.
+  # identity and never from the path (Contract 1); enterpriseaiframework-8e4 built that.
   selector:
     app.kubernetes.io/component: agent
     agent.enterprise-ai/user: "__USER__"
     agent.enterprise-ai/name: "__NAME__"
   ports:
-    # The hermes dashboard's native port (agents-gateway-console.md Contract B/C). The
-    # `gateway run` container has NO web port of its own — that split is exactly why the
-    # live agents have no console today and adding the dashboard container is what gives
-    # them one.
+    # The hermes dashboard's native port (agents-gateway-console.md Contract B/C), served by
+    # the agent container's own s6 dashboard alongside the gateway.
     - name: dashboard
       port: 9119
       targetPort: 9119
-# The :9119 admission is a NAMESPACE-WIDE policy in 66-agent-console-common.yaml, applied at
-# deploy time — NOT a per-agent object here. The control-plane ServiceAccount deliberately
-# has no `networkpolicies` authority (deploy/k8s/39-control-plane-rbac.yaml: "NO
-# networkpolicies"), so the provisioner cannot create one per agent; a single common policy
-# admitting :9119 from the control-plane pod to every `component: agent` pod gives the
-# identical "the proxy is the only door" posture with no RBAC widening. This DEVIATES from
-# the record's per-agent wording for that reason; the security outcome is unchanged.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -109,9 +105,8 @@ spec:
   # `deleted` removes these objects then the PVC (Contract 2, unchanged from the opencode
   # path). Scale-to-zero is what makes "stopped costs nothing" literally true.
   replicas: 1
-  # ReadWriteOnce PVC shared by two containers, and a live gateway session: a rolling
-  # update would try to start a second pod against the same volume. Recreate never runs
-  # two.
+  # ReadWriteOnce PVC and a live gateway session: a rolling update would try to start a
+  # second pod against the same volume. Recreate never runs two.
   strategy: { type: Recreate }
   selector:
     matchLabels:
@@ -185,9 +180,14 @@ spec:
             - { name: data, mountPath: /opt/data }
             - { name: seed, mountPath: /seed, readOnly: true }
       containers:
-        # THE GATEWAY — resident, multi-channel, keeps working with nobody watching. No web
-        # port of its own; the dashboard container is its console. Runs the image's s6
-        # entrypoint (which drops root -> uid 10000), so it carries no capability overrides.
+        # THE AGENT — the resident gateway AND its own native dashboard, in ONE container
+        # under the image's s6 supervisor. `args: [gateway, run]` runs the gateway;
+        # HERMES_DASHBOARD=1 makes s6 ALSO run `hermes dashboard` on :9119, co-located, so
+        # the dashboard can see and control the gateway (Contract C/D). The June-2026
+        # hardening means a non-loopback dashboard REQUIRES an auth provider; the image's s6
+        # dashboard run-script registers the bundled basic provider from
+        # HERMES_DASHBOARD_BASIC_AUTH_USERNAME/_PASSWORD, so the console proxy
+        # (enterpriseaiframework-8e4) form-logs-in with the same credential from the Secret.
         - name: agent
           image: __IMAGE__
           imagePullPolicy: IfNotPresent
@@ -197,53 +197,44 @@ spec:
             # INTEGRATED inference (Contract 4): the agent's provider is configured in the
             # seeded config.yaml as `providers.gateway` (base_url http://gateway:4000/v1,
             # key_env OPENAI_API_KEY, discover_models true), so inference goes through the
-            # __USER__::agents/__NAME__ virtual key on our gateway and lands on the one
-            # bill. The pod holds no provider credential of its own beyond this key.
+            # __USER__::agents/__NAME__ virtual key on our gateway and lands on the one bill.
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
+            # The built-in s6 dashboard, co-located with the gateway.
+            - { name: HERMES_DASHBOARD, value: "1" }
+            - { name: HERMES_DASHBOARD_HOST, value: "0.0.0.0" }
+            - { name: HERMES_DASHBOARD_PORT, value: "9119" }
+            # The console credential, from the key Secret — the same one the -8e4 proxy
+            # presents on the user's behalf, so the browser never sees the dashboard login.
+            - name: HERMES_DASHBOARD_BASIC_AUTH_USERNAME
+              valueFrom:
+                secretKeyRef: { name: __KEY_SECRET__, key: DASHBOARD_USERNAME }
+            - name: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: __KEY_SECRET__, key: DASHBOARD_PASSWORD }
           # The tenant's own Slack/Discord/mailbox, reached with the tenant's own tokens.
           # There is no chat or mail server in this deployment — the same posture, Secrets
-          # and `optional: true` additivity as the opencode agent. envFrom is applied
-          # before `env`, so a connector Secret cannot override OPENAI_API_KEY / HERMES_HOME.
+          # and `optional: true` additivity as the opencode agent. envFrom is applied before
+          # `env`, so a connector Secret cannot override OPENAI_API_KEY / HERMES_HOME.
           envFrom:
             - secretRef: { name: agent-__USER__-__NAME__-email, optional: true }
             - secretRef: { name: agent-__USER__-__NAME__-slack, optional: true }
             - secretRef: { name: agent-__USER__-__NAME__-discord, optional: true }
-          volumeMounts:
-            - { name: data, mountPath: /opt/data }
-          resources:
-            requests: { cpu: "500m", memory: "1Gi", ephemeral-storage: "1Gi" }
-            limits:   { cpu: "1",    memory: "2Gi", ephemeral-storage: "4Gi" }
-        # THE CONSOLE — the agent's OWN native web UI (Contract C). Binds 0.0.0.0:9119; the
-        # June-2026 hardening means a non-loopback bind ALWAYS requires an auth provider
-        # (--insecure is a no-op), and that provider is the dashboard.basic_auth seeded into
-        # config.yaml. --skip-build serves the prebuilt dist (no npm in the container).
-        - name: console
-          image: __IMAGE__
-          imagePullPolicy: IfNotPresent
-          command: ["hermes", "dashboard", "--host", "0.0.0.0", "--port", "9119", "--skip-build", "--no-open"]
-          env:
-            - { name: HERMES_HOME, value: "/opt/data" }
-            # The dashboard's /api/model/options queries the gateway catalogue with this
-            # key, and Contract D's model set/get run over the same config — so the console
-            # holds the same integrated key as the gateway container.
-            - name: OPENAI_API_KEY
-              valueFrom:
-                secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
           ports:
             - { name: dashboard, containerPort: 9119 }
           volumeMounts:
             - { name: data, mountPath: /opt/data }
           resources:
-            requests: { cpu: "100m", memory: "256Mi", ephemeral-storage: "256Mi" }
-            limits:   { cpu: "500m", memory: "512Mi", ephemeral-storage: "1Gi" }
-          # The dashboard is up when it answers on 9119. Its unauthenticated responses are
-          # 401/302 (the auth gate), which is still proof the process holds the port.
+            requests: { cpu: "500m", memory: "1Gi", ephemeral-storage: "1Gi" }
+            limits:   { cpu: "1",    memory: "2Gi", ephemeral-storage: "4Gi" }
+          # Readiness on the dashboard port: the pod is serving when :9119 answers (its
+          # unauthenticated 401/302 is still proof the process holds the port), and the
+          # gateway is up under the same s6 by then.
           startupProbe:
             httpGet: { path: /, port: 9119 }
             periodSeconds: 3
-            failureThreshold: 40
+            failureThreshold: 60
           readinessProbe:
             httpGet: { path: /, port: 9119 }
             periodSeconds: 30

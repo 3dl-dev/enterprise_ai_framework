@@ -513,10 +513,11 @@ def test_creating_an_opencode_interim_agent_fills_every_placeholder(cluster):
     assert ("alice", "agent.create", "alice/helper") in AUDIT
 
 
-def test_creating_a_hermes_agent_renders_the_two_container_first_boot_seed_pod(cluster):
-    """The default create path (Contracts A/B/D). A hermes agent is a two-container pod over
-    one PVC — `hermes gateway run` plus the `hermes dashboard` console — seeded FIRST-BOOT
-    ONLY, on the hermes image, with the integrated key and the console credential in place."""
+def test_creating_a_hermes_agent_renders_the_single_container_first_boot_seed_pod(cluster):
+    """The default create path (Contracts A/B/D). A hermes agent is a SINGLE-container pod:
+    the image's s6 runs `hermes gateway run` AND its own dashboard on :9119 together (via
+    HERMES_DASHBOARD env), seeded FIRST-BOOT ONLY, on the hermes image, with the integrated
+    key and the console credential in place."""
     created = client_as("alice").post("/portal/api/agents", json={"name": "athena"})
     assert created.status_code == 201, created.text
     assert created.json()["type"] == "hermes"
@@ -528,12 +529,22 @@ def test_creating_a_hermes_agent_renders_the_two_container_first_boot_seed_pod(c
 
     spec = dep["spec"]["template"]["spec"]
     names = {c["name"]: c for c in spec["containers"]}
-    assert set(names) == {"agent", "console"}, "hermes is a two-container pod (gateway + console)"
-    assert names["agent"]["args"] == ["gateway", "run"]
-    assert names["agent"]["image"] == agents.HERMES_IMAGE, "the hermes image, not the workspace image"
-    assert names["console"]["command"][:2] == ["hermes", "dashboard"]
-    assert "--host" in names["console"]["command"] and "0.0.0.0" in names["console"]["command"]
-    assert {"name": "dashboard", "containerPort": 9119} in names["console"]["ports"]
+    assert set(names) == {"agent"}, (
+        "hermes is one container — the s6 image runs the gateway AND its dashboard together, "
+        "so the dashboard can see and control the gateway (an earlier two-container split "
+        "left the dashboard blind to its sibling gateway)"
+    )
+    agent = names["agent"]
+    assert agent["args"] == ["gateway", "run"]
+    assert agent["image"] == agents.HERMES_IMAGE, "the hermes image, not the workspace image"
+    assert {"name": "dashboard", "containerPort": 9119} in agent["ports"]
+    env = {e["name"]: e for e in agent["env"]}
+    # The built-in s6 dashboard is switched on and bound to :9119.
+    assert env["HERMES_DASHBOARD"]["value"] == "1"
+    assert env["HERMES_DASHBOARD_PORT"]["value"] == "9119"
+    # Its basic auth comes from the key Secret (env, not a config-file hash).
+    assert (env["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"]["valueFrom"]["secretKeyRef"]
+            == {"name": "agent-alice-athena-key", "key": "DASHBOARD_PASSWORD"})
 
     # FIRST-BOOT-ONLY seed (Contract B — the defect the record fixes): the init copies the
     # seed IFF the PVC has none, never an unconditional cp that clobbers persisted settings.
@@ -543,19 +554,18 @@ def test_creating_a_hermes_agent_renders_the_two_container_first_boot_seed_pod(c
         "the seed must be conditional; an unconditional cp wipes the agent's own config"
     )
 
-    # The seed ConfigMap holds the gateway provider, the model, and the dashboard basic-auth
-    # HASH (never the plaintext).
+    # The seed ConfigMap holds the gateway provider and the model — NOT any credential.
     cm = cluster.get("configmaps", "agent-alice-athena-config")
     seed_yaml = cm["data"]["config.yaml"]
     assert "http://gateway:4000/v1" in seed_yaml and "discover_models: true" in seed_yaml
-    assert "password_hash: scrypt$" in seed_yaml
+    assert "basic_auth" not in seed_yaml and "password" not in seed_yaml, (
+        "the console credential is env-based (from the Secret); it must not be in the ConfigMap"
+    )
 
-    # The key Secret carries the integrated key AND the console credential (plaintext here,
-    # verified against the seeded hash by the dashboard) — never in the ConfigMap.
+    # The key Secret carries the integrated key AND the console credential.
     secret = cluster.get("secrets", "agent-alice-athena-key")
     assert base64.b64decode(secret["data"]["OPENAI_API_KEY"]).decode() == "sk-fake-alice-agents/athena"
     assert "DASHBOARD_PASSWORD" in secret["data"] and "DASHBOARD_USERNAME" in secret["data"]
-    assert "DASHBOARD_PASSWORD" not in seed_yaml, "the console plaintext must not be in the ConfigMap"
 
     # No opencode ConfigMap and no OPENCODE_SERVER_PASSWORD — that is the Code pillar.
     assert cluster.get("configmaps", "agent-entrypoint") is None
