@@ -10,6 +10,44 @@ set -euo pipefail
 
 WS_USER="${WS_USER:-coder}"
 
+# ---------------------------------------------------------------- self-contained docker
+# A real dockerd inside the workspace, so `docker build` / `docker run` / qemu just work
+# (enterpriseaiframework-ee4). This runs ONLY when the pod opts in with WS_DOCKER=1 AND we
+# started as container-root — which happens exclusively under the Sysbox runtime, where
+# that root is user-namespace-mapped to an unprivileged host UID. When WS_DOCKER is unset
+# (every default hardened pod) this whole block is skipped and the entrypoint behaves
+# exactly as it always has: no daemon, shell as the unprivileged user.
+#
+# The shell must NEVER run as root — docker or not — so we start dockerd as root and then
+# re-exec ourselves as `coder` via gosu. WS_DROPPED guards the re-exec so dockerd is not
+# started twice, and it means the project seeding below always runs as coder (files stay
+# coder-owned on the PVC), identical to the non-docker path.
+if [[ "${WS_DOCKER:-}" == "1" && "$(id -u)" == "0" && -z "${WS_DROPPED:-}" ]]; then
+    echo "==> WS_DOCKER=1: starting self-contained dockerd"
+    # data-root is where images/layers live; a build can be large, so the pod is expected
+    # to back this path with a sized volume (see the Sysbox pod variant). Default keeps it
+    # off the small project PVC.
+    DOCKER_DATA_ROOT="${WS_DOCKER_DATA_ROOT:-/var/lib/docker}"
+    mkdir -p "${DOCKER_DATA_ROOT}"
+    # dockerd's own output goes to a log, never the user's terminal.
+    dockerd --host=unix:///var/run/docker.sock --data-root="${DOCKER_DATA_ROOT}" \
+        >/var/log/dockerd.log 2>&1 &
+    for _ in $(seq 1 30); do [[ -S /var/run/docker.sock ]] && break; sleep 1; done
+    if [[ -S /var/run/docker.sock ]]; then
+        # Let coder use the socket without being root.
+        chgrp "${WS_USER}" /var/run/docker.sock 2>/dev/null || true
+        chmod 0660 /var/run/docker.sock 2>/dev/null || true
+        echo "==> dockerd ready"
+    else
+        # Not fatal: the shell must still come up. docker just won't be there, which is a
+        # far better failure than a workspace that never starts.
+        echo "!! dockerd did not create its socket in time; see /var/log/dockerd.log" >&2
+    fi
+    export WS_DROPPED=1
+    export DOCKER_HOST="unix:///var/run/docker.sock"
+    exec gosu "${WS_USER}" "$0" "$@"
+fi
+
 # Projects, plural. A child makes several things across a camp, and the first version of
 # this had exactly one project directory and one publish slot — so a second game silently
 # destroyed the first. Each project is its own directory and its own git repo, and gets
