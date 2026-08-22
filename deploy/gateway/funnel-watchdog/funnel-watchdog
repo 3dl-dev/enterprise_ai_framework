@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# funnel-watchdog — recover the public Tailscale Funnel path when it wedges.
+#
+# INTERIM MITIGATION, NOT THE DURABLE FIX. See enterpriseaiframework-b66.
+#
+# Root cause: the gateway VM sits behind CGNAT, and a middlebox on its uplink path
+# (the on-prem router at 192.168.2.1 runs MiniUPnPd on Debian "wheezy", and/or the
+# carrier CGNAT) flushes long-lived TCP connection state on a fixed ~34-minute timer,
+# REGARDLESS of traffic — measured: the gateway's Tailscale control+DERP flows carry
+# packets every 2-13s yet still die, silently (no RST/FIN, bytes stuck in Send-Q), on
+# the tick. Each flush drops the gateway's Tailscale control+DERP connections, so the
+# public Funnel path (off-tailnet client -> Tailscale ingress -> gateway DERP -> Caddy)
+# goes dead. tailscaled usually self-heals in 1-2 min; it occasionally wedges and needs
+# a `tailscale down; up`. Keepalives cannot beat a scheduled flush — the ONLY durable
+# fix is to move public ingress off this CGNAT path (operator decision: replace the
+# ancient router, or a public-IP/Cloudflare-Tunnel ingress with the auth-hostname
+# reconfiguration that implies). This script only bounds the damage until then.
+#
+# The previous version checked `tailscale status ... offline`, which the fast self-heal
+# almost never trips, so it fired 0x in 12h while the portal was actually down. This
+# version probes the REAL public Funnel path and only bounces after a sustained outage
+# (debounced past normal self-heal), so it recovers genuine wedges without fighting
+# tailscaled's own recovery or thrashing.
+
+set -u
+
+HOST="gateway.tailcb6ef9.ts.net"
+# Public DNS A records for the Tailscale Funnel ingress (gateway.tailcb6ef9.ts.net).
+INGRESS_IPS=(199.38.181.54 209.177.145.137)
+PROBE_PATH="/portal/"
+PROBE_TIMEOUT=8          # seconds per curl
+FAIL_THRESHOLD=3         # consecutive failed runs before bouncing
+COOLDOWN_SECS=120        # after a bounce, wait this long before acting again
+
+# Timer fires every 30s, so FAIL_THRESHOLD=3 => ~90s of sustained public-path outage
+# before a bounce. Normal tailscaled self-heal (1-2 min) usually recovers before that,
+# so this only fires on genuine wedges.
+
+FAILS_FILE=/run/funnel-watchdog.fails
+COOLDOWN_FILE=/run/funnel-watchdog.cooldown
+
+now=$(date +%s)
+
+# Respect cooldown after a recent bounce (tailscale needs ~15-30s to re-establish
+# Funnel; do not re-bounce into that window).
+if [[ -f "$COOLDOWN_FILE" ]]; then
+    until=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
+    if [[ "$now" -lt "$until" ]]; then
+        exit 0
+    fi
+fi
+
+probe() {
+    # Reachable end-to-end over the PUBLIC path if any ingress IP answers the funnel
+    # host with an HTTP status (any status = the request reached Caddy through the
+    # gateway's DERP connection; connection failure/timeout yields 000).
+    local ip code
+    for ip in "${INGRESS_IPS[@]}"; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time "$PROBE_TIMEOUT" \
+            --resolve "${HOST}:443:${ip}" "https://${HOST}${PROBE_PATH}" 2>/dev/null)
+        case "$code" in
+            2??|3??|401|403) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+if probe; then
+    echo 0 > "$FAILS_FILE"
+    exit 0
+fi
+
+# Probe failed: increment the consecutive-failure counter.
+fails=$(cat "$FAILS_FILE" 2>/dev/null || echo 0)
+[[ "$fails" =~ ^[0-9]+$ ]] || fails=0
+fails=$((fails + 1))
+echo "$fails" > "$FAILS_FILE"
+
+if [[ "$fails" -ge "$FAIL_THRESHOLD" ]]; then
+    logger -t funnel-watchdog "public funnel unreachable for ~$((FAIL_THRESHOLD * 30))s -> bouncing tailscale (see enterpriseaiframework-b66)"
+    tailscale down || true
+    sleep 3
+    tailscale up || true
+    echo 0 > "$FAILS_FILE"
+    echo $((now + COOLDOWN_SECS)) > "$COOLDOWN_FILE"
+fi
