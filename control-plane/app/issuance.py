@@ -22,7 +22,50 @@ A second copy of that list would have drifted from this one within a release.
 
 from fastapi import HTTPException
 
-from . import db, gateway
+from . import db, gateway, identity
+
+
+async def _resolve_principal(conn, username: str) -> dict:
+    """The principal row for `username`, reconciling it from the IdP if it is missing.
+
+    The principal table is a mirror of identity, and until now it was refreshed only by a
+    full `/admin/sync`. A user added to the IdP after the last sync therefore had no row,
+    and every self-service path that mints a key (create an agent, rotate a key) failed
+    with an error that told the *end user* to run an operator-only command they cannot run.
+
+    An already-authenticated caller is, by definition, someone the IdP knows: this looks
+    them up there and upserts the row on the spot, so self-service works the moment they
+    can sign in. Identity stays the source of truth — a username the realm does not know
+    still yields no principal (the caller raises 404), and a disabled account is refused —
+    so the exist-and-enabled invariant is enforced against identity, not the stale mirror.
+    """
+    principal = await conn.fetchrow(
+        "SELECT id, idp_user_id, enabled FROM principal WHERE username = $1",
+        username,
+    )
+    if principal is not None:
+        return principal
+
+    idp_user = await identity.get_user(username)
+    if idp_user is None:
+        raise HTTPException(404, f"no such principal: {username}")
+
+    # Upsert on the IdP id, exactly as /admin/sync does, so a later full sync converges to
+    # the same row rather than colliding with it.
+    return await conn.fetchrow(
+        """
+        INSERT INTO principal (idp_user_id, username, email, enabled, synced_at)
+        VALUES ($1, $2, $3, $4, now())
+        ON CONFLICT (idp_user_id) DO UPDATE
+            SET username = EXCLUDED.username,
+                email    = EXCLUDED.email,
+                enabled  = EXCLUDED.enabled,
+                synced_at = now()
+        RETURNING id, idp_user_id, enabled
+        """,
+        idp_user["idp_user_id"], idp_user["username"],
+        idp_user["email"], idp_user["enabled"],
+    )
 
 
 async def issue(username: str, surface: str, *, actor: str) -> dict:
@@ -42,12 +85,7 @@ async def issue(username: str, surface: str, *, actor: str) -> dict:
 
     pool = await db.pool()
     async with pool.acquire() as conn:
-        principal = await conn.fetchrow(
-            "SELECT id, idp_user_id, enabled FROM principal WHERE username = $1",
-            username,
-        )
-        if principal is None:
-            raise HTTPException(404, f"no such principal: {username} (run /admin/sync)")
+        principal = await _resolve_principal(conn, username)
         if not principal["enabled"]:
             raise HTTPException(409, f"{username} is disabled in the identity provider")
 

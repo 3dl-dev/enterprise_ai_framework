@@ -1670,3 +1670,32 @@ The general lesson is the one AGENTS.md rule 1 already states for a different re
 venue's network is hostile to anything nonstandard.** A nonstandard *port* fails the same way
 a remote CDN reference does — fine on the builder's network, dead at the venue — and the fix
 is the same shape: use the boring, universally-allowed thing (`:443`).
+
+### 52. A user added after the last sync could sign in but not self-serve — the error told her to run an operator command
+
+**Found by** julie: she signed in and tried to create a bot, and got
+`no such principal: julie (run /admin/sync)` from `issuance.issue`.
+
+The `principal` table is a mirror of identity, and it was refreshed only by a full
+`/admin/sync` — which runs at deploy time (`post-deploy.sh`) and inside the operator
+provision scripts, never on a timer and never at login. So anyone added to Keycloak after
+the last deploy had no principal row, and every self-service mint path (create an agent,
+rotate a key) failed until an operator ran the batch command. Worse, the failure told the
+*end user* to run `/admin/sync`, an admin-only endpoint she cannot reach — a
+turnkey-means-in-product violation, since she was already fully authenticated (the portal
+trusts only the oauth2-proxy `preferred_username` header its sidecar sets).
+
+**Fixed** in `enterpriseaiframework-bcd` by lazy per-user reconciliation: when
+`issuance.issue` finds no principal, it looks the caller up in the IdP
+(`identity.get_user`, exact match) and upserts the row on the spot before minting. Identity
+stays the source of truth — a username the realm does not know still yields 404 (now
+without the unactionable `/admin/sync` advice), and a disabled account is still refused —
+so the exist-and-enabled invariant is enforced against identity rather than the stale
+mirror. The upsert keys on the IdP id exactly as the batch sync does, so a later full sync
+converges to the same row. The immediate incident was cleared by running `/admin/sync` once
+against the live cluster, which minted julie's three surface keys.
+
+**Regression test:** `control-plane/tests/test_issuance_lazy_principal.py` — a missing
+principal known to the IdP is created and the key minted; an unknown username still 404s
+without the `/admin/sync` string; a disabled account 409s; an existing principal never
+reaches for the IdP.

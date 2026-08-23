@@ -67,6 +67,42 @@ async def list_users() -> list[dict]:
     ]
 
 
+async def get_user(username: str) -> dict | None:
+    """One realm user by exact username, in the same shape as `list_users` entries.
+
+    This exists so a surface can reconcile a single, already-authenticated principal on
+    demand instead of waiting for the next full `/admin/sync`. A user who has signed in
+    through the IdP but whose principal row does not exist yet — because they were added
+    after the last sync — must be able to self-serve (create an agent, rotate a key)
+    without an operator running a batch command. The IdP is still the source of truth:
+    this returns None for a username the realm does not know, so the exist-and-enabled
+    invariant is enforced against identity, not merely against the stale mirror.
+    """
+    token = await _admin_token()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"{base_url()}/admin/realms/{realm()}/users",
+            headers={"Authorization": f"Bearer {token}"},
+            # `exact` so `jul` cannot resolve to `julie`; Keycloak still returns a list.
+            params={"username": username, "exact": "true"},
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+    for u in batch:
+        if u.get("username", "") != username:
+            continue
+        # Service accounts are not people and must not be issued surface keys.
+        if u.get("username", "").startswith("service-account-"):
+            return None
+        return {
+            "idp_user_id": u["id"],
+            "username": u.get("username", ""),
+            "email": u.get("email"),
+            "enabled": bool(u.get("enabled", False)),
+        }
+    return None
+
+
 async def health() -> bool:
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
