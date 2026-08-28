@@ -60,7 +60,7 @@ spec:
       # and the connection is reset — while the issuer string must stay byte-identical
       # on both sides or the token is rejected.
       hostAliases:
-        - ip: "192.168.2.42"
+        - ip: "192.168.2.45"
           hostnames: ["gateway.tailcb6ef9.ts.net"]
       # The pod's own account, so the resident meter's two reads (agent pods, and the
       # kubelet's cAdvisor counter) are bound to THIS workload and not to the namespace's
