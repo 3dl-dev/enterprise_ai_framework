@@ -60,7 +60,7 @@ import httpx
 import yaml
 from fastapi import HTTPException
 
-from . import agent_usage, db, gateway, issuance
+from . import agent_usage, catalog, db, gateway, issuance
 
 # One source for the in-cluster credential and the API address. See the module docstring.
 KUBE_API = agent_usage.KUBE_API
@@ -1219,7 +1219,17 @@ async def create(
 
 
 def allowed_models() -> tuple[str, ...]:
-    """Models a user may pick for a new agent. Deployment configuration, not a request field."""
+    """Models a user may pick for a new agent.
+
+    Discovered live from the router catalog (item enterpriseaiframework-8e0) so a model
+    added to the router is immediately offered here with no AGENT_MODELS edit — the same
+    single source every other picker reads. Falls back to the AGENT_MODELS env list (then
+    DEFAULT_MODEL) when the router is unreachable or its catalog is empty, so the picker is
+    never worse than the static list it replaces.
+    """
+    discovered = catalog.model_ids()
+    if discovered:
+        return discovered
     configured = os.environ.get("AGENT_MODELS", "")
     models = tuple(m.strip() for m in configured.split(",") if m.strip())
     return models or (DEFAULT_MODEL,)
