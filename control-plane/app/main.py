@@ -22,6 +22,7 @@ from . import (
     chat_identity,
     db,
     export,
+    freerouter,
     gateway,
     identity,
     issuance,
@@ -54,6 +55,12 @@ def require_admin(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> str:
 async def lifespan(app: FastAPI):
     await db.init()
     await db.audit("system", "control_plane.start")
+    # When provisioning against the freerouter spoke, the control plane is itself a
+    # freerouter tenant (freerouter has no admin key). Bootstrap that tenant once and
+    # persist its bearer, so a restart reuses it rather than stranding a new empty tenant.
+    # No-op for the LiteLLM default. (item enterpriseaiframework-757)
+    if provisioning.backend() is freerouter:
+        await freerouter.bootstrap_master_key()
     # The resident-usage collector (enterpriseaiframework-914). A timer, not a request
     # hook: resident time is measured by sampling a pod that exists, and nobody opens the
     # page while an agent runs overnight. It is a no-op where there is no cluster

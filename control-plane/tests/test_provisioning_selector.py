@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import httpx
 import pytest
@@ -42,31 +43,53 @@ def test_generate_key_dispatches_to_selected_backend(monkeypatch):
     assert calls == ["freerouter"]
 
 
-def test_ensure_operator_tenant_returns_existing_key_without_signup(monkeypatch):
-    monkeypatch.setenv("FREEROUTER_MASTER_KEY", "fr-sk-already-have-it")
-
-    def explode(request):  # signup must NOT be called
-        raise AssertionError("ensure_operator_tenant signed up despite an existing key")
-
-    real = httpx.AsyncClient
-    monkeypatch.setattr(freerouter.httpx, "AsyncClient",
-                        lambda *a, **k: real(*a, transport=httpx.MockTransport(explode), **k))
-    assert run(freerouter.ensure_operator_tenant()) == "fr-sk-already-have-it"
-
-
-def test_ensure_operator_tenant_signs_up_when_absent(monkeypatch):
-    monkeypatch.delenv("FREEROUTER_MASTER_KEY", raising=False)
-    monkeypatch.setenv("FREEROUTER_URL", "http://freerouter:8080")
-
+def _signup_transport(monkeypatch, api_key="fr-sk-newly-minted"):
     def handler(request):
         assert request.url.path == "/api/v1/signup"
         return httpx.Response(201, json={"data": {
             "account_id": "tenant-enterprise-ai-control-plane-abc",
             "parent_account_id": "op-root",
-            "api_key": "fr-sk-newly-minted",
+            "api_key": api_key,
         }})
 
     real = httpx.AsyncClient
     monkeypatch.setattr(freerouter.httpx, "AsyncClient",
                         lambda *a, **k: real(*a, transport=httpx.MockTransport(handler), **k))
-    assert run(freerouter.ensure_operator_tenant()) == "fr-sk-newly-minted"
+
+
+def _no_signup_transport(monkeypatch):
+    def explode(request):
+        raise AssertionError("bootstrap signed up despite an existing key")
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(freerouter.httpx, "AsyncClient",
+                        lambda *a, **k: real(*a, transport=httpx.MockTransport(explode), **k))
+
+
+def test_bootstrap_returns_injected_secret_without_signup(monkeypatch):
+    monkeypatch.setenv("FREEROUTER_MASTER_KEY", "fr-sk-already-have-it")
+    monkeypatch.delenv("FREEROUTER_MASTER_KEY_FILE", raising=False)
+    _no_signup_transport(monkeypatch)
+    assert run(freerouter.bootstrap_master_key()) == "fr-sk-already-have-it"
+
+
+def test_bootstrap_signs_up_and_persists_to_keyfile(monkeypatch, tmp_path):
+    monkeypatch.delenv("FREEROUTER_MASTER_KEY", raising=False)
+    monkeypatch.setenv("FREEROUTER_URL", "http://freerouter:8080")
+    keyfile = tmp_path / "sub" / "operator.key"
+    monkeypatch.setenv("FREEROUTER_MASTER_KEY_FILE", str(keyfile))
+    _signup_transport(monkeypatch)
+    got = run(freerouter.bootstrap_master_key())
+    assert got == "fr-sk-newly-minted"
+    assert keyfile.read_text().strip() == "fr-sk-newly-minted"
+    assert os.environ["FREEROUTER_MASTER_KEY"] == "fr-sk-newly-minted"
+
+
+def test_bootstrap_reuses_persisted_keyfile_without_signup(monkeypatch, tmp_path):
+    monkeypatch.delenv("FREEROUTER_MASTER_KEY", raising=False)
+    keyfile = tmp_path / "operator.key"
+    keyfile.write_text("fr-sk-from-disk\n")
+    monkeypatch.setenv("FREEROUTER_MASTER_KEY_FILE", str(keyfile))
+    _no_signup_transport(monkeypatch)  # must NOT sign up — the key is on disk
+    assert run(freerouter.bootstrap_master_key()) == "fr-sk-from-disk"
+    assert os.environ["FREEROUTER_MASTER_KEY"] == "fr-sk-from-disk"

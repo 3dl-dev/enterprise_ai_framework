@@ -26,6 +26,7 @@ Confirmed live against freerouter (signup=open):
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import httpx
 
@@ -163,19 +164,12 @@ async def health() -> bool:
         return False
 
 
-async def ensure_operator_tenant() -> str:
-    """Return the control plane's freerouter tenant bearer, provisioning it once if absent.
+async def _signup_operator_tenant() -> str:
+    """Provision the control plane's own freerouter tenant, returning its one-time bearer.
 
     freerouter has no admin key: the control plane is itself a tenant under op-root, created
-    by a one-time `POST /api/v1/signup` (requires FREEROUTER_SIGNUP=open on the spoke). When
-    FREEROUTER_MASTER_KEY is already set (a durable restart, or an injected secret) it is
-    returned unchanged; otherwise a tenant is provisioned and its one-time bearer returned
-    for the caller to PERSIST — signing up twice would strand a second empty tenant, so the
-    caller must store the result (secret / control-plane DB) rather than call this per boot.
+    by a one-time `POST /api/v1/signup` (requires FREEROUTER_SIGNUP=open on the spoke).
     """
-    existing = os.environ.get("FREEROUTER_MASTER_KEY", "").strip()
-    if existing:
-        return existing
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             f"{base_url()}/api/v1/signup",
@@ -183,3 +177,44 @@ async def ensure_operator_tenant() -> str:
         )
         resp.raise_for_status()
         return resp.json()["data"]["api_key"]
+
+
+def keyfile_path() -> str | None:
+    p = os.environ.get("FREEROUTER_MASTER_KEY_FILE", "").strip()
+    return p or None
+
+
+async def bootstrap_master_key() -> str:
+    """Resolve the control plane's freerouter bearer, provisioning + persisting it once.
+
+    Precedence: an injected FREEROUTER_MASTER_KEY secret wins; else a previously-persisted
+    keyfile (FREEROUTER_MASTER_KEY_FILE) is reused; else the tenant is signed up ONCE and the
+    one-time bearer is written to the keyfile so it survives restarts — signing up twice would
+    strand a second empty tenant. The resolved key is exported into the process env so the
+    rest of this module (`_headers`) uses it unchanged.
+
+    Idempotent across restarts as long as either the secret or the keyfile persists; call it
+    once at startup when GATEWAY_PROVIDER=freerouter.
+    """
+    existing = os.environ.get("FREEROUTER_MASTER_KEY", "").strip()
+    if existing:
+        return existing
+
+    path = keyfile_path()
+    if path:
+        try:
+            stored = Path(path).read_text().strip()
+        except FileNotFoundError:
+            stored = ""
+        if stored:
+            os.environ["FREEROUTER_MASTER_KEY"] = stored
+            return stored
+
+    bearer = await _signup_operator_tenant()
+    if path:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(bearer)
+        p.chmod(0o600)
+    os.environ["FREEROUTER_MASTER_KEY"] = bearer
+    return bearer
