@@ -19,7 +19,7 @@ services:
     environment:
       <<: *pg-env
       POSTGRES_DB: postgres
-      POSTGRES_MULTIPLE_DATABASES: identity,gateway,controlplane
+      POSTGRES_MULTIPLE_DATABASES: identity,gateway,controlplane,freerouter
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
@@ -142,6 +142,33 @@ services:
       timeout: 5s
       retries: 30
       start_period: 30s
+    restart: unless-stopped
+
+  # freerouter — the inference spoke (docs/design/records/freerouter-reference-router.md).
+  # Bundled + self-hosted, air-gap DEFAULT: personal-gateway profile, its own meter in the
+  # welded postgres, NO provider keys and NO router.3dl.one peer here (those are 3DL-overlay
+  # config only — guardrail enterpriseaiframework-bd6). During the transition it runs ALONGSIDE
+  # the LiteLLM gateway; retiring LiteLLM (enterpriseaiframework-f24) is gated on freerouter
+  # gaining native Anthropic inbound (freerouter-887). Empty catalog until EAF's providers are
+  # onboarded (enterpriseaiframework-8e0) — it comes up healthy and serves {"data":[]}.
+  #
+  # No compose healthcheck: the runtime is distroless (no shell/wget). Health is GET /healthz;
+  # the k8s manifest uses an httpGet probe (deploy/k8s, enterpriseaiframework-f09).
+  #
+  # Interim image source: built from the sibling OSS checkout. Distribution swaps this for
+  # image: <registry>/freerouter:<tag> so recipients need no freerouter source tree.
+  freerouter:
+    build: ../../freerouter
+    environment:
+      FREEROUTER_PROFILE: personal-gateway
+      FREEROUTER_METER_BACKEND: postgres
+      FREEROUTER_METER_DSN: postgresql://${POSTGRES_USER:-eai}:${POSTGRES_PASSWORD}@postgres:5432/freerouter
+      FREEROUTER_LISTEN_ADDR: ":8080"
+    ports:
+      - "${FREEROUTER_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   control-plane:
