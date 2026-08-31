@@ -1,0 +1,80 @@
+# freerouter — the inference spoke (docs/design/records/freerouter-reference-router.md).
+#
+# Bundled, self-hosted, air-gap DEFAULT: personal-gateway profile, its own meter in the
+# welded postgres (the `freerouter` database), NO provider keys and NO router.3dl.one peer
+# here — those are 3DL-overlay config only (guardrail enterpriseaiframework-bd6). During the
+# transition it runs ALONGSIDE the LiteLLM gateway (30-gateway.yaml); retiring LiteLLM
+# (enterpriseaiframework-f24) is gated on freerouter gaining native Anthropic inbound
+# (freerouter-887). Empty catalog until EAF's providers are onboarded
+# (enterpriseaiframework-8e0) — it comes up healthy and serves {"data":[]}.
+#
+# Image: built by deploy/bin/kaniko-build.sh from the freerouter checkout and substituted by
+# hand, exactly like the other custom images (mcp-echo, fakeprovider, codeapi). deploy.sh
+# HOLDS BACK any manifest still carrying `image: REPLACED_BY_DEPLOY` it does not itself build,
+# so this is applied once its image is built + the tag substituted — never applied blind.
+apiVersion: v1
+kind: Service
+metadata:
+  name: freerouter
+  namespace: enterprise-ai
+spec:
+  selector: { app: freerouter }
+  ports: [{ name: http, port: 8080, targetPort: 8080 }]
+---
+# Exposed on a NodePort so the coding surfaces and any direct-to-spoke client can reach it
+# from the LAN or tailnet, mirroring the gateway. Not fronted by Caddy: not published to the
+# internet in this deployment; the chat surface reaches it in-cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: freerouter-nodeport
+  namespace: enterprise-ai
+spec:
+  type: NodePort
+  selector: { app: freerouter }
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      nodePort: 30480
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: freerouter
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: freerouter } }
+  template:
+    metadata:
+      labels: { app: freerouter }
+    spec:
+      containers:
+        - name: freerouter
+          image: REPLACED_BY_DEPLOY
+          env:
+            - name: FREEROUTER_PROFILE
+              value: personal-gateway
+            - name: FREEROUTER_METER_BACKEND
+              value: postgres
+            # postgresql://<user>:<pass>@postgres:5432/freerouter — built by deploy.sh into
+            # the enterprise-ai-secrets secret, same shape as GATEWAY_DATABASE_URL.
+            - name: FREEROUTER_METER_DSN
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_METER_DSN } }
+            - name: FREEROUTER_LISTEN_ADDR
+              value: ":8080"
+          ports: [{ containerPort: 8080 }]
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 10
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { memory: "1Gi" }
