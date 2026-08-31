@@ -164,6 +164,11 @@ services:
       FREEROUTER_METER_BACKEND: postgres
       FREEROUTER_METER_DSN: postgresql://${POSTGRES_USER:-eai}:${POSTGRES_PASSWORD}@postgres:5432/freerouter
       FREEROUTER_LISTEN_ADDR: ":8080"
+      # Signup is how the control plane provisions its operator tenant + per-user tenants —
+      # freerouter has no admin key, a tenant bearer mints under itself (item 757). A fresh
+      # tenant has zero balance and cannot buy inference until the operator funds it, so an
+      # open signup route on this in-cluster/NodePort spoke does not itself grant spend.
+      FREEROUTER_SIGNUP: open
     ports:
       - "${FREEROUTER_PORT:-8080}:8080"
     depends_on:
@@ -178,6 +183,13 @@ services:
       GATEWAY_DATABASE_URL: postgresql://${POSTGRES_USER:-eai}:${POSTGRES_PASSWORD}@postgres:5432/gateway
       GATEWAY_URL: http://gateway:4000
       GATEWAY_MASTER_KEY: ${GATEWAY_MASTER_KEY}
+      # The inference spoke (item 757). GATEWAY_PROVIDER selects which backend the control
+      # plane provisions against; defaults to litellm through the transition, flips to
+      # freerouter once the spoke is the gateway. FREEROUTER_MASTER_KEY is the control
+      # plane's own tenant bearer, bootstrapped via a one-time signup (empty until then).
+      GATEWAY_PROVIDER: ${GATEWAY_PROVIDER:-litellm}
+      FREEROUTER_URL: http://freerouter:8080
+      FREEROUTER_MASTER_KEY: ${FREEROUTER_MASTER_KEY:-}
       IDP_URL: http://identity:8080
       IDP_REALM: ${IDP_REALM:-enterprise-ai}
       IDP_CLIENT_ID: control-plane

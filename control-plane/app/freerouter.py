@@ -150,3 +150,25 @@ async def health() -> bool:
             return r.status_code == 200
     except Exception:
         return False
+
+
+async def ensure_operator_tenant() -> str:
+    """Return the control plane's freerouter tenant bearer, provisioning it once if absent.
+
+    freerouter has no admin key: the control plane is itself a tenant under op-root, created
+    by a one-time `POST /api/v1/signup` (requires FREEROUTER_SIGNUP=open on the spoke). When
+    FREEROUTER_MASTER_KEY is already set (a durable restart, or an injected secret) it is
+    returned unchanged; otherwise a tenant is provisioned and its one-time bearer returned
+    for the caller to PERSIST — signing up twice would strand a second empty tenant, so the
+    caller must store the result (secret / control-plane DB) rather than call this per boot.
+    """
+    existing = os.environ.get("FREEROUTER_MASTER_KEY", "").strip()
+    if existing:
+        return existing
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{base_url()}/api/v1/signup",
+            json={"display_name": "enterprise-ai-control-plane"},
+        )
+        resp.raise_for_status()
+        return resp.json()["data"]["api_key"]
