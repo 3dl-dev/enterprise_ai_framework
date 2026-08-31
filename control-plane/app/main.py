@@ -27,6 +27,7 @@ from . import (
     issuance,
     metering,
     portal,
+    provisioning,
     workshop,
 )
 from .analytics import collector as analytics_collector
@@ -99,7 +100,7 @@ async def health():
 async def ready():
     checks = {
         "identity": await identity.health(),
-        "gateway": await gateway.health(),
+        "gateway": await provisioning.health(),
         "ledger": await metering.ledger_ready(),
     }
     return {"ready": all(checks.values()), "checks": checks}
@@ -135,7 +136,7 @@ async def sync(default_budget: float | None = Query(default=None)):
             "SELECT key_alias FROM virtual_key WHERE status = 'active' AND gateway_token_hash IS NULL"
         )
         if unknown:
-            mapping = await gateway.token_hashes_by_alias()
+            mapping = await provisioning.token_hashes_by_alias()
             for r in unknown:
                 token = mapping.get(r["key_alias"])
                 if token:
@@ -169,7 +170,7 @@ async def sync(default_budget: float | None = Query(default=None)):
                     principal_id,
                 )
                 if stale:
-                    await gateway.delete_by_aliases([r["key_alias"] for r in stale])
+                    await provisioning.delete_by_aliases([r["key_alias"] for r in stale])
                     await conn.execute(
                         "UPDATE virtual_key SET status = 'revoked', revoked_at = now() "
                         "WHERE principal_id = $1 AND status = 'active'",
@@ -191,7 +192,7 @@ async def sync(default_budget: float | None = Query(default=None)):
                 )
                 if existing:
                     continue
-                created = await gateway.generate_key(
+                created = await provisioning.generate_key(
                     username=u["username"],
                     surface=surface,
                     idp_user_id=u["idp_user_id"],
@@ -316,7 +317,7 @@ async def set_budget(req: BudgetRequest):
                 raise HTTPException(404, "no active keys for that user/surface")
             for r in rows:
                 if r["gateway_token_hash"]:
-                    await gateway.update_budget(r["gateway_token_hash"], req.max_budget)
+                    await provisioning.update_budget(r["gateway_token_hash"], req.max_budget)
             await conn.execute(
                 f"""
                 UPDATE virtual_key k SET max_budget = ${len(args) + 1}
@@ -510,11 +511,11 @@ async def revoke_all():
 
     # Revoke what the gateway holds too, not only what we recorded — anything minted out
     # of band (the chat surface key is, deliberately) would otherwise survive the exit.
-    gateway_aliases = await gateway.list_aliases()
+    gateway_aliases = await provisioning.list_aliases()
     all_aliases = sorted(set(aliases) | set(gateway_aliases))
 
     if all_aliases:
-        await gateway.delete_by_aliases(all_aliases)
+        await provisioning.delete_by_aliases(all_aliases)
         async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE virtual_key SET status = 'revoked', revoked_at = now() "

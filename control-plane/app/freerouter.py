@@ -69,7 +69,18 @@ async def generate_key(
         # freerouter's `limit` is a monthly USD ceiling (limitToMonthlyUSD server-side).
         body["limit"] = max_budget
     resp = await _request("POST", "/api/v1/keys", json=body)
-    return resp.json()
+    payload = resp.json()
+    # Normalize to the caller contract that gateway.generate_key already satisfies:
+    # `token` is the durable hash the control plane stores (gateway_token_hash), `key` is
+    # the raw one-time key handed to the surface. freerouter's native envelope
+    # ({"data": {"hash", ...}, "key": ...}) is preserved under `data` for callers that want
+    # the full object. This is what lets provisioning.py flip backends without touching any
+    # caller.
+    return {
+        "token": payload["data"]["hash"],
+        "key": payload["key"],
+        "data": payload["data"],
+    }
 
 
 async def delete_by_aliases(aliases: list[str], *, missing_ok: bool = False) -> dict:

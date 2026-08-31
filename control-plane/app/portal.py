@@ -35,7 +35,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
-from . import agent_usage, agents, chat_identity, db, gateway, issuance, metering
+from . import agent_usage, agents, chat_identity, db, gateway, issuance, metering, provisioning
 from .analytics import report as analytics_report
 
 router = APIRouter()
@@ -344,7 +344,7 @@ async def _agent_usage_beside_spend(user: str, by_surface: dict) -> tuple[list[d
 @router.get("/portal/api/keys")
 async def my_keys(user: str = Depends(require_user)):
     """The caller's own virtual keys. Never the secret — only what it is and what it may spend."""
-    keys = await gateway.list_keys()
+    keys = await provisioning.list_keys()
     out = []
     for k in keys:
         alias = k.get("key_alias") or ""
@@ -592,7 +592,7 @@ async def admin_overview(since: str | None = None,
         s["requests"] += r.get("requests") or 0
         s["spend"] += r.get("spend") or 0.0
 
-    keys = await gateway.list_keys()
+    keys = await provisioning.list_keys()
     budgets: dict[str, dict] = {}
     for k in keys:
         alias = k.get("key_alias") or ""

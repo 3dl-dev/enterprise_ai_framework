@@ -22,7 +22,7 @@ A second copy of that list would have drifted from this one within a release.
 
 from fastapi import HTTPException
 
-from . import db, gateway, identity
+from . import db, gateway, identity, provisioning
 
 
 async def _resolve_principal(conn, username: str) -> dict:
@@ -105,8 +105,8 @@ async def issue(username: str, surface: str, *, actor: str) -> dict:
     # missing_ok: there may be no key to rotate. That is the normal state the first time a
     # surface is provisioned and also the state after a revocation, so treating "nothing
     # to delete" as an error would fail in the two cases this is most needed.
-    await gateway.delete_by_aliases([alias], missing_ok=True)
-    created = await gateway.generate_key(
+    await provisioning.delete_by_aliases([alias], missing_ok=True)
+    created = await provisioning.generate_key(
         username=username, surface=surface,
         idp_user_id=principal["idp_user_id"], max_budget=max_budget,
     )

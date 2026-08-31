@@ -96,6 +96,8 @@ def test_generate_key_mints_named_sub_key_with_budget(fake):
         fr.generate_key(username="bob", surface="chat", idp_user_id="idp-bob", max_budget=25.0)
     )
     assert created["key"].startswith("fr-sk-")
+    # normalized caller contract: `token` is the durable hash (== data.hash), `key` the raw
+    assert created["token"] == created["data"]["hash"]
     assert created["data"]["name"] == "bob::chat"
     assert created["data"]["limit"] == 25.0
 

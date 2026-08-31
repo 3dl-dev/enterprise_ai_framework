@@ -60,7 +60,7 @@ import httpx
 import yaml
 from fastapi import HTTPException
 
-from . import agent_usage, catalog, db, gateway, issuance
+from . import agent_usage, catalog, db, gateway, issuance, provisioning
 
 # One source for the in-cluster credential and the API address. See the module docstring.
 KUBE_API = agent_usage.KUBE_API
@@ -1370,7 +1370,7 @@ async def delete(user: str, name: str) -> dict:
         still_there = await _get(client, "v1", "PersistentVolumeClaim", obj)
 
     alias = gateway.agent_key_alias(user, name)
-    await gateway.delete_by_aliases([alias], missing_ok=True)
+    await provisioning.delete_by_aliases([alias], missing_ok=True)
     pool = await db.pool()
     async with pool.acquire() as conn:
         await conn.execute(
