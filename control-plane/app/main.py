@@ -11,7 +11,7 @@ may, how much, and records what was decided.
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -50,6 +50,32 @@ def require_admin(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> str:
     if creds.credentials != expected:
         raise HTTPException(401, "bad admin token")
     return "admin"
+
+
+# An OPTIONAL bearer: a browser operator acting through the console carries no token, only
+# the proxy's identity headers, so require_operator must not 403 on a missing Authorization.
+_optional_bearer = HTTPBearer(auto_error=False)
+
+
+def require_operator(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> str:
+    """Authorize an operator WRITE action (item c44).
+
+    Two ways in, both authorising the same actions: the shared admin token (CLI /
+    break-glass — unchanged), OR a Keycloak operator ROLE delivered through the
+    authenticating proxy (a signed-in operator ACTING in the console). This reverses the
+    old token-only posture — operators can now act, not just view — while a plain signed-in
+    user still cannot (no operator role → 403). The nuclear actions (exit/revoke-all) stay
+    require_admin: too destructive for a browser click.
+    """
+    token = os.environ.get("CONTROL_PLANE_ADMIN_TOKEN")
+    if creds is not None and token and creds.credentials == token:
+        return "admin-token"
+    if portal.roles(request) & portal.ADMIN_ROLES:
+        return portal.require_user(request)  # the operator's username, for the audit trail
+    raise HTTPException(403, "operator role or admin token required")
 
 
 @asynccontextmanager
@@ -123,7 +149,7 @@ class SyncResult(BaseModel):
     details: list[dict] = Field(default_factory=list)
 
 
-@app.post("/admin/sync", response_model=SyncResult, dependencies=[Depends(require_admin)])
+@app.post("/admin/sync", response_model=SyncResult, dependencies=[Depends(require_operator)])
 async def sync(default_budget: float | None = Query(default=None)):
     """Reconcile identity → virtual keys.
 
@@ -274,7 +300,7 @@ class IssuedKey(BaseModel):
 
 
 @app.post("/admin/keys/issue", response_model=IssuedKey,
-          dependencies=[Depends(require_admin)])
+          dependencies=[Depends(require_operator)])
 async def issue_key(req: IssueKeyRequest):
     """Mint a surface key and hand back the raw value exactly once.
 
@@ -296,7 +322,7 @@ class BudgetRequest(BaseModel):
     max_budget: float
 
 
-@app.post("/admin/budget", dependencies=[Depends(require_admin)])
+@app.post("/admin/budget", dependencies=[Depends(require_operator)])
 async def set_budget(req: BudgetRequest):
     """Set a hard budget. Past it the gateway refuses, it does not merely record."""
     if req.surface and not gateway.is_known_surface(req.surface):
@@ -435,7 +461,7 @@ async def agent_usage_view(username: str | None = None):
     }
 
 
-@app.post("/admin/agents/usage/collect", dependencies=[Depends(require_admin)])
+@app.post("/admin/agents/usage/collect", dependencies=[Depends(require_operator)])
 async def agent_usage_collect():
     """Force one sample. Idempotent in the sense that matters: it can only add elapsed time.
 
