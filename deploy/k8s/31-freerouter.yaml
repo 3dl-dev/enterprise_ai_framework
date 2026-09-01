@@ -64,6 +64,35 @@ spec:
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_METER_DSN } }
             - name: FREEROUTER_LISTEN_ADDR
               value: ":8080"
+            # Signup open so the control plane can broker per-user sub-account provisioning
+            # (757/1da). Safe: in-cluster / NodePort only, never internet-published — enforced
+            # by the posture guard (tests/test_freerouter_posture.py).
+            - name: FREEROUTER_SIGNUP
+              value: open
+            # --- 3DL-OVERLAY ONLY (guardrail bd6): all absent in the shipped base, so it
+            # stays an air-gap personal gateway with no tab and no peer. The 3DL deploy's
+            # secret sets these to turn ai.3dl.one into the cred-less federated BUYER + give
+            # its users the operator tab (171 recast; without it a zero-balance sub-account
+            # 402s post-0d4). The self-pay canary becomes a pure secret/overlay exercise —
+            # no manifest edit — once the peer's 971 buyer half lands.
+            - name: FREEROUTER_OPERATOR_TAB_MICRO
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_OPERATOR_TAB_MICRO, optional: true } }
+            - name: FREEROUTER_PEER_SERVE
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_SERVE, optional: true } }
+            - name: FREEROUTER_PEER_TESTNET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_TESTNET, optional: true } }
+            - name: FREEROUTER_PEER_SETTLEMENT_CHAIN_ID
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_SETTLEMENT_CHAIN_ID, optional: true } }
+            - name: FREEROUTER_PEER_ALLOWLIST
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_ALLOWLIST, optional: true } }
+            - name: FREEROUTER_PEER_UPSTREAMS
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_UPSTREAMS, optional: true } }
+            - name: FREEROUTER_PEER_RELAY_URL
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_RELAY_URL, optional: true } }
+            # secp256k1 testnet settlement wallet; the FR self-generates it here on boot if
+            # the file is absent (mainnet keystore forbidden by code). On the small PVC below.
+            - name: FREEROUTER_PEER_WALLET_KEYSTORE
+              value: /var/lib/freerouter/wallet/testnet.key
           ports: [{ containerPort: 8080 }]
           readinessProbe:
             httpGet: { path: /healthz, port: 8080 }
@@ -78,3 +107,21 @@ spec:
           resources:
             requests: { cpu: "100m", memory: "128Mi" }
             limits:   { memory: "1Gi" }
+          volumeMounts:
+            # Self-generated testnet settlement wallet (3DL overlay / canary). Empty in the
+            # base — the FR writes it only when FREEROUTER_PEER_* turns federation on.
+            - { name: freerouter-wallet, mountPath: /var/lib/freerouter/wallet }
+      volumes:
+        - name: freerouter-wallet
+          persistentVolumeClaim: { claimName: freerouter-wallet }
+---
+# Durable store for the freerouter testnet settlement wallet (3DL overlay / canary). Tiny.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: freerouter-wallet
+  namespace: enterprise-ai
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 16Mi } }

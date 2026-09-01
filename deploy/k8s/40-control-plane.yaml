@@ -80,6 +80,19 @@ spec:
               value: http://gateway:4000
             - name: GATEWAY_MASTER_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: GATEWAY_MASTER_KEY } }
+            # The inference spoke (item 757). GATEWAY_PROVIDER flips provisioning + the bill
+            # from litellm to freerouter; absent → litellm, so this manifest is safe to ship
+            # pre-flip. FREEROUTER_MASTER_KEY is the control plane's own tenant bearer —
+            # bootstrapped + persisted to the keyfile volume below, or injected as a secret.
+            # Values live in the 3DL overlay secret (bd6: never a shipped default).
+            - name: GATEWAY_PROVIDER
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: GATEWAY_PROVIDER, optional: true } }
+            - name: FREEROUTER_URL
+              value: http://freerouter:8080
+            - name: FREEROUTER_MASTER_KEY_FILE
+              value: /var/lib/enterprise-ai/freerouter/operator.key
+            - name: FREEROUTER_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_MASTER_KEY, optional: true } }
             - name: IDP_URL
               value: http://identity:8080
             - name: IDP_REALM
@@ -154,6 +167,9 @@ spec:
             # Writable, durable store for the behavioural-analytics records the collector
             # produces and the /portal/analytics report reads.
             - { name: analytics-records, mountPath: /var/lib/enterprise-ai/analytics }
+            # Durable store for the freerouter operator-tenant bearer (item 757): a restart
+            # reuses it rather than stranding a new empty tenant. Only written post-flip.
+            - { name: freerouter-key, mountPath: /var/lib/enterprise-ai/freerouter }
           readinessProbe:
             httpGet: { path: /health, port: 8000 }
             initialDelaySeconds: 10
@@ -228,6 +244,20 @@ spec:
           configMap: { name: agent-assets, optional: true }
         - name: analytics-records
           persistentVolumeClaim: { claimName: analytics-records }
+        - name: freerouter-key
+          persistentVolumeClaim: { claimName: freerouter-operator-key }
+---
+# Durable store for the freerouter operator-tenant bearer (item 757). Tiny; RWO,
+# single-replica; local-path like the rest of this cluster.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: freerouter-operator-key
+  namespace: enterprise-ai
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources: { requests: { storage: 16Mi } }
 ---
 # Durable store for the behavioural-analytics records (content-free turn/session metrics +
 # real ledger cost). RWO is fine — the control plane is single-replica. local-path like the
