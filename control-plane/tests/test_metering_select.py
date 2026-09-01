@@ -24,12 +24,45 @@ def test_backend_selects_freerouter(monkeypatch):
     assert metering_select.backend() is metering_freerouter
 
 
-def test_freerouter_spend_is_empty_pending_573(monkeypatch):
-    # Honest blank bill on the new backend beats reading stale LiteLLM numbers after a flip.
+def _rollup_transport(monkeypatch, rows):
+    def handler(request):
+        assert request.url.path == "/api/v1/usage/rollup"
+        return httpx.Response(200, json={"data": rows})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(metering_freerouter.httpx, "AsyncClient",
+                        lambda *a, **k: real(*a, transport=httpx.MockTransport(handler), **k))
+
+
+def test_freerouter_spend_maps_573_rollup_rows(monkeypatch):
+    monkeypatch.setenv("FREEROUTER_URL", "http://freerouter:8080")
+    monkeypatch.setenv("FREEROUTER_MASTER_KEY", "fr-sk-cp")
+    _rollup_transport(monkeypatch, [
+        {"account_id": "acc1", "name": "alice::chat", "spend_micro": 2_500_000,
+         "input_tokens": 100, "output_tokens": 40, "request_count": 3},
+        {"account_id": "acc2", "name": "bob::ide", "spend_micro": 500_000,
+         "input_tokens": 10, "output_tokens": 5, "request_count": 1},
+    ])
+    rows = run(metering_freerouter.spend_by_user_and_surface())
+    by = {(r["username"], r["surface"]): r for r in rows}
+    assert by[("alice", "chat")]["spend"] == 2.5  # micro-USD -> USD
+    assert by[("alice", "chat")]["prompt_tokens"] == 100
+    assert by[("alice", "chat")]["requests"] == 3
+    assert by[("bob", "ide")]["completion_tokens"] == 5
+    tot = run(metering_freerouter.totals())
+    assert tot["spend"] == 3.0 and tot["requests"] == 4 and tot["prompt_tokens"] == 110
+
+
+def test_freerouter_spend_empty_when_router_unreachable(monkeypatch):
+    monkeypatch.setenv("FREEROUTER_MASTER_KEY", "fr-sk-cp")
+
+    def boom(request):
+        raise httpx.ConnectError("down", request=request)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(metering_freerouter.httpx, "AsyncClient",
+                        lambda *a, **k: real(*a, transport=httpx.MockTransport(boom), **k))
     assert run(metering_freerouter.spend_by_user_and_surface()) == []
-    assert run(metering_freerouter.totals()) == {
-        "requests": 0, "spend": 0.0, "prompt_tokens": 0, "completion_tokens": 0,
-    }
 
 
 def test_freerouter_unpriced_is_empty_by_invariant():

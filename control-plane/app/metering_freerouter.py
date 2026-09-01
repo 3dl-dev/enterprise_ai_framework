@@ -30,18 +30,51 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {os.environ['FREEROUTER_MASTER_KEY']}"}
 
 
+def _split_alias(name: str, account_id: str) -> tuple[str, str]:
+    """A sub-account's label is "<user>::<surface>" (set by the control plane at mint).
+
+    Fall back to the account_id as the username with an unknown surface when a row carries
+    no label (e.g. the control-plane tenant's own account, or a pre-1da account).
+    """
+    if "::" in name:
+        user, surface = name.split("::", 1)
+        return user, surface
+    return (name or account_id or "(unknown)"), "(unknown)"
+
+
 async def _rollup(since: str | None) -> list[dict]:
     """Operator subtree usage grouped by sub-account, via freerouter-573.
 
-    Returns rows shaped like metering.spend_by_user_and_surface's:
-    {username, surface, requests, spend, prompt_tokens, completion_tokens}. Empty until the
-    573 endpoint exists (or if the router is unreachable) — never raises, so the console
-    renders a blank-but-honest bill rather than erroring.
+    GET /api/v1/usage/rollup (requireTenant, subtree-scoped to the control-plane tenant) →
+    {data:[{account_id, name, spend_micro, input_tokens, output_tokens, request_count}]}.
+    Mapped to metering.spend_by_user_and_surface's shape. Empty on any failure (unreachable
+    router, malformed body) so the console renders a blank-but-honest bill rather than
+    erroring.
     """
-    # TODO(freerouter-573): call the operator subtree rollup once its path/schema is
-    # confirmed, e.g. GET /v1/usage/subtree, and map AccountID -> (username, surface) by
-    # splitting on "::". Until then, degrade to empty.
-    return []
+    try:
+        params = {"since": since} if since else None
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{base_url()}/api/v1/usage/rollup", headers=_headers(), params=params
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+    except Exception:
+        return []
+    rows: list[dict] = []
+    for a in data:
+        if not isinstance(a, dict):
+            continue
+        user, surface = _split_alias(a.get("name") or "", a.get("account_id") or "")
+        rows.append({
+            "username": user,
+            "surface": surface,
+            "requests": a.get("request_count", 0) or 0,
+            "spend": (a.get("spend_micro", 0) or 0) / 1_000_000,  # micro-USD → USD
+            "prompt_tokens": a.get("input_tokens", 0) or 0,
+            "completion_tokens": a.get("output_tokens", 0) or 0,
+        })
+    return rows
 
 
 async def spend_by_user_and_surface(since: str | None = None) -> list[dict]:
