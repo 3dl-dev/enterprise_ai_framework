@@ -190,6 +190,10 @@ services:
       GATEWAY_PROVIDER: ${GATEWAY_PROVIDER:-litellm}
       FREEROUTER_URL: http://freerouter:8080
       FREEROUTER_MASTER_KEY: ${FREEROUTER_MASTER_KEY:-}
+      # Where the bootstrapped operator-tenant bearer is persisted so a restart reuses it
+      # rather than stranding a second empty tenant (item 757). On the durable cpstate
+      # volume below. Only written when GATEWAY_PROVIDER=freerouter.
+      FREEROUTER_MASTER_KEY_FILE: /var/lib/enterprise-ai/freerouter/operator.key
       IDP_URL: http://identity:8080
       IDP_REALM: ${IDP_REALM:-enterprise-ai}
       IDP_CLIENT_ID: control-plane
@@ -209,6 +213,11 @@ services:
       # exist here to be tested against. Empty is still the safe default everywhere else:
       # a deployment that names nobody gets no console.
       PORTAL_ADMINS: ${PORTAL_ADMINS:-${BOOTSTRAP_USER:-baron}}
+    volumes:
+      # Durable control-plane state: the persisted freerouter operator-tenant bearer
+      # (FREEROUTER_MASTER_KEY_FILE) must survive restarts, else a re-signup strands a
+      # second empty tenant (item 757).
+      - cpstate:/var/lib/enterprise-ai/freerouter
     ports:
       - "${CONTROL_PLANE_PORT:-8081}:8000"
     depends_on:
@@ -979,3 +988,4 @@ volumes:
   codeapiredisdata:
   codeapiminiodata:
   codeapipkgs:
+  cpstate:
