@@ -28,12 +28,12 @@ def catalog_url() -> str:
     ).rstrip("/")
 
 
-def model_ids(base_url: str | None = None) -> tuple[str, ...]:
-    """The model ids the router currently advertises, in catalog order.
+def model_catalog(base_url: str | None = None) -> tuple[dict, ...]:
+    """The full per-model objects the router advertises, in catalog order.
 
-    Returns an empty tuple on any failure (unreachable router, malformed body, empty
-    catalog). Callers treat empty as "fall back to my configured default" — discovery is
-    an enhancement over a static list, never a hard dependency that can break a picker.
+    OpenRouter-parity objects: at least `id`, usually `name` and `context_length`. Returns
+    an empty tuple on any failure (unreachable router, malformed body, empty catalog) so
+    every caller degrades to its configured default rather than breaking.
     """
     url = (base_url or catalog_url()).rstrip("/")
     try:
@@ -43,4 +43,13 @@ def model_ids(base_url: str | None = None) -> tuple[str, ...]:
             data = resp.json().get("data", [])
     except Exception:
         return ()
-    return tuple(m["id"] for m in data if isinstance(m, dict) and m.get("id"))
+    return tuple(m for m in data if isinstance(m, dict) and m.get("id"))
+
+
+def model_ids(base_url: str | None = None) -> tuple[str, ...]:
+    """The model ids the router currently advertises, in catalog order.
+
+    Empty tuple on any failure — discovery is an enhancement over a static list, never a
+    hard dependency that can break a picker.
+    """
+    return tuple(m["id"] for m in model_catalog(base_url))
