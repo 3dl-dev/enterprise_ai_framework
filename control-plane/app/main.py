@@ -27,6 +27,7 @@ from . import (
     identity,
     issuance,
     metering,
+    metering_select,
     portal,
     provisioning,
     workshop,
@@ -108,7 +109,7 @@ async def ready():
     checks = {
         "identity": await identity.health(),
         "gateway": await provisioning.health(),
-        "ledger": await metering.ledger_ready(),
+        "ledger": await metering_select.ledger_ready(),
     }
     return {"ready": all(checks.values()), "checks": checks}
 
@@ -356,8 +357,8 @@ async def spend(since: str | None = None):
     an ObjectId where a name belongs, is worse than one that is obviously broken — so the
     caveat travels with the number rather than living on a page nobody opens.
     """
-    rows = await metering.spend_by_user_and_surface(since)
-    unpriced = await metering.unpriced_models(since)
+    rows = await metering_select.spend_by_user_and_surface(since)
+    unpriced = await metering_select.unpriced_models(since)
     warnings = []
     if unpriced:
         warnings.append({
@@ -383,7 +384,7 @@ async def spend(since: str | None = None):
         })
     return {
         "since": since,
-        "totals": await metering.totals(since),
+        "totals": await metering_select.totals(since),
         "by_user_and_surface": rows,
         "warnings": warnings,
     }
@@ -448,7 +449,7 @@ async def agent_usage_collect():
 @app.get("/admin/unpriced", dependencies=[Depends(require_admin)])
 async def unpriced(since: str | None = None):
     """Models consuming tokens at zero recorded cost. Should always be empty."""
-    rows = await metering.unpriced_models(since)
+    rows = await metering_select.unpriced_models(since)
     return {"ok": not rows, "models": rows}
 
 
