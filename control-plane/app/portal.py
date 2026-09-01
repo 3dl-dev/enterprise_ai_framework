@@ -140,13 +140,38 @@ async def portal_static(request: Request, name: str, user: str = Depends(require
 # the safe direction to fail.
 ADMINS = {a.strip() for a in os.environ.get("PORTAL_ADMINS", "").split(",") if a.strip()}
 
+# RBAC: operator access is granted by a Keycloak realm ROLE, not a hand-maintained username
+# list. The authenticating proxy passes the token's roles/groups (oauth2-proxy --pass-groups)
+# as a groups header, honoured under the SAME loopback trust boundary as the username. The
+# PORTAL_ADMINS allowlist stays a TRANSITION fallback so a deployment whose proxy does not yet
+# pass groups (or whose realm has no operator role assigned) keeps working — both paths grant
+# the same read-only console. Once every deployment passes roles, the allowlist is retired.
+ADMIN_ROLES = {
+    r.strip().lstrip("/")
+    for r in os.environ.get("PORTAL_ADMIN_ROLES", "operator,admin").split(",")
+    if r.strip()
+}
+
+
+def roles(request: Request) -> set[str]:
+    """Realm roles/groups the proxy asserts for the caller (empty off the trusted proxy)."""
+    client = request.client.host if request.client else ""
+    if client not in ("127.0.0.1", "::1"):
+        return set()
+    raw = (
+        request.headers.get("x-auth-request-groups")
+        or request.headers.get("x-forwarded-groups")
+        or ""
+    )
+    return {g.strip().lstrip("/") for g in raw.split(",") if g.strip()}
+
 
 def require_admin_user(request: Request, user: str = Depends(require_user)) -> str:
-    if user not in ADMINS:
-        # 404 rather than 403: a non-operator has no business learning that an operator
-        # console exists at this path.
-        raise HTTPException(404, "not found")
-    return user
+    if (roles(request) & ADMIN_ROLES) or (user in ADMINS):
+        return user
+    # 404 rather than 403: a non-operator has no business learning that an operator
+    # console exists at this path.
+    raise HTTPException(404, "not found")
 
 
 # ---------------------------------------------------------------- behavioural analytics
