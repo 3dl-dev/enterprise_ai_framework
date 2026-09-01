@@ -59,99 +59,89 @@ async def _request(method: str, path: str, **kwargs) -> httpx.Response:
 async def generate_key(
     *, username: str, surface: str, idp_user_id: str, max_budget: float | None
 ) -> dict:
-    """Mint a sub-key bound to one user and one surface, under the control-plane tenant.
+    """Mint a nested sub-ACCOUNT bound to one user and one surface (item 1da).
 
-    Returns freerouter's create envelope: {"data": {"hash", "name", "label", "limit", ...},
-    "key": "<raw one-time key>"}. `idp_user_id` is retained in the signature for
-    gateway.py parity; freerouter attributes by the sub-key `name`, so it rides in `name`.
+    Each (user,surface) is its OWN sub-account under the control-plane tenant, not a sub-key,
+    so the operator bill (freerouter-573 rollup) attributes per (user,surface) by AccountID.
+    POST /api/v1/subaccounts {name:"<user>::<surface>"} → {data:{account_id, api_key, name}}.
+
+    Returns the caller contract gateway.generate_key satisfies: `token` = the durable handle
+    the control plane stores (here the ACCOUNT_ID), `key` = the one-time bearer handed to the
+    surface. `max_budget` is not enforced per-account in M1 — every sub-account draws on the
+    operator tab (freerouter-171); per-account caps are a later capability (ca9). `idp_user_id`
+    rides for gateway.py parity; attribution is by the sub-account label.
     """
-    body: dict = {"name": surface_alias(username, surface)}
-    if max_budget is not None:
-        # freerouter's `limit` is a monthly USD ceiling (limitToMonthlyUSD server-side).
-        body["limit"] = max_budget
-    resp = await _request("POST", "/api/v1/keys", json=body)
-    payload = resp.json()
-    # Normalize to the caller contract that gateway.generate_key already satisfies:
-    # `token` is the durable hash the control plane stores (gateway_token_hash), `key` is
-    # the raw one-time key handed to the surface. freerouter's native envelope
-    # ({"data": {"hash", ...}, "key": ...}) is preserved under `data` for callers that want
-    # the full object. This is what lets provisioning.py flip backends without touching any
-    # caller.
+    resp = await _request(
+        "POST", "/api/v1/subaccounts", json={"name": surface_alias(username, surface)}
+    )
+    data = resp.json()["data"]
+    return {"token": data["account_id"], "key": data["api_key"], "data": data}
+
+
+async def _account_ids_by_alias() -> dict[str, str]:
+    """alias "<user>::<surface>" → sub-account id, from the operator subtree rollup (573).
+
+    The rollup lists sub-accounts that have accrued usage. The control plane's own DB is the
+    authoritative alias→account_id map (stored at mint); this is the freerouter-side view,
+    used to resolve a revoke target by alias. A never-used sub-account has no rollup row yet —
+    the control plane revokes such by passing its stored account_id directly.
+    """
+    resp = await _request("GET", "/api/v1/usage/rollup")
     return {
-        "token": payload["data"]["hash"],
-        "key": payload["key"],
-        "data": payload["data"],
+        a["name"]: a["account_id"]
+        for a in resp.json().get("data", [])
+        if a.get("name") and a.get("account_id")
     }
 
 
 async def delete_by_aliases(aliases: list[str], *, missing_ok: bool = False) -> dict:
-    """Hard-revoke by alias. freerouter deletes by hash, so resolve alias -> hash first.
+    """Hard-revoke each (user,surface) by alias, parent-scoped.
 
-    Mirrors gateway.delete_by_aliases including the missing_ok contract: a rotation that
-    finds nothing to delete is a valid outcome, not an error.
+    DELETE /api/v1/subaccounts/{account_id} disables every key under the sub-account so it
+    can't authenticate — ledger/bill row intact, and the control plane never holds the user's
+    key (posture preserved). missing_ok mirrors gateway: nothing to revoke is a valid outcome.
     """
     if not aliases:
         return {"deleted_keys": []}
-    by_alias = await token_hashes_by_alias()
+    by_alias = await _account_ids_by_alias()
     wanted = [(a, by_alias[a]) for a in aliases if a in by_alias]
     if not wanted:
         if missing_ok:
             return {"deleted_keys": []}
-        raise KeyError(f"no freerouter key matches aliases {aliases}")
+        raise KeyError(f"no freerouter sub-account matches aliases {aliases}")
     deleted: list[str] = []
-    for alias, key_hash in wanted:
-        await _request("DELETE", f"/api/v1/keys/{key_hash}")
+    for alias, account_id in wanted:
+        await _request("DELETE", f"/api/v1/subaccounts/{account_id}")
         deleted.append(alias)
     return {"deleted_keys": deleted}
 
 
 async def update_budget(token_hash: str, max_budget: float) -> dict:
-    """Update a sub-key's monthly USD ceiling in place, without re-minting.
-
-    NOTE: freerouter's PATCH currently mutates only `name` and `disabled`
-    (internal/core/keys.go PatchKeyRequest) — NOT `limit`. Until it does (freerouter ask,
-    tracked from enterpriseaiframework-757), an in-place budget change cannot be applied:
-    delete+re-mint would rotate the user's key and drop accrued usage, which is exactly
-    what gateway.update_budget exists to avoid. We send `limit` (forward-compatible so this
-    starts working the moment freerouter ships the field) and VERIFY it took effect, raising
-    loudly rather than silently leaving the old budget in force.
-    """
-    await _request("PATCH", f"/api/v1/keys/{token_hash}", json={"limit": max_budget})
-    for k in await list_keys():
-        if k.get("hash") == token_hash:
-            if k.get("limit") != max_budget:
-                raise NotImplementedError(
-                    "freerouter PATCH /api/v1/keys/{hash} does not update `limit` yet "
-                    "(only name/disabled); in-place budget change is a pending freerouter "
-                    "ask — see enterpriseaiframework-757"
-                )
-            return k
-    raise KeyError(f"no freerouter key with hash {token_hash}")
+    """Per-account budget is not an M1 feature: every sub-account draws on the operator tab
+    (freerouter-171), and there is no per-account cap endpoint yet (ca9). Fail loudly rather
+    than silently pretend a per-user budget was applied."""
+    raise NotImplementedError(
+        "per-(user,surface) budget is not supported on the freerouter path yet — M1 uses the "
+        "operator tab (freerouter-171); per-account caps are pending (ca9). See "
+        "enterpriseaiframework-1da"
+    )
 
 
 async def list_keys() -> list[dict]:
-    """Every sub-key under the control-plane tenant."""
-    resp = await _request("GET", "/api/v1/keys")
-    data = resp.json().get("data", [])
-    return [k for k in data if isinstance(k, dict)]
+    """The control plane's sub-accounts as the operator subtree rollup reports them."""
+    resp = await _request("GET", "/api/v1/usage/rollup")
+    return [a for a in resp.json().get("data", []) if isinstance(a, dict)]
 
 
 async def token_hashes_by_alias() -> dict[str, str]:
-    """alias (sub-key name) -> hash, as freerouter currently holds it.
-
-    freerouter's list carries the durable `hash`; the sub-key `name` is the alias the
-    control plane assigned. Unnamed keys (e.g. the tenant's own bearer key) are skipped.
-    """
-    return {
-        k["name"]: k["hash"]
-        for k in await list_keys()
-        if k.get("name") and k.get("hash")
-    }
+    """alias "<user>::<surface>" → sub-account id (the durable handle the control plane stores
+    at mint). Freerouter-side view, used to verify/backfill."""
+    return await _account_ids_by_alias()
 
 
 async def list_aliases(prefix: str | None = None) -> list[str]:
-    """Aliases (sub-key names) freerouter currently holds. Used to verify revocation."""
-    names = [k["name"] for k in await list_keys() if k.get("name")]
+    """Sub-account aliases the operator subtree currently shows. Used to verify revocation."""
+    names = list((await _account_ids_by_alias()).keys())
     return [a for a in names if not prefix or a.startswith(prefix)]
 
 
