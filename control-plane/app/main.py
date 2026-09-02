@@ -306,6 +306,10 @@ class IssuedKey(BaseModel):
     key: str
     max_budget: float | None = None
     rotated: bool
+    # True only on the freerouter backend with max_budget <= 0 (enterpriseaiframework-9ef):
+    # `key` above is real but freerouter disabled it the instant it was minted, so it
+    # authenticates as nobody. Default False keeps this additive for every existing caller.
+    blocked: bool = False
 
 
 @app.post("/admin/keys/issue", response_model=IssuedKey,

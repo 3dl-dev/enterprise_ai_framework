@@ -161,6 +161,7 @@ async def issue(username: str, surface: str, *, actor: str) -> dict:
     await db.audit(
         actor, "key.issue", username,
         surface=surface, rotated=existing is not None, max_budget=max_budget,
+        blocked=created.get("blocked", False),
     )
     return {
         "username": username,
@@ -169,4 +170,10 @@ async def issue(username: str, surface: str, *, actor: str) -> dict:
         "key": created["key"],
         "max_budget": max_budget,
         "rotated": existing is not None,
+        # True only on the freerouter backend, only for max_budget <= 0
+        # (enterpriseaiframework-9ef): `key` above authenticates as nobody — freerouter
+        # disabled it the instant it was minted, rather than the caller receiving an
+        # unlimited key. LiteLLM's own zero-budget key already spends nothing on its own
+        # terms, so this is always False there; see provisioning.generate_key backends.
+        "blocked": created.get("blocked", False),
     }

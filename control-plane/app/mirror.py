@@ -256,11 +256,17 @@ async def mirror(*, dry_run: bool = False) -> dict:
             key_alias=row["key_alias"],
             account_id=created["token"],
             limit_usd=created.get("limit_usd"),
+            blocked=created.get("blocked", False),
         )
         details.append(
             {
                 "key_alias": row["key_alias"],
-                "action": "minted",
+                # "minted_blocked": a 0-or-negative LiteLLM budget mirrored to a REAL
+                # sub-account whose key freerouter.generate_key disabled before returning it
+                # (enterpriseaiframework-9ef) — never the unlimited key omitting `limit` used
+                # to produce. The row is still written like any other mirror: the account_id
+                # is real and addressable, only the key on it can never authenticate.
+                "action": "minted_blocked" if created.get("blocked") else "minted",
                 "account_id": created["token"],
                 "limit_usd": created.get("limit_usd"),
             }
