@@ -22,7 +22,7 @@ A second copy of that list would have drifted from this one within a release.
 
 from fastapi import HTTPException
 
-from . import chat_identity, db, gateway, identity, provisioning
+from . import chat_identity, db, freerouter, gateway, identity, mirror, provisioning
 
 # The chat surface's shared key (chat_identity.SHARED_SURFACE_PRINCIPAL, alias
 # "chat-surface::chat") is not a person — it is LibreChat's own service credential, minted
@@ -157,6 +157,30 @@ async def issue(username: str, surface: str, *, actor: str) -> dict:
             """,
             principal["id"], surface, alias, created.get("token"), max_budget,
         )
+        # On freerouter, `created["token"]` is a freshly minted sub-account id, not a
+        # LiteLLM key handle — and it is a DIFFERENT sub-account than whatever
+        # `freerouter_mirror` last recorded for this alias, because `delete_by_aliases`
+        # above resolved and removed the old one. Leaving that row stale is exactly the
+        # bug this closes: the NEXT call through this same path (another rotate, or a
+        # revoke) resolves the alias via `mirror.recorded_account_ids`, which reads
+        # `freerouter_mirror` — so a stale row means it targets an account that is
+        # already gone (a revoke that silently deletes nothing) while the account this
+        # rotation just minted is invisible to every alias-addressed operation that
+        # follows, including the next re-provision. `mirror.record_account` is the ONE
+        # place that writes this row (see its docstring) — reusing it here rather than a
+        # second raw UPSERT is what keeps `/admin/budget`'s rotation and this one
+        # answering the same question the same way. Skipped entirely on the LiteLLM
+        # backend: `freerouter_mirror` describes freerouter sub-accounts only, and
+        # `created` there carries no `key_hash`/`limit_usd` to record.
+        if provisioning.backend() is freerouter:
+            await mirror.record_account(
+                conn,
+                key_alias=alias,
+                account_id=created["token"],
+                key_hash=created.get("key_hash"),
+                source_max_budget=max_budget,
+                limit_usd=created.get("limit_usd"),
+            )
 
     await db.audit(
         actor, "key.issue", username,

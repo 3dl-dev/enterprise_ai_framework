@@ -517,15 +517,35 @@ def test_the_shared_chat_key_is_now_a_real_virtual_key_row(world):
 
 
 def test_the_mirror_now_carries_the_shared_chat_key_across_the_flip(world):
-    """The actual done-condition: mirror() — unmodified — picks the shared key up."""
+    """The actual done-condition: mirror() picks the shared key up.
+
+    `issuance.issue` now records `freerouter_mirror` itself the moment it mints on the
+    freerouter backend (enterpriseaiframework-f48 — the same fix that makes a workspace
+    key re-provision leave a correct mirror row instead of a stale one). So the row is
+    already there BEFORE `mirror()` ever runs, and `mirror()` — idempotent by alias per its
+    own docstring — mints nothing for it; the row it wrote earlier is what `mirror()` is
+    idempotent against. What must still hold is the mirror-era done-condition: the alias is
+    not `missing` from the reconcile once `mirror()` has run.
+    """
     run(issuance.issue(chat_identity.SHARED_SURFACE_PRINCIPAL, "chat", actor="operator"))
+
+    mirrored_before = run(_mirror_rows(world["dsn"]))
+    assert "chat-surface::chat" in mirrored_before, (
+        "issuance.issue on freerouter must record the mirror row itself, not leave it to "
+        "a later mirror() run"
+    )
 
     result = run(mirror.mirror())
 
     minted = {d["key_alias"] for d in result["details"]}
-    assert "chat-surface::chat" in minted
+    assert "chat-surface::chat" not in minted, (
+        "already mirrored by issue() — mirror() minting it again would strand a second, "
+        "redundant sub-account under the same alias"
+    )
     mirrored = run(_mirror_rows(world["dsn"]))
-    assert "chat-surface::chat" in mirrored
+    assert mirrored["chat-surface::chat"]["account_id"] == (
+        mirrored_before["chat-surface::chat"]["account_id"]
+    )
     report = run(mirror.reconcile())
     assert report["missing"] == []
 
@@ -571,6 +591,88 @@ def test_rotating_the_shared_chat_key_remaps_it_in_place_without_touching_the_id
         "silently keep working instead of being remapped"
     )
     assert authenticates(second["key"]), "the remapped credential must actually work"
+
+
+# ------------------------------------------------------------ workspace re-provision (f48)
+#
+# deploy/bin/provision-workspace.sh is repeatable and idempotent by design: rerun it for the
+# same user and it hands back a freshly rotated `<user>::ide` key, through the exact call
+# `issuance.issue` makes under the control plane's own `/admin/keys/issue`. On freerouter that
+# rotation MINTS A NEW SUB-ACCOUNT under the same alias (freerouter cannot re-cap or reuse a
+# handle — see freerouter.update_budget) and `provisioning.delete_by_aliases` resolves WHICH
+# account to revoke by reading `freerouter_mirror` (mirror.recorded_account_ids). Before this
+# fix, `issuance.issue` updated `virtual_key` on every mint but never wrote
+# `freerouter_mirror` — so a second re-provision resolved the alias to nothing, reported
+# "deleted" having deleted nothing, and the pod's PREVIOUS key kept authenticating right
+# alongside the new one. `mirror.record_account` (the one write path 257 centralized —
+# `/admin/budget`'s own rotation uses it the same way) is what closes the gap.
+
+
+def test_reprovisioning_through_issuance_revokes_the_old_key_the_way_the_script_relies_on(
+    world,
+):
+    """Two runs of `provision-workspace.sh` for the same user, modeled as two `issuance.issue`
+    calls for `alice::ide` — the exact path `/admin/keys/issue` takes. `alice` already has a
+    principal row (SEED), so this needs no IdP round trip, matching a real re-provision of an
+    existing user.
+    """
+    first = run(issuance.issue("alice", "ide", actor="admin"))
+    assert first["key_alias"] == "alice::ide"
+    assert first["rotated"] is True, (
+        "SEED already carries an active alice::ide (LiteLLM) key, so this is a rotation, "
+        "not a first mint — exactly what a workspace that predates the flip looks like"
+    )
+
+    mirrored_after_first = run(_mirror_rows(world["dsn"]))
+    first_account = mirrored_after_first["alice::ide"]["account_id"]
+    assert first_account, (
+        "issuance.issue minted on freerouter but left no freerouter_mirror row — the next "
+        "re-provision has no way to find this account to revoke it"
+    )
+
+    second = run(issuance.issue("alice", "ide", actor="admin"))
+    assert second["rotated"] is True
+    assert second["key"] != first["key"], "a re-provision must hand back a genuinely new key"
+
+    mirrored_after_second = run(_mirror_rows(world["dsn"]))
+    second_account = mirrored_after_second["alice::ide"]["account_id"]
+    assert second_account != first_account, (
+        "freerouter_mirror still names the FIRST account after the second re-provision — "
+        "the row was not updated, so a THIRD re-provision would try to revoke an account "
+        "that is already gone and could never find the one actually live"
+    )
+
+    # Ground truth, not the ledger's opinion of itself (Q2): ask the real freerouter binary
+    # whether each bearer still authenticates. The first run's PVC-mounted `ws-alice-key`
+    # Secret held `first["key"]`; a workspace pod re-reading that Secret after only the
+    # first re-provision must not go on being served by a key provision-workspace.sh
+    # believes it already revoked.
+    import httpx
+
+    def authenticates(key: str) -> bool:
+        r = httpx.get(
+            f"{world['base']}/api/v1/keys",
+            headers={"Authorization": f"Bearer {key}"}, timeout=10.0,
+        )
+        return r.status_code == 200
+
+    assert not authenticates(first["key"]), (
+        "the key from the FIRST re-provision still authenticates against freerouter after "
+        "the SECOND — the old sub-account was never resolved and revoked, so the pod's "
+        "outgoing key and the operator's belief about which key is live have diverged"
+    )
+    assert authenticates(second["key"]), (
+        "the key from the second (current) re-provision must actually work"
+    )
+
+    # The alias identity holds across both rotations — this is the SAME workspace's key
+    # being rotated in place, never a second alias born from a stale lookup.
+    rows = run(_virtual_keys(world["dsn"]))
+    aliases = {r[0] for r in rows}
+    assert aliases == {
+        "alice::chat", "alice::ide", "alice::terminal",
+        "bob::chat", "bob::agents/scraper", "carol::chat",
+    }
 
 
 # ---------------------------------------------------------------- the reconcile
