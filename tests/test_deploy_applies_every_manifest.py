@@ -183,6 +183,13 @@ def test_the_manifests_currently_held_are_the_ones_we_expect():
         "05-fakeprovider.yaml",
         "06-mcp-echo.yaml",
         "07-web-search.yaml",
+        # The freerouter inference spoke. Held back exactly like the others until its image
+        # is built into the rail registry and the component is stood up (the prod-cutover
+        # epic's first outcome, enterpriseaiframework-e50). Deliberately added here so this
+        # guard stays accurate: the merge that introduced 31-freerouter.yaml is
+        # behavior-preserving — deploy.sh's image substitution is guarded to
+        # 40-control-plane.yaml, so this manifest is held, not applied, until then.
+        "31-freerouter.yaml",
         "40-control-plane.yaml",
         "70-codeapi.yaml",
     }, (
