@@ -113,7 +113,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-GATEWAY_BASE="http://gateway:4000/v1"
+# The integrated agent's inference endpoint. Defaults to the LiteLLM gateway; set
+# GATEWAY_SURFACE_BASE=http://freerouter:8080 to repoint an agent at the freerouter spoke
+# during the cutover (matches provision-workspace.sh's GATEWAY_SURFACE_BASE convention).
+GATEWAY_BASE="${GATEWAY_SURFACE_BASE:-http://gateway:4000}/v1"
 
 # The mode is derived from what was supplied rather than from a --mode flag that could
 # disagree with it. Both halves are required together: a BYO key with no base URL would
@@ -139,7 +142,7 @@ if [[ -n "$BYO_KEY_FILE" || -n "${AGENT_BYO_API_KEY:-}" || -n "$BYO_API_BASE" ]]
         echo "  provider credential to our gateway, which cannot spend it and must not see it." >&2
         exit 1
     fi
-    if [[ "$BYO_API_BASE" == "$GATEWAY_BASE" || "$BYO_API_BASE" == *"//gateway:"* ]]; then
+    if [[ "$BYO_API_BASE" == "$GATEWAY_BASE" || "$BYO_API_BASE" == *"//gateway:"* || "$BYO_API_BASE" == *"//freerouter:"* ]]; then
         echo "refusing: --byo-api-base points at our own gateway (${BYO_API_BASE})." >&2
         echo "  BYO means the traffic routes AROUND this layer; pointing it back here would" >&2
         echo "  hand the gateway a credential it cannot use and label the agent 'byo' while" >&2
