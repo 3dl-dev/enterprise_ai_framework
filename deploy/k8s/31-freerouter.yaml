@@ -64,16 +64,6 @@ spec:
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_METER_DSN } }
             - name: FREEROUTER_LISTEN_ADDR
               value: ":8080"
-            # --- upstream catalog (3DL overlay): router.3dl.one as a standard OpenAI-compatible
-            # provider (the "a peer is a tenant" ruling, enterpriseaiframework-064). The onboarding
-            # bundle at FREEROUTER_CATALOG_DIR uses discovery "openai_list", so /v1/models is a LIVE
-            # slurp of router's /v1/models (109+, auto-appearing) — not a baked list. The tenant key
-            # (FREEROUTER_ROUTER_TENANT_KEY) is this instance's tenant credential on router; absent
-            # in the shipped base, so the base stays an empty-catalog personal gateway.
-            - name: FREEROUTER_CATALOG_DIR
-              value: /etc/freerouter/catalog
-            - name: FREEROUTER_ROUTER_TENANT_KEY
-              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_ROUTER_TENANT_KEY, optional: true } }
             # Signup open so the control plane can broker per-user sub-account provisioning
             # (757/1da). Safe: in-cluster / NodePort only, never internet-published — enforced
             # by the posture guard (tests/test_freerouter_posture.py).
@@ -139,14 +129,9 @@ spec:
             # Self-generated testnet settlement wallet (3DL overlay / canary). Empty in the
             # base — the FR writes it only when FREEROUTER_PEER_* turns federation on.
             - { name: freerouter-wallet, mountPath: /var/lib/freerouter/wallet }
-            # Onboarding bundles (router.3dl.one provider descriptor). optional: the shipped
-            # base has no overlay catalog and comes up empty, per the manifest header.
-            - { name: freerouter-catalog, mountPath: /etc/freerouter/catalog, readOnly: true }
       volumes:
         - name: freerouter-wallet
           persistentVolumeClaim: { claimName: freerouter-wallet }
-        - name: freerouter-catalog
-          configMap: { name: freerouter-catalog, optional: true }
 ---
 # Durable store for the freerouter testnet settlement wallet (3DL overlay / canary). Tiny.
 apiVersion: v1
