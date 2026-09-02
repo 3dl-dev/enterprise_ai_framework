@@ -120,3 +120,12 @@ test-first-conversation:
 ## if the router is unreachable, so it never breaks a build.
 render-workspace-config:
 	@$(BUNDLE)/bin/render_opencode_config.py deploy/workspace/opencode.json "$${CATALOG_URL:-$${FREEROUTER_URL:-http://freerouter:8080}}"
+
+## Render aider's context-window table (deploy/workspace/model-metadata.json) from the
+## router catalog (item enterpriseaiframework-987, design record C4 / item -037). Run
+## alongside render-workspace-config, before the workspace image is rebuilt. Degrades to
+## the baked table if the router is unreachable/empty, so it never breaks a build.
+## model-settings.yml (edit-format tuning) stays hand-curated on purpose — see the
+## renderer's own docstring for why.
+render-aider-config:
+	@$(BUNDLE)/bin/render_aider_metadata.py deploy/workspace/model-metadata.json "$${CATALOG_URL:-$${FREEROUTER_URL:-http://freerouter:8080}}"
