@@ -7,25 +7,36 @@ docs/design/records/freerouter-reference-router.md (C1/C3), item enterpriseaifra
 
 The one model difference from LiteLLM, and how it is bridged here:
 
-  LiteLLM has a single master key that mints aliased keys. freerouter has no admin scope
-  (`requireTenant` resolves a bearer to a *tenant*); a tenant mints *sub-keys under itself*
-  (`MintSubKey`). So the control plane is itself ONE freerouter tenant — provisioned once at
-  bootstrap via `POST /api/v1/signup`, its one-time bearer stored as FREEROUTER_MASTER_KEY
-  (the GATEWAY_MASTER_KEY analogue) — and every `<user>::<surface>` key is a sub-key minted
-  under that tenant, attributed by the sub-key's `name`. Per-user *nested* tenancy (a tenant
-  per user, item enterpriseaiframework-1da) layers on top later; this flat mapping is the
-  drop-in that retires LiteLLM's provisioning without changing the caller contract.
+  LiteLLM has a single master key that mints aliased keys, each carrying its own budget.
+  freerouter has no admin scope at all: `requireTenant` resolves a bearer to a *tenant*, and
+  every write is scoped to the CALLING tenant's own subtree. So the control plane is itself
+  ONE freerouter tenant — provisioned once at bootstrap via `POST /api/v1/signup`, its
+  one-time bearer stored as FREEROUTER_MASTER_KEY (the GATEWAY_MASTER_KEY analogue) — and
+  every `<user>::<surface>` is a nested SUB-ACCOUNT under it (item enterpriseaiframework-1da),
+  so the operator bill attributes per (user,surface) by account id.
 
-Confirmed live against freerouter (signup=open):
-  POST /api/v1/signup {display_name} -> {data:{account_id, parent_account_id, api_key}}
-  POST /api/v1/keys   {name, limit}  -> {data:{hash, name, label, limit, ...}, key}
-  GET  /api/v1/keys                  -> {data:[{hash, name, label, limit, usage, ...}]}
-  PATCH/DELETE /api/v1/keys/{hash}
+  The BUDGET then lands one level further down, and that is not a stylistic choice: a cap is
+  a per-KEY property set at mint, and `POST /api/v1/keys` is scoped to the caller. The parent
+  therefore cannot cap its child's key, so `generate_key` uses the sub-account's own one-time
+  bearer, once, in-process, to mint the capped key it hands to the surface.
+
+Confirmed live against a running freerouter binary (signup=open), including the two facts
+this module's shape depends on — the parent cannot read or set a child's cap, and the rollup
+carries only accounts that have SPENT:
+  POST   /api/v1/signup      {display_name} -> {data:{account_id, parent_account_id, api_key}}
+  POST   /api/v1/subaccounts {name}         -> {data:{account_id, api_key, name}}
+  DELETE /api/v1/subaccounts/{account_id}   -> revokes the child's keys, keeps its bill rows
+  POST   /api/v1/keys        {name, limit}  -> {data:{hash, name, label, limit, ...}, key}
+  GET    /api/v1/keys                       -> the CALLER's own keys only
+  PATCH  /api/v1/keys/{hash} {name,disabled} -- carries NO limit: a cap is fixed at mint
+  GET    /api/v1/usage/rollup               -> subtree rows, SPENT accounts only
 """
 
 from __future__ import annotations
 
+import math
 import os
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import httpx
@@ -56,35 +67,103 @@ async def _request(method: str, path: str, **kwargs) -> httpx.Response:
         return resp
 
 
+def budget_to_monthly_usd(max_budget: float | None) -> int | None:
+    """The LiteLLM budget as freerouter's per-key cap, or None for unlimited.
+
+    freerouter's only spend cap is a per-KEY MONTHLY budget in WHOLE USD, ceil()-rounded and
+    with 0 meaning unlimited (internal/core/keys.go `limitToMonthlyUSD`, verified against a
+    running binary). LiteLLM's `max_budget` is an unrounded float. The conversion is therefore
+    LOSSY IN ONE DIRECTION ONLY — 0.5 becomes 1, never 0 — so a mirrored cap is never TIGHTER
+    than the LiteLLM one and no user loses access to spend they already had. The reconcile
+    reports the rounding separately from a real mismatch so the loss is visible rather than
+    absorbed here.
+    """
+    if max_budget is None or max_budget <= 0:
+        return None
+    return math.ceil(max_budget)
+
+
 async def generate_key(
     *, username: str, surface: str, idp_user_id: str, max_budget: float | None
 ) -> dict:
-    """Mint a nested sub-ACCOUNT bound to one user and one surface (item 1da).
+    """Mint a nested sub-ACCOUNT bound to one user and one surface, plus its capped key.
 
     Each (user,surface) is its OWN sub-account under the control-plane tenant, not a sub-key,
     so the operator bill (freerouter-573 rollup) attributes per (user,surface) by AccountID.
     POST /api/v1/subaccounts {name:"<user>::<surface>"} → {data:{account_id, api_key, name}}.
 
-    Returns the caller contract gateway.generate_key satisfies: `token` = the durable handle
-    the control plane stores (here the ACCOUNT_ID), `key` = the one-time bearer handed to the
-    surface. `max_budget` is not enforced per-account in M1 — every sub-account draws on the
-    operator tab (freerouter-171); per-account caps are a later capability (ca9). `idp_user_id`
-    rides for gateway.py parity; attribution is by the sub-account label.
+    Then the BUDGET, which the sub-account alone cannot carry. freerouter has no per-account
+    cap (freerouter-171/ca9) — its one spend cap is a per-KEY monthly limit set at mint,
+    `POST /api/v1/keys {name, limit}`. That route is scoped to the CALLING tenant, so the only
+    principal that can put a cap on this user's key is the sub-account ITSELF. So the mint is
+    two calls: create the sub-account, then use its one-time bearer ONCE, in-process, to mint
+    the named, capped key that is actually handed to the surface. The sub-account's root bearer
+    is dropped on the floor and never persisted — it is not returned, not stored, and not
+    recoverable, so the control plane still holds no credential for anybody.
+
+    Returns the caller contract gateway.generate_key satisfies — `token` = the durable handle
+    the control plane stores (the ACCOUNT_ID, which is what revoke addresses), `key` = the
+    one-time bearer handed to the surface — plus, additively, `key_hash` and `limit_usd` as
+    FREEROUTER REPORTED them. limit_usd is the gateway's own answer about the cap it applied,
+    which is what makes a later budget reconcile a comparison against freerouter rather than
+    against our own request. `idp_user_id` rides for gateway.py parity; attribution is by the
+    sub-account label.
     """
-    resp = await _request(
-        "POST", "/api/v1/subaccounts", json={"name": surface_alias(username, surface)}
-    )
+    alias = surface_alias(username, surface)
+    resp = await _request("POST", "/api/v1/subaccounts", json={"name": alias})
     data = resp.json()["data"]
-    return {"token": data["account_id"], "key": data["api_key"], "data": data}
+
+    limit = budget_to_monthly_usd(max_budget)
+    body: dict = {"name": alias}
+    if limit is not None:
+        body["limit"] = limit
+    # The sub-account's own bearer, used here and nowhere else. A local client rather than
+    # `_request`, which carries the control-plane tenant's header and therefore would mint the
+    # key under the CONTROL PLANE's account — attributing every user's spend to the operator.
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        minted = await client.post(
+            f"{base_url()}/api/v1/keys",
+            headers={"Authorization": f"Bearer {data['api_key']}"},
+            json=body,
+        )
+        minted.raise_for_status()
+    key = minted.json()
+    return {
+        "token": data["account_id"],
+        "key": key["key"],
+        "key_hash": key["data"]["hash"],
+        # freerouter renders an unlimited cap as null, not 0.
+        "limit_usd": (int(key["data"]["limit"]) if key["data"].get("limit") else None),
+        "data": data,
+    }
 
 
-async def _account_ids_by_alias() -> dict[str, str]:
+# The control plane's OWN record of alias → sub-account id, installed by app/mirror.py at
+# import. It exists because of a measured hole, not a hypothetical one:
+#
+#   GET /api/v1/usage/rollup is built ONLY from recorded generation events
+#   (freerouter metering/rollup.go: it aggregates the usage ledger, then filters to the
+#   caller's subtree). A sub-account that has never spent produces no event, so it does not
+#   appear in the rollup AT ALL — confirmed against a running freerouter: mint a sub-account,
+#   read the rollup, get `{"data":[]}`.
+#
+# Every read below was derived from that rollup, so before this hook a freshly-minted key was
+# invisible to the control plane: `list_aliases` said the user had no key, and
+# `delete_by_aliases(..., missing_ok=True)` — the ROTATE path in issuance.py and the
+# disabled-in-IdP revoke in main.py — reported success while revoking nothing, leaving a live
+# key behind for a user identity had just switched off. Resolving the alias from our own
+# durable record closes that: the DB knows every sub-account we ever minted, spent or not.
+#
+# A callable rather than an import so app/freerouter.py keeps no database dependency of its
+# own (it is also driven from scripts with no pool) — unset, behaviour is exactly the old
+# rollup-only read.
+alias_resolver: Callable[[], Awaitable[dict[str, str]]] | None = None
+
+
+async def rollup_account_ids_by_alias() -> dict[str, str]:
     """alias "<user>::<surface>" → sub-account id, from the operator subtree rollup (573).
 
-    The rollup lists sub-accounts that have accrued usage. The control plane's own DB is the
-    authoritative alias→account_id map (stored at mint); this is the freerouter-side view,
-    used to resolve a revoke target by alias. A never-used sub-account has no rollup row yet —
-    the control plane revokes such by passing its stored account_id directly.
+    freerouter's side of the mirror, and SPENT-ONLY by construction — see `alias_resolver`.
     """
     resp = await _request("GET", "/api/v1/usage/rollup")
     return {
@@ -92,6 +171,19 @@ async def _account_ids_by_alias() -> dict[str, str]:
         for a in resp.json().get("data", [])
         if a.get("name") and a.get("account_id")
     }
+
+
+async def _account_ids_by_alias() -> dict[str, str]:
+    """alias → sub-account id: our durable record, widened by freerouter's own rollup.
+
+    The rollup goes second so freerouter wins any disagreement about an account it can see,
+    while an account it cannot see yet (zero usage) is still resolvable from our record.
+    """
+    known: dict[str, str] = {}
+    if alias_resolver is not None:
+        known.update(await alias_resolver())
+    known.update(await rollup_account_ids_by_alias())
+    return known
 
 
 async def delete_by_aliases(aliases: list[str], *, missing_ok: bool = False) -> dict:
@@ -117,13 +209,19 @@ async def delete_by_aliases(aliases: list[str], *, missing_ok: bool = False) -> 
 
 
 async def update_budget(token_hash: str, max_budget: float) -> dict:
-    """Per-account budget is not an M1 feature: every sub-account draws on the operator tab
-    (freerouter-171), and there is no per-account cap endpoint yet (ca9). Fail loudly rather
-    than silently pretend a per-user budget was applied."""
+    """A budget can be SET at mint (see generate_key) but never CHANGED afterwards.
+
+    freerouter's per-key cap is fixed at `POST /api/v1/keys` time: `PATCH /api/v1/keys/{hash}`
+    accepts only `name` and `disabled` (internal/core/keys.go PatchKeyRequest — verified
+    against a running binary), and there is no per-ACCOUNT cap at all (freerouter-171/ca9).
+    The only way to change a user's cap on this backend is to rotate the key, which
+    issuance.issue already does end-to-end. Fail loudly rather than silently pretend
+    `/admin/budget` applied a new cap that the gateway will never enforce.
+    """
     raise NotImplementedError(
-        "per-(user,surface) budget is not supported on the freerouter path yet — M1 uses the "
-        "operator tab (freerouter-171); per-account caps are pending (ca9). See "
-        "enterpriseaiframework-1da"
+        "freerouter caps are fixed at mint: PATCH /api/v1/keys/{hash} carries no limit and "
+        "there is no per-account cap (freerouter-171/ca9). Rotate the key (issuance.issue) to "
+        "change a budget. See enterpriseaiframework-1da / -1f8"
     )
 
 
