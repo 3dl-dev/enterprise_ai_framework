@@ -41,9 +41,16 @@ class FakeFreerouter:
         # because freerouter's is derived from recorded generations — an account that has
         # never spent is simply not in the rollup. `spend()` is how a test opts one in.
         self._spent: set[str] = set()
+        # Accounts whose keys have been revoked. They keep their bill rows (and therefore
+        # their rollup presence) exactly as freerouter's revoke does.
+        self._revoked: set[str] = set()
 
     def spend(self, account_id: str) -> None:
         self._spent.add(account_id)
+
+    def live_keys(self, account_id: str) -> list[dict]:
+        """The keys under an account that can still authenticate."""
+        return [k for k in self._keys.get(account_id, []) if not k["disabled"]]
 
     def _caller(self, request: httpx.Request) -> str | None:
         bearer = request.headers.get("authorization", "").removeprefix("Bearer ")
@@ -102,8 +109,16 @@ class FakeFreerouter:
             acct = path.rsplit("/", 1)[-1]
             if acct not in self._accts:
                 return httpx.Response(404, json={"error": "not a descendant"})
-            del self._accts[acct]
-            self._spent.discard(acct)
+            # Faithful to internal/core/subaccounts.go handleRevokeSubAccount: the revoke
+            # kills the KEYS and LEAVES THE BILL. The account row survives, its recorded
+            # spend survives, and it therefore goes on appearing in the rollup — which is
+            # exactly why a rotated alias can be reported by two account ids and why
+            # `_account_ids_by_alias` must let our own record win. An earlier version of this
+            # double deleted the account outright, which made a retired account vanish and
+            # would have hidden that whole class of defect.
+            for key in self._keys.get(acct, []):
+                key["disabled"] = True
+            self._revoked.add(acct)
             return httpx.Response(200, json={"data": {"account_id": acct, "revoked": True}})
         return httpx.Response(500, json={"error": f"unhandled {request.method} {path}"})
 
@@ -192,11 +207,23 @@ def test_an_unspent_subaccount_is_invisible_to_the_rollup(fake):
 
 
 def test_delete_by_alias_revokes_the_subaccount(fake):
+    """The outcome that matters is that the KEYS die, not that the row disappears.
+
+    freerouter's revoke deliberately leaves the account and its bill in place (that claim is
+    settled against the real binary in test_freerouter_mirror.py), so "the alias is gone from
+    the rollup" was never the right assertion — it only passed because the double used to
+    delete the account outright.
+    """
     created = run(fr.generate_key(username="bob", surface="chat", idp_user_id="x", max_budget=None))
     fake.spend(created["token"])
+    assert fake.live_keys(created["token"]) != []
+
     res = run(fr.delete_by_aliases(["bob::chat"]))
+
     assert res["deleted_keys"] == ["bob::chat"]
-    assert run(fr.list_aliases(prefix="bob::")) == []
+    assert fake.live_keys(created["token"]) == []  # nothing under it can authenticate
+    # ...and the bill survives, which is why the alias is still visible in the rollup.
+    assert run(fr.list_aliases(prefix="bob::")) == ["bob::chat"]
 
 
 def test_delete_missing_ok_is_not_an_error(fake):
@@ -208,11 +235,95 @@ def test_delete_missing_without_ok_raises(fake):
         run(fr.delete_by_aliases(["nope::x"]))
 
 
-def test_update_budget_is_unsupported_and_fails_loudly(fake):
-    # A cap is fixed at mint: PATCH /api/v1/keys/{hash} carries no limit. Never silently
-    # no-op — /admin/budget must not report success for a cap nothing will enforce.
-    with pytest.raises(NotImplementedError):
-        run(fr.update_budget("tenant-whatever-0001", 50.0))
+def _resolver(mapping: dict[str, str]):
+    async def resolve():
+        return dict(mapping)
+
+    return resolve
+
+
+def test_update_budget_mints_a_replacement_at_the_new_cap(fake, monkeypatch):
+    """A cap is fixed at mint, so changing one means a new sub-account under the same alias.
+
+    The end state the caller is promised: a key that freerouter itself says is capped at the
+    NEW number, wearing the SAME alias, under a DIFFERENT account id.
+    """
+    created = run(fr.generate_key(username="bob", surface="chat", idp_user_id="x", max_budget=25.0))
+    monkeypatch.setattr(fr, "alias_resolver", _resolver({"bob::chat": created["token"]}))
+
+    rotated = run(fr.update_budget(created["token"], 60.0))
+
+    assert rotated["rotated"] is True
+    assert rotated["key_alias"] == "bob::chat"
+    assert rotated["retire_token"] == created["token"]
+    assert rotated["token"] != created["token"]
+    # freerouter's own answer about the cap it applied, not our request echoed back.
+    assert rotated["limit_usd"] == 60
+    assert [k["limit"] for k in fake.live_keys(rotated["token"])] == [60.0]
+    assert fake._accts[rotated["token"]]["name"] == "bob::chat"
+
+
+def test_update_budget_does_not_take_the_users_key_away(fake, monkeypatch):
+    """The mint must not revoke. The caller writes the new handle to the ledger FIRST and
+    retires the old one after, so a failure in between cannot leave the user with no key."""
+    created = run(fr.generate_key(username="bob", surface="chat", idp_user_id="x", max_budget=25.0))
+    monkeypatch.setattr(fr, "alias_resolver", _resolver({"bob::chat": created["token"]}))
+
+    rotated = run(fr.update_budget(created["token"], 60.0))
+    assert fake.live_keys(created["token"]) != []  # still spendable at the old cap
+
+    run(fr.revoke_token(rotated["retire_token"]))
+    assert fake.live_keys(created["token"]) == []
+    assert fake.live_keys(rotated["token"]) != []  # ...and the replacement is untouched
+
+
+def test_a_rotated_alias_still_resolves_to_the_live_account(fake, monkeypatch):
+    """The defect the resolver ordering exists for, both ways.
+
+    Fault injected through the DATA the read actually consumes: the retired account has SPENT,
+    so freerouter's rollup reports it under the alias forever (its revoke keeps the bill). If
+    the rollup were allowed to win, the alias would resolve to the DEAD account and
+    `delete_by_aliases` would report success having revoked nothing.
+    """
+    created = run(fr.generate_key(username="bob", surface="chat", idp_user_id="x", max_budget=25.0))
+    fake.spend(created["token"])  # it has a bill, so the revoke below leaves it in the rollup
+    monkeypatch.setattr(fr, "alias_resolver", _resolver({"bob::chat": created["token"]}))
+    rotated = run(fr.update_budget(created["token"], 60.0))
+    run(fr.revoke_token(rotated["retire_token"]))
+    # The replacement has not spent yet — the ordinary state seconds after a budget change —
+    # so the ONLY account freerouter reports under this alias is the RETIRED one.
+    monkeypatch.setattr(fr, "alias_resolver", _resolver({"bob::chat": rotated["token"]}))
+
+    assert run(fr.rollup_accounts_by_alias())["bob::chat"] == [created["token"]]
+
+    # Fixed: our own record names the live account and the rollup does not get to override it.
+    assert run(fr._account_ids_by_alias())["bob::chat"] == rotated["token"]
+    # ...so the revoke lands on the key the user is actually holding, and not on a dead one.
+    run(fr.delete_by_aliases(["bob::chat"]))
+    assert fake.live_keys(rotated["token"]) == []
+
+
+def test_update_budget_refuses_a_zero_cap_instead_of_minting_an_unlimited_key(fake, monkeypatch):
+    """freerouter reads limit<=0 as UNLIMITED, so a zero budget must not be minted at all.
+
+    Applying it would hand the user the most permissive key in the system at the exact moment
+    an operator tried to stop them spending.
+    """
+    created = run(fr.generate_key(username="bob", surface="chat", idp_user_id="x", max_budget=25.0))
+    monkeypatch.setattr(fr, "alias_resolver", _resolver({"bob::chat": created["token"]}))
+
+    with pytest.raises(fr.BudgetNotExpressible):
+        run(fr.update_budget(created["token"], 0))
+
+    assert len(fake._accts) == 1  # nothing minted
+    assert [k["limit"] for k in fake.live_keys(created["token"])] == [25.0]
+
+
+def test_update_budget_on_an_unrecorded_handle_names_the_problem(fake):
+    """A handle the control plane cannot map to an alias — a ledger row still carrying the
+    LiteLLM hash, say — must be a named error, not a mint under a guessed alias."""
+    with pytest.raises(KeyError):
+        run(fr.update_budget("litellm-hash-bob-chat", 50.0))
 
 
 def test_budget_to_monthly_usd_matches_freerouters_own_conversion(fake):
