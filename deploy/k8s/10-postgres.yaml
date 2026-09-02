@@ -14,7 +14,7 @@ data:
   init-databases.sh: |
     #!/bin/bash
     set -euo pipefail
-    for db in identity gateway controlplane; do
+    for db in identity gateway controlplane freerouter; do
         echo "creating database: $db"
         psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<-EOSQL
             SELECT 'CREATE DATABASE "$db"'

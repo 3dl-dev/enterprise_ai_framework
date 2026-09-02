@@ -19,7 +19,7 @@ services:
     environment:
       <<: *pg-env
       POSTGRES_DB: postgres
-      POSTGRES_MULTIPLE_DATABASES: identity,gateway,controlplane
+      POSTGRES_MULTIPLE_DATABASES: identity,gateway,controlplane,freerouter
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
@@ -144,6 +144,38 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # freerouter — the inference spoke (docs/design/records/freerouter-reference-router.md).
+  # Bundled + self-hosted, air-gap DEFAULT: personal-gateway profile, its own meter in the
+  # welded postgres, NO provider keys and NO router.3dl.one peer here (those are 3DL-overlay
+  # config only — guardrail enterpriseaiframework-bd6). During the transition it runs ALONGSIDE
+  # the LiteLLM gateway; retiring LiteLLM (enterpriseaiframework-f24) is gated on freerouter
+  # gaining native Anthropic inbound (freerouter-887). Empty catalog until EAF's providers are
+  # onboarded (enterpriseaiframework-8e0) — it comes up healthy and serves {"data":[]}.
+  #
+  # No compose healthcheck: the runtime is distroless (no shell/wget). Health is GET /healthz;
+  # the k8s manifest uses an httpGet probe (deploy/k8s, enterpriseaiframework-f09).
+  #
+  # Interim image source: built from the sibling OSS checkout. Distribution swaps this for
+  # image: <registry>/freerouter:<tag> so recipients need no freerouter source tree.
+  freerouter:
+    build: ../../freerouter
+    environment:
+      FREEROUTER_PROFILE: personal-gateway
+      FREEROUTER_METER_BACKEND: postgres
+      FREEROUTER_METER_DSN: postgresql://${POSTGRES_USER:-eai}:${POSTGRES_PASSWORD}@postgres:5432/freerouter
+      FREEROUTER_LISTEN_ADDR: ":8080"
+      # Signup is how the control plane provisions its operator tenant + per-user tenants —
+      # freerouter has no admin key, a tenant bearer mints under itself (item 757). A fresh
+      # tenant has zero balance and cannot buy inference until the operator funds it, so an
+      # open signup route on this in-cluster/NodePort spoke does not itself grant spend.
+      FREEROUTER_SIGNUP: open
+    ports:
+      - "${FREEROUTER_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   control-plane:
     build: ../control-plane
     environment:
@@ -151,6 +183,17 @@ services:
       GATEWAY_DATABASE_URL: postgresql://${POSTGRES_USER:-eai}:${POSTGRES_PASSWORD}@postgres:5432/gateway
       GATEWAY_URL: http://gateway:4000
       GATEWAY_MASTER_KEY: ${GATEWAY_MASTER_KEY}
+      # The inference spoke (item 757). GATEWAY_PROVIDER selects which backend the control
+      # plane provisions against; defaults to litellm through the transition, flips to
+      # freerouter once the spoke is the gateway. FREEROUTER_MASTER_KEY is the control
+      # plane's own tenant bearer, bootstrapped via a one-time signup (empty until then).
+      GATEWAY_PROVIDER: ${GATEWAY_PROVIDER:-litellm}
+      FREEROUTER_URL: http://freerouter:8080
+      FREEROUTER_MASTER_KEY: ${FREEROUTER_MASTER_KEY:-}
+      # Where the bootstrapped operator-tenant bearer is persisted so a restart reuses it
+      # rather than stranding a second empty tenant (item 757). On the durable cpstate
+      # volume below. Only written when GATEWAY_PROVIDER=freerouter.
+      FREEROUTER_MASTER_KEY_FILE: /var/lib/enterprise-ai/freerouter/operator.key
       IDP_URL: http://identity:8080
       IDP_REALM: ${IDP_REALM:-enterprise-ai}
       IDP_CLIENT_ID: control-plane
@@ -170,6 +213,11 @@ services:
       # exist here to be tested against. Empty is still the safe default everywhere else:
       # a deployment that names nobody gets no console.
       PORTAL_ADMINS: ${PORTAL_ADMINS:-${BOOTSTRAP_USER:-baron}}
+    volumes:
+      # Durable control-plane state: the persisted freerouter operator-tenant bearer
+      # (FREEROUTER_MASTER_KEY_FILE) must survive restarts, else a re-signup strands a
+      # second empty tenant (item 757).
+      - cpstate:/var/lib/enterprise-ai/freerouter
     ports:
       - "${CONTROL_PLANE_PORT:-8081}:8000"
     depends_on:
@@ -940,3 +988,4 @@ volumes:
   codeapiredisdata:
   codeapiminiodata:
   codeapipkgs:
+  cpstate:

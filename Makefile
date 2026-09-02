@@ -114,3 +114,9 @@ test-workspace:
 ## DOM. Mints and deletes its own account against the cluster's identity provider.
 test-first-conversation:
 	@.venv-test/bin/pytest tests-live/test_first_conversation.py -v --tb=short -p no:cacheprovider
+
+## Render the coding surface's (opencode) model list from the router catalog. Run before the
+## workspace image is rebuilt (item enterpriseaiframework-75c). Degrades to the baked models
+## if the router is unreachable, so it never breaks a build.
+render-workspace-config:
+	@$(BUNDLE)/bin/render_opencode_config.py deploy/workspace/opencode.json "$${CATALOG_URL:-$${FREEROUTER_URL:-http://freerouter:8080}}"

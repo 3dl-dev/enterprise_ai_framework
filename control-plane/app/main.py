@@ -11,7 +11,7 @@ may, how much, and records what was decided.
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -22,11 +22,14 @@ from . import (
     chat_identity,
     db,
     export,
+    freerouter,
     gateway,
     identity,
     issuance,
     metering,
+    metering_select,
     portal,
+    provisioning,
     workshop,
 )
 from .analytics import collector as analytics_collector
@@ -49,10 +52,42 @@ def require_admin(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> str:
     return "admin"
 
 
+# An OPTIONAL bearer: a browser operator acting through the console carries no token, only
+# the proxy's identity headers, so require_operator must not 403 on a missing Authorization.
+_optional_bearer = HTTPBearer(auto_error=False)
+
+
+def require_operator(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_optional_bearer),
+) -> str:
+    """Authorize an operator WRITE action (item c44).
+
+    Two ways in, both authorising the same actions: the shared admin token (CLI /
+    break-glass — unchanged), OR a Keycloak operator ROLE delivered through the
+    authenticating proxy (a signed-in operator ACTING in the console). This reverses the
+    old token-only posture — operators can now act, not just view — while a plain signed-in
+    user still cannot (no operator role → 403). The nuclear actions (exit/revoke-all) stay
+    require_admin: too destructive for a browser click.
+    """
+    token = os.environ.get("CONTROL_PLANE_ADMIN_TOKEN")
+    if creds is not None and token and creds.credentials == token:
+        return "admin-token"
+    if portal.roles(request) & portal.ADMIN_ROLES:
+        return portal.require_user(request)  # the operator's username, for the audit trail
+    raise HTTPException(403, "operator role or admin token required")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init()
     await db.audit("system", "control_plane.start")
+    # When provisioning against the freerouter spoke, the control plane is itself a
+    # freerouter tenant (freerouter has no admin key). Bootstrap that tenant once and
+    # persist its bearer, so a restart reuses it rather than stranding a new empty tenant.
+    # No-op for the LiteLLM default. (item enterpriseaiframework-757)
+    if provisioning.backend() is freerouter:
+        await freerouter.bootstrap_master_key()
     # The resident-usage collector (enterpriseaiframework-914). A timer, not a request
     # hook: resident time is measured by sampling a pod that exists, and nobody opens the
     # page while an agent runs overnight. It is a no-op where there is no cluster
@@ -99,8 +134,8 @@ async def health():
 async def ready():
     checks = {
         "identity": await identity.health(),
-        "gateway": await gateway.health(),
-        "ledger": await metering.ledger_ready(),
+        "gateway": await provisioning.health(),
+        "ledger": await metering_select.ledger_ready(),
     }
     return {"ready": all(checks.values()), "checks": checks}
 
@@ -114,7 +149,7 @@ class SyncResult(BaseModel):
     details: list[dict] = Field(default_factory=list)
 
 
-@app.post("/admin/sync", response_model=SyncResult, dependencies=[Depends(require_admin)])
+@app.post("/admin/sync", response_model=SyncResult, dependencies=[Depends(require_operator)])
 async def sync(default_budget: float | None = Query(default=None)):
     """Reconcile identity → virtual keys.
 
@@ -135,7 +170,7 @@ async def sync(default_budget: float | None = Query(default=None)):
             "SELECT key_alias FROM virtual_key WHERE status = 'active' AND gateway_token_hash IS NULL"
         )
         if unknown:
-            mapping = await gateway.token_hashes_by_alias()
+            mapping = await provisioning.token_hashes_by_alias()
             for r in unknown:
                 token = mapping.get(r["key_alias"])
                 if token:
@@ -169,7 +204,7 @@ async def sync(default_budget: float | None = Query(default=None)):
                     principal_id,
                 )
                 if stale:
-                    await gateway.delete_by_aliases([r["key_alias"] for r in stale])
+                    await provisioning.delete_by_aliases([r["key_alias"] for r in stale])
                     await conn.execute(
                         "UPDATE virtual_key SET status = 'revoked', revoked_at = now() "
                         "WHERE principal_id = $1 AND status = 'active'",
@@ -191,7 +226,7 @@ async def sync(default_budget: float | None = Query(default=None)):
                 )
                 if existing:
                     continue
-                created = await gateway.generate_key(
+                created = await provisioning.generate_key(
                     username=u["username"],
                     surface=surface,
                     idp_user_id=u["idp_user_id"],
@@ -265,7 +300,7 @@ class IssuedKey(BaseModel):
 
 
 @app.post("/admin/keys/issue", response_model=IssuedKey,
-          dependencies=[Depends(require_admin)])
+          dependencies=[Depends(require_operator)])
 async def issue_key(req: IssueKeyRequest):
     """Mint a surface key and hand back the raw value exactly once.
 
@@ -287,7 +322,7 @@ class BudgetRequest(BaseModel):
     max_budget: float
 
 
-@app.post("/admin/budget", dependencies=[Depends(require_admin)])
+@app.post("/admin/budget", dependencies=[Depends(require_operator)])
 async def set_budget(req: BudgetRequest):
     """Set a hard budget. Past it the gateway refuses, it does not merely record."""
     if req.surface and not gateway.is_known_surface(req.surface):
@@ -316,7 +351,7 @@ async def set_budget(req: BudgetRequest):
                 raise HTTPException(404, "no active keys for that user/surface")
             for r in rows:
                 if r["gateway_token_hash"]:
-                    await gateway.update_budget(r["gateway_token_hash"], req.max_budget)
+                    await provisioning.update_budget(r["gateway_token_hash"], req.max_budget)
             await conn.execute(
                 f"""
                 UPDATE virtual_key k SET max_budget = ${len(args) + 1}
@@ -348,8 +383,8 @@ async def spend(since: str | None = None):
     an ObjectId where a name belongs, is worse than one that is obviously broken — so the
     caveat travels with the number rather than living on a page nobody opens.
     """
-    rows = await metering.spend_by_user_and_surface(since)
-    unpriced = await metering.unpriced_models(since)
+    rows = await metering_select.spend_by_user_and_surface(since)
+    unpriced = await metering_select.unpriced_models(since)
     warnings = []
     if unpriced:
         warnings.append({
@@ -375,7 +410,7 @@ async def spend(since: str | None = None):
         })
     return {
         "since": since,
-        "totals": await metering.totals(since),
+        "totals": await metering_select.totals(since),
         "by_user_and_surface": rows,
         "warnings": warnings,
     }
@@ -426,7 +461,7 @@ async def agent_usage_view(username: str | None = None):
     }
 
 
-@app.post("/admin/agents/usage/collect", dependencies=[Depends(require_admin)])
+@app.post("/admin/agents/usage/collect", dependencies=[Depends(require_operator)])
 async def agent_usage_collect():
     """Force one sample. Idempotent in the sense that matters: it can only add elapsed time.
 
@@ -440,7 +475,7 @@ async def agent_usage_collect():
 @app.get("/admin/unpriced", dependencies=[Depends(require_admin)])
 async def unpriced(since: str | None = None):
     """Models consuming tokens at zero recorded cost. Should always be empty."""
-    rows = await metering.unpriced_models(since)
+    rows = await metering_select.unpriced_models(since)
     return {"ok": not rows, "models": rows}
 
 
@@ -510,11 +545,11 @@ async def revoke_all():
 
     # Revoke what the gateway holds too, not only what we recorded — anything minted out
     # of band (the chat surface key is, deliberately) would otherwise survive the exit.
-    gateway_aliases = await gateway.list_aliases()
+    gateway_aliases = await provisioning.list_aliases()
     all_aliases = sorted(set(aliases) | set(gateway_aliases))
 
     if all_aliases:
-        await gateway.delete_by_aliases(all_aliases)
+        await provisioning.delete_by_aliases(all_aliases)
         async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE virtual_key SET status = 'revoked', revoked_at = now() "

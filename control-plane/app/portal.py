@@ -35,7 +35,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
-from . import agent_usage, agents, chat_identity, db, gateway, issuance, metering
+from . import agent_usage, agents, chat_identity, db, gateway, issuance, metering, metering_select, provisioning
 from .analytics import report as analytics_report
 
 router = APIRouter()
@@ -140,13 +140,38 @@ async def portal_static(request: Request, name: str, user: str = Depends(require
 # the safe direction to fail.
 ADMINS = {a.strip() for a in os.environ.get("PORTAL_ADMINS", "").split(",") if a.strip()}
 
+# RBAC: operator access is granted by a Keycloak realm ROLE, not a hand-maintained username
+# list. The authenticating proxy passes the token's roles/groups (oauth2-proxy --pass-groups)
+# as a groups header, honoured under the SAME loopback trust boundary as the username. The
+# PORTAL_ADMINS allowlist stays a TRANSITION fallback so a deployment whose proxy does not yet
+# pass groups (or whose realm has no operator role assigned) keeps working — both paths grant
+# the same read-only console. Once every deployment passes roles, the allowlist is retired.
+ADMIN_ROLES = {
+    r.strip().lstrip("/")
+    for r in os.environ.get("PORTAL_ADMIN_ROLES", "operator,admin").split(",")
+    if r.strip()
+}
+
+
+def roles(request: Request) -> set[str]:
+    """Realm roles/groups the proxy asserts for the caller (empty off the trusted proxy)."""
+    client = request.client.host if request.client else ""
+    if client not in ("127.0.0.1", "::1"):
+        return set()
+    raw = (
+        request.headers.get("x-auth-request-groups")
+        or request.headers.get("x-forwarded-groups")
+        or ""
+    )
+    return {g.strip().lstrip("/") for g in raw.split(",") if g.strip()}
+
 
 def require_admin_user(request: Request, user: str = Depends(require_user)) -> str:
-    if user not in ADMINS:
-        # 404 rather than 403: a non-operator has no business learning that an operator
-        # console exists at this path.
-        raise HTTPException(404, "not found")
-    return user
+    if (roles(request) & ADMIN_ROLES) or (user in ADMINS):
+        return user
+    # 404 rather than 403: a non-operator has no business learning that an operator
+    # console exists at this path.
+    raise HTTPException(404, "not found")
 
 
 # ---------------------------------------------------------------- behavioural analytics
@@ -270,7 +295,7 @@ async def _spend_by_surface(user: str, since: str | None) -> tuple[dict, dict]:
     there — the principal is named by `chat_identity.attribute` AFTER the database has
     answered, so filtering in SQL would silently drop the caller's own chat rows.
     """
-    rows = await metering.spend_by_user_and_surface(since)
+    rows = await metering_select.spend_by_user_and_surface(since)
     mine: dict[str, dict] = {}
     total = {"requests": 0, "spend": 0.0, "prompt_tokens": 0, "completion_tokens": 0}
     for r in rows:
@@ -344,7 +369,7 @@ async def _agent_usage_beside_spend(user: str, by_surface: dict) -> tuple[list[d
 @router.get("/portal/api/keys")
 async def my_keys(user: str = Depends(require_user)):
     """The caller's own virtual keys. Never the secret — only what it is and what it may spend."""
-    keys = await gateway.list_keys()
+    keys = await provisioning.list_keys()
     out = []
     for k in keys:
         alias = k.get("key_alias") or ""
@@ -577,7 +602,7 @@ async def admin_overview(since: str | None = None,
     them a second time, because a second copy of that step is precisely what let this view
     show names while `/admin/spend` showed hex (finding 34).
     """
-    rows = await metering.spend_by_user_and_surface(since)
+    rows = await metering_select.spend_by_user_and_surface(since)
     people: dict[str, dict] = {}
     for r in rows:
         who = r.get("username") or chat_identity.UNATTRIBUTED
@@ -592,7 +617,7 @@ async def admin_overview(since: str | None = None,
         s["requests"] += r.get("requests") or 0
         s["spend"] += r.get("spend") or 0.0
 
-    keys = await gateway.list_keys()
+    keys = await provisioning.list_keys()
     budgets: dict[str, dict] = {}
     for k in keys:
         alias = k.get("key_alias") or ""
@@ -618,7 +643,7 @@ async def admin_overview(since: str | None = None,
             {"surface": s, **v} for s, v in sorted(person["surfaces"].items())
         ]
 
-    unpriced = await metering.unpriced_models(since)
+    unpriced = await metering_select.unpriced_models(since)
     # The resident dimension for everybody, beside the inference dimension for everybody.
     # A separate key rather than a field folded into `people`, for the same reason
     # `by_agent` is a sibling of `by_surface` above: `people[*].spend` means inference
@@ -630,7 +655,7 @@ async def admin_overview(since: str | None = None,
         agent_usage_rows, agent_usage_error = [], f"{type(exc).__name__}: {exc}"
     return {
         "since": since,
-        "totals": await metering.totals(since),
+        "totals": await metering_select.totals(since),
         "people": sorted(people.values(), key=lambda p: -p["spend"]),
         # Usage quantities per agent — hours, CPU-core-hours, MB. No dollars: Baron's
         # ruling is that owned compute is metered, not priced (enterpriseaiframework-914).

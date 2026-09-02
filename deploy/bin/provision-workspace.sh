@@ -185,6 +185,7 @@ sync_workspace_memory "$NS" "workspace-memory-${USER_NAME}" "$USER_NAME" \
 sed -e "s|__USER__|${USER_NAME}|g" \
     -e "s|__IMAGE__|${IMAGE}|g" \
     -e "s|__MODEL__|${MODEL}|g" \
+    -e "s|__GATEWAY_BASE__|${GATEWAY_SURFACE_BASE:-http://gateway:4000}|g" \
     -e "s|__KEYSUM__|${KEYSUM}|g" \
     -e "s|__PUBLISH_URL__|${PUBLISH_URL}|g" \
     deploy/k8s/61-workspace.template.yaml | kubectl apply -f - >/dev/null

@@ -55,6 +55,16 @@ kubectl -n "$NS" create secret generic enterprise-ai-secrets \
     --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
     --from-literal=CONTROL_PLANE_DATABASE_URL="postgresql://${PGUSER}:${POSTGRES_PASSWORD}@postgres:5432/controlplane" \
     --from-literal=GATEWAY_DATABASE_URL="postgresql://${PGUSER}:${POSTGRES_PASSWORD}@postgres:5432/gateway" \
+    --from-literal=FREEROUTER_METER_DSN="postgresql://${PGUSER}:${POSTGRES_PASSWORD}@postgres:5432/freerouter" \
+    --from-literal=GATEWAY_PROVIDER="${GATEWAY_PROVIDER:-}" \
+    --from-literal=FREEROUTER_MASTER_KEY="${FREEROUTER_MASTER_KEY:-}" \
+    --from-literal=FREEROUTER_OPERATOR_TAB_MICRO="${FREEROUTER_OPERATOR_TAB_MICRO:-}" \
+    --from-literal=FREEROUTER_PEER_SERVE="${FREEROUTER_PEER_SERVE:-}" \
+    --from-literal=FREEROUTER_PEER_TESTNET="${FREEROUTER_PEER_TESTNET:-}" \
+    --from-literal=FREEROUTER_PEER_SETTLEMENT_CHAIN_ID="${FREEROUTER_PEER_SETTLEMENT_CHAIN_ID:-}" \
+    --from-literal=FREEROUTER_PEER_ALLOWLIST="${FREEROUTER_PEER_ALLOWLIST:-}" \
+    --from-literal=FREEROUTER_PEER_UPSTREAMS="${FREEROUTER_PEER_UPSTREAMS:-}" \
+    --from-literal=FREEROUTER_PEER_RELAY_URL="${FREEROUTER_PEER_RELAY_URL:-}" \
     --from-literal=GATEWAY_MASTER_KEY="$GATEWAY_MASTER_KEY" \
     --from-literal=GATEWAY_SALT_KEY="$GATEWAY_SALT_KEY" \
     --from-literal=CONTROL_PLANE_ADMIN_TOKEN="$CONTROL_PLANE_ADMIN_TOKEN" \
