@@ -40,26 +40,58 @@ import argparse
 import asyncio
 import json
 
-from . import db, freerouter, gateway, provisioning
+from . import chat_identity, db, freerouter, gateway, provisioning
 
 
 # ---------------------------------------------------------------- the alias -> account map
 
 
 async def recorded_account_ids() -> dict[str, str]:
-    """alias -> freerouter sub-account id, from our own durable mirror record.
+    """alias -> freerouter sub-account id, from our own durable records.
 
     Installed into app/freerouter as its `alias_resolver` by `install_alias_resolver` so that
     revoke and alias listing stop depending on a sub-account having already spent money.
 
-    It does NOT swallow a missing table. If the mirror record cannot be read, the honest
-    outcome is a loud failure — falling back to the rollup would silently restore the exact
-    behaviour this exists to remove, and it would do so on the revoke path.
+    `freerouter_mirror` (written only by `mirror()`, for keys carried over from a live LiteLLM
+    key before the flip) is the general case. One alias gets a second source on top of it: the
+    chat surface's own shared key (chat_identity.SHARED_SURFACE_PRINCIPAL, alias
+    "chat-surface::chat", enterpriseaiframework-e6b). That key is not a person's — LibreChat
+    holds it, not a user — so `issuance.issue` mints and rotates it DIRECTLY against
+    `provisioning.backend()` rather than through `mirror()`, and a key that has never spent
+    AND was never mirrored resolves to nothing through either of `_account_ids_by_alias`'s
+    other sources: not the rollup (no spend yet), not `freerouter_mirror` (never mirrored).
+    Proven against a running freerouter binary before this fix — `delete_by_aliases(...,
+    missing_ok=True)` reported success having deleted nothing, and a rotate minted a SECOND
+    live sub-account while the pre-rotation one kept authenticating
+    (control-plane/tests/test_freerouter_mirror.py
+    ::test_rotating_the_shared_chat_key_remaps_it_in_place_without_touching_the_idp).
+
+    `virtual_key.gateway_token_hash` IS the sub-account id for a freerouter-native mint (see
+    `freerouter.generate_key`'s `token` field) — but ONLY for that one alias is it safe to read
+    it that way here: for every other alias the column may still hold a LiteLLM token hash
+    (pre-flip, or simply never mirrored), and treating that as a freerouter account id would
+    turn a clean "nothing to revoke" into a DELETE against a nonexistent sub-account. Scoping
+    the fallback to the one alias this item owns keeps every other alias's resolution exactly
+    as it was.
+
+    It does NOT swallow a missing table. If either record cannot be read, the honest outcome
+    is a loud failure — falling back to the rollup would silently restore the exact behaviour
+    this exists to remove, and it would do so on the revoke path.
     """
+    shared_alias = gateway.surface_alias(chat_identity.SHARED_SURFACE_PRINCIPAL, "chat")
     pool = await db.pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT key_alias, account_id FROM freerouter_mirror")
-    return {r["key_alias"]: r["account_id"] for r in rows}
+        shared_row = await conn.fetchrow(
+            "SELECT gateway_token_hash FROM virtual_key "
+            "WHERE key_alias = $1 AND status = 'active' AND gateway_token_hash IS NOT NULL",
+            shared_alias,
+        )
+        mirror_rows = await conn.fetch("SELECT key_alias, account_id FROM freerouter_mirror")
+    known: dict[str, str] = {}
+    if shared_row is not None:
+        known[shared_alias] = shared_row["gateway_token_hash"]
+    known.update({r["key_alias"]: r["account_id"] for r in mirror_rows})
+    return known
 
 
 def install_alias_resolver() -> None:

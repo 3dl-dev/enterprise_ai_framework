@@ -85,7 +85,7 @@ if asyncpg is None:
     pytest.skip("asyncpg is not installed; the mirror is a Postgres feature",
                 allow_module_level=True)
 
-from app import db, freerouter, gateway, mirror, provisioning  # noqa: E402
+from app import chat_identity, db, freerouter, gateway, issuance, mirror, provisioning  # noqa: E402
 
 FR_BINARY = Path(os.environ.get("FREEROUTER_BINARY", "/tmp/fr-enterpriseaiframework-1f8"))
 FR_SOURCE = Path(os.environ.get("FREEROUTER_SOURCE", "/home/baron/projects/freerouter"))
@@ -470,6 +470,107 @@ def test_mirror_never_touches_the_live_litellm_key_set(world):
     run(mirror.mirror())
     after = run(_virtual_keys(world["dsn"]))
     assert before == after
+
+
+# --------------------------------- the chat surface's shared key (enterpriseaiframework-e6b)
+#
+# LibreChat holds ONE key for every user (chat_identity.py): "chat-surface::chat". Both
+# operator scripts that have ever minted it (bundle/bin/provision-chat-key.sh,
+# deploy/bin/post-deploy.sh) talk straight to the gateway, bypassing issuance.issue —
+# because "chat-surface" is not a real IdP identity and issuance._resolve_principal used to
+# 404 on it. That left the key with no virtual_key row, which is exactly the row
+# SOURCE_SQL above reads: the shared key was invisible to the mirror, so the cutover would
+# have flipped GATEWAY_PROVIDER while LibreChat's stored credential still pointed at a
+# LiteLLM key nobody had mirrored to freerouter. These tests prove the fix end to end
+# against the real freerouter binary and postgres `world` already wires: issuance.issue can
+# now mint/rotate the shared key, the mint lands through provisioning.backend() (so it
+# already targets freerouter under GATEWAY_PROVIDER=freerouter, exactly as the flip needs),
+# and the mirror — unmodified — now includes it.
+
+
+def test_issuing_the_shared_chat_key_never_reaches_the_idp(world, monkeypatch):
+    """chat-surface is not a person; resolving its principal must not call identity.get_user."""
+
+    async def explode(username):
+        raise AssertionError(f"identity.get_user reached for the shared surface: {username}")
+
+    monkeypatch.setattr(issuance.identity, "get_user", explode)
+
+    result = run(issuance.issue(
+        chat_identity.SHARED_SURFACE_PRINCIPAL, "chat", actor="operator",
+    ))
+
+    assert result["key_alias"] == "chat-surface::chat"
+    assert result["key"]  # a real freerouter bearer, minted through provisioning.backend()
+
+
+def test_the_shared_chat_key_is_now_a_real_virtual_key_row(world):
+    run(issuance.issue(chat_identity.SHARED_SURFACE_PRINCIPAL, "chat", actor="operator"))
+
+    rows = run(_virtual_keys(world["dsn"]))
+    aliases = {r[0]: r for r in rows}
+    assert "chat-surface::chat" in aliases, (
+        "the shared key still has no virtual_key row — SOURCE_SQL, and therefore the "
+        "mirror, cannot see it"
+    )
+    assert aliases["chat-surface::chat"][3] == "active"
+
+
+def test_the_mirror_now_carries_the_shared_chat_key_across_the_flip(world):
+    """The actual done-condition: mirror() — unmodified — picks the shared key up."""
+    run(issuance.issue(chat_identity.SHARED_SURFACE_PRINCIPAL, "chat", actor="operator"))
+
+    result = run(mirror.mirror())
+
+    minted = {d["key_alias"] for d in result["details"]}
+    assert "chat-surface::chat" in minted
+    mirrored = run(_mirror_rows(world["dsn"]))
+    assert "chat-surface::chat" in mirrored
+    report = run(mirror.reconcile())
+    assert report["missing"] == []
+
+
+def test_rotating_the_shared_chat_key_remaps_it_in_place_without_touching_the_idp(
+    world, monkeypatch
+):
+    """The item's DONE condition: re-issuing hands back a NEW, live credential — the remap
+    LibreChat's held key rides across the flip on — while nothing about IdP identity moves,
+    because no end user is involved in this key at all."""
+
+    async def explode(username):
+        raise AssertionError("a rotate of the shared key must not touch the IdP")
+
+    monkeypatch.setattr(issuance.identity, "get_user", explode)
+
+    first = run(issuance.issue(chat_identity.SHARED_SURFACE_PRINCIPAL, "chat", actor="operator"))
+    assert first["rotated"] is False  # first mint in this world
+
+    second = run(issuance.issue(chat_identity.SHARED_SURFACE_PRINCIPAL, "chat", actor="operator"))
+    assert second["rotated"] is True
+    assert second["key"] != first["key"], "rotate must hand back a genuinely new credential"
+
+    rows = run(_virtual_keys(world["dsn"]))
+    aliases = {r[0]: r for r in rows}
+    assert aliases["chat-surface::chat"][3] == "active"
+
+    # The outcome that matters to LibreChat: can it still authenticate? Not "was an endpoint
+    # called" — checked against the real freerouter binary, both ways (Q2). The OLD bearer
+    # must stop working (issue() deletes the prior alias before minting the new one) and the
+    # NEW bearer, the one the operator would push into LibreChat's config, must work.
+    import httpx
+
+    def authenticates(key: str) -> bool:
+        r = httpx.get(
+            f"{world['base']}/api/v1/keys",
+            headers={"Authorization": f"Bearer {key}"}, timeout=10.0,
+        )
+        return r.status_code == 200
+
+    assert not authenticates(first["key"]), (
+        "the pre-rotation credential still authenticates — LibreChat's OLD key would "
+        "silently keep working instead of being remapped"
+    )
+    assert authenticates(second["key"]), "the remapped credential must actually work"
 
 
 # ---------------------------------------------------------------- the reconcile
