@@ -60,6 +60,15 @@ fi
 # thing that is actually under test, not a nicety to skip installing.
 "$VENV/bin/pip" install --quiet pymongo==4.10.1
 
+# asyncpg, pinned to the same version control-plane/requirements.txt runs, for
+# control-plane/tests/test_metering_continuous_history.py (enterpriseaiframework-730). Its
+# whole point is proving app/metering.py's real SQL (the LiteLLM pre-flip half of the
+# continuous-history merge) against a real, disposable Postgres container -- same rationale
+# as pymongo above, and unlike test_export_attribution.py/test_portal_auth.py, which stub
+# asyncpg out because their subject is attribution wiring, not SQL correctness. The suite
+# itself skips (not fails) when docker is unavailable.
+"$VENV/bin/pip" install --quiet asyncpg==0.30.0
+
 # control-plane/tests/ is not under tests/ and pytest.ini's testpaths is overridden by any
 # explicit path given here, so it must be listed alongside tests/ or it silently never
 # runs — which is exactly how it sat green-by-never-executing before this line existed.
