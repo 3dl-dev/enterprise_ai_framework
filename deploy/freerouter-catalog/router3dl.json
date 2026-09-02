@@ -1,0 +1,17 @@
+{
+  "provider": {
+    "slug": "router3dl",
+    "display_name": "router.3dl.one",
+    "base_url": "https://router.3dl.one/v1",
+    "auth": { "scheme": "bearer", "credential_source": "operator", "key_env": "FREEROUTER_ROUTER_TENANT_KEY" },
+    "openai_compat": {
+      "chat_completions_path": "/chat/completions",
+      "models_path": "/models",
+      "discovery": "openai_list",
+      "streaming": "sse"
+    },
+    "data_policy": { "retention": "unknown" }
+  },
+  "models": [],
+  "endpoint_health": {}
+}
