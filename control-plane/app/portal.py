@@ -406,7 +406,12 @@ async def rotate_my_key(body: dict, user: str = Depends(require_user)):
         # Shown once and never retrievable. The ledger stores the hash, not this.
         "key": issued["key"],
         "rotated": issued["rotated"],
-        "note": "Copy it now — it is not shown again.",
+        "blocked": issued.get("blocked", False),
+        "note": (
+            "This key cannot spend: its budget is 0. Ask an operator to raise it."
+            if issued.get("blocked")
+            else "Copy it now — it is not shown again."
+        ),
     }
 
 

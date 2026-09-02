@@ -472,6 +472,154 @@ def test_mirror_never_touches_the_live_litellm_key_set(world):
     assert before == after
 
 
+# --------------------- a 0-or-negative budget must never mirror to an unlimited key
+# (enterpriseaiframework-9ef, the hole enterpriseaiframework-257 left open: that item guarded
+# `/admin/budget` only — `mirror.mirror()` and `issuance.issue()` both call
+# `provisioning.generate_key` directly, with no guard of their own, for any live (user,
+# surface) whose LiteLLM budget happens to be zero or less.)
+
+
+def test_generate_key_blocks_rather_than_mints_unlimited_for_a_zero_budget(world):
+    """The shared primitive both `mirror()` and `issuance.issue()` call. Ground truth is
+    freerouter's own `GET /api/v1/keys`, authenticated as the key under test — the same
+    independent check `_seed_alice_chat_on_freerouter`'s callers use for a real cap, applied
+    here to the "no expressible cap" case. `blocked` mints and immediately revokes
+    (enterpriseaiframework-9ef's decision: mint-then-disable, not refuse-to-mint — see
+    `freerouter.generate_key`'s docstring), so the returned key must 401, never 200.
+    """
+    # --- defect control: a real budget must still mint a live, working key at that cap.
+    control = run(provisioning.generate_key(
+        username="quinn", surface="ide", idp_user_id="idp-quinn", max_budget=5.0,
+    ))
+    assert control["blocked"] is False
+    status, keys = _key_state(world["base"], control["key"])
+    assert status == 200, "a real budget must still produce a working key"
+    assert _limit_of(keys, control["key_hash"]) == 5.0
+
+    # --- the fix, exercised the way it actually breaks: a zero budget, through the real
+    # mint path, on the real binary.
+    zero = run(provisioning.generate_key(
+        username="quinn", surface="chat", idp_user_id="idp-quinn", max_budget=0,
+    ))
+    assert zero["blocked"] is True
+    assert zero["key"], "still a real freerouter bearer, not a stub value"
+    status, _ = _key_state(world["base"], zero["key"])
+    assert status == 401, (
+        "THE DEFECT this guards: a zero budget must never authenticate as an unlimited key"
+    )
+
+    # Negative budgets take the same path as zero — freerouter's limitToMonthlyUSD treats
+    # anything <= 0 as unlimited, not just exactly 0.
+    negative = run(provisioning.generate_key(
+        username="quinn", surface="terminal", idp_user_id="idp-quinn", max_budget=-3.0,
+    ))
+    assert negative["blocked"] is True
+    assert _key_state(world["base"], negative["key"])[0] == 401
+
+    # None (no budget ever set) is a DIFFERENT case from a zero budget and must still mint
+    # unlimited on purpose — the fix must not conflate "no cap" with "zero cap".
+    unset = run(provisioning.generate_key(
+        username="quinn", surface="agents/scraper", idp_user_id="idp-quinn", max_budget=None,
+    ))
+    assert unset["blocked"] is False
+    assert _key_state(world["base"], unset["key"])[0] == 200
+
+
+def test_mirror_blocks_a_zero_budget_key_instead_of_minting_it_unlimited(world):
+    """`mirror.mirror()` itself, end to end, against a live (user, surface) whose LiteLLM
+    budget is 0 — the exact shape a pre-existing zero-budget key has today. Captures the
+    bearer `mirror()` deliberately drops (see its own comment) by tapping the return of the
+    SAME `provisioning.generate_key` call it makes, without altering what that call does —
+    the mint and disable both hit the real freerouter binary; only the raw key, which
+    `mirror()` throws away by design, is copied out for this test to check.
+    """
+    import httpx as httpx_mod
+
+    conn_dsn = world["dsn"]
+
+    async def seed_zero_budget_key():
+        conn = await asyncpg.connect(conn_dsn)
+        try:
+            pid = await conn.fetchval(
+                "INSERT INTO principal (idp_user_id, username, email, enabled) "
+                "VALUES ($1, $2, $3, TRUE) RETURNING id",
+                "idp-zoe", "zoe", "zoe@example.test",
+            )
+            await conn.execute(
+                "INSERT INTO virtual_key (principal_id, surface, key_alias, "
+                "gateway_token_hash, max_budget, status) VALUES ($1, $2, $3, $4, $5, 'active')",
+                pid, "chat", "zoe::chat", "litellm-hash-zoe-chat", 0,
+            )
+        finally:
+            await conn.close()
+
+    run(seed_zero_budget_key())
+
+    captured: dict = {}
+    real_generate_key = provisioning.generate_key
+
+    async def tap(**kwargs):
+        result = await real_generate_key(**kwargs)
+        if kwargs["max_budget"] is not None and kwargs["max_budget"] <= 0:
+            captured[kwargs["surface"]] = result
+        return result
+
+    original = provisioning.generate_key
+    provisioning.generate_key = tap
+    try:
+        result = run(mirror.mirror())
+    finally:
+        provisioning.generate_key = original
+
+    minted = {d["key_alias"]: d for d in result["details"]}
+    assert minted["zoe::chat"]["action"] == "minted_blocked"
+    assert minted["zoe::chat"]["account_id"]  # a real, addressable sub-account: no schema
+    # change needed to name it, unlike the rejected "record blocked with no account" option.
+
+    rows = run(_mirror_rows(conn_dsn))
+    assert rows["zoe::chat"]["account_id"] == minted["zoe::chat"]["account_id"]
+
+    # The independent check: ask freerouter itself, with the exact bearer mirror() minted
+    # and then discarded, whether that key can authenticate.
+    assert "chat" in captured, "the zero-budget row never reached generate_key"
+    zoe_key = captured["chat"]["key"]
+    resp = httpx_mod.get(
+        f"{world['base']}/api/v1/keys",
+        headers={"Authorization": f"Bearer {zoe_key}"}, timeout=10.0,
+    )
+    assert resp.status_code == 401, (
+        "THE DEFECT this guards: mirror() must never hand a zero-budget user a key that "
+        "authenticates, unlimited or otherwise"
+    )
+
+
+def test_issuance_issue_blocks_a_zero_budget_key_instead_of_minting_it_unlimited(world):
+    """`issuance.issue()` itself: a user rotating their OWN key whose recorded LiteLLM budget
+    is 0. Unlike `mirror()`, `issue()` hands the raw key straight back to its caller — so the
+    returned `key` is exactly what a real user/portal caller would hold, and it must not work.
+    """
+    old = _seed_alice_chat_on_freerouter(world, budget=25.0)
+    status, keys = _key_state(world["base"], old["key"])
+    assert status == 200 and _limit_of(keys, old["key_hash"]) == 25.0
+
+    run(_set_budget(world["dsn"], "alice::chat", 0))
+
+    result = run(issuance.issue("alice", "chat", actor="alice"))
+
+    assert result["blocked"] is True
+    assert result["max_budget"] == 0
+    assert result["key"] and result["key"] != old["key"]
+    status, _ = _key_state(world["base"], result["key"])
+    assert status == 401, (
+        "THE DEFECT this guards: issuance.issue() must never hand a zero-budget user a "
+        "working key, unlimited or otherwise"
+    )
+
+    # The old key was superseded by the rotation (issuance deletes-then-mints), so it is
+    # gone too — not lingering as an accidental way to still spend at the old cap.
+    assert _key_state(world["base"], old["key"])[0] == 401
+
+
 # --------------------------------- the chat surface's shared key (enterpriseaiframework-e6b)
 #
 # LibreChat holds ONE key for every user (chat_identity.py): "chat-surface::chat". Both

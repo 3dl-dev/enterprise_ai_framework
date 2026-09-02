@@ -113,12 +113,39 @@ async def generate_key(
     which is what makes a later budget reconcile a comparison against freerouter rather than
     against our own request. `idp_user_id` rides for gateway.py parity; attribution is by the
     sub-account label.
+
+    A `max_budget` of 0 or less is BLOCKED, never minted unlimited (enterpriseaiframework-9ef,
+    the ADMITTED hole `update_budget`'s own pre-check (enterpriseaiframework-257) does not
+    cover: `mirror.mirror()` and `issuance.issue()` both call this function directly, with no
+    guard of their own, for every (user, surface) whose LiteLLM budget happens to be zero).
+    `budget_to_monthly_usd` returns None for BOTH "no cap was ever set" (max_budget is None)
+    and "the cap is zero/negative" (max_budget <= 0) — freerouter's `limit<=0` means UNLIMITED
+    (internal/core/keys.go `limitToMonthlyUSD`), so omitting `limit` for a zero budget would
+    mint the MOST permissive key in the system for the user least entitled to spend at all.
+
+    The decision, DOCUMENTED here rather than left implicit: MINT, THEN DISABLE — not
+    refuse-to-mint. `POST /api/v1/subaccounts` and `POST /api/v1/keys` proceed exactly as
+    for any other budget, then, only for the blocked case, one extra call —
+    `PATCH /api/v1/keys/{hash} {"disabled": true}` — using the same one-time sub-account
+    bearer before it is dropped. freerouter's PATCH-disable is a ONE-WAY REVOKE through the
+    metering library (internal/core/keys.go: `Disabled:true` calls `RevokeSubKey`; there is no
+    un-disable), so the key handed back can authenticate never — not "until someone notices",
+    not "until it spends $1" — proven against a running binary in
+    test_freerouter_mirror.py::test_generate_key_blocks_rather_than_mints_unlimited_for_a_zero_budget.
+    Refuse-to-mint (skip the row, mark it blocked in `freerouter_mirror`) was the other option
+    named in the item and was rejected here: `freerouter_mirror.account_id` is NOT NULL by
+    design (every mirror row names a real, addressable sub-account — see app/db.py), so
+    "recorded but blocked" would need a schema change; `issuance.issue()` also has no path to
+    hand a caller "no key" without turning an ordinary zero-budget rotation into a 500 for a
+    user who did nothing wrong. Mint-then-disable keeps ONE code path, no schema change, and a
+    freerouter account_id that always resolves — the key on it simply never authenticates.
     """
     alias = surface_alias(username, surface)
     resp = await _request("POST", "/api/v1/subaccounts", json={"name": alias})
     data = resp.json()["data"]
 
-    limit = budget_to_monthly_usd(max_budget)
+    blocked = max_budget is not None and max_budget <= 0
+    limit = None if blocked else budget_to_monthly_usd(max_budget)
     body: dict = {"name": alias}
     if limit is not None:
         body["limit"] = limit
@@ -132,13 +159,23 @@ async def generate_key(
             json=body,
         )
         minted.raise_for_status()
-    key = minted.json()
+        key = minted.json()
+        if blocked:
+            # See the docstring: a zero/negative budget mints, then is revoked in-place
+            # before it is ever handed back, so it is dead on arrival rather than unlimited.
+            disable = await client.patch(
+                f"{base_url()}/api/v1/keys/{key['data']['hash']}",
+                headers={"Authorization": f"Bearer {data['api_key']}"},
+                json={"disabled": True},
+            )
+            disable.raise_for_status()
     return {
         "token": data["account_id"],
         "key": key["key"],
         "key_hash": key["data"]["hash"],
         # freerouter renders an unlimited cap as null, not 0.
         "limit_usd": (int(key["data"]["limit"]) if key["data"].get("limit") else None),
+        "blocked": blocked,
         "data": data,
     }
 
