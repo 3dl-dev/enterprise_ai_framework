@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from . import (
     agent_console,
     agent_usage,
+    agents,
     chat_identity,
     db,
     export,
@@ -332,7 +333,28 @@ class BudgetRequest(BaseModel):
 
 @app.post("/admin/budget", dependencies=[Depends(require_operator)])
 async def set_budget(req: BudgetRequest):
-    """Set a hard budget. Past it the gateway refuses, it does not merely record."""
+    """Set a hard budget. Past it the gateway refuses, it does not merely record.
+
+    Both backends land the same end state — the live key enforces the new cap and the ledger
+    records it — but only one of them can do it in place, and the difference is visible here
+    because it has to be:
+
+      * LiteLLM patches the key. The handle does not move, the user's key keeps working, and
+        this reads exactly as it always did.
+      * freerouter cannot re-cap a key at all (the cap is fixed at mint and there is no
+        per-account cap — see freerouter.update_budget). Its `update_budget` MINTS a
+        replacement sub-account under the same `<user>::<surface>` alias, and hands back the
+        new key plus the handle to retire. The ledger is repointed at the new handle inside
+        the same transaction as the budget, and only THEN is the old one revoked. Ordered the
+        other way, a failure between the revoke and the commit would leave the user with no
+        working key and the control plane with no record of the one that replaced it. Ordered
+        this way the worst case is a stranded sub-account, which `/admin/freerouter/reconcile`
+        reports and the user's access never stops.
+
+    A rotation is a real change to what the user is holding, so the new keys are returned to
+    the operator who asked for the budget change, exactly as `/admin/keys/issue` returns one.
+    Silently rotating and saying "updated: 3" would strand every surface the user has open.
+    """
     if req.surface and not gateway.is_known_surface(req.surface):
         raise HTTPException(400, f"unknown surface: {req.surface}")
 
@@ -344,22 +366,66 @@ async def set_budget(req: BudgetRequest):
         predicate += " AND k.surface = $2"
         args.append(req.surface)
 
+    on_freerouter = provisioning.backend() is freerouter
+
     pool = await db.pool()
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            rows = await conn.fetch(
-                f"""
-                SELECT k.gateway_token_hash, k.surface
-                FROM virtual_key k JOIN principal p ON p.id = k.principal_id
-                WHERE {predicate}
-                """,
-                *args,
+        rows = await conn.fetch(
+            f"""
+            SELECT k.gateway_token_hash, k.surface, k.key_alias, m.account_id
+            FROM virtual_key k
+            JOIN principal p ON p.id = k.principal_id
+            LEFT JOIN freerouter_mirror m ON m.key_alias = k.key_alias
+            WHERE {predicate}
+            """,
+            *args,
+        )
+        if not rows:
+            raise HTTPException(404, "no active keys for that user/surface")
+
+        rotations: list[dict] = []
+        for r in rows:
+            # On freerouter the ledger's `gateway_token_hash` may still be the LiteLLM hash:
+            # the cutover mirror is deliberately additive and never writes over it, so a key
+            # that was mirrored rather than re-issued carries the old backend's handle right
+            # up until something repoints it. The mirror row is what names the freerouter
+            # account for that alias, so it is what the freerouter backend is addressed by —
+            # and the rotation below then repoints the ledger, so this converges.
+            handle = (
+                r["account_id"] if on_freerouter and r["account_id"]
+                else r["gateway_token_hash"]
             )
-            if not rows:
-                raise HTTPException(404, "no active keys for that user/surface")
-            for r in rows:
-                if r["gateway_token_hash"]:
-                    await provisioning.update_budget(r["gateway_token_hash"], req.max_budget)
+            if not handle:
+                continue
+            try:
+                applied = await provisioning.update_budget(handle, req.max_budget)
+            except freerouter.BudgetNotExpressible as exc:
+                raise HTTPException(400, str(exc)) from exc
+            except KeyError as exc:
+                raise HTTPException(
+                    409,
+                    f"{r['key_alias']}: the gateway has no key this budget can be applied "
+                    f"to ({exc}). Re-issue the key (/admin/keys/issue) first.",
+                ) from exc
+            if isinstance(applied, dict) and applied.get("rotated"):
+                rotations.append({"row": r, "applied": applied})
+
+        async with conn.transaction():
+            for rot in rotations:
+                applied = rot["applied"]
+                alias = rot["row"]["key_alias"]
+                await conn.execute(
+                    "UPDATE virtual_key SET gateway_token_hash = $2 WHERE key_alias = $1",
+                    alias, applied["token"],
+                )
+                await mirror.record_account(
+                    conn,
+                    key_alias=alias,
+                    account_id=applied["token"],
+                    key_hash=applied.get("key_hash"),
+                    source_max_budget=req.max_budget,
+                    limit_usd=applied.get("limit_usd"),
+                )
             await conn.execute(
                 f"""
                 UPDATE virtual_key k SET max_budget = ${len(args) + 1}
@@ -368,11 +434,42 @@ async def set_budget(req: BudgetRequest):
                 """,
                 *args, req.max_budget,
             )
+
+    # Committed. Now, and not before, the superseded handles stop being able to spend.
+    for rot in rotations:
+        retire = rot["applied"].get("retire_token")
+        if retire:
+            await provisioning.revoke_token(retire)
+
     await db.audit(
         "admin", "budget.set", req.username,
         surface=req.surface or "all", max_budget=req.max_budget,
+        # The account ids, never the keys: the audit trail records what was decided, and a
+        # bearer in it would make the trail worth stealing.
+        rotated=[
+            {
+                "key_alias": rot["row"]["key_alias"],
+                "account_id": rot["applied"]["token"],
+                "retired": rot["applied"].get("retire_token"),
+            }
+            for rot in rotations
+        ],
     )
-    return {"updated": len(rows), "max_budget": req.max_budget}
+    return {
+        "updated": len(rows),
+        "max_budget": req.max_budget,
+        # Always empty on the LiteLLM backend, which patches in place and never rotates. A
+        # non-empty list means the named surfaces are holding a NEW key and their old one has
+        # just stopped working, so the operator has to deliver these.
+        "rotated": [
+            {
+                "surface": rot["row"]["surface"],
+                "key_alias": rot["row"]["key_alias"],
+                "key": rot["applied"]["key"],
+            }
+            for rot in rotations
+        ],
+    }
 
 
 # ------------------------------------------------- the LiteLLM -> freerouter cutover mirror
@@ -404,6 +501,21 @@ async def freerouter_mirror(dry_run: bool = False):
         return await mirror.mirror(dry_run=dry_run)
     except mirror.BackendNotFreerouter as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/admin/agents/reprovision", dependencies=[Depends(require_operator)])
+async def agents_reprovision():
+    """Re-mint every agent's key through `provisioning.backend()`, live, no pod restart.
+
+    The Phase 3 step `/admin/freerouter/mirror` has no equivalent for: mirroring seeds a
+    matching freerouter sub-account for base (chat/ide/terminal) keys ahead of the flip, but
+    an agent's Secret and its resident process both hold the actual LiteLLM key VALUE, which
+    a freerouter mint cannot reproduce (app/agents.py `reprovision_key`'s docstring). Run
+    this AFTER `GATEWAY_PROVIDER` flips, once per flip — it re-issues every agent's key
+    against whichever backend is now live and pushes it into each running agent's own
+    console API, never by restarting its pod, so no resident session is dropped.
+    """
+    return await agents.rolling_reprovision(actor="admin")
 
 
 # ---------------------------------------------------------------- the one bill

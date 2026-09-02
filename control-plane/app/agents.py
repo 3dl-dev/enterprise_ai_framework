@@ -1321,6 +1321,158 @@ async def set_model(user: str, name: str, model: str) -> dict:
     return {"name": name, "model": model, "restarted": restarted}
 
 
+# ---------------------------------------------------------------- key reprovision (cutover)
+
+
+async def reprovision_key(user: str, name: str, *, actor: str) -> dict:
+    """Re-mint one agent's gateway key through `provisioning.backend()`, live, no restart.
+
+    The problem this exists for (enterpriseaiframework-b00, Phase 3 of the LiteLLM ->
+    freerouter cutover): a running agent's Secret carries a LiteLLM-minted key. `mirror.py`
+    seeds a matching freerouter SUB-ACCOUNT ahead of the flip, but freerouter mints its own
+    KEY VALUE at `POST /api/v1/keys` — there is no way to hand it the old LiteLLM string, so
+    the two backends' key VALUES never coincide (see freerouter.generate_key's docstring).
+    The instant GATEWAY_PROVIDER flips, every already-running agent is holding a bearer that
+    authenticates against nothing on the new backend. This is the fix: mint a fresh key
+    against whichever backend is now live and get it into the agent WITHOUT the one thing
+    this item forbids — a pod restart, which would drop the resident session that is the
+    entire product (agents-gateway-console.md Contract B).
+
+    `issuance.issue` does the mint: it goes through `provisioning.backend()` (never straight
+    at a backend module), revokes the OLD key first so no leaked manifest outlives the
+    reprovision, and updates the ledger's `virtual_key` row in the same breath — so a later
+    budget change never fails silently against a hash the gateway no longer holds.
+
+    THE SECRET IS PATCHED SEPARATELY FROM THE LIVE PUSH, DELIBERATELY. Every other field
+    already in `<obj>-key` (the hermes console credential, or OPENCODE_SERVER_PASSWORD) is
+    preserved untouched — this writes ONE key, `OPENAI_API_KEY`, keeping the Secret correct
+    for whatever the agent next reads it from (a future stop/start, a rebuild). It does NOT
+    bump the pod-template checksum annotation the way `configure_connector` does for a
+    connector credential: THAT patch exists specifically to trigger a Deployment rollout
+    (`envFrom` only resolves at pod start), and a rollout is a pod restart — precisely the
+    thing this function must not cause.
+
+    THE LIVE PUSH is hermes-specific because it is the only type with a rescue path today
+    (Contract D; the opencode-interim path `set_model` also gates on `type == "hermes"` for
+    the identical reason — there is no console settings API for the interim type yet). It
+    goes through the SAME owner-scoped `console_target` + `agent_gateway_console.call` seam
+    `set_model` uses: `PUT /api/env` writes the new value into the RESIDENT gateway
+    process's own environment (confirmed live by -2ba/-8e4 alongside `/api/model/set`) — the
+    process's `key_env: OPENAI_API_KEY` provider config (`hermes_seed_config`) then reads
+    the new value, not the pod's original OS env, which is what makes this different from
+    the `envFrom` limitation above. `POST /api/gateway/restart` (the same call `set_model`
+    makes to pick up a model change now rather than on the agent's next session) restarts
+    ONLY the resident gateway's outbound connection, not the container — the dashboard
+    session and any in-flight chat PTY are untouched, exactly as `set_model`'s own comment
+    documents for the model case.
+
+    Owner-scoped: `_owned_deployment` is the same guard every other mutating path in this
+    module uses. `actor` rides through to the audit row so an operator-driven fleet-wide
+    reprovision (`rolling_reprovision`) and a hypothetical future self-service rotation are
+    both attributable to who actually asked for it, never silently to the agent's owner.
+    """
+    obj = object_name(user, name)
+    async with _client() as client:
+        deployment = await _owned_deployment(client, user, name)
+        secret = await _get(client, "v1", "Secret", f"{obj}-key")
+    labels = (deployment.get("metadata") or {}).get("labels") or {}
+    agent_type = labels.get(TYPE_LABEL, "")
+
+    issued = await issuance.issue(user, gateway.agent_surface(name), actor=actor)
+    new_key = issued["key"]
+
+    # Merge the new key into whatever the Secret already holds — decode every existing
+    # field, overwrite only OPENAI_API_KEY, re-apply. A blind `_secret_object` with just the
+    # one key would wipe the hermes console credential (or OPENCODE_SERVER_PASSWORD) the
+    # next time anything reads this Secret, locking the owner out of their own console.
+    data: dict[str, str] = {}
+    for key, encoded in ((secret or {}).get("data") or {}).items():
+        data[key] = base64.b64decode(encoded).decode()
+    data["OPENAI_API_KEY"] = new_key
+    async with _client() as client:
+        await _apply(client, _secret_object(
+            f"{obj}-key", data, labels={USER_LABEL: user, NAME_LABEL: name},
+        ))
+
+    live_applied = False
+    live_error = ""
+    if agent_type == "hermes":
+        from . import agent_gateway_console
+
+        try:
+            target = await console_target(user, name)
+            resp = await agent_gateway_console.call(
+                target, "PUT", "/api/env", json={"OPENAI_API_KEY": new_key})
+            if resp.status_code == 200:
+                restart = await agent_gateway_console.call(
+                    target, "POST", "/api/gateway/restart", json={})
+                live_applied = restart.status_code == 200
+                if not live_applied:
+                    live_error = f"gateway restart returned HTTP {restart.status_code}"
+            else:
+                live_error = f"console refused the new key (HTTP {resp.status_code})"
+        except HTTPException as exc:
+            # Unreachable (stopped agent, mid-restart): the Secret is already correct, so
+            # this is a delayed pickup, not a lost key — the agent picks it up on its next
+            # real start. Reported, never raised, so a fleet-wide reprovision does not abort
+            # on one unreachable agent.
+            live_error = str(exc.detail)
+    else:
+        live_error = (
+            f"no live rescue path for agent type {agent_type!r} yet (Contract D covers "
+            "hermes only) — the Secret is staged for the agent's next natural restart"
+        )
+
+    await db.audit(actor, "agent.key.reprovision", f"{user}/{name}",
+                   alias=issued["key_alias"], agent_type=agent_type,
+                   live_applied=live_applied)
+    return {
+        "name": name,
+        "user": user,
+        "alias": issued["key_alias"],
+        "type": agent_type,
+        "live_applied": live_applied,
+        "live_error": live_error,
+    }
+
+
+async def rolling_reprovision(*, actor: str) -> list[dict]:
+    """Re-provision EVERY agent's key, one at a time, for a `GATEWAY_PROVIDER` flip.
+
+    The fleet-wide form of `reprovision_key`, and the actual cutover operation: after
+    `provisioning.backend()` starts resolving to freerouter, this is what carries every
+    already-running agent's key across with nobody's session dropped. Deliberately NOT
+    owner-scoped — this walks every agent Deployment in the namespace regardless of owner,
+    because it is an operator's cutover action, not a self-service one; nothing here accepts
+    a caller-supplied user or name.
+
+    One agent's failure does not stop the run. A k8s hiccup, an agent mid-restart, or a
+    console that is momentarily unreachable are exactly the conditions a rolling operation
+    across a live fleet must tolerate — the alternative (abort on the first failure) would
+    leave every agent after it still holding a key that authenticates against nothing, which
+    is a worse outcome than one agent finishing this pass with a delayed pickup. Every
+    outcome, success or failure, is in the returned list, so an operator can see exactly
+    which agents still need a retry.
+    """
+    async with _client() as client:
+        deployments = await _list(client, "apps/v1", "Deployment", COMPONENT_SELECTOR)
+
+    results = []
+    for dep in deployments:
+        user = _owner_of(dep)
+        name = _agent_of(dep)
+        if not user or not name or not gateway.AGENT_SLUG.match(name):
+            continue
+        try:
+            results.append(await reprovision_key(user, name, actor=actor))
+        except HTTPException as exc:
+            results.append({
+                "name": name, "user": user, "live_applied": False,
+                "live_error": str(exc.detail),
+            })
+    return results
+
+
 # ---------------------------------------------------------------- delete
 
 

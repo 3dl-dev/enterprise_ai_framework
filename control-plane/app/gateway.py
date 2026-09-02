@@ -174,10 +174,35 @@ async def delete_by_aliases(aliases: list[str], *, missing_ok: bool = False) -> 
 
 
 async def update_budget(token_hash: str, max_budget: float) -> dict:
-    """The gateway accepts its own token hash wherever it documents `key`."""
+    """The gateway accepts its own token hash wherever it documents `key`.
+
+    LiteLLM patches the cap ON the existing key, so the key the user is holding keeps working
+    and its handle does not move. The result therefore carries no `rotated` marker, and
+    main.set_budget's continuity branch (which exists for freerouter, whose caps are fixed at
+    mint) stays untaken on this backend.
+    """
     resp = await _request(
         "POST", "/key/update", json={"key": token_hash, "max_budget": max_budget}
     )
+    return resp.json()
+
+
+async def revoke_token(token: str, *, missing_ok: bool = True) -> dict:
+    """Hard-revoke ONE key by its token hash rather than by alias.
+
+    The provisioning interface's counterpart to freerouter.revoke_token: retire a handle the
+    ledger has already replaced. Unreachable on this backend today — `update_budget` above
+    patches in place and so never asks anything to be retired — and it is here because the
+    seam is what callers program against, not the backend that happens to be selected.
+    """
+    if not token:
+        return {"deleted_keys": []}
+    try:
+        resp = await _request("POST", "/key/delete", json={"keys": [token]})
+    except httpx.HTTPStatusError as exc:
+        if missing_ok and exc.response.status_code == 404:
+            return {"deleted_keys": []}
+        raise
     return resp.json()
 
 

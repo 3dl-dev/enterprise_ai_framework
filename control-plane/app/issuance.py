@@ -22,7 +22,23 @@ A second copy of that list would have drifted from this one within a release.
 
 from fastapi import HTTPException
 
-from . import db, gateway, identity, provisioning
+from . import chat_identity, db, gateway, identity, provisioning
+
+# The chat surface's shared key (chat_identity.SHARED_SURFACE_PRINCIPAL, alias
+# "chat-surface::chat") is not a person — it is LibreChat's own service credential, minted
+# once and held by the surface itself rather than by any signed-in user (see
+# chat_identity.py's module docstring). It therefore has no row in the identity provider and
+# never will: routing it through `identity.get_user` below would 404 forever. That 404 is
+# exactly why every operator script that has ever provisioned it
+# (bundle/bin/provision-chat-key.sh, deploy/bin/post-deploy.sh) bypassed `issue` and talked to
+# the gateway directly — which left the key with no `virtual_key` row, and therefore invisible
+# to the freerouter cutover mirror (app/mirror.py), whose live key set is read straight out of
+# that table. A synthetic, permanently-enabled principal closes the gap: `issue("chat-surface",
+# "chat", ...)` becomes an ordinary rotate through `provisioning.backend()`, so the shared key
+# is mirrored to freerouter before the flip and moves with GATEWAY_PROVIDER like every other
+# key, with LibreChat's held credential remapped in place — no user re-login, because no user
+# ever held this key to begin with.
+_SYNTHETIC_IDP_ID = f"synthetic:{chat_identity.SHARED_SURFACE_PRINCIPAL}"
 
 
 async def _resolve_principal(conn, username: str) -> dict:
@@ -38,6 +54,9 @@ async def _resolve_principal(conn, username: str) -> dict:
     can sign in. Identity stays the source of truth — a username the realm does not know
     still yields no principal (the caller raises 404), and a disabled account is refused —
     so the exist-and-enabled invariant is enforced against identity, not the stale mirror.
+
+    One username is never looked up there at all: chat_identity.SHARED_SURFACE_PRINCIPAL,
+    the chat surface's own shared key. See the module-level comment above `_SYNTHETIC_IDP_ID`.
     """
     principal = await conn.fetchrow(
         "SELECT id, idp_user_id, enabled FROM principal WHERE username = $1",
@@ -45,6 +64,18 @@ async def _resolve_principal(conn, username: str) -> dict:
     )
     if principal is not None:
         return principal
+
+    if username == chat_identity.SHARED_SURFACE_PRINCIPAL:
+        return await conn.fetchrow(
+            """
+            INSERT INTO principal (idp_user_id, username, email, enabled, synced_at)
+            VALUES ($1, $2, NULL, TRUE, now())
+            ON CONFLICT (idp_user_id) DO UPDATE
+                SET username = EXCLUDED.username, enabled = TRUE, synced_at = now()
+            RETURNING id, idp_user_id, enabled
+            """,
+            _SYNTHETIC_IDP_ID, username,
+        )
 
     idp_user = await identity.get_user(username)
     if idp_user is None:
