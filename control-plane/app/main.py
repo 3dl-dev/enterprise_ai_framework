@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from . import (
     agent_console,
     agent_usage,
+    agents,
     chat_identity,
     db,
     export,
@@ -404,6 +405,21 @@ async def freerouter_mirror(dry_run: bool = False):
         return await mirror.mirror(dry_run=dry_run)
     except mirror.BackendNotFreerouter as exc:
         raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/admin/agents/reprovision", dependencies=[Depends(require_operator)])
+async def agents_reprovision():
+    """Re-mint every agent's key through `provisioning.backend()`, live, no pod restart.
+
+    The Phase 3 step `/admin/freerouter/mirror` has no equivalent for: mirroring seeds a
+    matching freerouter sub-account for base (chat/ide/terminal) keys ahead of the flip, but
+    an agent's Secret and its resident process both hold the actual LiteLLM key VALUE, which
+    a freerouter mint cannot reproduce (app/agents.py `reprovision_key`'s docstring). Run
+    this AFTER `GATEWAY_PROVIDER` flips, once per flip — it re-issues every agent's key
+    against whichever backend is now live and pushes it into each running agent's own
+    console API, never by restarting its pod, so no resident session is dropped.
+    """
+    return await agents.rolling_reprovision(actor="admin")
 
 
 # ---------------------------------------------------------------- the one bill

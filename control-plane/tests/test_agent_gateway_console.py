@@ -13,6 +13,8 @@ opencode's HTTP Basic. The claims under test are Contract C's:
   * one login is reused across a page's many requests, and a stale cookie triggers exactly
     one transparent re-login.
 """
+import asyncio
+import base64
 import json
 import socket
 import threading
@@ -21,10 +23,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from test_portal_agents import (  # noqa: E402 - path set up by that module's import
+    AUDIT,
+    ISSUED,
     _SA_DIR,
     FakeCluster,
     _stub_ledger,
@@ -45,8 +49,11 @@ class FakeDashboard:
         self.logins = 0
         self.model_sets: list[dict] = []   # bodies POSTed to /api/model/set
         self.restarts = 0
+        self.env_puts: list[dict] = []     # bodies PUT to /api/env
+        self.env: dict[str, str] = {}      # the resident process's own env override store
         self.requests: list[tuple[str, str, bool]] = []  # (method, path, authenticated)
         self.fail_next_authed = threading.Event()  # forces one 401 to test re-login
+        self.fail_env = threading.Event()  # forces /api/env to refuse, for the error path
         self._token = "sess-" + uuid.uuid4().hex
         try:
             self.srv = ThreadingHTTPServer((address, self.port), self._handler())
@@ -120,6 +127,27 @@ class FakeDashboard:
             def do_GET(self):
                 self._authed("GET", urlparse(self.path).path)
 
+            def do_PUT(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length)
+                path = urlparse(self.path).path
+                # PUT /api/env: the reprovision path (-b00) writes the new key straight into
+                # the RESIDENT gateway's own environment — distinct from the pod's envFrom,
+                # which never updates after start (see agents.py's Connector.annotation).
+                if path == "/api/env":
+                    if not self._has_session():
+                        self._send(401, "application/json", b"{}")
+                        return
+                    body = json.loads(raw or b"{}")
+                    dash.env_puts.append(body)
+                    if dash.fail_env.is_set():
+                        self._send(502, "application/json", b'{"ok":false}')
+                        return
+                    dash.env.update(body)
+                    self._send(200, "application/json", b'{"ok":true}')
+                    return
+                self._authed("PUT", path)
+
             def _authed(self, method, path):
                 ok = self._has_session()
                 dash.requests.append((method, path, ok))
@@ -153,6 +181,8 @@ class FakeDashboard:
 @pytest.fixture()
 def world(monkeypatch):
     _stub_ledger(monkeypatch)
+    AUDIT.clear()
+    ISSUED.clear()
     # The module-global session cache must not leak a cookie between tests (each test gets a
     # fresh dashboard with a fresh token), so it is cleared per test.
     agent_gateway_console._SESSIONS.clear()
@@ -322,3 +352,141 @@ def test_a_non_owner_cannot_change_another_users_model(world):
         "/portal/api/agents/athena/model", json={"model": agents.DEFAULT_MODEL})
     assert r.status_code == 404, r.text
     assert world.dash.model_sets == [] and world.dash.logins == 0
+
+
+# ---- key reprovision (-b00, Phase 3 of the LiteLLM -> freerouter cutover) --------------
+#
+# The claim under test: a running hermes agent's key changes VALUE (a real, distinct
+# string minted through the stubbed `issuance.issue` -> `provisioning.backend()` seam) and
+# reaches the LIVE resident process over its own console API (`PUT /api/env` then
+# `POST /api/gateway/restart`, exercised against the real FakeDashboard HTTP server, not a
+# mocked client) WITHOUT the pod being touched — no Secret re-apply that bumps the
+# checksum annotation, no Deployment patch, no rollout. Ground truth for "did the new key
+# actually reach the agent" is the FakeDashboard's own `env` store, populated only by a real
+# HTTP PUT it received and parsed — not an assertion that `agent_gateway_console.call` was
+# invoked with certain arguments.
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_reprovisioning_pushes_a_new_key_into_the_live_agent_without_a_pod_restart(world):
+    world.add_agent("alice", "athena")
+    obj = "agent-alice-athena"
+    before = world.cluster.get("deployments", obj)
+    before_dep = json.loads(json.dumps(before))  # deep copy for a real before/after diff
+
+    result = _run(agents.reprovision_key("alice", "athena", actor="admin"))
+
+    assert result["live_applied"] is True, result
+    assert result["type"] == "hermes"
+    # The FakeDashboard's own state, not a call-args assertion: the resident process was
+    # actually told the new key, and actually restarted to pick it up.
+    assert world.dash.env_puts == [{"OPENAI_API_KEY": "sk-fake-alice-agents/athena"}]
+    assert world.dash.env["OPENAI_API_KEY"] == "sk-fake-alice-agents/athena"
+    assert world.dash.restarts == 1
+    # The mint went through `provisioning.backend()` — never straight at a backend module —
+    # which is exactly what the stubbed `issuance.issue` records.
+    assert ISSUED == [("alice", "agents/athena", "admin")]
+
+    # The Secret holds the new key (staged for a future natural restart too)...
+    secret = world.cluster.get("secrets", f"{obj}-key")
+    data = secret["data"]
+    assert base64.b64decode(data["OPENAI_API_KEY"]).decode() == "sk-fake-alice-agents/athena"
+    # ...and every OTHER field the original Secret carried survived the merge untouched.
+    assert base64.b64decode(data["DASHBOARD_USERNAME"]).decode() == world.dash.username
+    assert base64.b64decode(data["DASHBOARD_PASSWORD"]).decode() == world.dash.password
+
+    # THE POD ITSELF WAS NEVER TOUCHED. This is the control: the Deployment object — the
+    # thing whose template annotation a rollout patches — is byte-identical before and
+    # after, and no PATCH ever reached "deployments" at the fake cluster's HTTP layer. A
+    # defect that routed the key change through `configure_connector`'s checksum-bump path
+    # instead of the live console push would fail this assertion, because that path's
+    # entire mechanism is a Deployment template patch.
+    after_dep = world.cluster.get("deployments", obj)
+    assert after_dep == before_dep, "reprovisioning a key must never touch the Deployment"
+    assert ("patch", "deployments") not in world.cluster.calls
+
+    assert ("admin", "agent.key.reprovision", "alice/athena") in AUDIT
+
+
+def test_reprovisioning_is_owner_scoped(world):
+    world.add_agent("alice", "athena")
+    with pytest.raises(HTTPException) as exc:
+        _run(agents.reprovision_key("bob", "athena", actor="bob"))
+    assert exc.value.status_code == 404
+    assert ISSUED == [], "no key may be minted before ownership is confirmed"
+    assert world.dash.env_puts == []
+
+
+def test_a_console_that_refuses_the_new_key_is_reported_not_raised(world):
+    world.add_agent("alice", "athena")
+    world.dash.fail_env.set()
+
+    result = _run(agents.reprovision_key("alice", "athena", actor="admin"))
+
+    assert result["live_applied"] is False
+    assert "console refused" in result["live_error"]
+    # The mint and the Secret write both still happened — a console hiccup must not lose
+    # the new key, only delay when the live agent starts using it.
+    assert ISSUED == [("alice", "agents/athena", "admin")]
+    secret = world.cluster.get("secrets", "agent-alice-athena-key")
+    assert (base64.b64decode(secret["data"]["OPENAI_API_KEY"]).decode()
+            == "sk-fake-alice-agents/athena")
+    assert world.dash.restarts == 0, "a refused key write must not trigger the restart"
+
+
+def test_an_unreachable_agent_is_reported_not_raised(world):
+    world.add_agent("alice", "athena", reachable=False)
+
+    result = _run(agents.reprovision_key("alice", "athena", actor="admin"))
+
+    assert result["live_applied"] is False
+    assert result["live_error"], "an unreachable console must explain itself"
+    # Still minted and staged, so the agent picks the key up on its next real start.
+    assert ISSUED == [("alice", "agents/athena", "admin")]
+
+
+def test_rolling_reprovision_covers_every_agent_and_tolerates_one_failure(world):
+    world.add_agent("alice", "athena")
+    world.add_agent("bob", "rudi")
+    # bob's console is unreachable — the rolling pass must not stop at alice's neighbor.
+    world.hosts["agent-bob-rudi"] = "127.0.0.3"
+
+    results = _run(agents.rolling_reprovision(actor="admin"))
+
+    by_name = {r["name"]: r for r in results}
+    assert set(by_name) == {"athena", "rudi"}
+    assert by_name["athena"]["live_applied"] is True
+    assert by_name["rudi"]["live_applied"] is False
+    assert by_name["rudi"]["live_error"]
+    # BOTH keys were minted — one agent's unreachable console must not skip the mint (and
+    # therefore the eventual pickup) for the OTHER agent, and must not abort the whole run.
+    assert ("alice", "agents/athena", "admin") in ISSUED
+    assert ("bob", "agents/rudi", "admin") in ISSUED
+
+
+def test_a_non_hermes_agent_stages_the_secret_without_a_live_push(world):
+    # openclaw (interim, opencode-rendered) has no console settings API yet (Contract D
+    # covers hermes only) — `set_model` gates on the identical condition for the identical
+    # reason.
+    world.cluster.add_agent("alice", "coder", agent_type="openclaw")
+    obj = "agent-alice-coder"
+    world.cluster.put("secrets", {
+        "apiVersion": "v1", "kind": "Secret",
+        "metadata": {"name": f"{obj}-key"},
+        "data": {
+            "OPENCODE_SERVER_PASSWORD": base64.b64encode(b"pw").decode(),
+            "OPENAI_API_KEY": base64.b64encode(b"sk-old").decode(),
+        },
+    })
+
+    result = _run(agents.reprovision_key("alice", "coder", actor="admin"))
+
+    assert result["live_applied"] is False
+    assert "hermes only" in result["live_error"]
+    secret = world.cluster.get("secrets", f"{obj}-key")
+    assert (base64.b64decode(secret["data"]["OPENAI_API_KEY"]).decode()
+            == "sk-fake-alice-agents/coder")
+    assert base64.b64decode(secret["data"]["OPENCODE_SERVER_PASSWORD"]).decode() == "pw"
