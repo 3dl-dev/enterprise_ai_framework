@@ -64,6 +64,42 @@ spec:
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_METER_DSN } }
             - name: FREEROUTER_LISTEN_ADDR
               value: ":8080"
+            # --- UPSTREAM TENANCY + AUTO-REPLENISH (3DL overlay; enterpriseaiframework-064).
+            # router.3dl.one is consumed as a standard TENANT (identity_passthrough descriptor in
+            # the catalog dir → canonical model ids, no masking). settlement_type usdc-voucher: the
+            # buyer thermostat keeps the balance-on-router topped up via signed EIP-3009 vouchers
+            # (buyer wallet → seller payout). All from the secret, absent in base (empty catalog,
+            # no thermostat) per guardrail bd6.
+            - name: FREEROUTER_CATALOG_DIR
+              value: /etc/freerouter/catalog
+            - name: FREEROUTER_ROUTER_TENANT_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_ROUTER_TENANT_KEY, optional: true } }
+            - name: FREEROUTER_REPLENISH_ENABLED
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_ENABLED, optional: true } }
+            - name: FREEROUTER_REPLENISH_UPSTREAM_URL
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_UPSTREAM_URL, optional: true } }
+            - name: FREEROUTER_REPLENISH_TENANT_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_TENANT_KEY, optional: true } }
+            - name: FREEROUTER_REPLENISH_SELLER_PAYOUT
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_SELLER_PAYOUT, optional: true } }
+            - name: FREEROUTER_REPLENISH_ALERT_URL
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_ALERT_URL, optional: true } }
+            - name: FREEROUTER_REPLENISH_LOW_MICRO
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_LOW_MICRO, optional: true } }
+            - name: FREEROUTER_REPLENISH_HIGH_MICRO
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_HIGH_MICRO, optional: true } }
+            - name: FREEROUTER_REPLENISH_HARD_FLOOR_MICRO
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_HARD_FLOOR_MICRO, optional: true } }
+            - name: FREEROUTER_REPLENISH_WALLET_AUTOREFILL
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_WALLET_AUTOREFILL, optional: true } }
+            - name: FREEROUTER_REPLENISH_WALLET_LOW_MICRO
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_WALLET_LOW_MICRO, optional: true } }
+            - name: FREEROUTER_REPLENISH_WALLET_HARD_FLOOR_MICRO
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_WALLET_HARD_FLOOR_MICRO, optional: true } }
+            - name: FREEROUTER_REPLENISH_POLL_SECONDS
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_POLL_SECONDS, optional: true } }
+            - name: FREEROUTER_REPLENISH_TENANT_ACCOUNT_ID
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_REPLENISH_TENANT_ACCOUNT_ID, optional: true } }
             # Signup open so the control plane can broker per-user sub-account provisioning
             # (757/1da). Safe: in-cluster / NodePort only, never internet-published — enforced
             # by the posture guard (tests/test_freerouter_posture.py).
@@ -129,9 +165,14 @@ spec:
             # Self-generated testnet settlement wallet (3DL overlay / canary). Empty in the
             # base — the FR writes it only when FREEROUTER_PEER_* turns federation on.
             - { name: freerouter-wallet, mountPath: /var/lib/freerouter/wallet }
+            # Upstream-tenancy onboarding bundle (router.3dl.one, identity_passthrough). optional:
+            # base has no overlay catalog and comes up empty.
+            - { name: freerouter-catalog, mountPath: /etc/freerouter/catalog, readOnly: true }
       volumes:
         - name: freerouter-wallet
           persistentVolumeClaim: { claimName: freerouter-wallet }
+        - name: freerouter-catalog
+          configMap: { name: freerouter-catalog, optional: true }
 ---
 # Durable store for the freerouter testnet settlement wallet (3DL overlay / canary). Tiny.
 apiVersion: v1
