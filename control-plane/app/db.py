@@ -94,6 +94,40 @@ ALTER TABLE virtual_key ADD CONSTRAINT virtual_key_surface_check CHECK (
     OR surface ~ '^agents/[a-z0-9][a-z0-9-]{0,38}$'
 );
 
+-- The LiteLLM -> freerouter CUTOVER MIRROR (enterpriseaiframework-1f8, phase 3 of the
+-- cutover; design record docs/design/records/freerouter-reference-router.md C1).
+--
+-- Deliberately a SIDE table and not new columns on virtual_key. virtual_key holds the LIVE
+-- LiteLLM key set — its gateway_token_hash is what /admin/budget and the spend join use — and
+-- the whole point of the mirror is that it is ADDITIVE: every user keeps the LiteLLM key they
+-- already hold, nobody re-logs in and nobody loses access, right up until GATEWAY_PROVIDER
+-- flips. Writing the freerouter handle over gateway_token_hash would break budget updates and
+-- spend attribution the moment the mirror ran, which is the opposite of a safe cutover.
+--
+-- key_alias is the join to virtual_key and the SAME "<user>::<surface>" string on both sides —
+-- that identity is the whole mirror invariant, so it is the unique key here too.
+--
+-- limit_usd is what FREEROUTER REPORTED it applied (its per-key monthly cap is whole USD,
+-- ceil()-rounded — internal/core/keys.go limitToMonthlyUSD), recorded from freerouter's own
+-- response rather than echoed from our request, so the reconcile compares our intent against
+-- the gateway's answer and not against itself. NULL means unlimited on both sides.
+CREATE TABLE IF NOT EXISTS freerouter_mirror (
+    id            BIGSERIAL PRIMARY KEY,
+    key_alias     TEXT UNIQUE NOT NULL,
+    -- freerouter's sub-account id: the durable, NON-SECRET handle the control plane revokes
+    -- by. Never a bearer — the sub-account's one-time key is handed to the surface and the
+    -- control plane keeps no copy, exactly as it keeps no copy of a LiteLLM virtual key.
+    account_id    TEXT NOT NULL,
+    -- SHA-256 of the minted user key, as freerouter reports it. Non-secret; it cannot
+    -- authenticate. It is the id the key surface addresses, not a credential.
+    key_hash      TEXT,
+    -- The LiteLLM budget this row was mirrored FROM, snapshotted at mirror time.
+    source_max_budget NUMERIC(12, 4),
+    -- The cap freerouter said it applied, in whole USD. NULL = unlimited.
+    limit_usd     INTEGER,
+    mirrored_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- The SECOND metering dimension (enterpriseaiframework-914, Contract 3 of
 -- docs/design/records/agents-surface.md): how long each agent was RESIDENT and what it
 -- burned. Deliberately its own table and NOT the inference ledger — inference spend lives

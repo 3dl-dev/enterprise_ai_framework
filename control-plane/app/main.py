@@ -28,6 +28,7 @@ from . import (
     issuance,
     metering,
     metering_select,
+    mirror,
     portal,
     provisioning,
     workshop,
@@ -88,6 +89,13 @@ async def lifespan(app: FastAPI):
     # No-op for the LiteLLM default. (item enterpriseaiframework-757)
     if provisioning.backend() is freerouter:
         await freerouter.bootstrap_master_key()
+    # Teach app/freerouter to resolve an alias from our OWN mirror record rather than only
+    # from freerouter's usage rollup. The rollup is built from recorded spend, so without
+    # this a sub-account that has never spent is invisible: `delete_by_aliases` would report
+    # a successful revoke having revoked nothing, on both the rotate path and the
+    # disabled-in-IdP path. Deliberately here and not at import — after db.init(), so the
+    # table it reads exists. (item enterpriseaiframework-1f8)
+    mirror.install_alias_resolver()
     # The resident-usage collector (enterpriseaiframework-914). A timer, not a request
     # hook: resident time is measured by sampling a pod that exists, and nobody opens the
     # page while an agent runs overnight. It is a no-op where there is no cluster
@@ -365,6 +373,37 @@ async def set_budget(req: BudgetRequest):
         surface=req.surface or "all", max_budget=req.max_budget,
     )
     return {"updated": len(rows), "max_budget": req.max_budget}
+
+
+# ------------------------------------------------- the LiteLLM -> freerouter cutover mirror
+#
+# The gate for the cutover, in the product rather than in an operator's shell history: an
+# operator can ask "is it safe to flip GATEWAY_PROVIDER yet?" and get the same answer the
+# deploy script's `python -m app.mirror --reconcile` gets, from the same code.
+
+
+@app.get("/admin/freerouter/reconcile", dependencies=[Depends(require_admin)])
+async def freerouter_reconcile(verify_litellm: bool = False):
+    """Diff the live LiteLLM key set against the mirrored freerouter sub-accounts.
+
+    `ok` is the flip gate. See app/mirror.reconcile for what each bucket means and, in
+    particular, why `unconfirmed` is reported apart from `missing`.
+    """
+    return await mirror.reconcile(verify_litellm=verify_litellm)
+
+
+@app.post("/admin/freerouter/mirror", dependencies=[Depends(require_operator)])
+async def freerouter_mirror(dry_run: bool = False):
+    """Provision the freerouter sub-account for every live LiteLLM key that lacks one.
+
+    Additive and idempotent: it writes only freerouter_mirror rows, so it changes nothing
+    about the keys users are holding right now. It requires GATEWAY_PROVIDER=freerouter,
+    because it provisions through the selector rather than around it.
+    """
+    try:
+        return await mirror.mirror(dry_run=dry_run)
+    except mirror.BackendNotFreerouter as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 # ---------------------------------------------------------------- the one bill
