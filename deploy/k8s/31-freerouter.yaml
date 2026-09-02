@@ -89,8 +89,26 @@ spec:
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_UPSTREAMS, optional: true } }
             - name: FREEROUTER_PEER_RELAY_URL
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_RELAY_URL, optional: true } }
+            # --- MAINNET custody (3DL-OVERLAY ONLY, guardrail bd6; all absent in the shipped
+            # base, so it stays a testnet-only air-gap gateway). Mainnet is NEVER auto-minted:
+            # the settlement key is a DELIBERATELY-PROVISIONED secp256k1 key injected as a Key
+            # Vault secret (FREEROUTER_PEER_WALLET_KEY_HEX), which by code takes PRECEDENCE over
+            # the testnet keystore below — so the keystore's mainnet-forbidden guard never fires.
+            # FREEROUTER_PEER_MAINNET_ENABLED=true is the explicit prod opt-in that lets
+            # settlement use a real-value mainnet chain (ChainAllowed), and RPC_URL points at the
+            # chain. All three live in the secret (the operator provisions them), never here as a
+            # literal — the manifest only names the wiring. Absent ⇒ testnet self-mint, unchanged.
+            - name: FREEROUTER_PEER_WALLET_KEY_HEX
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_WALLET_KEY_HEX, optional: true } }
+            - name: FREEROUTER_PEER_NOSTR_KEY_HEX
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_NOSTR_KEY_HEX, optional: true } }
+            - name: FREEROUTER_PEER_MAINNET_ENABLED
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_MAINNET_ENABLED, optional: true } }
+            - name: FREEROUTER_PEER_RPC_URL
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_RPC_URL, optional: true } }
             # secp256k1 testnet settlement wallet; the FR self-generates it here on boot if
-            # the file is absent (mainnet keystore forbidden by code). On the small PVC below.
+            # the file is absent (mainnet keystore forbidden by code). Ignored when
+            # FREEROUTER_PEER_WALLET_KEY_HEX is set (which wins). On the small PVC below.
             - name: FREEROUTER_PEER_WALLET_KEYSTORE
               value: /var/lib/freerouter/wallet/testnet.key
           ports: [{ containerPort: 8080 }]
