@@ -135,6 +135,41 @@ class BackendNotFreerouter(RuntimeError):
     """`mirror()` was asked to provision while the selector points at LiteLLM."""
 
 
+async def record_account(
+    conn,
+    *,
+    key_alias: str,
+    account_id: str,
+    key_hash: str | None,
+    source_max_budget: float | None,
+    limit_usd: int | None,
+) -> None:
+    """Upsert the mirror row that says WHICH sub-account currently wears this alias.
+
+    One statement, used by the initial mirror run and by `/admin/budget`'s rotation, because
+    that row is not bookkeeping: `freerouter.alias_resolver` reads it to decide which account
+    a revoke addresses. Two copies of this write would be two answers to that question.
+    """
+    await conn.execute(
+        """
+        INSERT INTO freerouter_mirror
+            (key_alias, account_id, key_hash, source_max_budget, limit_usd)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (key_alias) DO UPDATE
+            SET account_id = EXCLUDED.account_id,
+                key_hash = EXCLUDED.key_hash,
+                source_max_budget = EXCLUDED.source_max_budget,
+                limit_usd = EXCLUDED.limit_usd,
+                mirrored_at = now()
+        """,
+        key_alias,
+        account_id,
+        key_hash,
+        source_max_budget,
+        limit_usd,
+    )
+
+
 async def mirror(*, dry_run: bool = False) -> dict:
     """Provision a freerouter sub-account for every live LiteLLM key that lacks one.
 
@@ -173,23 +208,13 @@ async def mirror(*, dry_run: bool = False) -> dict:
             max_budget=row["max_budget"],
         )
         async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO freerouter_mirror
-                    (key_alias, account_id, key_hash, source_max_budget, limit_usd)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (key_alias) DO UPDATE
-                    SET account_id = EXCLUDED.account_id,
-                        key_hash = EXCLUDED.key_hash,
-                        source_max_budget = EXCLUDED.source_max_budget,
-                        limit_usd = EXCLUDED.limit_usd,
-                        mirrored_at = now()
-                """,
-                row["key_alias"],
-                created["token"],
-                created.get("key_hash"),
-                row["max_budget"],
-                created.get("limit_usd"),
+            await record_account(
+                conn,
+                key_alias=row["key_alias"],
+                account_id=created["token"],
+                key_hash=created.get("key_hash"),
+                source_max_budget=row["max_budget"],
+                limit_usd=created.get("limit_usd"),
             )
         await db.audit(
             "system",
@@ -244,16 +269,27 @@ async def reconcile(*, verify_litellm: bool = False) -> dict:
       * `unconfirmed`        — mirror rows freerouter cannot corroborate because the
                                sub-account has never spent and the rollup is built from spend
                                events. NOT counted as missing, and NOT counted as verified.
-      * `account_id_conflict`— the rollup shows a DIFFERENT account id for an alias we
-                               recorded. That is two accounts wearing one alias and it makes
-                               the bill ambiguous, so it is called out on its own.
+      * `account_id_conflict`— the rollup shows accounts for an alias we recorded and NONE of
+                               them is the one we recorded. The bill cannot say which account
+                               is ours, so it is called out on its own and it fails the gate.
+      * `retired_accounts`   — the rollup shows an EXTRA account beside the recorded one. A
+                               budget change rotates the sub-account (freerouter cannot re-cap
+                               a key) and the retired account keeps its bill rows, so this is
+                               the ordinary tail of a rotation and does not fail the gate. It
+                               is still reported: if a retired account's spend is growing, the
+                               revoke that follows the rotation did not land and the user is
+                               holding two live keys at two different caps.
     """
     pool = await db.pool()
     async with pool.acquire() as conn:
         source = await source_keys(conn)
         mirrored = await mirrored_keys(conn)
 
-    rollup = await freerouter.rollup_account_ids_by_alias()
+    # Every account the rollup shows per alias, not one of them: a budget change rotates the
+    # sub-account and freerouter keeps the retired account's bill rows, so a rotated alias
+    # legitimately has two. Collapsing them would report the live, recorded account as an
+    # `account_id_conflict` roughly half the time, purely by dict order.
+    rollup_all = await freerouter.rollup_accounts_by_alias()
 
     source_by_alias = {r["key_alias"]: r for r in source}
     missing = sorted(set(source_by_alias) - set(mirrored))
@@ -287,16 +323,29 @@ async def reconcile(*, verify_litellm: bool = False) -> dict:
     confirmed: list[str] = []
     unconfirmed: list[str] = []
     account_id_conflict: list[dict] = []
+    retired_still_spending: list[dict] = []
     for alias, row in mirrored.items():
-        seen = rollup.get(alias)
-        if seen is None:
+        seen = rollup_all.get(alias, [])
+        if not seen:
             unconfirmed.append(alias)
-        elif seen != row["account_id"]:
+        elif row["account_id"] not in seen:
+            # NONE of the accounts freerouter reports under this alias is the one we
+            # recorded. That is two accounts wearing one label with the bill unable to say
+            # which is ours, and it is a different fault from a rotation's harmless tail.
             account_id_conflict.append(
-                {"key_alias": alias, "recorded": row["account_id"], "rollup": seen}
+                {"key_alias": alias, "recorded": row["account_id"], "rollup": sorted(seen)}
             )
         else:
             confirmed.append(alias)
+        stale = [a for a in seen if a != row["account_id"]]
+        if stale:
+            # A rotation's retired account, still carrying its (frozen) bill rows: expected
+            # and harmless. It is reported anyway because a retired account whose spend is
+            # STILL GROWING means the revoke that should have followed the rotation never
+            # landed and the user is holding two live keys at two different caps.
+            retired_still_spending.append(
+                {"key_alias": alias, "live": row["account_id"], "retired": sorted(stale)}
+            )
 
     result = {
         "source_keys": len(source),
@@ -308,6 +357,7 @@ async def reconcile(*, verify_litellm: bool = False) -> dict:
         "confirmed": sorted(confirmed),
         "unconfirmed": sorted(unconfirmed),
         "account_id_conflict": account_id_conflict,
+        "retired_accounts": retired_still_spending,
         "ok": not missing and not budget_mismatch and not account_id_conflict,
     }
 

@@ -91,6 +91,70 @@ FR_BINARY = Path(os.environ.get("FREEROUTER_BINARY", "/tmp/fr-enterpriseaiframew
 FR_SOURCE = Path(os.environ.get("FREEROUTER_SOURCE", "/home/baron/projects/freerouter"))
 
 
+# The running freerouter's own SQLite meter file, recorded by the server fixture. Written to
+# by `_record_spend` below — see there for why a test needs to reach it.
+METER: dict = {}
+
+
+def _record_spend(account_id: str, cost_usd: float = 0.25) -> None:
+    """Put a real generation event in freerouter's meter so the account appears in the rollup.
+
+    freerouter's `GET /api/v1/usage/rollup` is built from `usage_events` and NOTHING else
+    (metering/rollup.go aggregates them, then filters to the caller's subtree), and its SQLite
+    store re-reads the table on every call rather than caching — so a row inserted here is
+    read back by the RUNNING binary through its own aggregation and subtree walk. That is the
+    only way to reach the rollup at all in this suite: producing spend the ordinary way needs
+    a real upstream provider, and there is none here.
+
+    This is the meter's real table, in the real schema, read by the real service. What is
+    staged is the completion that would have written the row, not the read under test.
+    """
+    import sqlite3
+
+    event = {
+        "account_id": account_id,
+        "key_hash_prefix": "00000000",
+        "model_id": "test/model",
+        "provider": "test",
+        "status": "ok",
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "cost_usd": cost_usd,
+        "generation_id": f"gen-{account_id}-{uuid.uuid4().hex[:8]}",
+        "timestamp": "2026-09-01T00:00:00Z",
+    }
+    conn = sqlite3.connect(str(METER["db"]))
+    try:
+        conn.execute(
+            "INSERT INTO usage_events (generation_id, account_id, timestamp, event_json) "
+            "VALUES (?, ?, ?, ?)",
+            (event["generation_id"], account_id, event["timestamp"], json.dumps(event)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _clear_spend() -> None:
+    """Empty the meter's usage table so each test starts with the rollup it expects.
+
+    The freerouter process is module-scoped while the gateway database is per-test, so an
+    event left behind by one test is an account id from a DEAD world still wearing a live
+    alias in the next test's rollup — which reads, correctly but uselessly, as an
+    account_id_conflict. Cleared at the top of `world`, alongside the schema reset.
+    """
+    import sqlite3
+
+    if not METER.get("db") or not METER["db"].exists():
+        return
+    conn = sqlite3.connect(str(METER["db"]))
+    try:
+        conn.execute("DELETE FROM usage_events")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -117,6 +181,7 @@ def freerouter_server(tmp_path_factory):
 
     workdir = tmp_path_factory.mktemp("freerouter")
     port = free_port()
+    METER["db"] = workdir / "meter.db"
     env = {
         **os.environ,
         "FREEROUTER_METER_BACKEND": "sqlite",
@@ -254,6 +319,10 @@ def world(postgres, freerouter_server, control_plane_tenant, monkeypatch):
     # app.db caches its pool in a module global; a per-test pool against a per-test schema is
     # what keeps these independent of order.
     monkeypatch.setattr(db, "_pool", None, raising=False)
+    # The gateway database is per-test but the freerouter process is per-module, so its meter
+    # is reset here too — otherwise one test's recorded spend is a stale account id wearing a
+    # live alias in the next test's rollup.
+    _clear_spend()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -554,6 +623,291 @@ def test_revoking_an_unspent_subaccount_works_only_because_of_our_own_record(wor
     assert not key_authenticates(), "after revoke the key must no longer authenticate"
 
 
+# ------------------------------------------------------ /admin/budget on the two backends
+#
+# enterpriseaiframework-257, the ADMITTED flip blocker: `main.set_budget` →
+# `provisioning.update_budget` → `freerouter.update_budget` used to raise NotImplementedError,
+# so POST /admin/budget was a 500 on the freerouter backend and the flip could not happen with
+# budgets working. These drive the real endpoint function against the real freerouter binary
+# and the real gateway database, and the assertions are about what FREEROUTER says the cap is
+# and whether a key can still authenticate — never about which functions were called.
+
+
+def _key_state(base: str, key: str) -> tuple[int, list]:
+    """Ask freerouter, with the USER's own key, what that key can do and what it is capped at.
+
+    GET /api/v1/keys is scoped to the caller, so authenticating with the user key both proves
+    the key still works (200 vs 401) and returns freerouter's OWN answer about the account's
+    keys and their limits — the independent source of truth for every cap asserted below. The
+    control plane never sees these numbers except through freerouter.
+
+    The listing carries TWO keys per sub-account, and finding that out is why this is read
+    from the real binary: `POST /api/v1/subaccounts` returns a root bearer for the new
+    account, and that bearer is a key, with NO limit. `generate_key` never hands it to anyone
+    and never stores it, but it is in the account's key set — so "what is the user's cap"
+    has to be asked of the specific minted hash, not of the account's keys as a whole.
+    """
+    import httpx
+
+    r = httpx.get(
+        f"{base}/api/v1/keys", headers={"Authorization": f"Bearer {key}"}, timeout=10.0
+    )
+    if r.status_code != 200:
+        return r.status_code, []
+    return 200, r.json().get("data", [])
+
+
+def _limit_of(keys: list, key_hash: str):
+    """freerouter's reported cap on ONE key, addressed by the hash the control plane recorded."""
+    matched = [k for k in keys if k.get("hash") == key_hash]
+    assert len(matched) == 1, f"{key_hash} not found in {[k.get('hash') for k in keys]}"
+    return matched[0]["limit"]
+
+
+def _seed_alice_chat_on_freerouter(world, budget: float = 25.0) -> dict:
+    """One mirrored (user, surface) whose USER KEY the test still holds.
+
+    `mirror()` drops the minted bearer on the floor by design, so a test that needs to prove
+    the OLD key stops working has to mint through the same selector itself and record the
+    mirror row exactly as the mirror would. Everything else in SEED is mirrored normally.
+    """
+    created = run(provisioning.generate_key(
+        username="alice", surface="chat", idp_user_id="idp-alice", max_budget=budget,
+    ))
+    run(_insert_mirror_row(
+        world["dsn"], "alice::chat", created["token"], created.get("key_hash"),
+        budget, created.get("limit_usd"),
+    ))
+    run(mirror.mirror())  # the other four live keys
+    return created
+
+
+def test_admin_budget_on_freerouter_applies_the_new_cap_instead_of_500(world):
+    """The done-condition, end to end: /admin/budget answers, and the cap it reports is the
+    one freerouter is actually enforcing on the key the user now holds."""
+    from app.main import BudgetRequest, set_budget
+
+    old = _seed_alice_chat_on_freerouter(world, budget=25.0)
+    status, keys = _key_state(world["base"], old["key"])
+    assert status == 200 and _limit_of(keys, old["key_hash"]) == 25.0
+
+    result = run(set_budget(BudgetRequest(username="alice", surface="chat", max_budget=99.0)))
+
+    assert result["updated"] == 1 and result["max_budget"] == 99.0
+    assert [r["key_alias"] for r in result["rotated"]] == ["alice::chat"]
+    new_key = result["rotated"][0]["key"]
+    assert new_key != old["key"]
+
+    # freerouter's own answer about the cap on the key the user is now holding, addressed by
+    # the hash the ledger recorded for it.
+    new_hash = run(_mirror_rows(world["dsn"]))["alice::chat"]["key_hash"]
+    status, keys = _key_state(world["base"], new_key)
+    assert status == 200, "the replacement key must authenticate"
+    assert _limit_of(keys, new_hash) == 99.0
+
+    # ...and the superseded key can no longer spend at the old cap.
+    assert _key_state(world["base"], old["key"])[0] == 401
+
+
+def test_admin_budget_repoints_the_ledger_and_the_mirror_at_the_live_account(world):
+    """The continuity half. A budget change that left `gateway_token_hash` naming the retired
+    account (or, worse, the LiteLLM hash the mirror deliberately never overwrote) would make
+    the NEXT budget change fail against a key the gateway no longer has — silently, from the
+    operator's side. That is the failure issuance.py's five steps exist to prevent."""
+    from app.main import BudgetRequest, set_budget
+
+    old = _seed_alice_chat_on_freerouter(world, budget=25.0)
+    before = {alias: row for alias, row in run(_mirror_rows(world["dsn"])).items()}
+    assert before["alice::chat"]["account_id"] == old["token"]
+    ledger_before = dict(
+        (alias, handle) for alias, handle, _b, _s in run(_virtual_keys(world["dsn"]))
+    )
+    assert ledger_before["alice::chat"] == "litellm-hash-alice-chat"
+
+    run(set_budget(BudgetRequest(username="alice", surface="chat", max_budget=99.0)))
+
+    after = run(_mirror_rows(world["dsn"]))
+    new_account = after["alice::chat"]["account_id"]
+    assert new_account != old["token"]
+    assert after["alice::chat"]["limit_usd"] == 99
+    assert float(after["alice::chat"]["source_max_budget"]) == 99.0
+    ledger_after = dict(
+        (alias, (handle, float(budget) if budget is not None else None))
+        for alias, handle, budget, _s in run(_virtual_keys(world["dsn"]))
+    )
+    assert ledger_after["alice::chat"] == (new_account, 99.0)
+    # Untouched surfaces keep the handle they had — this is one key's rotation, not a reprovision.
+    assert ledger_after["alice::ide"][0] == "litellm-hash-alice-ide"
+
+    # The alias now resolves to the LIVE account, so a later revoke lands on the live key.
+    assert run(freerouter._account_ids_by_alias())["alice::chat"] == new_account
+
+    # And the reconcile is green: before this item, a budget change on the freerouter path
+    # could only ever create permanent `budget_mismatch` drift, because nothing could move
+    # freerouter's cap. This is the same check the flip gate reads.
+    report = run(mirror.reconcile())
+    assert report["budget_mismatch"] == []
+    assert report["account_id_conflict"] == []
+    assert report["ok"] is True
+
+
+def test_admin_budget_without_a_surface_rotates_every_live_key(world):
+    """No surface means all of them, and every one must end up capped — a partial application
+    would leave some surfaces enforcing the old number with the ledger claiming the new one."""
+    from app.main import BudgetRequest, set_budget
+
+    _seed_alice_chat_on_freerouter(world, budget=25.0)
+
+    result = run(set_budget(BudgetRequest(username="alice", surface=None, max_budget=7.0)))
+
+    assert result["updated"] == 3  # chat, ide, terminal; carol's revoked key is not alice's
+    assert sorted(r["key_alias"] for r in result["rotated"]) == [
+        "alice::chat", "alice::ide", "alice::terminal",
+    ]
+    rows = run(_mirror_rows(world["dsn"]))
+    for rotated in result["rotated"]:
+        status, keys = _key_state(world["base"], rotated["key"])
+        assert status == 200, rotated["key_alias"]
+        assert _limit_of(keys, rows[rotated["key_alias"]]["key_hash"]) == 7.0, rotated["key_alias"]
+    assert run(mirror.reconcile())["ok"] is True
+
+
+def test_admin_budget_refuses_a_zero_cap_and_leaves_the_key_alone(world):
+    """freerouter reads limit<=0 as UNLIMITED, so applying a zero budget would hand the user
+    an uncapped key at the moment an operator tried to stop them spending. Refuse, and change
+    nothing — not the key, not the ledger."""
+    from fastapi import HTTPException
+
+    from app.main import BudgetRequest, set_budget
+
+    old = _seed_alice_chat_on_freerouter(world, budget=25.0)
+
+    with pytest.raises(HTTPException) as exc:
+        run(set_budget(BudgetRequest(username="alice", surface="chat", max_budget=0)))
+    assert exc.value.status_code == 400
+
+    status, keys = _key_state(world["base"], old["key"])
+    assert status == 200 and _limit_of(keys, old["key_hash"]) == 25.0
+    ledger = dict((alias, float(b)) for alias, _h, b, _s in run(_virtual_keys(world["dsn"])) if b is not None)
+    assert ledger["alice::chat"] == 25.0
+
+
+def test_admin_budget_on_a_handle_freerouter_cannot_name_is_a_409_not_a_500(world):
+    """Break it the way it actually breaks: the fault is injected through the DATA the
+    endpoint reads. With no mirror row, the ledger's handle is still the LiteLLM hash and
+    there is no freerouter account it can name — the operator must be told that, not handed a
+    stack trace, and nothing must be minted under a guessed alias."""
+    from fastapi import HTTPException
+
+    from app.main import BudgetRequest, set_budget
+
+    _seed_alice_chat_on_freerouter(world, budget=25.0)
+    run(_delete_mirror_row(world["dsn"], "alice::ide"))
+
+    with pytest.raises(HTTPException) as exc:
+        run(set_budget(BudgetRequest(username="alice", surface="ide", max_budget=50.0)))
+    assert exc.value.status_code == 409
+    assert "alice::ide" in str(exc.value.detail)
+
+    # Control: the SAME endpoint, same freerouter, on the surface whose mirror row is intact.
+    assert run(set_budget(
+        BudgetRequest(username="alice", surface="chat", max_budget=50.0)
+    ))["updated"] == 1
+
+
+def test_a_rotated_alias_with_spend_is_a_retired_account_not_a_conflict(world):
+    """The rollup's ONLY test with real rows in it, and the two claims that need them.
+
+    A budget change rotates the sub-account, and freerouter's revoke keeps the retired
+    account's bill — so from then on the rollup reports TWO accounts under one alias, forever.
+    Two things must survive that, and neither was reachable before this file could put real
+    events in the meter (nothing in this suite can spend: there is no upstream provider):
+
+      1. the reconcile must corroborate the LIVE account rather than calling the alias an
+         `account_id_conflict` — which, when the rollup was collapsed to one id per alias,
+         happened or did not happen purely by dict order;
+      2. the alias must still resolve to the live account, so a later revoke kills the key
+         the user is holding and not the one that is already dead.
+    """
+    from app.main import BudgetRequest, set_budget
+
+    old = _seed_alice_chat_on_freerouter(world, budget=25.0)
+    _record_spend(old["token"])  # the account has a bill before the budget changes
+    assert run(freerouter.rollup_accounts_by_alias())["alice::chat"] == [old["token"]]
+
+    run(set_budget(BudgetRequest(username="alice", surface="chat", max_budget=99.0)))
+    new_account = run(_mirror_rows(world["dsn"]))["alice::chat"]["account_id"]
+    _record_spend(new_account)
+
+    # freerouter now reports both, and says so.
+    assert sorted(run(freerouter.rollup_accounts_by_alias())["alice::chat"]) == sorted(
+        [old["token"], new_account]
+    )
+
+    report = run(mirror.reconcile())
+    assert report["account_id_conflict"] == []
+    assert "alice::chat" in report["confirmed"]
+    assert report["retired_accounts"] == [
+        {"key_alias": "alice::chat", "live": new_account, "retired": [old["token"]]}
+    ]
+    assert report["ok"] is True
+
+    # And the alias resolves to the live account even though the dead one is in the rollup.
+    assert run(freerouter._account_ids_by_alias())["alice::chat"] == new_account
+
+
+def test_admin_budget_on_litellm_patches_in_place_and_never_rotates(world, monkeypatch):
+    """Behaviour preservation, which is the standing constraint on this whole cutover.
+
+    The LiteLLM server is the one thing stubbed, and only at the TRANSPORT: app/gateway.py's
+    real request code runs (its URL, body, headers and raise_for_status), against an
+    httpx.MockTransport standing in for a LiteLLM that this suite has never run — the same
+    call the `--verify-litellm` test makes and for the same reason. What is under test is
+    main.set_budget's backend selection, and none of it is stubbed: it must address LiteLLM by
+    the LEDGER's hash (never the freerouter account id, which exists here), must not rotate,
+    and must leave every freerouter-side record untouched.
+    """
+    import httpx
+
+    from app.main import BudgetRequest, set_budget
+
+    _seed_alice_chat_on_freerouter(world, budget=25.0)
+    mirror_before = run(_mirror_rows(world["dsn"]))
+
+    seen: list[dict] = []
+
+    def litellm(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/key/update":
+            return httpx.Response(404, json={"error": f"unhandled {request.url.path}"})
+        body = json.loads(request.content)
+        seen.append(body)
+        return httpx.Response(200, json={"key": body["key"], "max_budget": body["max_budget"]})
+
+    real_client = httpx.AsyncClient
+
+    def client_with_mock(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(litellm)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setenv("GATEWAY_PROVIDER", "litellm")
+    monkeypatch.setenv("GATEWAY_MASTER_KEY", "sk-master")
+    monkeypatch.setattr(gateway.httpx, "AsyncClient", client_with_mock)
+    assert provisioning.backend() is gateway
+
+    result = run(set_budget(BudgetRequest(username="alice", surface="chat", max_budget=99.0)))
+
+    assert result["updated"] == 1 and result["rotated"] == []
+    # Addressed by the LiteLLM hash the ledger holds, not by the freerouter account id.
+    assert seen == [{"key": "litellm-hash-alice-chat", "max_budget": 99.0}]
+    ledger = dict(
+        (alias, (h, float(b) if b is not None else None))
+        for alias, h, b, _s in run(_virtual_keys(world["dsn"]))
+    )
+    assert ledger["alice::chat"] == ("litellm-hash-alice-chat", 99.0)
+    # The freerouter side is not a participant on this backend and must not have moved.
+    assert run(_mirror_rows(world["dsn"])) == mirror_before
+
+
 # ---------------------------------------------------------------- the script
 
 
@@ -615,13 +969,16 @@ async def _virtual_keys(dsn) -> list:
     return [tuple(r) for r in rows]
 
 
-async def _insert_mirror_row(dsn, alias, account_id, key_hash) -> None:
+async def _insert_mirror_row(
+    dsn, alias, account_id, key_hash, source_max_budget=None, limit_usd=None
+) -> None:
     conn = await asyncpg.connect(dsn)
     try:
         await conn.execute(
-            "INSERT INTO freerouter_mirror (key_alias, account_id, key_hash) "
-            "VALUES ($1, $2, $3)",
-            alias, account_id, key_hash,
+            "INSERT INTO freerouter_mirror "
+            "(key_alias, account_id, key_hash, source_max_budget, limit_usd) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            alias, account_id, key_hash, source_max_budget, limit_usd,
         )
     finally:
         await conn.close()
