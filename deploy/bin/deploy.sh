@@ -152,8 +152,15 @@ kubectl -n "$NS" create configmap gateway-config \
 # docs/design/hoistable-and-operated.md.
 CHAT_INFERENCE_BASE="${CHAT_INFERENCE_BASE:-http://gateway:4000/v1}"
 CHAT_ENDPOINT_APIKEY="${CHAT_ENDPOINT_APIKEY:-\${CHAT_VIRTUAL_KEY}}"
+# The chat picker's opening models are the operator's catalogue choice. Default to the bundled
+# local stub so a forker's personal profile works with no provider keys; 3dl sets its models in
+# bundle/.env. `fetch: true` still pulls the full live catalogue from the gateway at runtime.
+CHAT_MODEL_PRIMARY="${CHAT_MODEL_PRIMARY:-fake-provider/fake-gpt-small}"
+CHAT_MODEL_SECONDARY="${CHAT_MODEL_SECONDARY:-fake-provider/fake-gpt-small}"
 sed -e "s|baseURL: \"http://gateway:4000/v1\"|baseURL: \"${CHAT_INFERENCE_BASE}\"|" \
     -e "s|apiKey: \"\${CHAT_VIRTUAL_KEY}\"|apiKey: \"${CHAT_ENDPOINT_APIKEY}\"|" \
+    -e "s|__CHAT_MODEL_PRIMARY__|${CHAT_MODEL_PRIMARY}|g" \
+    -e "s|__CHAT_MODEL_SECONDARY__|${CHAT_MODEL_SECONDARY}|g" \
     bundle/librechat/librechat.yaml > /tmp/librechat-k8s.yaml
 kubectl -n "$NS" create configmap chat-config \
     --from-file=librechat.yaml=/tmp/librechat-k8s.yaml \

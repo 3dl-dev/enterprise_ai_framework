@@ -142,7 +142,7 @@ camp's current rules are what a fresh deployment gets by default.
 | URL | none of its own — reached at `$PUBLIC_BASE_URL/portal/`, Code tab |
 | Auth | the portal authenticates, then proxies you to your own pod; the pod is ClusterIP, admitted only from the control plane, and checks a token on every request |
 | Key | `<username>::ide`, minted by `POST /admin/keys/issue` at provision time |
-| Model | `glm-5.2@deepinfra` by default; `--model` overrides from the gateway catalogue |
+| Model | `<model>` by default; `--model` overrides from the gateway catalogue |
 | Budget | 0.5 CPU / 1Gi requested, 1 CPU / 2Gi limit, 4Gi ephemeral |
 
 ### What is deliberately closed

@@ -90,7 +90,7 @@ USAGE="usage: provision-agent.sh <keycloak-username> <agent-name> [--model NAME]
 USER_NAME="${1:?${USAGE}}"
 AGENT_NAME="${2:?${USAGE}}"
 shift 2
-MODEL="${AGENT_MODEL:-glm-5.2@deepinfra}"
+MODEL="${AGENT_MODEL:-fake-provider/fake-gpt-small}"
 BYO_KEY_FILE=""
 BYO_API_BASE="${AGENT_BYO_API_BASE:-}"
 EMAIL_CONFIG_FILE="${AGENT_EMAIL_CONFIG_FILE:-}"

@@ -31,7 +31,7 @@
 # looks generous for a non-reasoning model leaves a reasoning model short mid-edit — the
 # answer gets truncated after the thinking, which presents as the agent stopping partway
 # through a change rather than as a limit being hit.
-- name: openai/glm-5.2@deepinfra
+- name: openai/example-large
   edit_format: udiff
   use_repo_map: true
   examples_as_sys_msg: true
@@ -40,7 +40,7 @@
   extra_params:
     max_tokens: 32768
 
-- name: openai/glm-4.7@deepinfra
+- name: openai/example-small
   edit_format: diff
   use_repo_map: true
   examples_as_sys_msg: true

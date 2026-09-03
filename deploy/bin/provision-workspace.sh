@@ -70,7 +70,7 @@ CLIENT_ID=workspace
 
 USER_NAME="${1:?usage: provision-workspace.sh <keycloak-username> [--model NAME] [--instructions FILE]}"
 shift
-MODEL="${WORKSPACE_MODEL:-glm-5.2@deepinfra}"
+MODEL="${WORKSPACE_MODEL:-fake-provider/fake-gpt-small}"
 INSTRUCTIONS="${WORKSPACE_INSTRUCTIONS:-}"
 while [[ $# -gt 0 ]]; do
     case "$1" in

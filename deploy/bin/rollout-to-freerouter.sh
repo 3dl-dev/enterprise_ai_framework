@@ -12,7 +12,7 @@
 # that lacks its model would 404 every request — so this script refuses, per user, and says
 # which model is missing. This is why the rollout is blocked until full-catalog discovery
 # (freerouter epic-168) lands: today freerouter serves 1 model and the workspaces run
-# glm-5.2@deepinfra.
+# fake-provider/fake-gpt-small.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 NS=enterprise-ai
@@ -29,7 +29,7 @@ echo "freerouter catalog: $(echo "$CATALOG" | grep -c .) models"
 serves() { echo "$CATALOG" | grep -qxF "$1"; }
 
 # strand guard: refuse the whole rollout if the workspace default model is not served
-WS_MODEL="${WORKSPACE_MODEL:-glm-5.2@deepinfra}"
+WS_MODEL="${WORKSPACE_MODEL:-fake-provider/fake-gpt-small}"
 if ! serves "$WS_MODEL"; then
     echo "REFUSING: freerouter does not serve the workspace model '$WS_MODEL' — repointing" >&2
     echo "  surfaces now would strand them (404 on every request). Wait for full-catalog" >&2

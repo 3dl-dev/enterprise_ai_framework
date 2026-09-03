@@ -11,7 +11,7 @@
     "Costs are deliberately zero here: the gateway is the meter. A second, client-side",
     "cost estimate that disagrees with the bill is worse than no estimate at all."
   ],
-  "openai/glm-5.2@deepinfra": {
+  "openai/example-large": {
     "max_input_tokens": 200000,
     "max_output_tokens": 32768,
     "input_cost_per_token": 0,
@@ -19,7 +19,7 @@
     "litellm_provider": "openai",
     "mode": "chat"
   },
-  "openai/glm-4.7@deepinfra": {
+  "openai/example-small": {
     "max_input_tokens": 128000,
     "max_output_tokens": 32768,
     "input_cost_per_token": 0,

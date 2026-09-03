@@ -9,14 +9,14 @@
         "apiKey": "{env:OPENAI_API_KEY}"
       },
       "models": {
-        "glm-5.2@deepinfra": {
+        "example-large": {
           "name": "GLM 5.2",
           "limit": {
             "context": 200000,
             "output": 32768
           }
         },
-        "glm-4.7@deepinfra": {
+        "example-small": {
           "name": "GLM 4.7",
           "limit": {
             "context": 128000,
@@ -47,7 +47,7 @@
       }
     }
   },
-  "model": "enterprise-ai/glm-5.2@deepinfra",
+  "model": "enterprise-ai/example-large",
   "theme": "system",
   "instructions": [
     "/etc/opencode/PLATFORM.md",

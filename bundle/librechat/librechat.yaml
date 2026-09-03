@@ -71,7 +71,7 @@ interface:
 # through our own gateway on the chat surface's virtual key, same as any other model
 # call: same ledger, same audit trail, no second credential.
 #
-# Model choice: glm-5.2@deepinfra, not the cheaper glm-4.7 — memory extraction is a
+# Model choice is the operator's (CHAT_MODEL_PRIMARY). Memory extraction is a
 # tool call (`set_memory`/`delete_memory`) on every turn, and glm-5.2 is the model
 # this bundle has actually measured invoking tools reliably (wave 1). Getting this
 # wrong is silent (the model just answers instead of calling the tool) rather than a
@@ -101,7 +101,7 @@ memory:
   agent:
     enabled: true
     provider: "Enterprise AI"
-    model: "glm-5.2@deepinfra"
+    model: "__CHAT_MODEL_PRIMARY__"
 
 # Defaults. Without these the surface opens with nothing selected and the user has to
 # know which of eleven models to pick before they can type anything — which reads as
@@ -157,7 +157,7 @@ modelSpecs:
       webSearch: true
       preset:
         endpoint: "Enterprise AI"
-        model: "glm-5.2@deepinfra"
+        model: "__CHAT_MODEL_PRIMARY__"
         artifacts: "default"
         # A real zod key (data-provider/src/models.ts's tModelSpecPresetSchema), unlike
         # `interface.artifacts` above — turns on the codeapi sandbox
@@ -227,7 +227,7 @@ modelSpecs:
       webSearch: true
       preset:
         endpoint: "Enterprise AI"
-        model: "glm-4.7@deepinfra"
+        model: "__CHAT_MODEL_SECONDARY__"
         artifacts: "default"
         maxContextTokens: 128000
         maxOutputTokens: 32768
@@ -435,7 +435,7 @@ endpoints:
       baseURL: "http://gateway:4000/v1"
       models:
         # Fetched from the gateway so the catalogue has exactly one source.
-        default: ["glm-5.2@deepinfra", "glm-4.7@deepinfra"]
+        default: ["__CHAT_MODEL_PRIMARY__", "__CHAT_MODEL_SECONDARY__"]
         fetch: true
       titleConvo: true
       # The model that NAMES a conversation. It was "fake-small", which is the local
@@ -446,7 +446,7 @@ endpoints:
       #
       # Titling is one short call per conversation, so it goes to the cheaper of the two
       # real models rather than the default one.
-      titleModel: "glm-4.7@deepinfra"
+      titleModel: "__CHAT_MODEL_SECONDARY__"
       modelDisplayLabel: "Enterprise AI"
       # ATTRIBUTION — depends on the profile (see the apiKey/baseURL note above):
       #   * Default (shared key): chat rows carry a per-user `end_user` value — LibreChat's
