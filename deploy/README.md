@@ -7,12 +7,12 @@ one-command uninstall.
 ```bash
 op signin                                   # credentials come from 1Password via direnv
 direnv reload
-export PUBLIC_BASE_URL=https://gateway.tailcb6ef9.ts.net
+export PUBLIC_BASE_URL=https://ai.example.org
 deploy/bin/deploy.sh
 deploy/bin/post-deploy.sh                   # realm redirect URIs, bootstrap user, key sync
 ```
 
-**Live at <https://gateway.tailcb6ef9.ts.net>** — real Let's Encrypt cert, OIDC login
+**Live at <https://ai.example.org>** — real Let's Encrypt cert, OIDC login
 verified end to end.
 
 Everything lives in the `enterprise-ai` namespace. `kubectl delete namespace enterprise-ai`
@@ -31,7 +31,7 @@ is a complete uninstall.
 
 ## Known gaps
 
-- **`ai.3dl.network` is not served.** Tailscale Funnel terminates TLS with the node's
+- **`ai.example.org` is not served.** Tailscale Funnel terminates TLS with the node's
   `*.ts.net` certificate and cannot present one for a custom domain, so a CNAME to the
   funnel host resolves and then fails every handshake. Using the custom name needs an
   inbound 443 port-forward to the gateway VM, or a cloud entry point proxying back over
@@ -106,7 +106,7 @@ no longer drops the conversation. Sessions live on the PVC — they were on an e
 erased by every restart until that was found.
 
 ```bash
-deploy/bin/kaniko-build.sh deploy/workspace 192.168.2.43:30500/enterprise-ai-workspace:$(git rev-parse --short HEAD)
+deploy/bin/kaniko-build.sh deploy/workspace <registry>/enterprise-ai-workspace:$(git rev-parse --short HEAD)
 deploy/bin/ensure-second-user.sh student          # a realm user; each gets its own secret
 deploy/bin/provision-workspace.sh baron
 deploy/bin/provision-workspace.sh student

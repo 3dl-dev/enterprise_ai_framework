@@ -1,7 +1,7 @@
 """Normalized records -> metrics.json (the shape the report page consumes).
 
 Ports the practice kit's model-behavior-report.py aggregation into the product. Output is
-the five arrays + composite indices that 3dl.dev/coding-vs-orchestration.html reads, so the
+the five arrays + composite indices that the operator's published analytics report reads, so the
 in-product page (item -d27) renders the same way and a customer can line their numbers up
 against the reference.
 

@@ -225,7 +225,7 @@ ensure RAGVECTOR_PASSWORD          "$(hex 24)"
 # The first two are not secrets, but they must exist in .env for post-up to provision
 # the account — an .env written before these were added would otherwise skip it silently.
 ensure BOOTSTRAP_USER              "baron"
-ensure BOOTSTRAP_EMAIL             "baron@3dl.dev"
+ensure BOOTSTRAP_EMAIL             "admin@example.org"
 ensure BOOTSTRAP_PASSWORD          "$(hex 16)"
 
 # --- codeapi (enterpriseaiframework-082) ---

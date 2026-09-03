@@ -10,5 +10,5 @@ metadata:
     app.kubernetes.io/part-of: enterprise-ai-framework
     # No GPU is ever requested by this tenant. Recorded as a label so it is visible in
     # `kubectl get ns --show-labels` without reading the docs.
-    mainframe.3dl.dev/gpu: "none"
-    mainframe.3dl.dev/workload: "long-running-service"
+    workload.enterprise-ai/gpu: "none"
+    workload.enterprise-ai/workload: "long-running-service"

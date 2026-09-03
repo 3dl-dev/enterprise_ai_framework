@@ -7,8 +7,8 @@ file is baked into the workspace image. So "the coding surface's model list trac
 router" (item enterpriseaiframework-75c, design record C2) is a render step, like
 render-gateway-config.py is for LiteLLM: fetch GET /v1/models and regenerate the block.
 
-The catalog source is the router the workspaces reach — ai.3dl.one's freerouter, which
-reflects router.3dl.one's models through federation. Everything in opencode.json other than
+The catalog source is the router the workspaces reach — the operator's freerouter, which
+reflects its upstreams' models through federation. Everything in opencode.json other than
 the model block (provider wrapper, instructions, skills, mcp, theme) is preserved verbatim.
 
 Graceful: an empty/unreachable catalog leaves the template's baked models untouched, so the
