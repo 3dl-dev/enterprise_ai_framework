@@ -4,6 +4,11 @@ asyncpg==0.30.0
 httpx==0.28.1
 pydantic==2.11.7
 pymongo==4.10.1
+# AES-256-CBC to reproduce LibreChat's own credential encryption byte-for-byte, so the
+# control plane can seed each chat user's per-user key into LibreChat's store
+# (app/chat_keyseed.py). Pinned by a golden vector in test_chat_keyseed; a mismatch there
+# means chat would seed keys nobody can decrypt.
+cryptography==43.0.1
 websockets==13.1
 # The agent object set is a multi-document YAML template that app/agents.py renders and
 # then applies over the Kubernetes API (enterpriseaiframework-627). It arrived transitively

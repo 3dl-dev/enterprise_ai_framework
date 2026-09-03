@@ -71,7 +71,7 @@ interface:
 # through our own gateway on the chat surface's virtual key, same as any other model
 # call: same ledger, same audit trail, no second credential.
 #
-# Model choice: glm-5.2@deepinfra, not the cheaper glm-4.7 — memory extraction is a
+# Model choice: zai-org/GLM-5.2, not the cheaper glm-4.7 — memory extraction is a
 # tool call (`set_memory`/`delete_memory`) on every turn, and glm-5.2 is the model
 # this bundle has actually measured invoking tools reliably (wave 1). Getting this
 # wrong is silent (the model just answers instead of calling the tool) rather than a
@@ -101,7 +101,7 @@ memory:
   agent:
     enabled: true
     provider: "Enterprise AI"
-    model: "glm-5.2@deepinfra"
+    model: "zai-org/GLM-5.2"
 
 # Defaults. Without these the surface opens with nothing selected and the user has to
 # know which of eleven models to pick before they can type anything — which reads as
@@ -157,7 +157,7 @@ modelSpecs:
       webSearch: true
       preset:
         endpoint: "Enterprise AI"
-        model: "glm-5.2@deepinfra"
+        model: "zai-org/GLM-5.2"
         artifacts: "default"
         # A real zod key (data-provider/src/models.ts's tModelSpecPresetSchema), unlike
         # `interface.artifacts` above — turns on the codeapi sandbox
@@ -227,7 +227,7 @@ modelSpecs:
       webSearch: true
       preset:
         endpoint: "Enterprise AI"
-        model: "glm-4.7@deepinfra"
+        model: "zai-org/GLM-4.7"
         artifacts: "default"
         maxContextTokens: 128000
         maxOutputTokens: 32768
@@ -413,11 +413,19 @@ mcpServers:
 endpoints:
   custom:
     - name: "Enterprise AI"
-      apiKey: "${CHAT_VIRTUAL_KEY}"
-      baseURL: "http://gateway:4000/v1"
+      # PER-USER KEYS (not one shared key). freerouter's identity is the API key — the key IS
+      # the principal, authenticated by possession — so chat conforms to that model rather than
+      # asking freerouter to trust a spoofable `user` payload. "user_provided" makes LibreChat
+      # send each signed-in user's OWN key, chosen from its authenticated session. The user
+      # never pastes one: the control plane seeds each user's `<user>::chat` freerouter key
+      # into LibreChat's credential store (control-plane app/chat_keyseed.py, reconciled by
+      # POST /admin/chat/reconcile-keys). A user with no seeded key falls back to LibreChat's
+      # paste-a-key prompt — which is why the backfill must run before this file is deployed.
+      apiKey: "user_provided"
+      baseURL: "http://freerouter:8080/v1"
       models:
         # Fetched from the gateway so the catalogue has exactly one source.
-        default: ["glm-5.2@deepinfra", "glm-4.7@deepinfra"]
+        default: ["zai-org/GLM-5.2", "zai-org/GLM-4.7"]
         fetch: true
       titleConvo: true
       # The model that NAMES a conversation. It was "fake-small", which is the local
@@ -428,13 +436,22 @@ endpoints:
       #
       # Titling is one short call per conversation, so it goes to the cheaper of the two
       # real models rather than the default one.
-      titleModel: "glm-4.7@deepinfra"
+      titleModel: "zai-org/GLM-4.7"
       modelDisplayLabel: "Enterprise AI"
-      # ATTRIBUTION — this note used to say chat spend attributes to the surface as a
-      # whole rather than to the signed-in user, and that forwarding the user via
-      # addParams had been tried and removed. Both are now out of date, corrected against
-      # the cluster ledger 2026-07-29: chat rows carry a per-user `end_user` value, so
-      # chat spend IS attributed per person.
+      # ATTRIBUTION — as of the freerouter per-user-key cut, chat attributes by the same
+      # mechanism as every other surface: each request carries the signed-in user's OWN
+      # `<user>::chat` key (apiKey: user_provided above), so the spend row's alias names the
+      # person directly and unspoofably — the key is the principal. The forwarded-`user`
+      # machinery documented below is now LEGACY: LibreChat still puts its Mongo ObjectId in
+      # the `user` field, but attribution no longer depends on it, so chat_identity.py's
+      # id->name translation is vestigial for new chat rows (they already carry a username
+      # alias, which principal_label passes through untouched). Cleanup of that translation
+      # and TestChatPrincipalOnTheOneBill is a tracked follow-up, not done here to keep the
+      # cut's blast radius small. Everything from here down describes the legacy path:
+      #
+      # ---- legacy (pre-cut): chat spend attributed via a forwarded end_user ----
+      # chat rows carried a per-user `end_user` value (LibreChat's Mongo ObjectId), so chat
+      # spend was attributed per person by translating that id.
       #
       # What arrives there is LibreChat's own primary key (a 24-char Mongo ObjectId),
       # which is correct, stable, and useless to show a human.
