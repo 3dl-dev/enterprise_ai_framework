@@ -146,7 +146,7 @@ services:
 
   # freerouter — the inference spoke (docs/design/records/freerouter-reference-router.md).
   # Bundled + self-hosted, air-gap DEFAULT: personal-gateway profile, its own meter in the
-  # welded postgres, NO provider keys and NO router.3dl.one peer here (those are 3DL-overlay
+  # welded postgres, NO provider keys and NO upstream peer here (those are instance-overlay
   # config only — guardrail enterpriseaiframework-bd6). During the transition it runs ALONGSIDE
   # the LiteLLM gateway; retiring LiteLLM (enterpriseaiframework-f24) is gated on freerouter
   # gaining native Anthropic inbound (freerouter-887). Empty catalog until EAF's providers are

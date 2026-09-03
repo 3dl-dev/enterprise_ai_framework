@@ -25,7 +25,7 @@ spec:
           args:
             - "--context=dir:///workspace"
             - "--dockerfile=/workspace/Dockerfile"
-            - "--destination=192.168.2.43:30500/enterprise-ai-mcp-echo:12b2"
+            - "--destination=localhost:5000/enterprise-ai-mcp-echo:latest"
             - "--insecure"
             - "--skip-tls-verify"
             - "--insecure-pull"
