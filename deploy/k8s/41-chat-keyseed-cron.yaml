@@ -1,0 +1,49 @@
+# Keeps the chat surface turnkey after the per-user-key cut (control-plane app/chat_keyseed.py).
+#
+# The backfill seeds every EXISTING chat account. A NEW user, though, only gets a LibreChat
+# Mongo account the first time they sign in to chat — which is after the control plane has
+# provisioned them, so there is no single moment we can seed synchronously. This CronJob closes
+# that window: it calls the idempotent reconcile endpoint on a short interval, so a user who
+# just signed in for the first time is seeded within one tick and chat "just works" for them
+# with no paste-a-key prompt. Idempotent — users who already have a key are skipped — so
+# re-running costs a Mongo scan, not a key rotation.
+#
+# FOLLOW-UP (enterpriseaiframework-bbb): make this event-driven or recent-only, so it does not
+# re-attempt the synthetic test accounts (example.invalid, no IdP principal) that will fail
+# issuance on every tick. Harmless today (a cheap IdP 404 each), worth tightening as they grow.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: chat-keyseed-reconcile
+  namespace: enterprise-ai
+spec:
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # A stuck reconcile must not pile up; give it a bounded life and let the next tick retry.
+      activeDeadlineSeconds: 240
+      backoffLimit: 1
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: reconcile
+              image: curlimages/curl:8.10.1
+              command:
+                - sh
+                - -c
+                - >-
+                  curl -sS -m 200 -X POST
+                  -H "Authorization: Bearer $ADMIN_TOKEN"
+                  -H "Content-Type: application/json"
+                  http://control-plane:8000/admin/chat/reconcile-keys
+                  && echo "" && echo "reconcile ok"
+              env:
+                - name: ADMIN_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: enterprise-ai-secrets
+                      key: CONTROL_PLANE_ADMIN_TOKEN

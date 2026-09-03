@@ -116,6 +116,23 @@ spec:
               value: mongodb://chatdb:27017
             - name: CHAT_MONGO_DB
               value: librechat
+            # The WRITE side of the LibreChat coupling: the control plane seeds each user's
+            # per-user chat key into LibreChat's credential store so the chat surface can run
+            # on freerouter's key-as-principal model instead of one shared key + a spoofable
+            # user field. These two are LibreChat's own credential-encryption key/IV (the same
+            # secret keys 50-chat.yaml gives LibreChat); chat_keyseed reproduces LibreChat's
+            # AES-256-CBC v1 scheme byte-for-byte (golden-vector pinned) to write a value
+            # LibreChat itself decrypts. Optional so a deployment that has not cut chat over
+            # simply skips seeding (chat_keyseed.configured() is False) rather than failing.
+            - name: CHAT_CREDS_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_CREDS_KEY, optional: true } }
+            - name: CHAT_CREDS_IV
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_CREDS_IV, optional: true } }
+            # The custom endpoint's `name` in bundle/librechat/librechat.yaml — the key LibreChat
+            # looks a per-user credential up under. Must match that file, or seeded keys are
+            # unfindable and users fall back to the paste-a-key prompt.
+            - name: CHAT_ENDPOINT_NAME
+              value: "Enterprise AI"
             # The credential the portal presents to a workspace pod. The pod refuses to
             # start without its half of it, so a workspace can never come up reachable
             # but unauthenticated.

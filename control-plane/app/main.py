@@ -21,6 +21,7 @@ from . import (
     agent_usage,
     agents,
     chat_identity,
+    chat_keyseed,
     db,
     export,
     freerouter,
@@ -225,6 +226,13 @@ async def sync(default_budget: float | None = Query(default=None)):
                         reason="disabled_in_idp", count=len(stale),
                     )
                     details.append({"user": u["username"], "action": "revoked", "n": len(stale)})
+                # The chat surface's per-user key lives in LibreChat's own store, which
+                # delete_by_aliases (a gateway operation) cannot reach. Remove it here — even
+                # when there was no active gateway key to revoke — so a disabled user's seeded
+                # chat credential does not outlive their other surfaces (chat_keyseed.py).
+                if chat_keyseed.configured():
+                    for cid in chat_identity.ids_for(u["username"]):
+                        chat_keyseed.delete_chat_key(cid)
                 continue
 
             for surface in gateway.SURFACES:
@@ -327,6 +335,54 @@ async def issue_key(req: IssueKeyRequest):
     own key and must do it the identical way; see that module for why each step is there.
     """
     return IssuedKey(**await issuance.issue(req.username, req.surface, actor="admin"))
+
+
+class ChatKeyReconcile(BaseModel):
+    seeded: int
+    skipped: int
+    failed: int
+    details: list[dict]
+
+
+@app.post("/admin/chat/reconcile-keys", response_model=ChatKeyReconcile,
+          dependencies=[Depends(require_operator)])
+async def reconcile_chat_keys():
+    """Seed a per-user chat key into LibreChat for every chat account that lacks one.
+
+    This makes the chat surface conform to freerouter's key-as-principal model (see
+    app/chat_keyseed.py): each user's chat requests carry their OWN `<user>::chat` key —
+    minted here and written into LibreChat's own credential store — so nobody pastes a key and
+    freerouter attributes spend by an authenticated key, never a spoofable payload field.
+
+    Idempotent: a user who already has a seeded key is skipped, so this is safe to run on a
+    loop for new signups and safe to re-run after a partial failure. The backfill that must
+    precede flipping the endpoint to `user_provided` is exactly one call to this.
+    """
+    if not chat_keyseed.configured():
+        raise HTTPException(503, "chat key seeding is not configured (CHAT_MONGO_URL/CHAT_CREDS_*)")
+    seeded = skipped = failed = 0
+    details: list[dict] = []
+    for mongo_id, username in chat_identity.all_users():
+        if chat_keyseed.has_key(mongo_id):
+            skipped += 1
+            continue
+        try:
+            issued = await issuance.issue(username, "chat", actor="system")
+            if not chat_keyseed.seed_chat_key(mongo_id, issued["key"]):
+                failed += 1
+                details.append({"user": username, "error": "seed write failed"})
+                continue
+            seeded += 1
+            details.append({"user": username, "action": "seeded"})
+        except HTTPException as exc:
+            # A chat account with no matching IdP principal (issuance 404) or a disabled one
+            # (409): skip it, loudly, rather than failing everyone else's seeding on one
+            # orphaned chat account.
+            failed += 1
+            details.append({"user": username, "error": f"{exc.status_code}: {exc.detail}"})
+    await db.audit("system", "chat.reconcile_keys", "*",
+                   seeded=seeded, skipped=skipped, failed=failed)
+    return ChatKeyReconcile(seeded=seeded, skipped=skipped, failed=failed, details=details)
 
 
 class BudgetRequest(BaseModel):

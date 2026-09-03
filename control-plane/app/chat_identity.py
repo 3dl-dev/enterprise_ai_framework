@@ -120,6 +120,18 @@ def ids_for(username: str) -> list[str]:
     return [cid for cid, name in _cache.items() if name == username]
 
 
+def all_users() -> list[tuple[str, str]]:
+    """Every (mongo_id, username) chat account, freshly read.
+
+    For the per-user-key reconcile (chat_keyseed), which must seed a key for anybody who has
+    a chat account. Always refreshes rather than trusting the cache, because a user who signed
+    in to chat seconds ago is exactly the one that still needs seeding — the cache existing for
+    the bill's benefit would otherwise hide them for a whole render cycle.
+    """
+    refresh()
+    return list(_cache.items())
+
+
 # ---------------------------------------------------------------------------
 # Naming a principal on the bill
 #

@@ -413,6 +413,24 @@ mcpServers:
 endpoints:
   custom:
     - name: "Enterprise AI"
+      # These two are the operator-agnostic DEFAULTS, overridden per instance at deploy time —
+      # they are NOT hardcoded to any operator's backend (that would make this bundle
+      # un-hoistable; see docs/design/hoistable-and-operated.md). deploy/bin/deploy.sh
+      # substitutes both from the instance's gitignored bundle/.env before rendering the
+      # chat-config ConfigMap: CHAT_INFERENCE_BASE (default below) and CHAT_ENDPOINT_APIKEY
+      # (default below).
+      #
+      #   * Default profile (nothing set): a shared virtual key against the bundled LiteLLM
+      #     gateway. LibreChat identifies the person by forwarding them in the request `user`
+      #     field, which LiteLLM honors as `end_user` — per-user chat billing without a
+      #     per-user key. This is the simplest working profile and what a forker gets.
+      #   * Per-user-key profile (CHAT_ENDPOINT_APIKEY=user_provided, CHAT_INFERENCE_BASE at a
+      #     key-only gateway like freerouter): LibreChat sends each signed-in user's OWN
+      #     `<user>::chat` key, chosen from its authenticated session — the key is the
+      #     principal, unspoofable. The control plane seeds each user's key into LibreChat's
+      #     store so nobody pastes one (control-plane app/chat_keyseed.py, reconciled by
+      #     POST /admin/chat/reconcile-keys); the backfill must run before switching this
+      #     endpoint to user_provided, or an un-seeded user hits the paste-a-key prompt.
       apiKey: "${CHAT_VIRTUAL_KEY}"
       baseURL: "http://gateway:4000/v1"
       models:
@@ -430,11 +448,21 @@ endpoints:
       # real models rather than the default one.
       titleModel: "glm-4.7@deepinfra"
       modelDisplayLabel: "Enterprise AI"
-      # ATTRIBUTION — this note used to say chat spend attributes to the surface as a
-      # whole rather than to the signed-in user, and that forwarding the user via
-      # addParams had been tried and removed. Both are now out of date, corrected against
-      # the cluster ledger 2026-07-29: chat rows carry a per-user `end_user` value, so
-      # chat spend IS attributed per person.
+      # ATTRIBUTION — depends on the profile (see the apiKey/baseURL note above):
+      #   * Default (shared key): chat rows carry a per-user `end_user` value — LibreChat's
+      #     Mongo ObjectId, forwarded in the `user` field — which the gateway records and
+      #     chat_identity.py translates to a username. The rest of this note describes that
+      #     path, which is the one in force under the default profile.
+      #   * Per-user-key profile: each request carries the user's own `<user>::chat` key, so
+      #     the spend row's alias already names the person, unspoofably — the key is the
+      #     principal, exactly like every other surface. The forwarded `user` still arrives but
+      #     attribution no longer depends on it, making the id->name translation below
+      #     vestigial for those rows (principal_label passes a username alias through
+      #     untouched). Retiring it under that profile is tracked (enterpriseaiframework-e59).
+      #
+      # ---- the shared-key path (default profile): forwarded end_user ----
+      # chat rows carry a per-user `end_user` value (LibreChat's Mongo ObjectId), so chat
+      # spend is attributed per person by translating that id.
       #
       # What arrives there is LibreChat's own primary key (a 24-char Mongo ObjectId),
       # which is correct, stable, and useless to show a human.
