@@ -136,8 +136,17 @@ kubectl -n "$NS" create configmap gateway-config \
     --from-file=allow_reasoning_effort.py=deploy/gateway/allow_reasoning_effort.py \
     --dry-run=client -o yaml | kubectl apply -f -
 
-# The chat surface's in-cluster endpoint differs from compose only in hostname.
-sed 's|http://gateway:4000/v1|http://gateway:4000/v1|' bundle/librechat/librechat.yaml > /tmp/librechat-k8s.yaml
+# The chat surface's inference profile is an INSTANCE choice, not a bundled default. The
+# bundle ships operator-agnostic (a shared key against the LiteLLM gateway); an instance
+# overrides these two via bundle/.env to select a different backend / key model — e.g. a
+# key-only gateway with per-user keys. Defaults reproduce the shipped bundle verbatim, so a
+# forker who sets nothing gets a working chat surface. See librechat.yaml's endpoint note and
+# docs/design/hoistable-and-operated.md.
+CHAT_INFERENCE_BASE="${CHAT_INFERENCE_BASE:-http://gateway:4000/v1}"
+CHAT_ENDPOINT_APIKEY="${CHAT_ENDPOINT_APIKEY:-\${CHAT_VIRTUAL_KEY}}"
+sed -e "s|baseURL: \"http://gateway:4000/v1\"|baseURL: \"${CHAT_INFERENCE_BASE}\"|" \
+    -e "s|apiKey: \"\${CHAT_VIRTUAL_KEY}\"|apiKey: \"${CHAT_ENDPOINT_APIKEY}\"|" \
+    bundle/librechat/librechat.yaml > /tmp/librechat-k8s.yaml
 kubectl -n "$NS" create configmap chat-config \
     --from-file=librechat.yaml=/tmp/librechat-k8s.yaml \
     --dry-run=client -o yaml | kubectl apply -f -
