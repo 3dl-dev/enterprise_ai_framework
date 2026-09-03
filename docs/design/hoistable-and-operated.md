@@ -103,31 +103,23 @@ did. It runs in `make test` and CI.
 6. **Cascade** — this is an architecture change; run the downstream review cascade
    (dap:docs/practice/claude-md/architecture-change-cascade.md).
 
-## The rename (do it with the split, not after)
+## The rename — scrubbed (2026-09-03)
 
-`enterprise_ai_framework` is three generic buzzwords; it names nothing and is painful to say.
-The split is the natural moment to rename, because we are about to create a *second* repo
-(`<platform>-3dl`) and stamp the name into image names, the k8s namespace, Python packages, the
-CLI, and every doc — renaming after that is far more expensive.
+A rename was considered alongside this split and **dropped**. The split does not depend on it:
+the distributable/instance boundary, the oss-clean gate, and the `<current-name>-3dl` overlay
+all work under the current name. Recorded here so it is not reopened without new information:
 
-**Criteria.** Short; ownable (repo/CLI/domain); evokes the thesis (one controlled layer all AI
-traffic passes through — one login, one bill, one audit — self-hosted/sovereign, open); pairs
-cleanly beside `freerouter` (the routing core it sits above); not another buzzword.
-
-**Shortlist (final choice reserved to the operator):**
-
-| Name | Why | Risk |
-|---|---|---|
-| **Meridian** (lead) | A single reference line every point crosses — the one plane all AI traffic passes through; professional, ownable, on-thesis; reads well as the platform above `freerouter` | common word; some companies share it |
-| **Keep** | Sovereignty-forward — you hold your AI, keys, and audit in your own keep; very short, memorable | generic word, weak searchability |
-| **Conduit** | Literal function — the single channel all traffic flows through | slightly generic/technical |
-| **Bastion** | A fortified, controlled point of entry you operate | "bastion host" association |
-
-**Rename mechanics (once the name is chosen):** GitHub repo rename (redirects hold); Python
-package/module (`enterprise_ai_*` → new), import updates; container image names; k8s namespace
-`enterprise-ai` and the `enterprise-ai-secrets` secret; `PUBLIC_BASE_URL` and doc references; the
-overlay repo name `<name>-3dl`. Sequence it as one mechanical PR after the oss-clean split so the
-grep denylist and the rename land together.
+- The name search hit a wall. The AI-platform namespace is saturated — real words, trendy
+  compounds (`*stack`, `*build`, `vibe*`, `frontier*`), and even near-coinages are almost all
+  taken on domains, and several collided with **funded competitors or near-clones** (e.g.
+  `Tesslate` — a self-hosted full-stack AI dev tool — sits right on our positioning). Chasing a
+  clean, rival-free, ownable name in real time was not converging and was not worth the cost.
+- If revived later, the useful findings stand: name into the **ownership / actually-free /
+  sovereign** lane (which SaaS rivals structurally cannot follow us into — no competitor
+  collisions there), expect to solve the domain with a variant rather than a bare `.com`, and
+  vet every candidate for a *product/trademark* collision (not just a GitHub handle, which lives
+  under the org and does not matter). Coined words are the only lane with open namespace.
+- Until then, the current name stays, and nothing in this document is blocked by that.
 
 ## What is already done
 
