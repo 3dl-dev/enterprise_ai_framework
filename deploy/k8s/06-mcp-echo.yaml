@@ -13,7 +13,7 @@
 # `image: REPLACED_BY_DEPLOY` is substituted at apply time (no automated deploy script
 # owns this yet, matching 05-fakeprovider.yaml's manual-substitution convention). Built
 # with kaniko per mcp-echo/kaniko-job.yaml (no Docker socket, no privileged container).
-# Currently live: 192.168.2.43:30500/enterprise-ai-mcp-echo:12b2
+# Built by deploy/bin/kaniko-build.sh and pushed to the rail registry (RAIL_REGISTRY).
 apiVersion: v1
 kind: Service
 metadata:

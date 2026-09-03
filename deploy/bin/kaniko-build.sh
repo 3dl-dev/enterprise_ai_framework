@@ -14,7 +14,7 @@
 set -euo pipefail
 
 NS=enterprise-ai
-REGISTRY="${RAIL_REGISTRY:-192.168.2.43:30500}"
+REGISTRY="${RAIL_REGISTRY:-localhost:5000}"
 
 CONTEXT="${1:?usage: kaniko-build.sh <context-dir> <image-ref> [--build-arg K=V ...]}"
 IMAGE="${2:?usage: kaniko-build.sh <context-dir> <image-ref> [--build-arg K=V ...]}"

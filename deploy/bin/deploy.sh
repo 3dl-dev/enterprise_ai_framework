@@ -5,7 +5,7 @@
 # cannot drift into different credentials. Nothing secret is written to the repo — Secrets
 # are created directly against the API.
 #
-#   PUBLIC_BASE_URL=https://ai.3dl.network deploy/bin/deploy.sh
+#   PUBLIC_BASE_URL=https://ai.example.org deploy/bin/deploy.sh
 #
 # PUBLIC_BASE_URL must be the URL a *browser* will use. The chat surface's OIDC client
 # refuses plaintext discovery and validates that the issuer matches what it requested, so
@@ -16,17 +16,25 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 NS=enterprise-ai
-REGISTRY="${RAIL_REGISTRY:-192.168.2.43:30500}"
 IMAGE_NAME="enterprise-ai-control-plane"
 TAG="$(git rev-parse --short HEAD 2>/dev/null || echo latest)"
-IMAGE="${REGISTRY}/${IMAGE_NAME}:${TAG}"
 
 [[ -f bundle/.env ]] || { echo "bundle/.env missing — run 'make up' locally first" >&2; exit 1; }
 set -a; . ./bundle/.env; set +a
 
+# Instance profile — operator-agnostic DEFAULTS; the instance overrides these in bundle/.env
+# (see docs/design/hoistable-and-operated.md). Defined AFTER sourcing bundle/.env so the
+# instance's values win. The manifests carry __GATEWAY_LAN_IP__/__GATEWAY_TAILNET_HOST__
+# placeholders (the OIDC-backchannel hostAlias), substituted in the apply loop below.
+REGISTRY="${RAIL_REGISTRY:-localhost:5000}"
+IMAGE="${REGISTRY}/${IMAGE_NAME}:${TAG}"
+GATEWAY_LAN_IP="${GATEWAY_LAN_IP:-127.0.0.1}"
+GATEWAY_TAILNET_HOST="${GATEWAY_TAILNET_HOST:-gateway.local}"
+LAN_CIDR="${LAN_CIDR:-127.0.0.0/8}"
+
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 if [[ -z "$PUBLIC_BASE_URL" ]]; then
-    echo "error: PUBLIC_BASE_URL is required (e.g. https://ai.3dl.network)" >&2
+    echo "error: PUBLIC_BASE_URL is required (e.g. https://ai.example.org)" >&2
     exit 1
 fi
 if [[ "$PUBLIC_BASE_URL" != https://* ]]; then
@@ -261,6 +269,13 @@ for path in deploy/k8s/*.yaml; do
     else
         rendered=$(sed "s|REPLACED_BY_DEPLOY|${CFG_SUM}|" "$path")
     fi
+    # Instance network shape: the OIDC-backchannel hostAlias (and its NetworkPolicy peer) is
+    # operator-specific. Manifests ship placeholders; the instance sets the real LAN IP + tailnet
+    # host in bundle/.env. Defaults keep a forker's cluster applying cleanly.
+    rendered=$(printf '%s\n' "$rendered" | sed \
+        -e "s|__GATEWAY_LAN_IP__|${GATEWAY_LAN_IP}|g" \
+        -e "s|__GATEWAY_TAILNET_HOST__|${GATEWAY_TAILNET_HOST}|g" \
+        -e "s|__LAN_CIDR__|${LAN_CIDR}|g")
     echo "    apply $f"
     printf '%s\n' "$rendered" | kubectl apply -f -
 done

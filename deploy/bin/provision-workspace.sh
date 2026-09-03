@@ -52,8 +52,16 @@ cd "$(dirname "$0")/../.."
 source deploy/bin/lib/tenant-instructions.sh
 source deploy/bin/lib/workspace-memory.sh
 
+# Instance config — same channel as deploy.sh (bundle/.env), so a workspace re-provision uses
+# the operator's real registry / network shape. The defaults below are agnostic, so this runs
+# on a forker's cluster with nothing set (docs/design/hoistable-and-operated.md).
+[[ -f bundle/.env ]] && { set -a; . ./bundle/.env; set +a; }
+GATEWAY_LAN_IP="${GATEWAY_LAN_IP:-127.0.0.1}"
+GATEWAY_TAILNET_HOST="${GATEWAY_TAILNET_HOST:-gateway.local}"
+LAN_CIDR="${LAN_CIDR:-127.0.0.0/8}"
+
 NS=enterprise-ai
-REGISTRY="${RAIL_REGISTRY:-192.168.2.43:30500}"
+REGISTRY="${RAIL_REGISTRY:-localhost:5000}"
 IMAGE_NAME="enterprise-ai-workspace"
 WORKSPACE_TAG="${WORKSPACE_TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo latest)}"
 IMAGE="${WORKSPACE_IMAGE:-${REGISTRY}/${IMAGE_NAME}:${WORKSPACE_TAG}}"
@@ -79,7 +87,7 @@ ISSUER="$(secret OPENID_ISSUER)"
 
 # The address a browser will use to reach this workspace. NodePorts answer on every node;
 # one is named so the OIDC redirect URI is a single fixed string.
-WORKSPACE_HOST="${WORKSPACE_HOST:-192.168.2.44}"
+WORKSPACE_HOST="${WORKSPACE_HOST:-localhost}"
 
 echo "==> workspace for ${USER_NAME}"
 echo "    image    ${IMAGE}"
@@ -162,10 +170,10 @@ KEYSUM=$(printf '%s' "$VKEY" | sha256sum | cut -c1-16)
 # Where a published page can be opened from. Deliberately NOT behind oauth2-proxy: the
 # audience is parents, who have no account. Override to a funnel-fronted URL when one
 # exists; the LAN NodePort is the honest default.
-PUBLISH_URL="${PUBLISH_URL:-https://gateway.tailcb6ef9.ts.net}"
+PUBLISH_URL="${PUBLISH_URL:-https://${GATEWAY_TAILNET_HOST}}"
 
 # ---------------------------------------------------------------- apply
-kubectl apply -f deploy/k8s/60-workspace-common.yaml >/dev/null
+sed -e "s|__GATEWAY_LAN_IP__|${GATEWAY_LAN_IP}|g" -e "s|__LAN_CIDR__|${LAN_CIDR}|g" deploy/k8s/60-workspace-common.yaml | kubectl apply -f - >/dev/null
 
 # One ConfigMap for the whole deployment, applied BEFORE the pod template below so a pod
 # created by this run always finds it already there — see
@@ -186,6 +194,8 @@ sed -e "s|__USER__|${USER_NAME}|g" \
     -e "s|__IMAGE__|${IMAGE}|g" \
     -e "s|__MODEL__|${MODEL}|g" \
     -e "s|__GATEWAY_BASE__|${GATEWAY_SURFACE_BASE:-http://gateway:4000}|g" \
+    -e "s|__GATEWAY_LAN_IP__|${GATEWAY_LAN_IP}|g" \
+    -e "s|__GATEWAY_TAILNET_HOST__|${GATEWAY_TAILNET_HOST}|g" \
     -e "s|__KEYSUM__|${KEYSUM}|g" \
     -e "s|__PUBLISH_URL__|${PUBLISH_URL}|g" \
     deploy/k8s/61-workspace.template.yaml | kubectl apply -f - >/dev/null

@@ -50,9 +50,9 @@ spec:
       # The browser is unaffected: it resolves the same name via the tailnet or the
       # public funnel as before.
       hostAliases:
-        - ip: "192.168.2.42"
+        - ip: "__GATEWAY_LAN_IP__"
           hostnames:
-            - "gateway.tailcb6ef9.ts.net"
+            - "__GATEWAY_TAILNET_HOST__"
       # A ConfigMap volume is a SYMLINK FARM: Kubernetes materialises the keys under a
       # timestamped directory and points `..data` at it. LibreChat's deployment-skills
       # loader refuses symlinks outright — "..data: symlinks are not allowed in deployment

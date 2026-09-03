@@ -49,7 +49,7 @@ spec:
     # Only reachable at all through the NodePort, which sets externalTrafficPolicy: Local
     # so the real client address survives instead of being replaced by the node's.
     - from:
-        - ipBlock: { cidr: 192.168.2.0/24 }   # the LAN the nodes and operators are on
+        - ipBlock: { cidr: __LAN_CIDR__ }   # the LAN the nodes and operators are on
         - ipBlock: { cidr: 100.64.0.0/10 }    # the tailnet
       ports:
         - { protocol: TCP, port: 4180 }
@@ -134,14 +134,14 @@ spec:
     # issuer — and this egress — is now :443. It is the same endpoint any browser on the
     # internet can reach, and it needs credentials.
     - to:
-        - ipBlock: { cidr: 192.168.2.42/32 }
+        - ipBlock: { cidr: __GATEWAY_LAN_IP__/32 }
       ports:
         - { protocol: TCP, port: 443 }
 
     # The internet, for pip / npm / git clone. Every private range is excluded, which is
     # what closes the routes that matter:
     #   10.43.0.1:443   the Kubernetes API server (service CIDR)
-    #   192.168.2.43/44 the API server on the nodes, and the image registry
+    #   the LAN nodes (API server + image registry)
     #   10.42.0.0/16    every other pod, including other people's workspaces
     #   169.254.0.0/16  link-local, i.e. any metadata service
     - to:

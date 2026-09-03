@@ -73,7 +73,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 NS=enterprise-ai
-REGISTRY="${RAIL_REGISTRY:-192.168.2.43:30500}"
+REGISTRY="${RAIL_REGISTRY:-localhost:5000}"
 IMAGE_NAME="enterprise-ai-workspace"
 # The SAME image the Code surface runs, derived the same way provision-workspace.sh
 # derives it — including the WORKSPACE_TAG/WORKSPACE_IMAGE overrides, because the tag that
