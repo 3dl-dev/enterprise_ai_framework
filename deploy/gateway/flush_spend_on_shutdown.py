@@ -3,7 +3,7 @@
 WHAT THIS FIXES, MEASURED RATHER THAN REASONED
 
 `enterpriseaiframework-3f3`: one request, served with HTTP 200 from a workspace pod on its
-own `baron::ide` key on 2026-07-28 at 02:10:50Z, never appeared in the spend ledger. Two
+own `alice::ide` key on 2026-07-28 at 02:10:50Z, never appeared in the spend ledger. Two
 earlier explanations were disproved by measurement — it was not a cache hit (cache hits
 write their own row) and it was not the master key (master-key rows land in the ledger as
 `(unattributed)`; there were none in that hour at all). The row was not orphaned from a

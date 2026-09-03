@@ -5,19 +5,19 @@
 #
 :8080 {
     handle_path /v1/audio/speech* {
-        reverse_proxy inference-a.stealth.baron.local:8880
+        reverse_proxy inference-a.internal:8880
     }
     handle_path /v1/audio/transcriptions* {
-        reverse_proxy inference-a.stealth.baron.local:8200
+        reverse_proxy inference-a.internal:8200
     }
     handle /v1/chat/completions* {
-        reverse_proxy inference-a.stealth.baron.local:8000
+        reverse_proxy inference-a.internal:8000
     }
     handle /v1/models* {
-        reverse_proxy inference-a.stealth.baron.local:8000
+        reverse_proxy inference-a.internal:8000
     }
     handle /v1/images/generations* {
-        reverse_proxy inference-b.stealth.baron.local:8188
+        reverse_proxy inference-b.internal:8188
     }
     respond 404
 }
@@ -144,7 +144,7 @@ https://ai.example.org:443, https://ai.example.org:8443 {
     }
 }
 
-# enterprise-ai Coder workspace (ws-baron). Funnel-exposed on :10000 because the
+# enterprise-ai Coder workspace (ws-alice). Funnel-exposed on :10000 because the
 # workspace NodePorts live on the node subnet and the operator is on another subnet.
 :8083 {
     reverse_proxy NODE_IP:30440

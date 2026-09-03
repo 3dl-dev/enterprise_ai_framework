@@ -147,7 +147,7 @@ spec:
             # should not require holding the credential that can revoke every key.
             # Empty means no console at all, which is the safe direction to fail.
             - name: PORTAL_ADMINS
-              value: "baron"
+              value: "__PORTAL_ADMINS__"
             - name: WORKSPACE_INTERNAL_TOKEN
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: WORKSPACE_INTERNAL_TOKEN } }
             # How often the resident-usage meter samples agent pods

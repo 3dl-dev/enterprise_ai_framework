@@ -8,14 +8,14 @@
 # Worked examples — the whole point of this file is that these are the whole command:
 #
 #   # Slack (the default) — a resident agent metered on the one bill, in your workspace
-#   deploy/bin/hermes-up.sh baron hermes --slack-config-file ~/.secrets/hermes-slack.env
+#   deploy/bin/hermes-up.sh alice hermes --slack-config-file ~/.secrets/hermes-slack.env
 #
 #   # Discord instead
-#   deploy/bin/hermes-up.sh baron hermes --chat discord \
+#   deploy/bin/hermes-up.sh alice hermes --chat discord \
 #       --discord-config-file ~/.secrets/hermes-discord.env
 #
 #   # Re-run it. Nothing restarts, nothing rotates, the credential file is not needed again.
-#   deploy/bin/hermes-up.sh baron hermes
+#   deploy/bin/hermes-up.sh alice hermes
 #
 # THIS SCRIPT COMPOSES. IT IMPLEMENTS NOTHING.
 # ===========================================
@@ -109,7 +109,7 @@ done
 
 # ---------------------------------------------------------------- the chat choice
 # SLACK IS THE DEFAULT, and it is derived here rather than being a default the operator has
-# to know: `hermes-up.sh baron hermes --slack-config-file F` must work with no --chat, and
+# to know: `hermes-up.sh alice hermes --slack-config-file F` must work with no --chat, and
 # `--discord-config-file F` must not silently provision a Slack agent that has no Slack.
 if [[ -z "$CHAT" ]]; then
     if [[ -n "$DISCORD_CONFIG_FILE" && -z "$SLACK_CONFIG_FILE" ]]; then

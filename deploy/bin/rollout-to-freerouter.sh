@@ -5,7 +5,7 @@
 # a freerouter key. Session-safe: workspace PVC/XDG state survives, agents keep their loop.
 #
 #   deploy/bin/rollout-to-freerouter.sh <wave>
-#     wave = a space-separated user list ("baron", "baron claire", "all"), or "chat"
+#     wave = a space-separated user list ("alice", "alice claire", "all"), or "chat"
 #
 # HARD PRECONDITION (the strand guard): a surface is repointed ONLY if prod freerouter's
 # /v1/models actually serves the model that surface uses. Repointing a surface at a catalog

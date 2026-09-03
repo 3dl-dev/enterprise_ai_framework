@@ -108,7 +108,7 @@ erased by every restart until that was found.
 ```bash
 deploy/bin/kaniko-build.sh deploy/workspace <registry>/enterprise-ai-workspace:$(git rev-parse --short HEAD)
 deploy/bin/ensure-second-user.sh student          # a realm user; each gets its own secret
-deploy/bin/provision-workspace.sh baron
+deploy/bin/provision-workspace.sh alice
 deploy/bin/provision-workspace.sh student
 make test-workspace                               # drives both, as a person would
 ```
@@ -125,7 +125,7 @@ agent, mounted from a ConfigMap and never baked in. It is **per-deployment, not 
 `workspace-tenant-instructions` ConfigMap, shared by every workspace this namespace provisions.
 
 ```bash
-deploy/bin/provision-workspace.sh baron                                   # seeds TENANT.md from deploy/workspace/AGENTS.md the first time
+deploy/bin/provision-workspace.sh alice                                   # seeds TENANT.md from deploy/workspace/AGENTS.md the first time
 deploy/bin/provision-workspace.sh student --instructions ./our-house-rules.md   # replaces it, for every workspace, no image rebuild
 ```
 
@@ -185,15 +185,15 @@ command, and it is the *validation* that makes it worth having:
 
 ```bash
 # Slack (the default) — resident agent, metered on the one bill, in your workspace
-deploy/bin/hermes-up.sh baron hermes --slack-config-file ~/.secrets/hermes-slack.env
+deploy/bin/hermes-up.sh alice hermes --slack-config-file ~/.secrets/hermes-slack.env
 
 # Discord instead
-deploy/bin/hermes-up.sh baron hermes --chat discord \
+deploy/bin/hermes-up.sh alice hermes --chat discord \
     --discord-config-file ~/.secrets/hermes-discord.env
 
 # Re-run it any time. Nothing restarts, nothing rotates, the credential file is not
 # needed again — re-supplying it is the only way to rotate.
-deploy/bin/hermes-up.sh baron hermes
+deploy/bin/hermes-up.sh alice hermes
 ```
 
 It **composes** `provision-agent.sh` and the chat tools the pod already carries; it

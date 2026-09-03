@@ -212,7 +212,7 @@ services:
       # of the bill — one of the two renderings that disagreed in finding 34 — did not
       # exist here to be tested against. Empty is still the safe default everywhere else:
       # a deployment that names nobody gets no console.
-      PORTAL_ADMINS: ${PORTAL_ADMINS:-${BOOTSTRAP_USER:-baron}}
+      PORTAL_ADMINS: ${PORTAL_ADMINS:-${BOOTSTRAP_USER:-admin}}
     volumes:
       # Durable control-plane state: the persisted freerouter operator-tenant bearer
       # (FREEROUTER_MASTER_KEY_FILE) must survive restarts, else a re-signup strands a

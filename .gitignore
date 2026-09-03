@@ -32,3 +32,5 @@ bundle/litellm/forge-catalog.cache.json
 
 # Runtime audit-trail output must never be committed to the distributable (hoistable-split)
 bundle/audit.jsonl
+bundle/keys.csv
+bundle/spend.csv

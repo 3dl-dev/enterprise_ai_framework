@@ -39,8 +39,8 @@ wrapper would nest recursively. Only exact `/` is matched, so chat's `/api`, `/a
 ## Applying a change
 
 ```sh
-scp deploy/caddy/Caddyfile baron@gateway:/tmp/Caddyfile.new
-ssh baron@gateway '
+scp deploy/caddy/Caddyfile alice@gateway:/tmp/Caddyfile.new
+ssh alice@gateway '
   sudo caddy validate --adapter caddyfile --config /tmp/Caddyfile.new &&
   sudo cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak-$(date +%Y%m%d-%H%M%S) &&
   sudo cp /tmp/Caddyfile.new /etc/caddy/Caddyfile &&
@@ -50,7 +50,7 @@ ssh baron@gateway '
 Then confirm the repo copy still matches the VM:
 
 ```sh
-ssh baron@gateway 'cat /etc/caddy/Caddyfile' | diff - deploy/caddy/Caddyfile && echo IN SYNC
+ssh alice@gateway 'cat /etc/caddy/Caddyfile' | diff - deploy/caddy/Caddyfile && echo IN SYNC
 ```
 
 Caddy warns that the file "is not formatted" — that is intentional. The file is kept in the

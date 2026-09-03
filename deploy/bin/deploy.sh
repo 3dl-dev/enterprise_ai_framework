@@ -275,7 +275,8 @@ for path in deploy/k8s/*.yaml; do
     rendered=$(printf '%s\n' "$rendered" | sed \
         -e "s|__GATEWAY_LAN_IP__|${GATEWAY_LAN_IP}|g" \
         -e "s|__GATEWAY_TAILNET_HOST__|${GATEWAY_TAILNET_HOST}|g" \
-        -e "s|__LAN_CIDR__|${LAN_CIDR}|g")
+        -e "s|__LAN_CIDR__|${LAN_CIDR}|g" \
+        -e "s|__PORTAL_ADMINS__|${PORTAL_ADMINS:-}|g")
     echo "    apply $f"
     printf '%s\n' "$rendered" | kubectl apply -f -
 done
