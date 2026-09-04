@@ -88,6 +88,16 @@ spec:
       ports:
         - { protocol: TCP, port: 4000 }
 
+    # The freerouter spoke — the other model-traffic route, used when the surface's inference
+    # base points at it (GATEWAY_PROVIDER=freerouter). A bundled component exactly like the
+    # gateway above; without this the agent is firewalled off from freerouter and every
+    # inference call fails with a connection error.
+    - to:
+        - podSelector:
+            matchLabels: { app: freerouter }
+      ports:
+        - { protocol: TCP, port: 8080 }
+
     # ------------------------------------------------------------------ tool servers
     # ONE `podSelector` PER SERVER, MATCHING THAT SERVER'S OWN `app` LABEL, AND NOTHING
     # BROADER. Not `namespaceSelector`, not the pod CIDR, not a shared label. The full
