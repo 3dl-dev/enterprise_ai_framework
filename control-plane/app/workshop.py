@@ -2,7 +2,7 @@
 
 WHY
 
-The workshop used to live at `http://192.168.2.44:<per-user-nodeport>`. That is a
+The workshop used to live at `http://<node-ip>:<per-user-nodeport>`. That is a
 different origin, plain HTTP, and only routable on the house LAN — so it could not be
 embedded in the HTTPS portal at all, and from any other network it did not fail cleanly,
 it hung and timed out. "Everything in one place" cannot be built on a link like that.

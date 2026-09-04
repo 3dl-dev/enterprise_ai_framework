@@ -60,8 +60,8 @@ spec:
       # and the connection is reset — while the issuer string must stay byte-identical
       # on both sides or the token is rejected.
       hostAliases:
-        - ip: "192.168.2.42"
-          hostnames: ["gateway.tailcb6ef9.ts.net"]
+        - ip: "__GATEWAY_LAN_IP__"
+          hostnames: ["__GATEWAY_TAILNET_HOST__"]
       # The pod's own account, so the resident meter's two reads (agent pods, and the
       # kubelet's cAdvisor counter) are bound to THIS workload and not to the namespace's
       # `default` account, which every other pod without an explicit account also uses.
@@ -147,7 +147,7 @@ spec:
             # should not require holding the credential that can revoke every key.
             # Empty means no console at all, which is the safe direction to fail.
             - name: PORTAL_ADMINS
-              value: "baron"
+              value: "__PORTAL_ADMINS__"
             - name: WORKSPACE_INTERNAL_TOKEN
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: WORKSPACE_INTERNAL_TOKEN } }
             # How often the resident-usage meter samples agent pods

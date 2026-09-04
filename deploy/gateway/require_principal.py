@@ -5,7 +5,7 @@ WHAT THIS FIXES, MEASURED RATHER THAN REASONED
 On the live cluster on 2026-07-29, `GET /admin/spend` reported 42 requests and $0.1133
 under `(unattributed)`, 25 of them — 98% of the unattributed money — spent in a two-hour
 window on 2026-07-28 between 21:31Z and 23:31Z, some 26 hours after the deployment. Real
-agent traffic: glm-5.2@deepinfra at 16k-55k tokens a request, plus a burst of one-shot
+agent traffic: <model> at 16k-55k tokens a request, plus a burst of one-shot
 model probes. Finding 25 ("rows written before the alias metadata existed") did not cover
 it, and neither did finding 34 (a principal that exists, named inconsistently). There was
 no principal at all.

@@ -1,9 +1,0 @@
-request_id,start_time,end_time,model,key_alias,surface,end_user,spend,prompt_tokens,completion_tokens,total_tokens,cache_hit
-fakecmpl-758d61f26a444483,2026-07-27 15:29:04.465,2026-07-27 15:29:04.667,fake-gpt-large,,,,0.000168,1,11,12,None
-fakecmpl-fcf152a1a40829b9,2026-07-27 15:29:04.735,2026-07-27 15:29:04.765,fake-gpt-large,,,,0.000198,11,11,22,False
-f562629c-166b-4949-9ee4-0d97fd34f7c6,2026-07-27 15:29:04.998,2026-07-27 15:29:04.998,fake-large,,,,0.0,0,0,0,False
-fakecmpl-d025c6f60ae6a4cf,2026-07-27 15:29:05.091,2026-07-27 15:29:05.095,fake-gpt-large,attrtest-bfab6056::ide,ide,,0.000195,10,11,21,None
-fakecmpl-35b87ad948c12419,2026-07-27 15:29:11.211,2026-07-27 15:29:11.215,fake-gpt-large,,,,0.000171,2,11,13,None
-fakecmpl-cbc09d09f1736b8f,2026-07-27 15:29:25.091,2026-07-27 15:29:25.095,fake-gpt-large,budget-b1518c50::chat,chat,,0.000192,9,11,20,None
-92c50945-6cb1-4f59-af6b-b9b2a976be3c,2026-07-27 15:29:25.132,2026-07-27 15:29:25.132,fake-large,,,,0.0,0,0,0,False
-fakecmpl-0d59f7d9458c0242,2026-07-27 15:29:25.162,2026-07-27 15:29:25.165,fake-gpt-large,,,,0.000171,2,11,13,None

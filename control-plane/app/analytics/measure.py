@@ -1,7 +1,7 @@
 """Pure per-turn measurement primitives.
 
 Ported verbatim-in-spirit from the practice kit's model-behavior.py so the numbers this
-product reports are the SAME numbers as 3dl.dev/coding-vs-orchestration.html — a customer
+product reports are the SAME numbers as the operator's published analytics report — a customer
 can line their own report up against the published one. Every function here is pure: text
 in, numbers out, no I/O, no clock. That is what lets the golden fixtures pin them down
 without a database (control-plane/tests/test_analytics_measure.py).

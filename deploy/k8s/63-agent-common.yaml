@@ -103,11 +103,11 @@ spec:
     # The internet, for pip / npm / git clone — the same working set a coding agent needs.
     # Every private range is excluded, which is what closes the routes that matter:
     #   10.43.0.1:443   the Kubernetes API server (service CIDR)
-    #   192.168.2.43/44 the API server on the nodes, and the image registry
+    #   the LAN nodes (API server + image registry)
     #   10.42.0.0/16    every other pod, including other agents and every workspace
     #   169.254.0.0/16  link-local, i.e. any metadata service
     #
-    # Note what is NOT copied from the workspace policy: its egress to 192.168.2.42:443
+    # Note what is NOT copied from the workspace policy: its egress to __GATEWAY_LAN_IP__:443
     # exists for the OIDC backchannel to the public TLS edge. An agent pod has no OIDC flow
     # of its own, so it does not get that rule.
     - to:

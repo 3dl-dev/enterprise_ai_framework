@@ -23,15 +23,15 @@ SURFACES = ("chat", "ide", "terminal")
 #
 #   `parse_alias` below splits on the LAST "::" (rpartition), while metering.py's SQL
 #   splits on the FIRST (split_part(alias,'::',1|2)). With two fields they agree. With
-#   three they disagree — Python reads the username as `baron::agents`, SQL reads the
+#   three they disagree — Python reads the username as `alice::agents`, SQL reads the
 #   surface as `agents` and loses the instance entirely. Both renderers wrong, differently.
 #
 # So the instance is folded into the SURFACE field with a "/" and the alias keeps exactly
 # one "::":
 #
-#   <username>::agents/<name>            e.g. baron::agents/scraper
+#   <username>::agents/<name>            e.g. alice::agents/scraper
 #
-# rpartition then yields ("baron", "agents/scraper") and split_part yields the same two
+# rpartition then yields ("alice", "agents/scraper") and split_part yields the same two
 # strings, so `metering.spend_by_user_and_surface` attributes an agent's inference to the
 # right user under a per-instance surface WITH NO QUERY CHANGE AT ALL. Everything below is
 # additive: `key_alias` and its `surface in SURFACES` guard are untouched, so no existing

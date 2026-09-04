@@ -24,7 +24,7 @@ carried them forward unedited. They are false, checked twice:
   for pip / npm / git clone" in its own top comment, present since the very first commit
   that created this NetworkPolicy (883e8a0).
 - Confirmed live against the running cluster, not just the checked-in YAML: `kubectl exec`
-  into `ws-baron`'s `ttyd` container and `curl -sS -o /dev/null -w '%{http_code}'
+  into `ws-alice`'s `ttyd` container and `curl -sS -o /dev/null -w '%{http_code}'
   https://registry.npmjs.org/` returned `200`. The pod reaches the internet today.
 
 A platform-facts file that asserts something checkably false is the same defect this file

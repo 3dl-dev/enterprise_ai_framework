@@ -1,7 +1,7 @@
 # Gateway-VM Caddy config
 
 `Caddyfile` here is the authoritative copy of `/etc/caddy/Caddyfile` on the **gateway VM**
-(the Tailscale node `gateway`, `192.168.2.42`). Caddy on that VM terminates TLS for the
+(the Tailscale node `gateway`, `GATEWAY_LAN_IP`). Caddy on that VM terminates TLS for the
 public name and fronts the k3s NodePorts — the k8s manifests in `../k8s/` describe what
 runs *inside* the cluster; this file describes how the outside reaches it.
 
@@ -16,7 +16,7 @@ file, not as the source of truth.
 |-------|---------|
 | `:8080` | Local-inference edge — proxies OpenAI-shaped `/v1/*` to the `inference-*` hosts on the LAN. Co-tenant on this VM; not part of the enterprise-ai public origin. Now reached over Funnel **`:8443`, tailnet-only** (it swapped ports with the public origin and its funnel is off — nothing external depends on it). |
 | `:8081` | The enterprise-ai public origin, **plain HTTP behind Tailscale Funnel on `:443`** (Funnel terminates TLS with the node cert). Moved from `:8443` to the standard `:443` because venue/school wifi routinely blocks the nonstandard port and a device off the tailnet then gets a connection *timeout* (`enterpriseaiframework-e32`). Routes `/realms/*` + `/resources/*` → identity, `/live/*` → published, `/portal/*` + `/workshop/*` → the portal, the bare landing page → the portal, and everything else → chat. |
-| `https://gateway.tailcb6ef9.ts.net:443, :8443` (bound to `192.168.2.42`) | The **same routes as `:8081`, over LAN TLS**, for the in-cluster OIDC backchannel. Pods reach the issuer here via `hostAliases` because the cluster is not on the tailnet; the issuer string must be byte-identical to what the browser uses or the OIDC token is rejected. The issuer is now port-less (`:443`), so this listener serves `:443`; `:8443` is kept as a harmless second address. Browsers never hit this block — Funnel forwards them to `:8081`. |
+| `https://ai.example.org:443, :8443` (bound to `GATEWAY_LAN_IP`) | The **same routes as `:8081`, over LAN TLS**, for the in-cluster OIDC backchannel. Pods reach the issuer here via `hostAliases` because the cluster is not on the tailnet; the issuer string must be byte-identical to what the browser uses or the OIDC token is rejected. The issuer is now port-less (`:443`), so this listener serves `:443`; `:8443` is kept as a harmless second address. Browsers never hit this block — Funnel forwards them to `:8081`. |
 | `:8083` | The Coder workspace, Funnel-exposed for an operator on another subnet. |
 
 ## The landing page is the portal, not raw LibreChat
@@ -39,8 +39,8 @@ wrapper would nest recursively. Only exact `/` is matched, so chat's `/api`, `/a
 ## Applying a change
 
 ```sh
-scp deploy/caddy/Caddyfile baron@gateway:/tmp/Caddyfile.new
-ssh baron@gateway '
+scp deploy/caddy/Caddyfile alice@gateway:/tmp/Caddyfile.new
+ssh alice@gateway '
   sudo caddy validate --adapter caddyfile --config /tmp/Caddyfile.new &&
   sudo cp -a /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak-$(date +%Y%m%d-%H%M%S) &&
   sudo cp /tmp/Caddyfile.new /etc/caddy/Caddyfile &&
@@ -50,7 +50,7 @@ ssh baron@gateway '
 Then confirm the repo copy still matches the VM:
 
 ```sh
-ssh baron@gateway 'cat /etc/caddy/Caddyfile' | diff - deploy/caddy/Caddyfile && echo IN SYNC
+ssh alice@gateway 'cat /etc/caddy/Caddyfile' | diff - deploy/caddy/Caddyfile && echo IN SYNC
 ```
 
 Caddy warns that the file "is not formatted" — that is intentional. The file is kept in the

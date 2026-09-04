@@ -88,7 +88,7 @@ forge-config:
 ## The IDE surface (a browser terminal running opencode) against the live k3s cluster, with two real
 ## Keycloak users. Needs the workspaces provisioned first:
 ##   deploy/bin/ensure-second-user.sh student
-##   deploy/bin/provision-workspace.sh baron && deploy/bin/provision-workspace.sh student
+##   deploy/bin/provision-workspace.sh alice && deploy/bin/provision-workspace.sh student
 ## Spends a fraction of a cent per run. Kept out of `make test` — it needs a cluster.
 ## The whole journey in a real browser with a real account and real money: one login,
 ## chat signed in, the agent typed at until it writes a file, the run gate, running it,

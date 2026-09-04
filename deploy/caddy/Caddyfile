@@ -1,18 +1,23 @@
+# EXAMPLE ingress — the routing PATTERN only, not a working config. It ships in the
+# distributable so a forker can see how each surface maps to a node port. Replace NODE_IP /
+# GATEWAY_LAN_IP / ai.example.org with real values, or keep your real Caddyfile in your instance
+# overlay (docs/design/hoistable-and-operated.md; 3dl's lives in enterprise_ai_framework-3dl).
+#
 :8080 {
     handle_path /v1/audio/speech* {
-        reverse_proxy inference-a.stealth.baron.local:8880
+        reverse_proxy inference-a.internal:8880
     }
     handle_path /v1/audio/transcriptions* {
-        reverse_proxy inference-a.stealth.baron.local:8200
+        reverse_proxy inference-a.internal:8200
     }
     handle /v1/chat/completions* {
-        reverse_proxy inference-a.stealth.baron.local:8000
+        reverse_proxy inference-a.internal:8000
     }
     handle /v1/models* {
-        reverse_proxy inference-a.stealth.baron.local:8000
+        reverse_proxy inference-a.internal:8000
     }
     handle /v1/images/generations* {
-        reverse_proxy inference-b.stealth.baron.local:8188
+        reverse_proxy inference-b.internal:8188
     }
     respond 404
 }
@@ -23,29 +28,29 @@
     # Identity and the chat surface must share one public origin, or the OIDC issuer
     # check fails. Keycloak owns these paths; the chat surface owns everything else.
     handle /realms/* {
-        reverse_proxy 192.168.2.44:30382
+        reverse_proxy NODE_IP:30382
     }
     handle /resources/* {
-        reverse_proxy 192.168.2.44:30382
+        reverse_proxy NODE_IP:30382
     }
     # Published work. Deliberately NOT behind any auth: the audience is parents, who have
     # no account. Static files only, served by a plain web server with no interpreter and
     # no workspace volume mounted, so a published page cannot reach back into anyone work.
     handle /live/* {
-        reverse_proxy 192.168.2.44:30450
+        reverse_proxy NODE_IP:30450
     }
     # The portal — the signed-in front door that ties the surfaces together. Same
     # origin as chat and identity on purpose: the OIDC issuer must be byte-identical
     # between browser and backchannel, and a second origin would need a second cert the
     # funnel cannot present. oauth2-proxy inside that pod owns /portal/oauth2/*.
     handle /portal/* {
-        reverse_proxy 192.168.2.44:30460
+        reverse_proxy NODE_IP:30460
     }
     # The workshop, proxied by the portal so it is a tab on this origin rather than a
     # separate site on a LAN address. Same upstream as /portal/* — the control plane
     # serves both, and its oauth2-proxy authenticates this path too.
     handle /workshop/* {
-        reverse_proxy 192.168.2.44:30460
+        reverse_proxy NODE_IP:30460
     }
     # An agent's console, attached by the portal at /agents/<name>/. Same upstream again,
     # and it must be listed: without this rule the path falls through to `handle` below
@@ -54,7 +59,7 @@
     # docs/design/records/agents-surface.md); the control plane resolves it from the
     # identity oauth2-proxy established, so there is nothing here to scope per user.
     handle /agents/* {
-        reverse_proxy 192.168.2.44:30460
+        reverse_proxy NODE_IP:30460
     }
     # The bare landing page is the portal wrapper (Chat/Code tabs, spend, keys, published
     # work), never raw LibreChat. enterpriseaiframework-6c9 follow-up. Only a top-level
@@ -67,10 +72,10 @@
     handle / {
         @not_iframe not header Sec-Fetch-Dest iframe
         redir @not_iframe /portal/ 302
-        reverse_proxy 192.168.2.44:30380
+        reverse_proxy NODE_IP:30380
     }
     handle {
-        reverse_proxy 192.168.2.44:30380
+        reverse_proxy NODE_IP:30380
     }
 }
 
@@ -84,33 +89,33 @@
 # enterpriseaiframework-e32), so the issuer is now port-less and this listener serves :443.
 # :8443 is kept as a second address for a transition window and is harmless. tailscaled
 # binds the funnel ports only on the tailnet addresses, so the LAN IP is free for both.
-https://gateway.tailcb6ef9.ts.net:443, https://gateway.tailcb6ef9.ts.net:8443 {
-    bind 192.168.2.42
+https://ai.example.org:443, https://ai.example.org:8443 {
+    bind GATEWAY_LAN_IP
     tls /etc/caddy/certs/ts.crt /etc/caddy/certs/ts.key
     handle /realms/* {
-        reverse_proxy 192.168.2.44:30382
+        reverse_proxy NODE_IP:30382
     }
     handle /resources/* {
-        reverse_proxy 192.168.2.44:30382
+        reverse_proxy NODE_IP:30382
     }
     # Published work. Deliberately NOT behind any auth: the audience is parents, who have
     # no account. Static files only, served by a plain web server with no interpreter and
     # no workspace volume mounted, so a published page cannot reach back into anyone work.
     handle /live/* {
-        reverse_proxy 192.168.2.44:30450
+        reverse_proxy NODE_IP:30450
     }
     # The portal — the signed-in front door that ties the surfaces together. Same
     # origin as chat and identity on purpose: the OIDC issuer must be byte-identical
     # between browser and backchannel, and a second origin would need a second cert the
     # funnel cannot present. oauth2-proxy inside that pod owns /portal/oauth2/*.
     handle /portal/* {
-        reverse_proxy 192.168.2.44:30460
+        reverse_proxy NODE_IP:30460
     }
     # The workshop, proxied by the portal so it is a tab on this origin rather than a
     # separate site on a LAN address. Same upstream as /portal/* — the control plane
     # serves both, and its oauth2-proxy authenticates this path too.
     handle /workshop/* {
-        reverse_proxy 192.168.2.44:30460
+        reverse_proxy NODE_IP:30460
     }
     # An agent's console, attached by the portal at /agents/<name>/. Same upstream again,
     # and it must be listed: without this rule the path falls through to `handle` below
@@ -119,7 +124,7 @@ https://gateway.tailcb6ef9.ts.net:443, https://gateway.tailcb6ef9.ts.net:8443 {
     # docs/design/records/agents-surface.md); the control plane resolves it from the
     # identity oauth2-proxy established, so there is nothing here to scope per user.
     handle /agents/* {
-        reverse_proxy 192.168.2.44:30460
+        reverse_proxy NODE_IP:30460
     }
     # The bare landing page is the portal wrapper (Chat/Code tabs, spend, keys, published
     # work), never raw LibreChat. enterpriseaiframework-6c9 follow-up. Only a top-level
@@ -132,15 +137,15 @@ https://gateway.tailcb6ef9.ts.net:443, https://gateway.tailcb6ef9.ts.net:8443 {
     handle / {
         @not_iframe not header Sec-Fetch-Dest iframe
         redir @not_iframe /portal/ 302
-        reverse_proxy 192.168.2.44:30380
+        reverse_proxy NODE_IP:30380
     }
     handle {
-        reverse_proxy 192.168.2.44:30380
+        reverse_proxy NODE_IP:30380
     }
 }
 
-# enterprise-ai Coder workspace (ws-baron). Funnel-exposed on :10000 because the
-# workspace NodePorts live on 192.168.2.x and the operator is on another subnet.
+# enterprise-ai Coder workspace (ws-alice). Funnel-exposed on :10000 because the
+# workspace NodePorts live on the node subnet and the operator is on another subnet.
 :8083 {
-    reverse_proxy 192.168.2.44:30440
+    reverse_proxy NODE_IP:30440
 }

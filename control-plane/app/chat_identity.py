@@ -3,7 +3,7 @@
 THE PROBLEM THIS SOLVES
 
 Every other surface holds a per-user virtual key, so the alias on the spend row already
-names the person: `baron::ide`. The chat surface cannot work that way — one deployment
+names the person: `alice::ide`. The chat surface cannot work that way — one deployment
 serves everybody through one key — so it identifies the person by forwarding them in the
 request's `user` field, which the gateway records as `end_user`.
 
@@ -214,7 +214,7 @@ def attribute(rows: list[dict]) -> list[dict]:
     """Name the principal on every spend row, then re-merge rows that now agree.
 
     Translation can make two rows the same row: one person can hold more than one chat
-    id, and a resolvable id and a plain username can both name `baron`. The query's
+    id, and a resolvable id and a plain username can both name `alice`. The query's
     contract is one row per (principal, surface), so merging here keeps that promise
     rather than emitting the same person twice and leaving each reader to add them up —
     which is how two renderings start disagreeing again.

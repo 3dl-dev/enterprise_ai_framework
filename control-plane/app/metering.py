@@ -61,7 +61,7 @@ LEFT JOIN "LiteLLM_VerificationToken" v ON v.token = s.api_key
 # `user`. For a per-user key it is redundant, because the alias already says who holds it.
 #
 # Trusting it everywhere meant the caller chose the name on the bill. Demonstrated on this
-# cluster with a legitimate `baron::ide` key and a body of {"user":"veracity-probe-xyz"}:
+# cluster with a legitimate `alice::ide` key and a body of {"user":"veracity-probe-xyz"}:
 # the spend appeared under `veracity-probe-xyz`. The money could not escape the key's own
 # budget — caps bind to the key — but attribution is the product, and attribution was
 # forgeable by anybody holding any key.

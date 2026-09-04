@@ -234,7 +234,7 @@ def yaml_entry(model: dict, price: dict, base_url: str) -> str:
 def main(argv) -> int:
     offline = "--offline" in argv
     env = read_env()
-    base_url = env.get("FORGE_BASE_URL", "https://forge.3dl.dev").rstrip("/")
+    base_url = env.get("FORGE_BASE_URL", "https://forge.example.org").rstrip("/")
 
     base_text = BASE.read_text()
 

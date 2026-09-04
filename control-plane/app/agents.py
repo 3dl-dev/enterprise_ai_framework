@@ -81,7 +81,7 @@ MAX_OBJECT_NAME = 63
 # opencode's default model for a new agent. The same default provision-agent.sh carries,
 # and overridable per deployment rather than per request — a model name from an untrusted
 # request body ends up in a pod spec.
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "glm-5.2@deepinfra")
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "fake-provider/fake-gpt-small")
 
 GATEWAY_BASE = os.environ.get("AGENT_GATEWAY_BASE", "http://gateway:4000/v1")
 

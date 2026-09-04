@@ -7,12 +7,12 @@ one-command uninstall.
 ```bash
 op signin                                   # credentials come from 1Password via direnv
 direnv reload
-export PUBLIC_BASE_URL=https://gateway.tailcb6ef9.ts.net
+export PUBLIC_BASE_URL=https://ai.example.org
 deploy/bin/deploy.sh
 deploy/bin/post-deploy.sh                   # realm redirect URIs, bootstrap user, key sync
 ```
 
-**Live at <https://gateway.tailcb6ef9.ts.net>** — real Let's Encrypt cert, OIDC login
+**Live at <https://ai.example.org>** — real Let's Encrypt cert, OIDC login
 verified end to end.
 
 Everything lives in the `enterprise-ai` namespace. `kubectl delete namespace enterprise-ai`
@@ -31,7 +31,7 @@ is a complete uninstall.
 
 ## Known gaps
 
-- **`ai.3dl.network` is not served.** Tailscale Funnel terminates TLS with the node's
+- **`ai.example.org` is not served.** Tailscale Funnel terminates TLS with the node's
   `*.ts.net` certificate and cannot present one for a custom domain, so a CNAME to the
   funnel host resolves and then fails every handshake. Using the custom name needs an
   inbound 443 port-forward to the gateway VM, or a cloud entry point proxying back over
@@ -106,9 +106,9 @@ no longer drops the conversation. Sessions live on the PVC — they were on an e
 erased by every restart until that was found.
 
 ```bash
-deploy/bin/kaniko-build.sh deploy/workspace 192.168.2.43:30500/enterprise-ai-workspace:$(git rev-parse --short HEAD)
+deploy/bin/kaniko-build.sh deploy/workspace <registry>/enterprise-ai-workspace:$(git rev-parse --short HEAD)
 deploy/bin/ensure-second-user.sh student          # a realm user; each gets its own secret
-deploy/bin/provision-workspace.sh baron
+deploy/bin/provision-workspace.sh alice
 deploy/bin/provision-workspace.sh student
 make test-workspace                               # drives both, as a person would
 ```
@@ -125,7 +125,7 @@ agent, mounted from a ConfigMap and never baked in. It is **per-deployment, not 
 `workspace-tenant-instructions` ConfigMap, shared by every workspace this namespace provisions.
 
 ```bash
-deploy/bin/provision-workspace.sh baron                                   # seeds TENANT.md from deploy/workspace/AGENTS.md the first time
+deploy/bin/provision-workspace.sh alice                                   # seeds TENANT.md from deploy/workspace/AGENTS.md the first time
 deploy/bin/provision-workspace.sh student --instructions ./our-house-rules.md   # replaces it, for every workspace, no image rebuild
 ```
 
@@ -142,7 +142,7 @@ camp's current rules are what a fresh deployment gets by default.
 | URL | none of its own — reached at `$PUBLIC_BASE_URL/portal/`, Code tab |
 | Auth | the portal authenticates, then proxies you to your own pod; the pod is ClusterIP, admitted only from the control plane, and checks a token on every request |
 | Key | `<username>::ide`, minted by `POST /admin/keys/issue` at provision time |
-| Model | `glm-5.2@deepinfra` by default; `--model` overrides from the gateway catalogue |
+| Model | `<model>` by default; `--model` overrides from the gateway catalogue |
 | Budget | 0.5 CPU / 1Gi requested, 1 CPU / 2Gi limit, 4Gi ephemeral |
 
 ### What is deliberately closed
@@ -185,15 +185,15 @@ command, and it is the *validation* that makes it worth having:
 
 ```bash
 # Slack (the default) — resident agent, metered on the one bill, in your workspace
-deploy/bin/hermes-up.sh baron hermes --slack-config-file ~/.secrets/hermes-slack.env
+deploy/bin/hermes-up.sh alice hermes --slack-config-file ~/.secrets/hermes-slack.env
 
 # Discord instead
-deploy/bin/hermes-up.sh baron hermes --chat discord \
+deploy/bin/hermes-up.sh alice hermes --chat discord \
     --discord-config-file ~/.secrets/hermes-discord.env
 
 # Re-run it any time. Nothing restarts, nothing rotates, the credential file is not
 # needed again — re-supplying it is the only way to rotate.
-deploy/bin/hermes-up.sh baron hermes
+deploy/bin/hermes-up.sh alice hermes
 ```
 
 It **composes** `provision-agent.sh` and the chat tools the pod already carries; it

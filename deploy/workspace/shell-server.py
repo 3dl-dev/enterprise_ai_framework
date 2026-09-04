@@ -128,8 +128,8 @@ OPENCODE_DB = Path(
 # `provider.enterprise-ai.models` block with its real context and output limits, or
 # opencode cannot resolve it. Kept in step with the gateway catalogue.
 MODELS = [
-    {"id": "glm-5.2@deepinfra", "label": "GLM 5.2 — better at hard things"},
-    {"id": "glm-4.7@deepinfra", "label": "GLM 4.7 — faster and cheaper"},
+    {"id": "example-large", "label": "Example Large — better at hard things"},
+    {"id": "example-small", "label": "Example Small — faster and cheaper"},
     {"id": "qwen3-coder-480b-a35b-instruct@deepinfra",
      "label": "Qwen3 Coder — fast, coding-tuned, no reasoning stall"},
     {"id": "deepseek-v4-pro@deepinfra",
