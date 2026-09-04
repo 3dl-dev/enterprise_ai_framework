@@ -29,3 +29,6 @@ bundle/litellm/forge-catalog.cache.json
 
 # Workflow agent worktrees — transient, and each is its own git repo.
 .claude/worktrees/
+
+# Runtime audit-trail output must never be committed to the distributable (hoistable-split)
+bundle/audit.jsonl
