@@ -72,6 +72,10 @@ spec:
             # no thermostat) per guardrail bd6.
             - name: FREEROUTER_CATALOG_DIR
               value: /etc/freerouter/catalog
+            # Legacy→canonical model-id aliases (soft migration, freerouter-149): stored surface
+            # configs referencing model@provider ids resolve to the upstream's canonical id.
+            - name: FREEROUTER_CATALOG_ALIASES
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_CATALOG_ALIASES, optional: true } }
             - name: FREEROUTER_ROUTER_TENANT_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_ROUTER_TENANT_KEY, optional: true } }
             - name: FREEROUTER_REPLENISH_ENABLED
