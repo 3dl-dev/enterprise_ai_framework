@@ -30,13 +30,14 @@ import jwt
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import gateway
+from . import agents, gateway, voice
 from .portal import require_user
 
 router = APIRouter()
 
 TOKEN_TTL_SECONDS = 600
 ROOM_PREFIX = "voice-"
+EMPTY_TIMEOUT_SECONDS = 10
 
 
 def room_name(user: str, raven: str) -> str:
@@ -44,8 +45,13 @@ def room_name(user: str, raven: str) -> str:
 
 
 def mint(api_key: str, api_secret: str, *, identity: str, room: str,
-         ttl: int = TOKEN_TTL_SECONDS, now: float | None = None) -> str:
-    """A LiveKit access token: HS256, iss=api key, sub=identity, `video` grant for one room."""
+         ttl: int = TOKEN_TTL_SECONDS, now: float | None = None,
+         room_config: dict | None = None) -> str:
+    """A LiveKit access token: HS256, iss=api key, sub=identity, `video` grant for one room.
+
+    `room_config` is LiveKit's documented `roomConfig` claim (RoomConfiguration in its JSON
+    form): the server applies it when this participant's join creates the room, which is how
+    the voice worker is dispatched to it."""
     issued = int(time.time() if now is None else now)
     claims = {
         "iss": api_key,
@@ -60,6 +66,8 @@ def mint(api_key: str, api_secret: str, *, identity: str, room: str,
             "canPublishData": True,
         },
     }
+    if room_config:
+        claims["roomConfig"] = room_config
     return jwt.encode(claims, api_secret, algorithm="HS256")
 
 
@@ -83,10 +91,25 @@ async def voice_token(body: TokenRequest, user: str = Depends(require_user)):
     if body.room is not None and body.room != room:
         # Somebody else's room, or a malformed one: the caller named a room it may not join.
         raise HTTPException(403, "you may only join your own rooms")
+    # The raven must exist and be the caller's (404 for both, as the console does) and must be a
+    # raven: 7f6 minted a token for any slug, which would have opened a room nobody serves.
+    async with agents._client() as client:
+        dep = await agents._owned_deployment(client, user, body.raven)
+    if ((dep.get("metadata") or {}).get("labels") or {}).get(agents.TYPE_LABEL) != "raven":
+        raise HTTPException(400, f"agent {body.raven!r} is not a raven")
+    voice_id, entry = voice.resolve(voice._pinned(dep))
+    session = voice.mint_session(user, body.raven, room)
+    room_config = {
+        # The room closes seconds after the user leaves, ending the worker's job with it.
+        "emptyTimeout": EMPTY_TIMEOUT_SECONDS,
+        "agents": [{"agentName": voice.WORKER_AGENT_NAME,
+                    "metadata": voice.dispatch_metadata(session, entry)}],
+    }
     return {
         "url": url,
         "room": room,
         "identity": user,
-        "token": mint(api_key, api_secret, identity=user, room=room),
+        "voice": voice_id,
+        "token": mint(api_key, api_secret, identity=user, room=room, room_config=room_config),
         "expires_in": TOKEN_TTL_SECONDS,
     }
