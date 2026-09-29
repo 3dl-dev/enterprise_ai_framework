@@ -1,0 +1,171 @@
+"""Hosted-mode Raven: the invariants the image enforces, asserted on what the seed really writes.
+
+Item enterpriseaiframework-39e (agents-raven.md, Contract E). These are the RENDER-level
+tests; the container is started for real, on the cluster, by tests-live/test_raven_hosted.py.
+
+The expected values here are written out by hand from the design record, not read back from
+hosted_seed.py, so they are an independent statement of the requirement. The faults are
+injected the way drift reaches the system: through the config.json on the PVC (a WebUI edit,
+or an older image's file) and through the pod environment, then hosted_seed.py is RUN.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import yaml
+
+REPO = Path(__file__).resolve().parent.parent
+RAVEN = REPO / "deploy" / "raven"
+SEED = RAVEN / "hosted_seed.py"
+K8S = REPO / "deploy" / "k8s"
+
+GATEWAY = "http://gateway:4000/v1"
+KEY = "sk-eaf-test-raven-key"
+MODEL = "claude-sonnet-4-5"
+
+
+def _run_seed(home: Path, **env_overrides):
+    env = {
+        "PATH": os.environ["PATH"],
+        "RAVEN_HOME": str(home),
+        "AGENT_GATEWAY_BASE": GATEWAY,
+        "OPENAI_API_KEY": KEY,
+        "RAVEN_MODEL": MODEL,
+    }
+    env.update(env_overrides)
+    env = {k: v for k, v in env.items() if v is not None}
+    return subprocess.run([sys.executable, str(SEED)], env=env, capture_output=True, text=True)
+
+
+def _cfg(home: Path) -> dict:
+    return json.loads((home / "config.json").read_text())
+
+
+def test_fresh_home_is_seeded_hosted(tmp_path):
+    r = _run_seed(tmp_path)
+    assert r.returncode == 0, r.stderr
+    cfg = _cfg(tmp_path)
+    assert cfg["providers"]["custom"] == {"apiKey": KEY, "apiBase": GATEWAY}
+    assert cfg["agents"]["defaults"] == {"model": MODEL, "provider": "custom"}
+    assert cfg["a2a"]["server"] == {"enabled": False, "token": ""}
+    assert cfg["a2a"]["peers"] == []
+    assert cfg["skillForge"]["router"]["hub"]["endpoint"] is None
+    assert cfg["memory"]["backend"] == "everos"
+    ev = cfg["plugins"]["config"]["everos-memory"]
+    assert ev["root"] == str(tmp_path / "everos")  # on the PVC, under RAVEN_HOME
+    assert ev["port"] == 18791 and ev["base_url"] == "http://127.0.0.1:18791" and ev["owned"] is True
+    # The seed carries the Raven's OWN key only, and the file is not world-readable.
+    assert (tmp_path / "config.json").stat().st_mode & 0o077 == 0
+
+
+def test_a_drifted_pvc_config_is_pulled_back_and_user_settings_survive(tmp_path):
+    """The PVC outlives the image. A WebUI edit or an older image's file must not win."""
+    drifted = {
+        "language": "zh",  # a user setting: must survive
+        "agents": {"defaults": {"model": "anthropic/claude-opus-4-5", "provider": "openrouter", "temperature": 0.7}},
+        "providers": {"openrouter": {"apiKey": "sk-or-user-added"}, "custom": {"apiKey": "old", "apiBase": "https://api.example.com/v1"}},
+        "a2a": {"server": {"enabled": True, "token": "open-sesame"}, "peers": [{"name": "x", "url": "http://x"}]},
+        "skillForge": {"router": {"hub": {"endpoint": "https://skillhub.evermind.ai", "apiKey": "hub-key"}}},
+        "subagents": {
+            "agents": [
+                {"name": "hermes", "kind": "acp", "command": "hermes acp", "enabled": True},
+                {"name": "codex", "kind": "acp", "command": "npx -y @agentclientprotocol/codex-acp", "enabled": True},
+                {"name": "aider", "kind": "cli", "command": "aider {prompt}", "enabled": True},
+                {"name": "raven-code", "kind": "builtin", "enabled": True},
+            ]
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(drifted))
+    r = _run_seed(tmp_path)
+    assert r.returncode == 0, r.stderr
+    cfg = _cfg(tmp_path)
+    assert cfg["providers"]["custom"] == {"apiKey": KEY, "apiBase": GATEWAY}
+    assert cfg["agents"]["defaults"]["provider"] == "custom"
+    assert cfg["agents"]["defaults"]["model"] == MODEL
+    assert cfg["agents"]["defaults"]["temperature"] == 0.7  # sibling preserved
+    assert cfg["a2a"]["server"]["enabled"] is False and cfg["a2a"]["server"]["token"] == ""
+    assert cfg["a2a"]["peers"] == []
+    assert cfg["skillForge"]["router"]["hub"]["endpoint"] is None
+    assert cfg["language"] == "zh"
+    by_name = {a["name"]: a for a in cfg["subagents"]["agents"]}
+    assert by_name["hermes"]["enabled"] is False
+    assert by_name["codex"]["enabled"] is False
+    assert by_name["aider"]["enabled"] is False
+    assert by_name["raven-code"]["enabled"] is True  # in-process built-ins are not spawned harnesses
+
+
+def test_the_legacy_third_party_key_cannot_smuggle_an_enabled_acp_row(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"subagents": {"thirdParty": [{"name": "hermes", "kind": "acp", "command": "hermes acp", "enabled": True}]}})
+    )
+    assert _run_seed(tmp_path).returncode == 0
+    cfg = _cfg(tmp_path)
+    assert "thirdParty" not in cfg["subagents"]
+    assert [a["enabled"] for a in cfg["subagents"]["agents"]] == [False]
+
+
+@pytest.mark.parametrize("missing", ["AGENT_GATEWAY_BASE", "OPENAI_API_KEY", "RAVEN_MODEL"])
+def test_refuses_to_boot_without_the_gateway_route(tmp_path, missing):
+    """No fall-through to Raven's shipped default provider/model (which bills a key we do not hold)."""
+    r = _run_seed(tmp_path, **{missing: None})
+    assert r.returncode != 0
+    assert missing in (r.stderr + r.stdout)
+    assert not (tmp_path / "config.json").exists()
+
+
+def test_unparseable_config_is_not_overwritten(tmp_path):
+    (tmp_path / "config.json").write_text("{not json")
+    r = _run_seed(tmp_path)
+    assert r.returncode != 0
+    assert (tmp_path / "config.json").read_text() == "{not json"
+
+
+# --- the image and manifests -------------------------------------------------------------
+
+
+def _dockerfile_env() -> dict:
+    text = (RAVEN / "Dockerfile").read_text()
+    m = re.search(r"^ENV ((?:.*\\\n)*.*)$", text, re.M)
+    assert m, "hosted Dockerfile has no ENV block"
+    pairs = re.findall(r"(\w+)=(\S+)", m.group(1).replace("\\\n", " "))
+    return dict(pairs)
+
+
+def test_image_bakes_the_hosted_defaults():
+    env = _dockerfile_env()
+    assert env["RAVEN_HOSTED"] == "1"
+    assert env["RAVEN_AUTO_LOGIN"] == "0"  # design: RAVEN_AUTO_LOGIN=0
+    assert env["RAVEN_NO_UPDATE_CHECK"] == "1"
+    assert env["EVEROS_API__PORT"] == "18791"  # design: EverOS on :18791
+    # The SkillHub URL must be one the engine accepts (https, not local) that can never resolve.
+    assert re.fullmatch(r"https://[a-z0-9.-]+\.invalid", env["RAVEN_SKILLHUB_URL"])
+    assert "evermind" not in env["RAVEN_SKILLHUB_URL"]
+
+
+def test_agent_isolation_stops_selecting_raven_and_raven_isolation_has_no_internet():
+    """NetworkPolicies are additive: if 63's internet-egress policy still selected raven pods
+    the raven policy could not take anything away."""
+    docs = {d["metadata"]["name"]: d for d in yaml.safe_load_all((K8S / "63-agent-common.yaml").read_text()) if d}
+    sel = docs["agent-isolation"]["spec"]["podSelector"]
+    assert {"key": "agent.enterprise-ai/type", "operator": "NotIn", "values": ["raven"]} in sel["matchExpressions"]
+
+    raven = yaml.safe_load((K8S / "68-raven-common.yaml").read_text())
+    assert raven["spec"]["podSelector"]["matchLabels"]["agent.enterprise-ai/type"] == "raven"
+    assert set(raven["spec"]["policyTypes"]) == {"Ingress", "Egress"}
+    for rule in raven["spec"]["egress"]:
+        for to in rule["to"]:
+            assert "ipBlock" not in to, "a raven egress rule reaches outside the cluster"
+    ingress_ports = [p["port"] for r in raven["spec"]["ingress"] for p in r["ports"]]
+    assert ingress_ports == [18793]
+    assert raven["spec"]["ingress"][0]["from"] == [{"podSelector": {"matchLabels": {"app": "control-plane"}}}]
+
+
+def test_console_policy_admits_the_raven_webui_port():
+    doc = yaml.safe_load((K8S / "66-agent-console-common.yaml").read_text())
+    ports = [p["port"] for r in doc["spec"]["ingress"] for p in r["ports"]]
+    assert 18793 in ports and 9119 in ports and 18789 in ports

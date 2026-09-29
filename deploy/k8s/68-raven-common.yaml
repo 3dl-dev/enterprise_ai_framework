@@ -1,0 +1,68 @@
+# Namespace-wide network isolation for HOSTED RAVEN agent pods (agents-raven.md, Contract E;
+# item enterpriseaiframework-39e). Sibling of 63-agent-common.yaml, not an extension of it.
+#
+# WHY A SEPARATE POLICY. NetworkPolicies are additive: a pod selected by two of them gets
+# the UNION of their allowed traffic. 63-agent-common.yaml's `agent-isolation` allows every
+# agent pod egress to the public internet (Discord/Slack/pip/git for hermes and openclaw).
+# A hosted Raven must make NO call to EverMind services (SkillHub, raven.evermind.ai, the
+# release lookup) and must not be able to reach Discord/Slack with a credential the control
+# plane does not manage. That cannot be expressed by adding a rule beside 63's; it needs
+# Raven pods to be SELECTED BY THIS POLICY ONLY. So 63's `agent-isolation` now excludes
+# `agent.enterprise-ai/type: raven` (a NotIn expression, which still matches every existing
+# agent pod, since none carries type=raven) and this policy governs raven pods alone.
+#
+# What a raven pod may do, and nothing else:
+#   ingress   :18793 (the WebUI) from the control-plane pod only. Naming the one allowed
+#             source is the entire control (kube-router admits on the destination's ingress
+#             without consulting the source's egress; see 60-workspace-common.yaml).
+#   egress    DNS; the gateway (:4000) and freerouter (:8080), the single model route, which
+#             also carries EverOS chat + embeddings; the control plane (:8000), Raven's only
+#             other route, for the agent-manager API and relay (Contract F/G).
+#   NOT       the public internet, the Kubernetes API, Postgres, workspaces, other agents.
+#
+# The `type: raven` label is set on both the Deployment and its pod template by
+# deploy/k8s/67-agent-raven.template.yaml (enterpriseaiframework-f16).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: raven-isolation
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: agent
+      agent.enterprise-ai/type: raven
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: control-plane }
+      ports:
+        - { protocol: TCP, port: 18793 }
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - podSelector:
+            matchLabels: { app: gateway }
+      ports:
+        - { protocol: TCP, port: 4000 }
+    - to:
+        - podSelector:
+            matchLabels: { app: freerouter }
+      ports:
+        - { protocol: TCP, port: 8080 }
+    - to:
+        - podSelector:
+            matchLabels: { app: control-plane }
+      ports:
+        - { protocol: TCP, port: 8000 }
