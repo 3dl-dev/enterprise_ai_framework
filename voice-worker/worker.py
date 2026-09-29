@@ -14,6 +14,7 @@ End of turn is Silero VAD, and interruption handling is pinned to VAD so the ada
 (cloud-backed) detector is never constructed.
 """
 import logging
+import os
 
 from livekit import agents
 from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext
@@ -24,7 +25,9 @@ import settings
 logger = logging.getLogger("eaf-voice")
 AGENT_NAME = "eaf-voice"
 
-server = AgentServer()
+# One idle warm process by default rather than one per CPU: each holds a Silero VAD, and a
+# session is one process, so this is a per-node concurrency knob, not a correctness one.
+server = AgentServer(num_idle_processes=int(os.environ.get("VOICE_IDLE_PROCESSES", "2")))
 
 
 def prewarm(proc: agents.JobProcess) -> None:

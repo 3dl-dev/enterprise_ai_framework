@@ -55,7 +55,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from . import agents, db, gateway, provisioning
+from . import agents, db, gateway
 from .portal import require_user
 
 _log = logging.getLogger("voice")
@@ -214,9 +214,10 @@ async def _raven_key(s: Session) -> str:
 
 
 def audio_base() -> str:
-    """The gateway's OpenAI-shaped base for audio: the SAME backend the Raven's key was minted
-    by (an fr- key sent to LiteLLM is a 401), overridable for a dedicated speech edge."""
-    return (os.environ.get("VOICE_GATEWAY_BASE") or provisioning.inference_base()).rstrip("/")
+    """The gateway's OpenAI-shaped base for audio: the SAME endpoint the Raven's own model
+    traffic uses (agents.gateway_base(): AGENT_GATEWAY_BASE, else the backend its key was
+    minted by; an fr- key sent to LiteLLM is a 401), overridable for a dedicated speech edge."""
+    return (os.environ.get("VOICE_GATEWAY_BASE") or agents.gateway_base()).rstrip("/")
 
 
 _TIMEOUT = httpx.Timeout(60.0, connect=10.0)
@@ -367,6 +368,11 @@ async def raven_turn(target: dict, session_key: str, text: str):
                 yield ev["payload"]["text"]
             elif ev.get("type") == "message.complete":
                 return
+            elif ev.get("type") == "error":
+                # The turn failed inside the Raven (its model call, most often). Without this the
+                # socket stays open and the caller waits out the whole turn timeout in silence.
+                p = ev.get("payload") or {}
+                raise RuntimeError(f"raven turn_failed: {p.get('message')}: {str(p.get('detail'))[:200]}")
 
 
 def _chunk(cid: str, model: str, delta: dict, finish: str | None = None) -> str:
