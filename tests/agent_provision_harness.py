@@ -44,7 +44,12 @@ _KUBECTL = r'''#!/usr/bin/env bash
 # Recording stand-in for kubectl. Every invocation is appended to $STUB_LOG; anything
 # applied from stdin is appended to $STUB_DIR/applied.yaml.
 set -u
-{ printf 'kubectl'; for a in "$@"; do printf ' %s' "$a"; done; printf '\n'; } >> "$STUB_LOG"
+# ONE write per record. The script under test pipes `kubectl create ... | kubectl apply`,
+# so two recorders run at once; word-at-a-time printfs interleaved on O_APPEND and
+# produced lines like `create secretkubectl generic ... apply` under load, which made
+# a test that greps this log fail about 1 run in 50 (measured).
+_rec=""; (( $# )) && printf -v _rec ' %s' "$@"
+printf 'kubectl%s\n' "$_rec" >> "$STUB_LOG"
 
 cmd=""
 args=("$@")
@@ -192,7 +197,12 @@ exit 0
 _CURL = r'''#!/usr/bin/env bash
 # Recording stand-in for the control plane. Only the two endpoints the script calls.
 set -u
-{ printf 'curl'; for a in "$@"; do printf ' %s' "$a"; done; printf '\n'; } >> "$STUB_LOG"
+# ONE write per record. The script under test pipes `kubectl create ... | kubectl apply`,
+# so two recorders run at once; word-at-a-time printfs interleaved on O_APPEND and
+# produced lines like `create secretkubectl generic ... apply` under load, which made
+# a test that greps this log fail about 1 run in 50 (measured).
+_rec=""; (( $# )) && printf -v _rec ' %s' "$@"
+printf 'curl%s\n' "$_rec" >> "$STUB_LOG"
 url=""
 body=""
 prev=""
@@ -335,7 +345,7 @@ def _run(script: Path, stub_dir: Path, args, env: dict | None) -> Run:
     # under test do. Cleared rather than inherited.
     for leak in ("AGENT_BYO_API_KEY", "AGENT_BYO_API_BASE", "AGENT_OPENAI_API_KEY",
                  "AGENT_SLACK_CONFIG_FILE", "AGENT_DISCORD_CONFIG_FILE",
-                 "AGENT_EMAIL_CONFIG_FILE"):
+                 "AGENT_EMAIL_CONFIG_FILE", "GATEWAY_SURFACE_BASE"):
         environ.pop(leak, None)
     environ.update(env or {})
 
@@ -346,7 +356,7 @@ def _run(script: Path, stub_dir: Path, args, env: dict | None) -> Run:
     return Run(proc, stub_dir)
 
 
-def _integrated_gateway_base() -> str:
+def provisioner_gateway_base() -> str:
     """The base an integrated agent's pod actually reports, per the script that sets it.
 
     Read out of provision-agent.sh rather than written down again here. hermes-up.sh
@@ -354,11 +364,20 @@ def _integrated_gateway_base() -> str:
     ledger row), so if this were a second copy of the literal, changing the provisioner's
     GATEWAY_BASE would leave the healthy fixture agreeing with the stale value and every
     test green while the real command refused every real agent.
+
+    The definition is a shell expression (`${GATEWAY_SURFACE_BASE:-http://gateway:4000}/v1`
+    since the freerouter cutover made the base repointable), so it is EVALUATED by bash
+    exactly as the provisioner evaluates it, in the same environment _run() gives the
+    script (GATEWAY_SURFACE_BASE cleared). Taking the raw text of the assignment compared
+    the pod's real base against an unexpanded `${...}` string.
     """
     text = (REPO / "deploy/bin/provision-agent.sh").read_text()
     match = re.search(r'^GATEWAY_BASE="([^"]+)"', text, re.M)
     assert match, "provision-agent.sh no longer defines GATEWAY_BASE"
-    return match.group(1)
+    environ = {k: v for k, v in os.environ.items() if k != "GATEWAY_SURFACE_BASE"}
+    out = subprocess.run(["bash", "-c", f'printf %s "{match.group(1)}"'],
+                         capture_output=True, text=True, timeout=10, env=environ, check=True)
+    return out.stdout
 
 
 # What a healthy cluster answers. Every hermes_up() test starts from these and overrides
@@ -370,7 +389,7 @@ HEALTHY = {
     "chat-config": '{"bot_token_set": true, "app_token_set": true, '
                    '"default_channel": "C0123ABCD"}',
     "doc-state": "DOC_WIRED",
-    "gateway-out": f"200 {_integrated_gateway_base()} glm-5.2@deepinfra",
+    "gateway-out": f"200 {provisioner_gateway_base()} glm-5.2@deepinfra",
     "gateway-rc": "0",
 }
 

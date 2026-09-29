@@ -25,10 +25,32 @@ def test_admin_token_authorizes(monkeypatch):
 
 
 def test_bad_token_without_role_is_denied(monkeypatch):
+    # A bearer PRESENTED but wrong is an authentication failure: 401, as require_admin
+    # answers it (RFC 7235). The live TestItem2 issuance test pins the same code.
     monkeypatch.setenv("CONTROL_PLANE_ADMIN_TOKEN", "sekret")
     with pytest.raises(HTTPException) as e:
         main.require_operator(FakeRequest(), _creds("wrong"))
+    assert e.value.status_code == 401
+
+
+def test_no_bearer_and_no_role_is_forbidden(monkeypatch):
+    # Nothing presented and no operator role: not an auth failure, a missing permission.
+    monkeypatch.setenv("CONTROL_PLANE_ADMIN_TOKEN", "sekret")
+    monkeypatch.setattr(portal, "ADMIN_ROLES", {"operator"})
+    with pytest.raises(HTTPException) as e:
+        main.require_operator(FakeRequest(), None)
     assert e.value.status_code == 403
+
+
+def test_operator_role_still_authorizes_alongside_a_foreign_bearer(monkeypatch):
+    # A proxy that forwards its own Authorization header must not lock a real operator out.
+    monkeypatch.setenv("CONTROL_PLANE_ADMIN_TOKEN", "sekret")
+    monkeypatch.setattr(portal, "ADMIN_ROLES", {"operator"})
+    req = FakeRequest(headers={
+        "x-auth-request-groups": "operator",
+        "x-auth-request-preferred-username": "carol",
+    })
+    assert main.require_operator(req, _creds("an-id-token")) == "carol"
 
 
 def test_operator_role_via_proxy_authorizes_and_names_the_operator(monkeypatch):

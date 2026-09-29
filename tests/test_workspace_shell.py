@@ -754,9 +754,11 @@ def test_switching_model_also_asks_for_a_fresh_session(shell):
     project = shell.get("/api/state").json()["project"]
     flag = shell.root / ".meta" / f"{project}.new-session"
     assert not flag.exists()
-    r = shell.post("/api/model", {"model": "glm-4.7@deepinfra"})
+    # example-small: the picker's second entry, i.e. a switch AWAY from the default.
+    # (Was glm-4.7@deepinfra until b0dc137 took operator slugs out of the distributable.)
+    r = shell.post("/api/model", {"model": "example-small"})
     assert r.status_code == 200, r.text
-    assert shell.get("/api/state").json()["model"] == "glm-4.7@deepinfra"
+    assert shell.get("/api/state").json()["model"] == "example-small"
     assert flag.is_file(), (
         "the model was written but no fresh session was asked for, so the agent would "
         "resume on the old model and the setting would appear to do nothing"
@@ -785,15 +787,20 @@ def test_every_offered_model_is_declared_in_opencode_config(shell):
     )
 
 
-def test_glm_5_2_remains_the_default_model(shell):
+def test_the_distributable_default_model_remains_the_default(shell):
     """Switching models is opt-in and per-project, so adding alternates to the picker must
-    not move the default: a new project — and every running session — stays on GLM 5.2
-    unless someone actively picks otherwise."""
+    not move the default: a new project — and every running session — stays on the baked
+    default unless someone actively picks otherwise.
+
+    The default is `example-large` since b0dc137 (#49, the distributable/instance split),
+    which took the operator's catalogue slug (glm-5.2@deepinfra) out of the distributable;
+    tests/test_oss_clean.py now forbids that slug in shipped files. The instance's real
+    model rides its own catalogue render, not this file."""
     config = json.loads((SERVER.parent / "opencode.json").read_text())
-    assert config["model"] == "enterprise-ai/glm-5.2@deepinfra", (
+    assert config["model"] == "enterprise-ai/example-large", (
         "the baked default model changed — adding alternates must stay additive"
     )
-    assert shell.get("/api/state").json()["models"][0]["id"] == "glm-5.2@deepinfra"
+    assert shell.get("/api/state").json()["models"][0]["id"] == "example-large"
 
 
 def test_switching_to_an_added_alternate_is_accepted(shell):

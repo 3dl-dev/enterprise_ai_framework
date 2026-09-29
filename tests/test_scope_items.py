@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import time
 import urllib.parse
@@ -2410,6 +2411,78 @@ class TestItem9ExitPath:
         )
         assert result.returncode == 0, f"verification failed:\n{result.stdout}"
         assert "EXPORT VERIFIED" in result.stdout
+
+    def test_a_ledger_row_landing_mid_export_yields_a_consistent_verified_export(
+        self, tmp_path, env
+    ):
+        """The ledger is live while it is exported; the archive must still be one cut.
+
+        exit.sh reads the manifest and the files in separate requests, and the gateway
+        writes spend rows in batches. A batch that landed between the manifest and the
+        spend dump made spend.csv longer than the manifest, and the export failed as
+        "truncated" (seen in make test, and 1 in 20 exports under live traffic).
+
+        The row is landed deterministically, through the real database, at the worst
+        moment: a curl shim on PATH inserts one into the real "LiteLLM_SpendLogs" just
+        before exit.sh's first spend dump, then runs the real curl. Everything else is
+        real — control plane, SQL, verify-export.py. The export must succeed, verify, and
+        CONTAIN the row: a consistent cut taken after it landed, not one that hid it.
+        """
+        request_id = f"midexport-probe-{uuid.uuid4().hex}"
+        user = env.get("POSTGRES_USER", "eai")
+        insert = (
+            'INSERT INTO "LiteLLM_SpendLogs" (request_id, call_type, "startTime", "endTime") '
+            f"VALUES ('{request_id}', 'acompletion', now(), now())"
+        )
+        shim_dir = tmp_path / "bin"
+        shim_dir.mkdir()
+        marker = tmp_path / "inserted"
+        real_curl = shutil.which("curl")
+        shim = shim_dir / "curl"
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            'for a in "$@"; do\n'
+            '  if [[ "$a" == */admin/export/spend && ! -e "$SHIM_MARK" ]]; then\n'
+            '    touch "$SHIM_MARK"\n'
+            '    docker compose -f "$SHIM_COMPOSE" --env-file "$SHIM_ENV" exec -T postgres \\\n'
+            '      psql -U "$SHIM_PGUSER" -d gateway -v ON_ERROR_STOP=1 -qc "$SHIM_SQL" >/dev/null\n'
+            "  fi\n"
+            "done\n"
+            f'exec {real_curl} "$@"\n'
+        )
+        shim.chmod(0o755)
+        out = tmp_path / "export"
+        out.mkdir()
+        try:
+            result = subprocess.run(
+                [str(BUNDLE / "bin" / "exit.sh"), "export"],
+                capture_output=True, text=True, cwd=str(BUNDLE),
+                env={
+                    **os.environ,
+                    "PATH": f"{shim_dir}:{os.environ['PATH']}",
+                    "EXPORT_DIR": str(out),
+                    "SHIM_MARK": str(marker),
+                    "SHIM_COMPOSE": str(BUNDLE / "docker-compose.yml"),
+                    "SHIM_ENV": str(BUNDLE / ".env"),
+                    "SHIM_PGUSER": user,
+                    "SHIM_SQL": insert,
+                },
+            )
+            assert marker.exists(), "the shim never saw a spend dump; nothing was injected"
+            assert result.returncode == 0, (
+                f"a row landing mid-export failed the export:\n{result.stdout}\n{result.stderr}"
+            )
+            export = (out / "latest").resolve()
+            spend = (export / "spend.csv").read_text()
+            assert request_id in spend, (
+                "the export verified but does not contain the row that landed during it"
+            )
+            manifest = json.loads((export / "manifest.json").read_text())
+            assert manifest["spend_rows"] == len(spend.splitlines()) - 1
+        finally:
+            compose("exec", "-T", "postgres", "psql", "-U", user, "-d", "gateway", "-qc",
+                    f"DELETE FROM \"LiteLLM_SpendLogs\" WHERE request_id = '{request_id}'",
+                    check=False)
 
     def test_verifier_detects_a_tampered_event(self, tmp_path):
         """A verifier that cannot fail proves nothing."""

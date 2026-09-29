@@ -144,7 +144,14 @@ def test_agent_key_speaks_then_transcribes_and_both_calls_are_billed_to_it(
     deadline = time.time() + 90
     spend: dict[str, float] = {}
     while time.time() < deadline and len(spend) < 2:
-        rows = httpx.get(f"{gateway_url}/spend/logs", headers=master_headers, timeout=60).json()
+        # Scoped server-side to this key's hash. Unscoped, /spend/logs returns the whole
+        # ledger: measured at 323MB / 55s on a stack that has run the suite a few times,
+        # which blew the 60s read timeout and failed this test on ledger size, not on
+        # speech. The client-side filter below is kept, so the claim is unchanged.
+        rows = httpx.get(
+            f"{gateway_url}/spend/logs", headers=master_headers,
+            params={"api_key": _hash(named_key_headers)}, timeout=60,
+        ).json()
         # The newest key is ours: named_key_headers mints one per test.
         mine = [r for r in rows if r["call_type"] in ("aspeech", "atranscription")
                 and r["api_key"] == _hash(named_key_headers)]
