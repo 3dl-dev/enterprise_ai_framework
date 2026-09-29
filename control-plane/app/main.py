@@ -79,6 +79,10 @@ def require_operator(
         return "admin-token"
     if portal.roles(request) & portal.ADMIN_ROLES:
         return portal.require_user(request)  # the operator's username, for the audit trail
+    if creds is not None:
+        # A bearer was PRESENTED and it is wrong: an authentication failure, answered
+        # the way require_admin answers it (RFC 7235). Nothing presented stays 403.
+        raise HTTPException(401, "bad admin token")
     raise HTTPException(403, "operator role or admin token required")
 
 
