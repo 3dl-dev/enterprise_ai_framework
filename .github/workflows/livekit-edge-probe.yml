@@ -1,0 +1,33 @@
+# External vantage point for the LiveKit exposure ruling (gate cfa, items 7f6/4d2):
+# LiveKit signalling/media must NOT be reachable from the public edge. GitHub-hosted runners
+# sit outside the LAN/VPN, so this is the probe from outside. Run on demand or daily.
+name: livekit-edge-probe
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: public hostname to probe
+        default: ai.3dl.one
+  schedule:
+    - cron: "17 6 * * *"
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install pytest httpx
+      - name: probe from outside
+        env:
+          HOST: ${{ github.event.inputs.host || 'ai.3dl.one' }}
+        run: |
+          ip=$(dig +short "$HOST" A | grep -E '^[0-9.]+$' | head -1)
+          echo "runner egress: $(curl -s https://api.ipify.org)  $HOST -> ${ip:-<none>}"
+          case "$ip" in
+            10.*|192.168.*|172.1[6-9].*|172.2?.*|172.3[01].*|127.*|"")
+              echo "::error::$HOST resolves to '$ip' from the runner: not a public address, the probe would prove nothing"; exit 1;;
+          esac
+          EDGE_HOST="$HOST,$ip" pytest tests-live/test_livekit_exposure.py -v -p no:cacheprovider

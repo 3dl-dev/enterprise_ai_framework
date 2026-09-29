@@ -4,9 +4,14 @@ BARON RULING 2026-09-29 (gate cfa): LiveKit is LAN/VPN only. This probes the PUB
 hostname from wherever the test runs (run it from outside the LAN/VPN, e.g. a cloud
 runner) and fails if any LiveKit port answers or if `/rtc` upgrades to a websocket.
 
-    EDGE_HOST=ai.3dl.one pytest tests-live/test_livekit_exposure.py
+    EDGE_HOST=ai.3dl.one,203.0.113.7 pytest tests-live/test_livekit_exposure.py
 
-EDGE_HOST is required; a missing value fails rather than skips.
+EDGE_HOST is required (comma-separated: the hostname and the public IP it resolves to); a
+missing value fails rather than skips. The gate is .github/workflows/livekit-edge-probe.yml,
+which runs this from a GitHub-hosted runner, i.e. outside the LAN/VPN. A test that only ever
+sees "refused" proves nothing, so the POSITIVE CONTROL asserts 443 on the same host DOES
+connect: if the runner cannot reach the edge at all, the probe fails instead of passing.
+UDP media (30782) cannot be probed: an unsolicited UDP datagram gets no reply either way.
 """
 
 import os
@@ -18,12 +23,21 @@ import pytest
 LIVEKIT_TCP_PORTS = (7880, 7881, 30780, 30781, 3478, 5349)
 
 
-@pytest.fixture(scope="module")
-def edge() -> str:
-    host = os.environ.get("EDGE_HOST", "")
-    if not host:
-        pytest.fail("set EDGE_HOST to the public hostname to probe (e.g. ai.3dl.one)")
-    return host
+def _hosts() -> list[str]:
+    return [h.strip() for h in os.environ.get("EDGE_HOST", "").split(",") if h.strip()]
+
+
+@pytest.fixture(params=_hosts() or ["<unset>"])
+def edge(request) -> str:
+    if request.param == "<unset>":
+        pytest.fail("set EDGE_HOST to the public hostname(s) to probe (e.g. ai.3dl.one)")
+    return request.param
+
+
+def test_positive_control_the_public_port_443_connects(edge):
+    """The probe can tell reachable from unreachable: 443 IS public and must connect."""
+    with socket.create_connection((edge, 443), timeout=10):
+        pass
 
 
 @pytest.mark.parametrize("port", LIVEKIT_TCP_PORTS)
