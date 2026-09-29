@@ -104,6 +104,46 @@ services:
       start_period: 40s
     restart: unless-stopped
 
+  # Local speech servers behind the gateway's /v1/audio/* (enterpriseaiframework-8cb; the
+  # cluster equivalent is deploy/k8s/32-speech.yaml). Speaches (MIT): Whisper STT + Kokoro
+  # TTS. Sits on an `internal: true` network with HF_HUB_OFFLINE=1, so nothing it runs can
+  # leave the host; the weights come from the one-shot speech-models service, which is the
+  # only container here that reaches the model hub.
+  speech-models:
+    image: ghcr.io/speaches-ai/speaches:0.8.3-cpu
+    command:
+      - python
+      - -c
+      - |
+        from huggingface_hub import snapshot_download
+        for repo in ("Systran/faster-whisper-small", "speaches-ai/Kokoro-82M-v1.0-ONNX"):
+            print(snapshot_download(repo))
+    user: root
+    volumes:
+      - speechmodels:/home/ubuntu/.cache/huggingface
+    restart: "no"
+
+  speech:
+    image: ghcr.io/speaches-ai/speaches:0.8.3-cpu
+    environment:
+      HF_HUB_OFFLINE: "1"
+      ENABLE_UI: "false"
+    user: root
+    volumes:
+      - speechmodels:/home/ubuntu/.cache/huggingface
+      - ./speech/model_aliases.json:/home/ubuntu/speaches/model_aliases.json:ro
+    networks: [speech-internal]
+    depends_on:
+      speech-models:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
   gateway:
     image: ghcr.io/berriai/litellm:main-v1.77.3-stable
     command: ["--config", "/app/config.yaml", "--port", "4000"]
@@ -129,6 +169,8 @@ services:
       - ../deploy/gateway/allow_reasoning_effort.py:/app/allow_reasoning_effort.py:ro
     ports:
       - "${GATEWAY_PORT:-4000}:4000"
+    # `speech-internal` is how the gateway reaches the local speech servers; see `speech`.
+    networks: [default, speech-internal]
     depends_on:
       postgres:
         condition: service_healthy
@@ -979,7 +1021,12 @@ services:
       start_period: 40s
     restart: unless-stopped
 
+networks:
+  speech-internal:
+    internal: true
+
 volumes:
+  speechmodels:
   pgdata:
   valkeydata:
   chatdbdata:

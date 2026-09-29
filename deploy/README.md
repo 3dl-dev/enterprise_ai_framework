@@ -224,3 +224,18 @@ metered.
   `<user>::agents/<name>` and the inference check cannot pass against it. Tracked on the
   ship checklist, `enterpriseaiframework-a39`. Until it lands, mint with a locally-run
   control-plane app (`enterpriseaiframework-ede`) or supply `AGENT_OPENAI_API_KEY`.
+
+## Speech — `/v1/audio/*` on the gateway, all local
+
+The bundled gateway serves `/v1/audio/speech` (TTS) and `/v1/audio/transcriptions` (STT) under
+the model names `speech-tts` and `speech-stt`, with an ordinary agent key. Upstream is the
+in-cluster `speech` service (`deploy/k8s/32-speech.yaml`; compose service `speech`): Speaches
+(MIT) running Whisper `faster-whisper-small` (MIT weights) and Kokoro-82M (Apache-2.0). The
+server runs offline behind a NetworkPolicy that admits only the gateway in and only DNS out;
+the weights are fetched once at install by the `speech-models-fetch` Job (pre-seed the
+`speech-models` PVC instead on an air-gapped install). Both routes are priced (STT per second,
+TTS per character), so per-key spend is real; rates live in `bundle/litellm/config.base.yaml`.
+
+Swap options, not defaults: Kyutai STT 1B (CC-BY-4.0 weights, permitted as a default by the
+2026-09-29 ruling, attribution required) or Qwen3-TTS behind the same routes by repointing
+`api_base`. WebSocket streaming is not served through the gateway yet.
