@@ -46,6 +46,10 @@ EXPECTED_SKIPS = {
     # (the :9119 dashboard admission), is deliberately NOT here — it must be applied every
     # deploy, exactly as 63-agent-common.yaml is.
     "65-agent-hermes.template.yaml",
+    # The openclaw gateway agent template (enterpriseaiframework-ff7). Same reason again:
+    # __USER__/__NAME__ placeholders, rendered per agent by control-plane/app/agents.py. Its
+    # Control UI port (18789) is admitted by the same namespace-wide 66-agent-console-common.
+    "67-agent-openclaw.template.yaml",
 }
 
 

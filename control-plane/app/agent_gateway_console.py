@@ -1,4 +1,14 @@
-"""The Agents-pillar console proxy — the hermes dashboard, surfaced at /agents/<name>/.
+"""The Agents-pillar console proxy — the hermes dashboard and the openclaw Control UI,
+surfaced at /agents/<name>/.
+
+THE TWO TYPES DIFFER ONLY IN HOW THE PROXY AUTHENTICATES TO THE AGENT. hermes: a form-login
+with a per-agent credential, then a session cookie (everything below the openclaw section).
+openclaw (enterpriseaiframework-ff7): NO login — the gateway runs `auth.mode: trusted-proxy`,
+so the proxy asserts the portal-authenticated owner in `x-forwarded-user` on every request
+and WebSocket upgrade, and the gateway believes it only from the pod network and only for
+that owner. Anything a browser sent under those header names is discarded first: the proxy is
+the sole author of identity. The forwarding-prefix, streaming and WebSocket-bridge code is
+shared.
 
 This is the gateway-agent counterpart to `agent_console.py`, and it is deliberately a
 SEPARATE adapter, not a reuse of that module's opencode shim (agents-gateway-console.md
@@ -82,6 +92,61 @@ def _clean(headers, *, drop_cookie: bool = True) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in skip}
 
 
+# ---- openclaw: trusted-proxy identity ---------------------------------------------------
+
+# A synthetic, non-loopback client address. openclaw's trusted-proxy mode refuses a request
+# whose forwarded client address is loopback, and the browser's real address is unknown here
+# (oauth2-proxy fronts this pod on loopback). The gateway is only reachable from the
+# control-plane pod, so every request really does come from one client: us.
+_PROXY_CLIENT_ADDR = "198.51.100.1"
+
+# Header families a browser must never be able to set on the upstream request: identity,
+# client address, and the scope cap. Dropped case-insensitively before ours are written.
+_IDENTITY_PREFIXES = ("x-forwarded-", "x-openclaw-")
+_IDENTITY_NAMES = {"x-real-ip", "forwarded"}
+
+
+def _is_identity_header(name: str) -> bool:
+    n = name.lower()
+    return n in _IDENTITY_NAMES or n.startswith(_IDENTITY_PREFIXES)
+
+
+def _openclaw_identity(user: str) -> dict:
+    return {"x-forwarded-user": user, "x-forwarded-for": _PROXY_CLIENT_ADDR}
+
+
+def _is_openclaw(target: dict) -> bool:
+    return target.get("type") == "openclaw"
+
+
+async def openclaw_rpc(target: dict, method: str, params: dict) -> dict:
+    """One call to openclaw's admin HTTP RPC (`POST /api/v1/admin/rpc`), as the owner.
+
+    The Contract D path for openclaw: no pods/exec and no config-file clobber — the gateway's
+    own `config.get` / `config.patch` handlers. Authorised by the same trusted-proxy identity
+    the console uses; `target` is owner-scoped by `console_target`.
+    """
+    headers = {
+        **_openclaw_identity(target["user"]),
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "control-plane",
+        "content-type": "application/json",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(
+                f"http://{target['host']}:{target['port']}/api/v1/admin/rpc",
+                json={"method": method, "params": params}, headers=headers)
+    except httpx.HTTPError as exc:
+        raise _unreachable(target.get("host", "?"), exc)
+    try:
+        return resp.json()
+    except ValueError:
+        raise HTTPException(
+            502, f"the agent's console answered HTTP {resp.status_code} with no JSON body "
+                 "to an admin RPC call.")
+
+
 def _prefix(name: str) -> str:
     """This console's mount point, no trailing slash — concatenated with a path."""
     return f"/agents/{name}"
@@ -120,6 +185,16 @@ def _upstream_path(scope: dict, name: str, decoded: str) -> str:
         if candidate.startswith(prefix):
             return candidate[len(prefix):] or "/"
     return "/" + decoded
+
+
+def _upstream_target_path(scope: dict, name: str, decoded: str, target: dict) -> str:
+    """Path to request upstream. hermes resolves its SPA from X-Forwarded-Prefix, so the
+    mount prefix is STRIPPED. openclaw is configured with `controlUi.basePath` and serves
+    only under it, so its upstream path keeps the FULL `/agents/<name>` prefix."""
+    path = _upstream_path(scope, name, decoded)
+    if _is_openclaw(target):
+        return _prefix(name) + path
+    return path
 
 
 def _unreachable(name: str, exc: Exception) -> HTTPException:
@@ -229,16 +304,21 @@ async def proxy_http(user: str, name: str, path: str, request: Request,
     broken console.
     """
     base = f"http://{target['host']}:{target['port']}"
-    url = f"{base}{_upstream_path(request.scope, name, path)}"
+    url = f"{base}{_upstream_target_path(request.scope, name, path, target)}"
     body = await request.body()
 
+    openclaw = _is_openclaw(target)
     base_headers = _clean(request.headers)
+    if openclaw:
+        base_headers = {k: v for k, v in base_headers.items() if not _is_identity_header(k)}
     base_headers.update(_forwarded_headers(name, request.headers, request.url.scheme))
+    if openclaw:
+        base_headers.update(_openclaw_identity(target["user"]))
     base_headers["accept-encoding"] = "identity"
 
     async def _send(cookie: str):
         client = httpx.AsyncClient(timeout=_TIMEOUT)
-        headers = dict(base_headers, cookie=cookie)
+        headers = dict(base_headers) if openclaw else dict(base_headers, cookie=cookie)
         try:
             req = client.build_request(
                 request.method, url, content=body, headers=headers,
@@ -250,10 +330,11 @@ async def proxy_http(user: str, name: str, path: str, request: Request,
             await client.aclose()
             raise _unreachable(name, exc)
 
-    cookie = await _cookie_for(base, target["host"], target)
+    cookie = "" if openclaw else await _cookie_for(base, target["host"], target)
     client, upstream = await _send(cookie)
-    if _session_rejected(upstream):
-        # Stale session — log in again once and retry. A second refusal is a real failure.
+    if not openclaw and _session_rejected(upstream):
+        # hermes only: stale session (401, or 302 -> /login after an agent restart) — log in
+        # again once and retry. A second refusal is a real failure. openclaw has no session.
         await upstream.aclose()
         await client.aclose()
         cookie = await _cookie_for(base, target["host"], target, force=True)
@@ -286,7 +367,8 @@ async def proxy_ws(ws: WebSocket, user: str, name: str, path: str, target: dict)
     import websockets
 
     base = f"http://{target['host']}:{target['port']}"
-    cookie = await _cookie_for(base, target["host"], target)
+    openclaw = _is_openclaw(target)
+    cookie = "" if openclaw else await _cookie_for(base, target["host"], target)
 
     offered = [
         p.strip()
@@ -294,12 +376,20 @@ async def proxy_ws(ws: WebSocket, user: str, name: str, path: str, target: dict)
         if p.strip()
     ]
     upstream_url = (f"ws://{target['host']}:{target['port']}"
-                    f"{_upstream_path(ws.scope, name, path)}")
+                    f"{_upstream_target_path(ws.scope, name, path, target)}")
     if ws.scope.get("query_string"):
         upstream_url += "?" + ws.scope["query_string"].decode()
 
     headers = _forwarded_headers(name, ws.headers, "https")
-    headers["Cookie"] = cookie
+    origin_kw: dict = {}
+    if openclaw:
+        headers.update(_openclaw_identity(target["user"]))
+        # The gateway checks the browser's Origin against `controlUi.allowedOrigins` on the
+        # upgrade, so the browser's own Origin must ride it (websockets sets none by itself).
+        if ws.headers.get("origin"):
+            origin_kw["origin"] = ws.headers["origin"]
+    else:
+        headers["Cookie"] = cookie
 
     # `websockets` renamed this between client implementations and connect() builds lazily,
     # so the wrong kw never surfaces at the call site — chosen from the signature, the same
@@ -313,7 +403,7 @@ async def proxy_ws(ws: WebSocket, user: str, name: str, path: str, target: dict)
     try:
         async with websockets.connect(
             upstream_url, subprotocols=offered or None, max_size=None,
-            open_timeout=15, **{header_kw: headers},
+            open_timeout=15, **origin_kw, **{header_kw: headers},
         ) as upstream:
             await ws.accept(subprotocol=getattr(upstream, "subprotocol", None))
 

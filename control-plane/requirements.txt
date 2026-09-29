@@ -15,3 +15,5 @@ websockets==13.1
 # with uvicorn[standard]; named here because a direct import must be a direct dependency —
 # a transitive one can vanish in a patch release and take agent creation with it.
 PyYAML==6.0.3
+# HS256 signing of LiveKit room tokens (app/livekit_tokens.py); replaces hand-rolled hmac/hashlib.
+PyJWT==2.12.1
