@@ -104,6 +104,9 @@ HERMES_IMAGE = os.environ.get("AGENT_HERMES_IMAGE", "nousresearch/hermes-agent:v
 # it, and the per-agent secret is the password, never the username.
 DASHBOARD_USERNAME = "console"
 
+# App-level retries per model call for a new hermes agent (hermes default: 3).
+HERMES_API_MAX_RETRIES = int(os.environ.get("AGENT_HERMES_API_MAX_RETRIES", "8"))
+
 # The hermes dashboard's native port (agents-gateway-console.md Contract C), the port the
 # per-agent Service publishes and the console proxy targets. Confirmed :9119 by -2ba.
 DASHBOARD_PORT = int(os.environ.get("AGENT_DASHBOARD_PORT", "9119"))
@@ -813,6 +816,10 @@ def hermes_seed_config(model: str) -> str:
                 },
             },
             "model": {"provider": "gateway", "default": model},
+            # Ride out an upstream overload burst instead of abandoning the turn. The default
+            # (3 attempts, ~8s of backoff) gives up inside one DeepInfra "model busy" burst,
+            # which stopped a live agent mid-task on 2026-09-29; 8 spans roughly a minute.
+            "agent": {"api_max_retries": HERMES_API_MAX_RETRIES},
             "terminal": {"backend": "local"},
         },
         default_flow_style=False,

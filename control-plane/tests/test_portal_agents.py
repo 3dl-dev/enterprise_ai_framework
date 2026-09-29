@@ -50,6 +50,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -616,6 +617,8 @@ def test_creating_a_hermes_agent_renders_the_single_container_first_boot_seed_po
     cm = cluster.get("configmaps", "agent-alice-athena-config")
     seed_yaml = cm["data"]["config.yaml"]
     assert "http://gateway:4000/v1" in seed_yaml and "discover_models: true" in seed_yaml
+    # A new agent tolerates an upstream overload burst rather than dropping the turn.
+    assert yaml.safe_load(seed_yaml)["agent"]["api_max_retries"] == agents.HERMES_API_MAX_RETRIES >= 8
     assert "basic_auth" not in seed_yaml and "password" not in seed_yaml, (
         "the console credential is env-based (from the Secret); it must not be in the ConfigMap"
     )

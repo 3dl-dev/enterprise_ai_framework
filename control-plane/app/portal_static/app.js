@@ -399,6 +399,7 @@ async function loadAdmin() {
   catch { $("panel-admin").hidden = true; return; }
   $("panel-admin").hidden = false;
   $("admin-total").textContent = money(d.totals?.spend);
+  renderCredit(d.credit);
 
   const body = $("admin-rows");
   body.innerHTML = "";
@@ -441,6 +442,31 @@ async function loadAdmin() {
         + "— investigate before trusting these numbers.";
     $("admin-audit").classList.toggle("bad", !okay);
   } catch { $("admin-audit").textContent = ""; }
+}
+
+/* The operator tab every key draws on. Shown because the failure it prevents is silent until
+   it is total: an unreachable or spent tab first appears as agents answering 402. */
+const CREDIT_TEXT = {
+  ok: (c) => `Credit line: ${money(c.headroom_usd)} left of ${money(c.credit_line_usd)} ` +
+    `(${money(c.used_usd)} used).`,
+  low: (c) => `Credit line nearly spent: ${money(c.headroom_usd)} left of ` +
+    `${money(c.credit_line_usd)}. Requests start failing (402) at zero.`,
+  exhausted: (c) => `Credit line spent: ${money(c.used_usd)} used of ` +
+    `${money(c.credit_line_usd)}. Requests are being refused (402).`,
+  not_on_tab: (c) => `Not on the operator credit line: every key bills to prepaid account ` +
+    `${c.billing_account_id} (${money(c.balance_usd)} left), not ${c.operator_root_id}. ` +
+    `Requests fail (402) when it runs out.`,
+  no_tab: (c) => `No operator credit line configured: prepaid balance ${money(c.balance_usd)}. ` +
+    `Requests fail (402) at zero.`,
+  unknown: (c) => `Credit line unknown — could not read it from the gateway (${c.error || "error"}).`,
+};
+
+function renderCredit(c) {
+  const el = $("admin-credit");
+  el.hidden = !c;
+  if (!c) return;
+  el.textContent = (CREDIT_TEXT[c.status] || CREDIT_TEXT.unknown)(c);
+  el.classList.toggle("bad", c.status !== "ok");
 }
 
 $("admin-since").addEventListener("change", loadAdmin);
