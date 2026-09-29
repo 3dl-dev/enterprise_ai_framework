@@ -1,0 +1,6 @@
+# Pinned by BARON RULING 2026-09-29 (gate cfa) and the design record: 1.6.1+ hard-depends on
+# livekit-local-inference (Apache-2.0 AND LiveKit Model License), which 1.6.0 does not.
+livekit-agents==1.6.0
+livekit-plugins-openai==1.6.0
+livekit-plugins-silero==1.6.0
+httpx==0.28.1  # imported by livekit-agents 1.6.0 (agents/inference) but not declared by it

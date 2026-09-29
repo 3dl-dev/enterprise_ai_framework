@@ -31,6 +31,9 @@ IMAGE="${REGISTRY}/${IMAGE_NAME}:${TAG}"
 # The hosted Raven image is built separately (deploy/raven/README.md, kaniko-build.sh), not by
 # this script; this is the pinned tag the control plane provisions `type: raven` agents from.
 RAVEN_HOSTED_TAG="${RAVEN_HOSTED_TAG:-v0.2.3-eaf2}"
+# The voice worker image (voice-worker/Dockerfile) is likewise built with kaniko-build.sh, not here;
+# 73-voice-worker.yaml names it through __VOICE_WORKER_IMAGE__.
+VOICE_WORKER_TAG="${VOICE_WORKER_TAG:-1.6.0-eaf1}"
 GATEWAY_LAN_IP="${GATEWAY_LAN_IP:-127.0.0.1}"
 GATEWAY_TAILNET_HOST="${GATEWAY_TAILNET_HOST:-gateway.local}"
 LAN_CIDR="${LAN_CIDR:-127.0.0.0/8}"
@@ -296,7 +299,8 @@ for path in deploy/k8s/*.yaml; do
         -e "s|__GATEWAY_LAN_IP__|${GATEWAY_LAN_IP}|g" \
         -e "s|__GATEWAY_TAILNET_HOST__|${GATEWAY_TAILNET_HOST}|g" \
         -e "s|__LAN_CIDR__|${LAN_CIDR}|g" \
-        -e "s|__PORTAL_ADMINS__|${PORTAL_ADMINS:-}|g")
+        -e "s|__PORTAL_ADMINS__|${PORTAL_ADMINS:-}|g" \
+        -e "s|__VOICE_WORKER_IMAGE__|${REGISTRY}/eaf-voice-worker:${VOICE_WORKER_TAG}|g")
     echo "    apply $f"
     printf '%s\n' "$rendered" | kubectl apply -f -
 done
