@@ -119,6 +119,41 @@ def _is_openclaw(target: dict) -> bool:
     return target.get("type") == "openclaw"
 
 
+# ---- raven: X-Raven-Token ----------------------------------------------------------------
+#
+# Raven's WebUI (agents-raven.md Contract E; verified against the hosted image by -f16) is an
+# nginx-served single-page app at the ROOT of its origin. It authenticates a request by the
+# `X-Raven-Token` header (the engine's RAVEN_SERVE_TOKEN, which the provisioner pins from the
+# agent's `-key` Secret) or by a session cookie a browser earns through a one-time nonce; the
+# proxy uses the header, so the browser never holds a credential and no cookie crosses the
+# hop in either direction. Everything the page does after it loads is JSON-RPC 2.0 over ONE
+# WEBSOCKET at `/rpc` (text frames `{"jsonrpc":"2.0","id":n,"method":"turn.send",...}`); it is
+# NOT HTTP POST. The only HTTP routes are `/health`, `/auth`, `/file`, `/files/`, `/assets/`.
+# Because the SPA hard-codes root-absolute URLs (`fetch("/health")`, `ws://<host>/rpc`), the
+# entry document goes through agent_console's URL shim, exactly as opencode's does.
+
+def _is_raven(target: dict) -> bool:
+    return target.get("type") == "raven"
+
+
+def _raven_identity_headers(target: dict) -> dict:
+    return {"x-raven-token": target["token"]}
+
+
+def raven_frame_gate(frame: str) -> str | None:
+    """THE SEAM for the WebUI provider/channel write lock (item enterpriseaiframework-250).
+
+    Called with every text frame the BROWSER sends up the /rpc socket, before it reaches the
+    agent. Return None to forward the frame; return a JSON-RPC error frame (a string) to
+    answer the browser with it instead and drop the frame. Pass-through today: the write
+    lock's method deny-list (fail-closed on unknown methods in the provider and channel
+    namespaces) attaches HERE, parsing `json.loads(frame)["method"]`, and nowhere else. The
+    RPC method names seen in the shipped SPA include `settings.set`, `config.set` and
+    `channels.configure`.
+    """
+    return None
+
+
 async def openclaw_rpc(target: dict, method: str, params: dict) -> dict:
     """One call to openclaw's admin HTTP RPC (`POST /api/v1/admin/rpc`), as the owner.
 
@@ -308,17 +343,24 @@ async def proxy_http(user: str, name: str, path: str, request: Request,
     body = await request.body()
 
     openclaw = _is_openclaw(target)
+    raven = _is_raven(target)
     base_headers = _clean(request.headers)
-    if openclaw:
-        base_headers = {k: v for k, v in base_headers.items() if not _is_identity_header(k)}
-    base_headers.update(_forwarded_headers(name, request.headers, request.url.scheme))
+    if openclaw or raven:
+        base_headers = {k: v for k, v in base_headers.items()
+                        if not _is_identity_header(k) and not k.lower().startswith("x-raven-")}
+    if raven:
+        # No forwarding-prefix headers: Raven resolves nothing from them, and the SPA's
+        # absolute URLs are fixed by the entry-document shim instead.
+        base_headers.update(_raven_identity_headers(target))
+    else:
+        base_headers.update(_forwarded_headers(name, request.headers, request.url.scheme))
     if openclaw:
         base_headers.update(_openclaw_identity(target["user"]))
     base_headers["accept-encoding"] = "identity"
 
     async def _send(cookie: str):
         client = httpx.AsyncClient(timeout=_TIMEOUT)
-        headers = dict(base_headers) if openclaw else dict(base_headers, cookie=cookie)
+        headers = dict(base_headers) if (openclaw or raven) else dict(base_headers, cookie=cookie)
         try:
             req = client.build_request(
                 request.method, url, content=body, headers=headers,
@@ -330,11 +372,12 @@ async def proxy_http(user: str, name: str, path: str, request: Request,
             await client.aclose()
             raise _unreachable(name, exc)
 
-    cookie = "" if openclaw else await _cookie_for(base, target["host"], target)
+    cookie = "" if (openclaw or raven) else await _cookie_for(base, target["host"], target)
     client, upstream = await _send(cookie)
-    if not openclaw and _session_rejected(upstream):
+    if not (openclaw or raven) and _session_rejected(upstream):
         # hermes only: stale session (401, or 302 -> /login after an agent restart) — log in
-        # again once and retry. A second refusal is a real failure. openclaw has no session.
+        # again once and retry. A second refusal is a real failure. openclaw and raven have
+        # no session: their credential rides every request.
         await upstream.aclose()
         await client.aclose()
         cookie = await _cookie_for(base, target["host"], target, force=True)
@@ -342,6 +385,19 @@ async def proxy_http(user: str, name: str, path: str, request: Request,
 
     out_headers = _clean(upstream.headers)
     ctype = upstream.headers.get("content-type", "")
+
+    if raven and "text/html" in ctype:
+        # The one buffered case: the SPA entry document, whose root-absolute URLs must gain
+        # the /agents/<name> prefix (agent_console's shim; see the raven section above).
+        from . import agent_console
+        try:
+            content = await upstream.aread()
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+        return Response(
+            content=agent_console._rewrite_entry_document(content, name),
+            status_code=upstream.status_code, headers=out_headers, media_type=ctype)
 
     async def relay():
         try:
@@ -368,7 +424,8 @@ async def proxy_ws(ws: WebSocket, user: str, name: str, path: str, target: dict)
 
     base = f"http://{target['host']}:{target['port']}"
     openclaw = _is_openclaw(target)
-    cookie = "" if openclaw else await _cookie_for(base, target["host"], target)
+    raven = _is_raven(target)
+    cookie = "" if (openclaw or raven) else await _cookie_for(base, target["host"], target)
 
     offered = [
         p.strip()
@@ -380,9 +437,13 @@ async def proxy_ws(ws: WebSocket, user: str, name: str, path: str, target: dict)
     if ws.scope.get("query_string"):
         upstream_url += "?" + ws.scope["query_string"].decode()
 
-    headers = _forwarded_headers(name, ws.headers, "https")
+    headers = {} if raven else _forwarded_headers(name, ws.headers, "https")
     origin_kw: dict = {}
-    if openclaw:
+    if raven:
+        # nginx rewrites Origin itself (the engine accepts only its own loopback origin), so
+        # none rides the hop; the token is the credential.
+        headers.update(_raven_identity_headers(target))
+    elif openclaw:
         headers.update(_openclaw_identity(target["user"]))
         # The gateway checks the browser's Origin against `controlUi.allowedOrigins` on the
         # upgrade, so the browser's own Origin must ride it (websockets sets none by itself).
@@ -415,6 +476,9 @@ async def proxy_ws(ws: WebSocket, user: str, name: str, path: str, target: dict)
                     if (data := msg.get("bytes")) is not None:
                         await upstream.send(data)
                     elif (text := msg.get("text")) is not None:
+                        if raven and (refusal := raven_frame_gate(text)) is not None:
+                            await ws.send_text(refusal)
+                            continue
                         await upstream.send(text)
 
             async def to_browser():

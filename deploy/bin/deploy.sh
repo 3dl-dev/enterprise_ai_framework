@@ -28,6 +28,9 @@ set -a; . ./bundle/.env; set +a
 # placeholders (the OIDC-backchannel hostAlias), substituted in the apply loop below.
 REGISTRY="${RAIL_REGISTRY:-localhost:5000}"
 IMAGE="${REGISTRY}/${IMAGE_NAME}:${TAG}"
+# The hosted Raven image is built separately (deploy/raven/README.md, kaniko-build.sh), not by
+# this script; this is the pinned tag the control plane provisions `type: raven` agents from.
+RAVEN_HOSTED_TAG="${RAVEN_HOSTED_TAG:-v0.2.3-eaf2}"
 GATEWAY_LAN_IP="${GATEWAY_LAN_IP:-127.0.0.1}"
 GATEWAY_TAILNET_HOST="${GATEWAY_TAILNET_HOST:-gateway.local}"
 LAN_CIDR="${LAN_CIDR:-127.0.0.0/8}"
@@ -197,6 +200,7 @@ kubectl -n "$NS" create configmap agent-assets \
     --from-file=64-agent.template.yaml=deploy/k8s/64-agent.template.yaml \
     --from-file=65-agent-hermes.template.yaml=deploy/k8s/65-agent-hermes.template.yaml \
     --from-file=67-agent-openclaw.template.yaml=deploy/k8s/67-agent-openclaw.template.yaml \
+    --from-file=69-agent-raven.template.yaml=deploy/k8s/69-agent-raven.template.yaml \
     --from-file=entrypoint.sh=deploy/agent/entrypoint.sh \
     --from-file=agent-email=deploy/agent/agent-email \
     --from-file=EMAIL.md=deploy/agent/EMAIL.md \
@@ -258,6 +262,10 @@ skip_manifest() {
         # The openclaw gateway agent template (enterpriseaiframework-ff7): same shape, same
         # reason; its Control UI port (18789) is already admitted by 66-agent-console-common.
         67-agent-openclaw.template.yaml) return 0 ;;
+        # The Raven host-agent template (enterpriseaiframework-f16): same shape, same reason.
+        # Its namespace-wide companions ARE applied: 68-raven-common.yaml (the policy that
+        # fences raven pods) and 66-agent-console-common.yaml (admits its :18793).
+        69-agent-raven.template.yaml) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -272,6 +280,7 @@ for path in deploy/k8s/*.yaml; do
     if [[ "$f" == 40-control-plane.yaml ]]; then
         # The one image this script builds and pushes, a few lines above.
         rendered=$(sed -e "s|image: REPLACED_BY_DEPLOY|image: ${IMAGE}|" \
+                       -e "s|__RAVEN_IMAGE__|${REGISTRY}/raven-hosted:${RAVEN_HOSTED_TAG}|" \
                        -e "s|REPLACED_BY_DEPLOY|${CFG_SUM}|" "$path")
     elif needs_built_image "$path"; then
         unbuilt+=("$f")
