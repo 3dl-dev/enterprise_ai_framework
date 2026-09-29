@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import secrets
 from pathlib import Path
@@ -100,6 +101,22 @@ DASHBOARD_USERNAME = "console"
 # per-agent Service publishes and the console proxy targets. Confirmed :9119 by -2ba.
 DASHBOARD_PORT = int(os.environ.get("AGENT_DASHBOARD_PORT", "9119"))
 
+# The openclaw image and its Control UI port (agents-gateway-console.md, openclaw column of
+# Contracts B/C/D; verified against the real image by enterpriseaiframework-ff7). The Control
+# UI is served by the gateway itself, on the SAME port as its WebSocket. MIT-licensed.
+OPENCLAW_IMAGE = os.environ.get("AGENT_OPENCLAW_IMAGE", "ghcr.io/openclaw/openclaw:2026.9.6")
+OPENCLAW_PORT = int(os.environ.get("AGENT_OPENCLAW_PORT", "18789"))
+
+# The source range openclaw's `trusted-proxy` auth will accept identity headers from. The
+# control-plane pod's address is not stable, so this is the pod network; the NetworkPolicy
+# (66-agent-console-common.yaml) is what narrows it to the control-plane pod alone, and
+# `allowUsers` narrows the identity to the owner. Override for a cluster whose pod CIDR is
+# not k3s's default.
+OPENCLAW_TRUSTED_PROXIES = tuple(
+    c.strip() for c in os.environ.get("AGENT_TRUSTED_PROXIES", "10.42.0.0/16").split(",")
+    if c.strip()
+)
+
 # The object set and the resident entrypoint, delivered to this pod as a ConfigMap because
 # the control-plane image is built from `control-plane/` alone and these files live under
 # `deploy/`. Rendering the SAME bytes provision-agent.sh renders is the point: a second
@@ -133,6 +150,7 @@ AGENT_FILES = (
 _ASSET_FALLBACK = {
     "64-agent.template.yaml": _REPO / "deploy" / "k8s" / "64-agent.template.yaml",
     "65-agent-hermes.template.yaml": _REPO / "deploy" / "k8s" / "65-agent-hermes.template.yaml",
+    "67-agent-openclaw.template.yaml": _REPO / "deploy" / "k8s" / "67-agent-openclaw.template.yaml",
     **{name: _REPO / "deploy" / "agent" / name for name in AGENT_FILES},
 }
 
@@ -636,6 +654,17 @@ async def console_target(user: str, name: str) -> dict:
             "password": password,
         }
 
+    if agent_type == "openclaw":
+        # The gateway's own Control UI on :18789. No credential to fetch: the proxy
+        # asserts the authenticated owner in a trusted-proxy identity header, so `user`
+        # rides in the target (already owner-checked above) rather than a password.
+        return {
+            "type": "openclaw",
+            "host": obj,
+            "port": OPENCLAW_PORT,
+            "user": user,
+        }
+
     # The opencode/interim path: HTTP Basic on the resident daemon. Unchanged.
     encoded = data.get("OPENCODE_SERVER_PASSWORD")
     if not encoded:
@@ -808,6 +837,101 @@ def render_hermes(user: str, name: str, *, image: str, model_source: str,
     docs = [d for d in yaml.safe_load_all(text) if d]
     if not docs:
         raise HTTPException(500, "the hermes agent template rendered to nothing")
+    return docs
+
+
+# ---------------------------------------------------------------- openclaw (Agents pillar)
+
+OPENCLAW_PROVIDER = "gateway"
+
+
+def _openclaw_model_ref(model: str) -> str:
+    """`provider/model` as openclaw's `agents.defaults.model.primary` spells it."""
+    return f"{OPENCLAW_PROVIDER}/{model}"
+
+
+def _openclaw_model_entries(models) -> list[dict]:
+    return [{"id": m, "name": m} for m in models]
+
+
+def openclaw_seed_config(user: str, name: str, model: str) -> str:
+    """The FIRST-BOOT-ONLY openclaw.json for an openclaw agent (Contract B).
+
+    Every key here was confirmed against a running ghcr.io/openclaw/openclaw by -ff7:
+
+      * `gateway.bind: lan` so the Service can reach the listener; non-loopback binds
+        require auth, which is `trusted-proxy` — the control-plane console proxy vouches for
+        the portal-authenticated owner, and the gateway believes it only from the pod
+        network (`trustedProxies`) and only for that owner (`allowUsers`). `identityScopes`
+        gives the owner admin on the console; `deviceAutoApprove` lets the browser's device
+        enrol without a second, manual approval step on a host nobody can reach.
+      * `controlUi.basePath: /agents/<name>` — native base-path mounting, no SPA shim
+        (Contract C). `allowedOrigins` names the portal's own origin, which the browser's
+        WebSocket presents.
+      * the provider is a custom OpenAI-compatible entry (`baseUrl` + a non-empty `models`
+        list, which openclaw requires) at the gateway, keyed by ${OPENAI_API_KEY} — the
+        integrated `<user>::agents/<name>` key, so inference stays on the one bill.
+      * `admin-http-rpc` is the plugin the control plane drives for a model change
+        (Contract D) — the same trusted-proxy identity authorises it.
+
+    After first boot this is never re-applied: the agent's own config on the PVC is
+    authoritative and settings change through the console / config.patch.
+    """
+    models = list(dict.fromkeys([model, *allowed_models()]))
+    gateway_cfg: dict = {
+        "port": OPENCLAW_PORT,
+        "bind": "lan",
+        "mode": "local",
+        "trustedProxies": list(OPENCLAW_TRUSTED_PROXIES),
+        "auth": {
+            "mode": "trusted-proxy",
+            "identityScopes": {user: ["operator.admin"]},
+            "trustedProxy": {
+                "userHeader": "x-forwarded-user",
+                "requiredHeaders": ["x-forwarded-proto", "x-forwarded-host"],
+                "allowUsers": [user],
+                "deviceAutoApprove": {"enabled": True},
+            },
+        },
+        "controlUi": {"basePath": f"/agents/{name}"},
+    }
+    public = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    if public:
+        gateway_cfg["controlUi"]["allowedOrigins"] = [public]
+    return json.dumps(
+        {
+            "gateway": gateway_cfg,
+            "models": {
+                "mode": "merge",
+                "providers": {
+                    OPENCLAW_PROVIDER: {
+                        "baseUrl": GATEWAY_BASE,
+                        "apiKey": "${OPENAI_API_KEY}",
+                        "api": "openai-completions",
+                        "models": _openclaw_model_entries(models),
+                    },
+                },
+            },
+            "agents": {"defaults": {"model": {"primary": _openclaw_model_ref(model)}}},
+            "plugins": {"entries": {"admin-http-rpc": {"enabled": True}}},
+        },
+        indent=2,
+    ) + "\n"
+
+
+def render_openclaw(user: str, name: str, *, image: str, model_source: str,
+                    key_secret: str, cfgsum: str, keysum: str) -> list[dict]:
+    """Render 67-agent-openclaw.template.yaml, exactly as render_hermes() renders its own."""
+    text = asset("67-agent-openclaw.template.yaml")
+    for placeholder, value in (
+        ("__USER__", user), ("__NAME__", name), ("__IMAGE__", image),
+        ("__MODEL_SOURCE__", model_source), ("__KEY_SECRET__", key_secret),
+        ("__CFGSUM__", cfgsum), ("__KEYSUM__", keysum),
+    ):
+        text = text.replace(placeholder, value)
+    docs = [d for d in yaml.safe_load_all(text) if d]
+    if not docs:
+        raise HTTPException(500, "the openclaw agent template rendered to nothing")
     return docs
 
 
@@ -1091,13 +1215,37 @@ async def _provision_hermes(client: httpx.AsyncClient, user: str, name: str, obj
         await _apply(client, doc)
 
 
+async def _provision_openclaw(client: httpx.AsyncClient, user: str, name: str, obj: str,
+                              model: str, api_key: str, keysum: str) -> None:
+    """Apply the object set for an openclaw gateway agent (agents-gateway-console.md B/C/D).
+
+    The key Secret carries only the integrated key — there is no console credential, because
+    the console is authenticated by the control plane's trusted-proxy identity assertion,
+    not by a password the proxy holds. The seed ConfigMap is first-boot-only, as hermes's.
+    """
+    seed = openclaw_seed_config(user, name, model)
+    cfgsum = hashlib.sha256(seed.encode()).hexdigest()[:16]
+    await _apply(client, _secret_object(f"{obj}-key", {"OPENAI_API_KEY": api_key},
+                                        labels={USER_LABEL: user, NAME_LABEL: name}))
+    await _apply(client, {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": f"{obj}-config", "namespace": namespace(),
+                     "labels": {USER_LABEL: user, NAME_LABEL: name}},
+        "data": {"openclaw.json": seed},
+    })
+    for doc in render_openclaw(
+        user, name, image=OPENCLAW_IMAGE, model_source="integrated",
+        key_secret=f"{obj}-key", cfgsum=cfgsum, keysum=keysum,
+    ):
+        await _apply(client, doc)
+
+
 async def _provision_opencode_interim(client: httpx.AsyncClient, user: str, name: str,
                                       obj: str, model: str, agent_type: str,
                                       api_key: str, keysum: str) -> None:
-    """The pre-gateway opencode render, kept as the interim path for a non-default type
-    until its real provisioner lands (openclaw = enterpriseaiframework-ff7). Identical to
-    the original create() body; the type label is stamped post-render since the opencode
-    template does not carry it."""
+    """The pre-gateway opencode render. No longer reachable from create(): both Agents-pillar
+    types now have their own provisioner (hermes -f55, openclaw -ff7). Retained, unchanged,
+    because render()/_stamp_agent_type are still exercised directly by tests."""
     image = await _workspace_image(client)
 
     # The resident entrypoint AND every tool it puts on PATH, deployment-wide (one control
@@ -1197,13 +1345,10 @@ async def create(
 
         if agent_type == "hermes":
             await _provision_hermes(client, user, name, obj, model, api_key, keysum)
-        else:
-            # openclaw has no provisioner yet (enterpriseaiframework-ff7). Until it lands,
-            # the interim path is the opencode render + type stamp that -5c9 established —
-            # NOT the default (hermes is), so the Code-pillar template is only reached by an
-            # explicit non-default type, exactly as the design record permits temporarily.
-            await _provision_opencode_interim(
-                client, user, name, obj, model, agent_type, api_key, keysum)
+        elif agent_type == "openclaw":
+            await _provision_openclaw(client, user, name, obj, model, api_key, keysum)
+        else:  # pragma: no cover - AGENT_TYPES is checked above; a fail-closed guard
+            raise HTTPException(400, f"no provisioner for agent type {agent_type!r}")
 
     await db.audit(user, "agent.create", f"{user}/{name}",
                    surface=gateway.agent_surface(name), alias=issued["key_alias"],
@@ -1277,11 +1422,13 @@ async def set_model(user: str, name: str, model: str) -> dict:
     # Owner-scoping and the upstream target are the SAME guard the console uses — a caller
     # can only ever reach an agent they own, and only its dashboard.
     target = await console_target(user, name)
+    if target.get("type") == "openclaw":
+        return await _set_openclaw_model(user, name, model, target)
     if target.get("type") != "hermes":
         raise HTTPException(
             501,
-            "changing the model from the control plane is implemented for hermes agents; "
-            "openclaw's openclaw.json path lands with enterpriseaiframework-ff7.",
+            "changing the model from the control plane is implemented for hermes and "
+            "openclaw agents.",
         )
 
     from . import agent_gateway_console
@@ -1319,6 +1466,40 @@ async def set_model(user: str, name: str, model: str) -> dict:
     await db.audit(user, "agent.model.set", f"{user}/{name}", model=model,
                    restarted=restarted)
     return {"name": name, "model": model, "restarted": restarted}
+
+
+async def _set_openclaw_model(user: str, name: str, model: str, target: dict) -> dict:
+    """Contract D for openclaw: `config.patch` through the gateway's admin RPC.
+
+    The patch writes BOTH the picker's catalogue into `models.providers.gateway.models` (a
+    custom provider only resolves ids it lists) and `agents.defaults.model.primary`, through
+    openclaw's own config writer — a targeted merge that leaves every other key the agent or
+    its Control UI persisted alone. openclaw hot-applies the model; no restart is needed.
+    """
+    from . import agent_gateway_console
+
+    got = await agent_gateway_console.openclaw_rpc(target, "config.get", {})
+    base_hash = ((got.get("payload") or {}).get("hash")) if got.get("ok") else None
+    if not base_hash:
+        raise HTTPException(
+            502,
+            f"the agent {name!r}'s console did not return its config. It may be "
+            "mid-restart — try again in a moment.",
+        )
+    patch = {
+        "agents": {"defaults": {"model": {"primary": _openclaw_model_ref(model)}}},
+        "models": {"providers": {OPENCLAW_PROVIDER: {
+            "models": _openclaw_model_entries(dict.fromkeys([model, *allowed_models()])),
+        }}},
+    }
+    res = await agent_gateway_console.openclaw_rpc(
+        target, "config.patch", {"raw": json.dumps(patch), "baseHash": base_hash})
+    if not res.get("ok"):
+        raise HTTPException(
+            409, ((res.get("error") or {}).get("message"))
+            or "the agent's console did not apply the model change.")
+    await db.audit(user, "agent.model.set", f"{user}/{name}", model=model, restarted=False)
+    return {"name": name, "model": model, "restarted": False}
 
 
 # ---------------------------------------------------------------- key reprovision (cutover)

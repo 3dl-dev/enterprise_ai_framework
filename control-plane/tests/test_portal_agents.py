@@ -471,46 +471,89 @@ def test_a_user_lists_stops_starts_and_deletes_their_own_agent(cluster):
     )
 
 
-def test_creating_an_opencode_interim_agent_fills_every_placeholder(cluster):
-    """The interim opencode render, reached now only by an explicit non-default type
-    (openclaw, until its own provisioner lands in enterpriseaiframework-ff7). It still runs
-    the workspace image read off a live pod, which is what makes it the Code-pillar render.
-    The default create path is hermes and is covered by the hermes render test below."""
-    cluster.add_workspace_pod(image="registry.invalid/enterprise-ai-workspace:xyz")
-    created = client_as("alice").post(
-        "/portal/api/agents", json={"name": "helper", "type": "openclaw"})
-    assert created.status_code == 201, created.text
+def test_creating_an_openclaw_agent_renders_the_single_container_gateway_pod(cluster):
+    """Contracts A/B/C/D for the second Agents-pillar type (enterpriseaiframework-ff7).
 
-    dep = cluster.get("deployments", "agent-alice-helper")
-    assert dep is not None, f"no Deployment was applied; store holds {list(cluster.store)}"
-    rendered = json.dumps(dep) + json.dumps(cluster.get("services", "agent-alice-helper"))
-    assert "__" not in rendered, (
-        f"an unsubstituted placeholder reached the cluster: {rendered[:400]}"
-    )
+    One container running `openclaw gateway run` on the openclaw image, its Control UI on the
+    gateway's own :18789, a first-boot-only JSON seed, both state directories on the one PVC,
+    trusted-proxy auth limited to the owner, and the integrated key as the provider key. No
+    workspace pod is needed: this is not the opencode render.
+    """
+    created = client_as("alice").post(
+        "/portal/api/agents", json={"name": "claw", "type": "openclaw"})
+    assert created.status_code == 201, created.text
+    assert created.json()["type"] == "openclaw"
+    assert created.json()["console_url"] == "/agents/claw/"
+
+    dep = cluster.get("deployments", "agent-alice-claw")
+    assert dep is not None, f"no Deployment applied; store holds {list(cluster.store)}"
+    rendered = json.dumps(dep) + json.dumps(cluster.get("services", "agent-alice-claw"))
+    assert "__" not in rendered, f"unsubstituted placeholder reached the cluster: {rendered[:400]}"
     labels = dep["metadata"]["labels"]
-    assert labels["agent.enterprise-ai/user"] == "alice", (
-        "the owner label is what every later authorisation check reads; if it is wrong "
-        "here the agent belongs to nobody and the guard cannot work"
-    )
-    assert labels["agent.enterprise-ai/name"] == "helper"
-    container = dep["spec"]["template"]["spec"]["containers"][0]
-    assert container["image"] == "registry.invalid/enterprise-ai-workspace:xyz", (
-        "an agent runs the image the Code surface is actually running, read off a live "
-        "workspace pod rather than computed from a tag"
-    )
-    secret = cluster.get("secrets", "agent-alice-helper-key")
-    key = base64.b64decode(secret["data"]["OPENAI_API_KEY"]).decode()
-    assert key == "sk-fake-alice-agents/helper", "the minted key must reach the pod's Secret"
-    assert key != agents.KEY_SENTINEL, (
-        "an agent that starts holding -055's sentinel 401s on its first request with "
-        "nothing on screen to say why"
-    )
-    assert ISSUED == [("alice", "agents/helper", "alice")], (
-        "the key must be minted through issuance.issue for the caller, as themselves — "
-        "the actor and the principal are both the signed-in user and neither is a "
-        "parameter"
-    )
-    assert ("alice", "agent.create", "alice/helper") in AUDIT
+    assert labels["agent.enterprise-ai/user"] == "alice"
+    assert labels["agent.enterprise-ai/name"] == "claw"
+    assert labels["agent.enterprise-ai/type"] == "openclaw"
+    assert (dep["spec"]["template"]["metadata"]["labels"]["agent.enterprise-ai/type"]
+            == "openclaw"), "the pod must carry the type, not only the Deployment object"
+
+    spec = dep["spec"]["template"]["spec"]
+    assert [c["name"] for c in spec["containers"]] == ["agent"], "one container"
+    agent = spec["containers"][0]
+    assert agent["image"] == agents.OPENCLAW_IMAGE
+    assert agent["image"].startswith("ghcr.io/openclaw/openclaw:")
+    assert agent["command"] + agent["args"] == ["openclaw", "gateway", "run"]
+    assert {"name": "console", "containerPort": 18789} in agent["ports"]
+    svc = cluster.get("services", "agent-alice-claw")
+    assert [p["port"] for p in svc["spec"]["ports"]] == [18789]
+    env = {e["name"]: e for e in agent["env"]}
+    assert (env["OPENAI_API_KEY"]["valueFrom"]["secretKeyRef"]
+            == {"name": "agent-alice-claw-key", "key": "OPENAI_API_KEY"})
+
+    # BOTH state directories, on the one PVC: sqlite sessions AND the encryption key.
+    mounts = {m["mountPath"]: m["subPath"] for m in agent["volumeMounts"]}
+    assert mounts == {"/home/node/.openclaw": "openclaw",
+                      "/home/node/.config/openclaw": "config"}
+
+    # FIRST-BOOT-ONLY seed (Contract B): conditional, never an unconditional cp.
+    seed_init = next(c for c in spec["initContainers"] if c["name"] == "config-seed")
+    seed_cmd = " ".join(seed_init["command"])
+    assert '[ -f "$C" ] || cp /seed/openclaw.json "$C"' in seed_cmd, (
+        "the seed must be conditional; an unconditional cp wipes the agent's own config")
+    assert "C=/home/node/.openclaw/openclaw.json" in seed_cmd
+
+    # The seed: trusted-proxy for the owner alone, mounted at the agent's own base path,
+    # the gateway as an OpenAI-compatible provider that lists its models.
+    cfg = json.loads(cluster.get("configmaps", "agent-alice-claw-config")["data"]["openclaw.json"])
+    auth = cfg["gateway"]["auth"]
+    assert auth["mode"] == "trusted-proxy"
+    assert auth["trustedProxy"]["allowUsers"] == ["alice"], "only the owner's identity"
+    assert cfg["gateway"]["controlUi"]["basePath"] == "/agents/claw"
+    assert cfg["gateway"]["trustedProxies"] == list(agents.OPENCLAW_TRUSTED_PROXIES)
+    provider = cfg["models"]["providers"]["gateway"]
+    assert provider["baseUrl"] == "http://gateway:4000/v1"
+    assert provider["apiKey"] == "${OPENAI_API_KEY}", "the key is by reference, never inline"
+    assert {"id": agents.DEFAULT_MODEL, "name": agents.DEFAULT_MODEL} in provider["models"]
+    assert cfg["agents"]["defaults"]["model"]["primary"] == f"gateway/{agents.DEFAULT_MODEL}"
+
+    # The key Secret carries the integrated key and NO console credential (auth is the
+    # trusted-proxy assertion) and no opencode material.
+    secret = cluster.get("secrets", "agent-alice-claw-key")
+    assert set(secret["data"]) == {"OPENAI_API_KEY"}
+    assert base64.b64decode(secret["data"]["OPENAI_API_KEY"]).decode() == "sk-fake-alice-agents/claw"
+    assert cluster.get("configmaps", "agent-entrypoint") is None
+
+    assert ISSUED == [("alice", "agents/claw", "alice")], "minted for the caller, as themselves"
+    assert ("alice", "agent.create", "alice/claw") in AUDIT
+
+    row = client_as("alice").get("/portal/api/agents").json()["agents"][0]
+    assert row["type"] == "openclaw"
+
+    # Delete removes the seed ConfigMap and revokes the key like any other agent.
+    body = client_as("alice").request("DELETE", "/portal/api/agents/claw").json()
+    assert body["deleted"] is True and body["key_revoked"] == "alice::agents/claw"
+    assert cluster.get("configmaps", "agent-alice-claw-config") is None
+    assert cluster.names("secrets") == []
+
 
 
 def test_creating_a_hermes_agent_renders_the_single_container_first_boot_seed_pod(cluster):
@@ -609,7 +652,6 @@ def test_creating_an_agent_defaults_the_type_to_hermes(cluster):
 
 
 def test_creating_an_agent_honours_an_explicit_openclaw_type(cluster):
-    cluster.add_workspace_pod(image="registry.invalid/enterprise-ai-workspace:xyz")
     created = client_as("alice").post(
         "/portal/api/agents", json={"name": "sidekick", "type": "openclaw"})
     assert created.status_code == 201, created.text

@@ -605,8 +605,8 @@ function agentRow(a) {
   // Change the model from the control plane (Contract D / -840), for gateway agents whose
   // console API this drives. It rewrites the model through the agent's own dashboard and
   // restarts it, so a model a user picks can never brick the agent — the control plane, not
-  // the agent, is what sets it. Only for hermes and only when there is more than one choice.
-  if (a.type === "hermes" && MODELS.length > 1) {
+  // the agent, is what sets it. For hermes and openclaw, and only when there is more than one choice.
+  if ((a.type === "hermes" || a.type === "openclaw") && MODELS.length > 1) {
     const msel = document.createElement("select");
     msel.className = "agent-model-pick";
     msel.setAttribute("aria-label", `Model for ${a.name}`);

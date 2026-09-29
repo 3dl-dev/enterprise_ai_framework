@@ -196,6 +196,7 @@ echo "==> agent assets -> configmap/agent-assets"
 kubectl -n "$NS" create configmap agent-assets \
     --from-file=64-agent.template.yaml=deploy/k8s/64-agent.template.yaml \
     --from-file=65-agent-hermes.template.yaml=deploy/k8s/65-agent-hermes.template.yaml \
+    --from-file=67-agent-openclaw.template.yaml=deploy/k8s/67-agent-openclaw.template.yaml \
     --from-file=entrypoint.sh=deploy/agent/entrypoint.sh \
     --from-file=agent-email=deploy/agent/agent-email \
     --from-file=EMAIL.md=deploy/agent/EMAIL.md \
@@ -254,6 +255,9 @@ skip_manifest() {
         # namespace-wide :9119 policy that fences its dashboard) is NOT a template and IS
         # applied, for the same reason 63-agent-common.yaml is.
         65-agent-hermes.template.yaml) return 0 ;;
+        # The openclaw gateway agent template (enterpriseaiframework-ff7): same shape, same
+        # reason; its Control UI port (18789) is already admitted by 66-agent-console-common.
+        67-agent-openclaw.template.yaml) return 0 ;;
         *) return 1 ;;
     esac
 }

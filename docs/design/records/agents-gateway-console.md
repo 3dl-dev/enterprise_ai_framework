@@ -287,3 +287,34 @@ were never touched.** Facts below are confirmed; **deltas** correct the contract
 | console build (new item) | Contract C (native console proxy, Keycloak OIDC, NetworkPolicy) |
 | hermes provisioner (new item) | Deployment shape, Contract B (first-boot seed), reuses Contracts 1/3/4/6 |
 | openclaw provisioner (new item) | Contract A + the openclaw column of B/C/D |
+
+---
+
+## Built and run live — openclaw (`enterpriseaiframework-ff7`, 2026-09-29)
+
+Verified on a throwaway k3s agent (`ghcr.io/openclaw/openclaw:2026.9.6`) driven through the real
+control-plane code path; torn down after. Deltas to the openclaw column above:
+
+1. **`token` and `trusted-proxy` are mutually exclusive** (`gateway.auth.token` with
+   `mode: trusted-proxy` is refused), so the "generated token" in the item text is not used.
+   The gate is layered instead: NetworkPolicy admits :18789 from the control-plane pod only;
+   `gateway.trustedProxies` (the pod CIDR, `AGENT_TRUSTED_PROXIES`) restricts who may assert
+   identity; `trustedProxy.allowUsers` restricts the identity to the owner; the proxy discards
+   any identity/`x-openclaw-*` header a browser sends and writes its own.
+2. **Trusted-proxy needs a non-loopback client address** (`x-forwarded-for`) or the gateway
+   answers `403 proxy_attribution_required`. oauth2-proxy makes every portal request loopback
+   to the control plane, so the proxy sends a synthetic constant client address.
+3. **Upstream path keeps the full `/agents/<name>` prefix** (unlike hermes, whose prefix is
+   stripped): openclaw serves only under `controlUi.basePath`.
+4. **Model change = `admin-http-rpc` `config.get` then `config.patch`** (plugin enabled in the
+   seed; `baseHash` from `config.get` is required). A custom provider only resolves ids listed
+   in `models.providers.gateway.models`, so the patch registers the catalogue and sets
+   `agents.defaults.model.primary`. It hot-reloads; no gateway restart.
+5. **State-dir ownership**: a fresh PVC directory is root-owned and the gateway (uid 1000)
+   fails `fchmod` on it, so every config write fails EPERM. The seed init container runs as
+   root with CHOWN/FOWNER/DAC_OVERRIDE only, chowns both state dirs and makes the (0444)
+   seeded file 0600. First-boot-only seeding is unchanged and was confirmed to survive a pod
+   restart with the model change intact.
+6. **Control UI WebSocket origin**: `controlUi.allowedOrigins` is seeded from `PUBLIC_BASE_URL`
+   and the proxy forwards the browser's `Origin` on the upgrade.
+7. Template file is `67-agent-openclaw.template.yaml` (`66-` was taken by the console policy).
