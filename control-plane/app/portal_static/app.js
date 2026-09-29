@@ -79,6 +79,12 @@ async function loadMe() {
   wire("mi-published", L.published);
   if (L.signout) $("signout").href = L.signout;
   LINKS = L;
+  // Where a key is actually usable from off-platform. Hidden when the deployment has no
+  // public origin configured, rather than showing a base URL that would not answer.
+  if (L.inference) {
+    $("inference-url").textContent = L.inference;
+    $("inference-base").hidden = false;
+  }
   IS_ADMIN = me.is_admin === true;
   // Operator-only entry to the behavioural-analytics report. Hidden for everyone else, who
   // gets a 404 from the endpoint anyway — no point advertising a door they can't open.
@@ -359,6 +365,8 @@ async function rotate(surface, alias) {
 }
 
 $("copy-key").addEventListener("click", () => copyText($("new-key").textContent, "Key copied."));
+$("copy-inference").addEventListener("click",
+  () => copyText($("inference-url").textContent, "Base URL copied."));
 $("close-key").addEventListener("click", () => {
   // Clear it out of the DOM on close; there is no reason for it to linger in the page.
   $("new-key").textContent = "";

@@ -239,6 +239,10 @@ async def me(request: Request, user: str = Depends(require_user)):
             "account": account_url,
             "password": f"{account_url}#/security/signingin" if account_url else "",
             "signout": "/portal/oauth2/sign_out",
+            # The OpenAI-compatible base_url a key works against from off-platform — the
+            # ingress's exact-path inference allowlist (enterpriseaiframework-1b4). A key with
+            # no address to use it at is not a feature.
+            "inference": f"{PUBLIC_BASE_URL}/v1" if PUBLIC_BASE_URL else "",
         },
     }
 
