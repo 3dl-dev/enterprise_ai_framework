@@ -18,17 +18,15 @@ check would hand one user the other's room. The separator here is `.`, which the
 the room derived for the caller.
 
 NO LIVEKIT CLOUD
-The token is a plain HS256 JWT (LiveKit's documented access-token format) signed locally.
-No livekit SDK is imported, so nothing here can reach LiveKit Cloud/Inference.
+The token is a plain HS256 JWT (LiveKit's documented access-token format) signed locally by
+PyJWT (MIT, maintained). No livekit SDK is imported, so nothing here can reach LiveKit
+Cloud/Inference. Signing is not hand-rolled: no digest primitives are imported here.
 """
 
-import base64
-import hashlib
-import hmac
-import json
 import os
 import time
 
+import jwt
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -43,10 +41,6 @@ ROOM_PREFIX = "voice-"
 
 def room_name(user: str, raven: str) -> str:
     return f"{ROOM_PREFIX}{user}.{raven}"
-
-
-def _b64(data: bytes) -> bytes:
-    return base64.urlsafe_b64encode(data).rstrip(b"=")
 
 
 def mint(api_key: str, api_secret: str, *, identity: str, room: str,
@@ -66,11 +60,7 @@ def mint(api_key: str, api_secret: str, *, identity: str, room: str,
             "canPublishData": True,
         },
     }
-    head = _b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
-    body = _b64(json.dumps(claims, separators=(",", ":")).encode())
-    signing_input = head + b"." + body
-    sig = _b64(hmac.new(api_secret.encode(), signing_input, hashlib.sha256).digest())
-    return (signing_input + b"." + sig).decode()
+    return jwt.encode(claims, api_secret, algorithm="HS256")
 
 
 class TokenRequest(BaseModel):
