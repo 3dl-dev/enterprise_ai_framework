@@ -128,6 +128,16 @@ spec:
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_CREDS_KEY, optional: true } }
             - name: CHAT_CREDS_IV
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_CREDS_IV, optional: true } }
+            # Voice: the control plane mints LiveKit room tokens for the caller's own rooms
+            # (app/livekit_tokens.py). LIVEKIT_URL is the LAN/VPN-reachable signalling URL a
+            # browser dials (ws://<node-lan-ip>:30780); all three optional — unset means the
+            # token endpoint answers 503 and nothing else changes. See 72-livekit.yaml.
+            - name: LIVEKIT_API_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: LIVEKIT_API_KEY, optional: true } }
+            - name: LIVEKIT_API_SECRET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: LIVEKIT_API_SECRET, optional: true } }
+            - name: LIVEKIT_URL
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: LIVEKIT_URL, optional: true } }
             # The custom endpoint's `name` in bundle/librechat/librechat.yaml — the key LibreChat
             # looks a per-user credential up under. Must match that file, or seeded keys are
             # unfindable and users fall back to the paste-a-key prompt.

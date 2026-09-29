@@ -1,0 +1,94 @@
+# Self-hosted LiveKit server (Apache-2.0): the SFU behind the Raven voice front end
+# (docs/design/records/agents-raven.md, item enterpriseaiframework-7f6).
+#
+# EXPOSURE: LAN / VPN ONLY. BARON RULING 2026-09-29 (gate cfa). There is no public
+# NodePort, no LoadBalancer, no externalIPs, no hostNetwork and NO TURN. The NodePorts
+# below bind the k3s node's addresses, which are LAN/tailnet addresses; the public edge is
+# the gateway VM's Caddy, which routes an explicit allowlist of paths and has no LiveKit
+# route (tests/test_livekit_exposure.py pins both facts, tests-live probes the edge).
+# Browsers off the LAN/VPN cannot connect, by design. Do not "fix" that by adding TURN or
+# an ingress rule: that is public exposure and is Baron-reserved.
+#
+# WHAT IS DELIBERATELY ABSENT
+#   * TURN (`turn.enabled: false`): it exists to relay across NATs from the public
+#     internet, which the ruling excludes.
+#   * LiveKit Cloud / Inference / Krisp / turn-detector: none is configured here; the
+#     server takes no cloud credential and makes no call to a LiveKit-operated service.
+#   * telemetry: `telemetry` is not enabled; the customer's layer talks to nothing of ours.
+#
+# The media ports are published on a NodePort whose number EQUALS the port the server
+# listens on and advertises (WebRTC candidates carry the port verbatim, so a NodePort that
+# remaps 7881 -> 30781 would advertise a port nothing answers on).
+#
+# Keys: LIVEKIT_API_KEY / LIVEKIT_API_SECRET in enterprise-ai-secrets, shared with the
+# control plane (which mints room tokens: control-plane/app/livekit_tokens.py). Optional,
+# so a deployment without voice applies this file without error and the pod simply waits.
+apiVersion: v1
+kind: Service
+metadata:
+  name: livekit
+  namespace: enterprise-ai
+  labels: { app.kubernetes.io/part-of: enterprise-ai-framework, app.kubernetes.io/component: livekit }
+spec:
+  type: NodePort
+  # Local, so the source address reaches the server unchanged and a packet is never
+  # bounced through another node.
+  externalTrafficPolicy: Local
+  selector: { app: livekit }
+  ports:
+    - { name: signal, protocol: TCP, port: 7880, targetPort: 7880, nodePort: 30780 }
+    - { name: rtc-tcp, protocol: TCP, port: 30781, targetPort: 30781, nodePort: 30781 }
+    - { name: rtc-udp, protocol: UDP, port: 30782, targetPort: 30782, nodePort: 30782 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: livekit
+  namespace: enterprise-ai
+  labels: { app.kubernetes.io/part-of: enterprise-ai-framework, app.kubernetes.io/component: livekit }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: livekit } }
+  template:
+    metadata:
+      labels: { app: livekit, app.kubernetes.io/component: livekit }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: livekit
+          image: livekit/livekit-server:v1.9.0
+          args: ["--config-body", "$(LIVEKIT_CONFIG_BODY)"]
+          env:
+            - name: NODE_IP
+              valueFrom: { fieldRef: { fieldPath: status.hostIP } }
+            - name: LIVEKIT_API_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: LIVEKIT_API_KEY, optional: true } }
+            - name: LIVEKIT_API_SECRET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: LIVEKIT_API_SECRET, optional: true } }
+            - name: LIVEKIT_CONFIG_BODY
+              value: |
+                port: 7880
+                bind_addresses: [""]
+                rtc:
+                  tcp_port: 30781
+                  udp_port: 30782
+                  node_ip: $(NODE_IP)
+                  use_external_ip: false
+                turn:
+                  enabled: false
+                keys:
+                  $(LIVEKIT_API_KEY): $(LIVEKIT_API_SECRET)
+                logging:
+                  level: info
+          ports:
+            - { containerPort: 7880, protocol: TCP }
+            - { containerPort: 30781, protocol: TCP }
+            - { containerPort: 30782, protocol: UDP }
+          readinessProbe:
+            httpGet: { path: /, port: 7880 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "25m", memory: "128Mi" }
+            limits: { memory: "512Mi" }
