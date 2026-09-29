@@ -373,7 +373,7 @@ async def _agent_usage_beside_spend(user: str, by_surface: dict) -> tuple[list[d
 # Surfaces whose key the user may mint or rotate themselves. Not chat: its key is seeded by the
 # operator into LibreChat's own credential store (chat_keyseed.py) and nothing re-seeds it on a
 # rotate, so a self-service rotation would silently break the user's chat.
-SELF_SERVICE_SURFACES = ("ide", "terminal")
+SELF_SERVICE_SURFACES = (gateway.API_SURFACE, "ide", "terminal")
 
 
 @router.get("/portal/api/keys")
@@ -399,7 +399,7 @@ async def my_keys(user: str = Depends(require_user)):
     # user with no key yet was shown "No keys issued yet" and nothing to press — a feature
     # that exists in the API and not in the product. `rotate` mints when there is no key.
     have = {k["surface"] for k in out}
-    for surface in gateway.SURFACES:
+    for surface in (*gateway.SURFACES, gateway.API_SURFACE):
         if surface not in have:
             out.append({"alias": gateway.surface_alias(user, surface), "surface": surface,
                         "issued": False, "self_service": surface in SELF_SERVICE_SURFACES,
@@ -416,7 +416,7 @@ async def rotate_my_key(body: dict, user: str = Depends(require_user)):
     admin API: there is no parameter here that can be pointed at somebody else.
     """
     surface = (body or {}).get("surface", "").strip()
-    if surface not in gateway.SURFACES:
+    if surface not in (*gateway.SURFACES, gateway.API_SURFACE):
         raise HTTPException(400, f"unknown surface: {surface}")
     if surface not in SELF_SERVICE_SURFACES:
         raise HTTPException(400, f"the {surface} key is managed by that surface and cannot be rotated here")

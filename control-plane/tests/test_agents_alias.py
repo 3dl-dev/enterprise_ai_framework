@@ -232,3 +232,10 @@ def test_the_database_check_constraint_admits_exactly_the_slug_gateway_admits():
 def test_the_base_surfaces_are_still_in_the_check_constraint():
     for surface in BASE_SURFACES:
         assert f"'{surface}'" in db.SCHEMA
+
+
+def test_the_api_surface_is_in_both_check_constraints():
+    """CREATE TABLE and the boot-time re-add both carry it, or an existing deployment
+    refuses the first external key with an IntegrityError (enterpriseaiframework-c8c)."""
+    assert db.SCHEMA.count("surface IN ('chat', 'ide', 'terminal', 'api')") == 2
+    assert gateway.is_known_surface(gateway.API_SURFACE)

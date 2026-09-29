@@ -38,7 +38,7 @@ def _keys(monkeypatch, listed: list[dict], user: str = "dana") -> dict[str, dict
 
 def test_a_user_with_no_keys_still_gets_a_row_per_surface_to_act_on(monkeypatch):
     rows = _keys(monkeypatch, [])
-    assert set(rows) == {"chat", "ide", "terminal"}
+    assert set(rows) == {"api", "chat", "ide", "terminal"}
     assert all(not r["issued"] for r in rows.values())
     assert rows["ide"]["alias"] == "dana::ide"
 
@@ -88,3 +88,19 @@ def test_freerouter_list_keys_reports_unspent_accounts_in_the_callers_shape(monk
     assert set(keys) == {"dana::ide", "dana::terminal"}
     assert keys["dana::ide"]["spend"] == 0.0
     assert keys["dana::terminal"]["spend"] == 2.5
+
+
+def test_the_api_key_is_self_service_and_separate_from_the_workspace_keys(monkeypatch):
+    """Using the platform from outside must never mean rotating a key a workspace holds."""
+    rows = _keys(monkeypatch, [{"key_alias": "dana::ide", "spend": 0.0, "max_budget": None}])
+    assert rows["api"]["self_service"] is True
+    assert rows["api"]["alias"] == "dana::api"
+    assert rows["api"]["issued"] is False and rows["ide"]["issued"] is True
+
+
+def test_the_api_surface_round_trips_but_is_never_auto_provisioned():
+    from app import gateway
+    assert gateway.parse_alias("dana::api") == ("dana", "api")
+    assert gateway.surface_alias("dana", "api") == "dana::api"
+    # SURFACES is what the IdP sync mints for every user; an external key must be asked for.
+    assert "api" not in gateway.SURFACES
