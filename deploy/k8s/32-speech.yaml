@@ -1,0 +1,142 @@
+# Local speech servers — the OSS profile's /v1/audio/* upstream (enterpriseaiframework-8cb,
+# design record docs/design/records/agents-raven.md "Audio through the one bill").
+#
+# ONE OSI-licensed server (Speaches, MIT) serves both directions on an OpenAI-compatible wire:
+#   STT  /v1/audio/transcriptions  Whisper via faster-whisper (Systran/faster-whisper-small, MIT)
+#   TTS  /v1/audio/speech          Kokoro-82M ONNX (Apache-2.0)
+# The bundled LiteLLM gateway routes the `speech-stt` / `speech-tts` model names here
+# (bundle/litellm/config.base.yaml); nothing in this path is a 3DL service.
+#
+# Air-gap shape. The weights are fetched ONCE, at install time, by the speech-models Job
+# below (the only workload here allowed to leave the cluster, and only for the model hub). The
+# server itself runs HF_HUB_OFFLINE=1 under a NetworkPolicy that admits no egress but DNS, so
+# "no request leaves the cluster" is enforced by the network, not by our good intentions.
+# An operator with no route to the hub pre-seeds the speech-models PVC instead.
+#
+# Swaps (documented, not defaults): Kyutai STT 1B (CC-BY-4.0 weights, allowed as a default by
+# the 2026-09-29 ruling, attribution required) needs its own server behind the same route;
+# Qwen3-TTS likewise. Point the speech-stt / speech-tts entries' api_base at them.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: speech-models
+  namespace: enterprise-ai
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 3Gi } }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: speech-aliases
+  namespace: enterprise-ai
+data:
+  # The gateway addresses the server by the OpenAI contract names (see config.base.yaml for
+  # why); this is where they resolve to weights. Speaches' own default maps whisper-1 to
+  # large-v3, which is a GPU-sized download the OSS install must not assume.
+  model_aliases.json: |
+    {
+      "tts-1": "speaches-ai/Kokoro-82M-v1.0-ONNX",
+      "tts-1-hd": "speaches-ai/Kokoro-82M-v1.0-ONNX",
+      "whisper-1": "Systran/faster-whisper-small"
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: speech
+  namespace: enterprise-ai
+spec:
+  selector: { app: speech }
+  ports: [{ name: http, port: 8000, targetPort: 8000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: speech
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # the RWO models volume cannot be shared by a surge pod
+  selector: { matchLabels: { app: speech } }
+  template:
+    metadata:
+      labels: { app: speech }
+    spec:
+      securityContext: { fsGroup: 1000 }
+      containers:
+        - name: speech
+          image: ghcr.io/speaches-ai/speaches:0.8.3-cpu
+          env:
+            - { name: HF_HUB_OFFLINE, value: "1" }
+            - { name: ENABLE_UI, value: "false" }
+            - { name: ALLOW_ORIGINS, value: "[]" }
+          ports: [{ containerPort: 8000 }]
+          volumeMounts:
+            - { name: models, mountPath: /home/ubuntu/.cache/huggingface }
+            - { name: aliases, mountPath: /home/ubuntu/speaches/model_aliases.json, subPath: model_aliases.json, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 30
+          resources:
+            requests: { cpu: "100m", memory: "1Gi" }
+            limits: { memory: "4Gi" }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: speech-models }
+        - name: aliases
+          configMap: { name: speech-aliases }
+---
+# The server may be reached by the gateway alone and may reach nothing but DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: speech-sealed
+  namespace: enterprise-ai
+spec:
+  podSelector: { matchLabels: { app: speech } }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: gateway } }
+      ports: [{ port: 8000 }]
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector: { matchLabels: { k8s-app: kube-dns } }
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+---
+# Install-time weight fetch. Deliberately a different label from the server so the policy
+# above does not apply to it. Idempotent: a cache hit downloads nothing.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: speech-models-fetch
+  namespace: enterprise-ai
+spec:
+  backoffLimit: 4
+  template:
+    metadata:
+      labels: { app: speech-models-fetch }
+    spec:
+      restartPolicy: OnFailure
+      securityContext: { fsGroup: 1000 }
+      containers:
+        - name: fetch
+          image: ghcr.io/speaches-ai/speaches:0.8.3-cpu
+          command:
+            - python
+            - -c
+            - |
+              from huggingface_hub import snapshot_download
+              for repo in ("Systran/faster-whisper-small", "speaches-ai/Kokoro-82M-v1.0-ONNX"):
+                  print(snapshot_download(repo))
+          volumeMounts:
+            - { name: models, mountPath: /home/ubuntu/.cache/huggingface }
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: speech-models }
