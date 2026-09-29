@@ -296,6 +296,21 @@ def test_a_stale_session_triggers_exactly_one_transparent_relogin(world):
     assert world.dash.logins == 2, "exactly one extra login, not a login per request"
 
 
+def test_an_agent_restart_does_not_strand_the_user_on_the_dashboards_login_page(world):
+    world.add_agent("alice", "athena")
+    c = app_client("alice")
+    assert c.get("/agents/athena/").status_code == 200
+    # The pod restarts (a connector change does this): the cached cookie is now unknown to
+    # the dashboard, which answers a page request with a 302 to its login, not a 401.
+    world.dash._token = "sess-" + uuid.uuid4().hex
+    r = c.get("/agents/athena/", follow_redirects=False)
+    assert r.status_code == 200, (
+        f"a redirect to the dashboard's own login must re-mint the session, not reach the "
+        f"browser (got {r.status_code} -> {r.headers.get('location')})"
+    )
+    assert world.dash.logins == 2
+
+
 def test_a_non_owner_gets_404_not_another_users_console(world):
     world.add_agent("alice", "athena")
     r = app_client("bob").get("/agents/athena/api/config")
