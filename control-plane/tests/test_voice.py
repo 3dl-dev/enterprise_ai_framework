@@ -423,6 +423,36 @@ def test_a_turn_with_no_user_message_or_an_unreachable_raven_is_a_clean_error(vw
     assert r.status_code == 502
 
 
+def test_a_turn_the_raven_fails_is_reported_at_once_not_after_the_timeout(vw):
+    """The failure event shape is RECORDED from the real hosted image (a Raven whose model route
+    was unreachable emitted, after llm_retry notices, an `error` event with code -32099,
+    message `turn_failed` and a detail string), NOT invented here."""
+    async def handler(conn):
+        async for message in conn:
+            call = json.loads(message)
+            await conn.send(json.dumps({"jsonrpc": "2.0", "id": call["id"], "result": {"accepted": True}}))
+            if call["method"] == "turn.send":
+                for ev in ({"type": "notice", "payload": {"kind": "llm_retry", "detail": "network"}},
+                           {"type": "error", "payload": {"code": -32099, "message": "turn_failed",
+                                                         "reason": "internal",
+                                                         "detail": "Error calling LLM (network@custom)"}}):
+                    await conn.send(json.dumps({"jsonrpc": "2.0", "method": "event",
+                                                "params": {"subscription_id": "s", "event": ev}}))
+
+    loop = _serve_ws(vw, handler)
+    vw.hosts["agent-alice-rv"] = "127.0.0.2"
+    try:
+        r = worker(session_for()).post("/voice/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 502 and "turn_failed" in r.json()["detail"]
+        assert "Error calling LLM" in r.json()["detail"]
+        s = worker(session_for()).post("/voice/v1/chat/completions", json={
+            "stream": True, "messages": [{"role": "user", "content": "hi"}]})
+        assert "turn_failed" in s.text and "[DONE]" not in s.text
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
 def test_a_hermes_agent_is_not_a_voice_llm(vw):
     vw.cluster.add_agent("alice", "hm", agent_type="hermes")
     r = worker(session_for("alice", "hm")).post("/voice/v1/chat/completions", json={
