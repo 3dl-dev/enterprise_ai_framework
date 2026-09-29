@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -41,6 +42,21 @@ def _k8s_docs() -> list[dict]:
 
 
 # ---- what an install ships ---------------------------------------------------------------
+
+
+def test_contract_model_ids_are_the_names_the_speech_server_serves():
+    """The audio routes keep the OpenAI contract ids (openai/whisper-1, openai/tts-1). Those
+    ids are what LiteLLM prices and meters by; renaming them to the self-hosted repo id
+    (e.g. Systran/faster-whisper-small) silently meters at $0. The independent source of
+    truth is the alias file the speech server itself mounts: every contract id must be a key
+    there (so the server resolves it) and must be exactly the pinned literal."""
+    cat = _catalogue()
+    aliases = json.loads(ALIASES.read_text())
+    assert cat["speech-stt"]["litellm_params"]["model"] == "openai/whisper-1"
+    assert cat["speech-tts"]["litellm_params"]["model"] == "openai/tts-1"
+    for name in ("speech-stt", "speech-tts"):
+        wire = cat[name]["litellm_params"]["model"].removeprefix("openai/")
+        assert wire in aliases, f"{name}: {wire!r} is not an id the speech server resolves"
 
 
 def test_both_audio_routes_are_in_the_catalogue_priced_and_pointed_at_the_local_server():
@@ -173,3 +189,32 @@ def test_the_master_key_cannot_buy_audio(gateway_url, master_headers):
     r = _multipart_transcribe(gateway_url, master_headers, b"RIFF" + uuid.uuid4().bytes)
     assert r.status_code >= 400
     assert "no_attributable_principal" in r.text
+
+
+# ---- the live seal -----------------------------------------------------------------------
+
+_PROBE = (
+    "import socket,sys\n"
+    "try:\n"
+    "    socket.create_connection((sys.argv[1],443),timeout=5).close();print('CONNECTED')\n"
+    "except Exception as e:\n"
+    "    print('REFUSED',type(e).__name__)\n"
+)
+
+
+def _probe(service: str, host: str) -> str:
+    from conftest import compose
+
+    r = compose("exec", "-T", service, "python3", "-c", _PROBE, host, check=False)
+    assert r.returncode == 0, f"probe could not run in {service}: {r.stderr[-300:]}"
+    return r.stdout.strip()
+
+
+def test_running_speech_container_cannot_reach_the_internet_but_a_peer_can():
+    """LIVE, on the compose stack. The same probe runs from the speech container and from the
+    gateway (a non-sealed container on the default network). The positive control proves the
+    host has egress and the probe works; only then is the speech refusal meaningful, and the
+    only thing that differs between the two is the speech-internal network."""
+    for host in ("huggingface.co", "1.1.1.1"):
+        assert _probe("gateway", host) == "CONNECTED", f"positive control failed for {host}"
+        assert _probe("speech", host).startswith("REFUSED"), f"speech reached {host}"
