@@ -1,0 +1,86 @@
+# The voice worker (Contract H, docs/design/records/agents-raven.md; item enterpriseaiframework-82e).
+#
+# A LiveKit Agents worker: it registers with the self-hosted LiveKit server (72-livekit.yaml) as
+# agent `eaf-voice` and takes one job per room `voice-<user>.<raven>`. The control plane
+# dispatches it explicitly, through the `roomConfig` claim of the user's room token, and puts a
+# per-session bearer in the job's metadata. Every model call the worker makes (STT, TTS, and the
+# Raven as its LLM) goes to the control plane's /voice/v1 relay with that bearer, which spends
+# the RAVEN's gateway key. The worker therefore holds NO user credential and NO gateway key.
+#
+# What it may reach, and nothing else (voice-worker-isolation below): DNS, the LiveKit server,
+# the control plane on :8000. No public internet, no gateway, no Kubernetes API. The image is
+# built with deploy/bin/kaniko-build.sh from voice-worker/ (see its Dockerfile); deploy.sh
+# substitutes the reference.
+#
+# NO TELEMETRY. livekit-agents 1.6.0 depends on opentelemetry-exporter-otlp; the invariant that
+# nothing leaves the customer's layer must not rest on that library's defaults, so this
+# manifest sets no OTEL_EXPORTER_* endpoint (tests/test_voice_worker.py asserts it) and the
+# NetworkPolicy would drop the packets if one appeared.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voice-worker
+  namespace: enterprise-ai
+  labels: { app.kubernetes.io/part-of: enterprise-ai-framework, app.kubernetes.io/component: voice-worker }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: voice-worker } }
+  template:
+    metadata:
+      labels: { app: voice-worker, app.kubernetes.io/component: voice-worker }
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: worker
+          image: __VOICE_WORKER_IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: LIVEKIT_URL, value: "ws://livekit:7880" }
+            - name: LIVEKIT_API_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: LIVEKIT_API_KEY, optional: true } }
+            - name: LIVEKIT_API_SECRET
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: LIVEKIT_API_SECRET, optional: true } }
+            # The single base every plugin (STT, TTS, LLM) is constructed with.
+            - { name: VOICE_AUDIO_BASE, value: "http://control-plane:8000/voice/v1" }
+            - { name: HF_HUB_OFFLINE, value: "1" }
+          ports:
+            - { name: health, containerPort: 8081 }
+          readinessProbe:
+            httpGet: { path: /, port: 8081 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "384Mi" }
+            limits: { memory: "1536Mi" }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: voice-worker-isolation
+  namespace: enterprise-ai
+  labels: { app.kubernetes.io/part-of: enterprise-ai-framework, app.kubernetes.io/component: voice-worker }
+spec:
+  podSelector: { matchLabels: { app: voice-worker } }
+  policyTypes: [Ingress, Egress]
+  # Nothing initiates a connection to the worker: it dials out to LiveKit. (The kubelet's
+  # readiness probe is not subject to NetworkPolicy.)
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - podSelector: { matchLabels: { app: livekit } }
+      ports:
+        - { protocol: TCP, port: 7880 }
+        # WebRTC media to the server (72-livekit.yaml: the rtc ports equal their NodePorts).
+        - { protocol: TCP, port: 30781 }
+        - { protocol: UDP, port: 30782 }
+    - to:
+        - podSelector: { matchLabels: { app: control-plane } }
+      ports:
+        - { protocol: TCP, port: 8000 }
