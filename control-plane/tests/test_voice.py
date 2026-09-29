@@ -105,6 +105,82 @@ class FakeGateway:
         self.srv.server_close()
 
 
+class FakeLiveKit:
+    """The LiveKit server's Twirp API, as much of it as the control plane calls.
+
+    Behaviour RECORDED from the real livekit-server v1.9.0 (throwaway pod, 2026-09-29): every
+    call needs a bearer JWT signed with the API secret carrying the right grants (401 otherwise);
+    CreateRoom is idempotent; CreateDispatch on a missing room creates it; ListParticipants on a
+    missing room is `not_found`. Set `.agents` to make an agent participant already present."""
+
+    def __init__(self, key, secret):
+        self.key, self.secret = key, secret
+        self.calls: list[dict] = []
+        self.rooms: dict[str, dict] = {}
+        self.agents: set[str] = set()  # rooms that already hold an agent participant
+        self.down = False
+        lk = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                path = self.path.rsplit("/", 2)
+                svc, method = path[-2].removeprefix("livekit."), path[-1]
+                if lk.down:
+                    return self._send(503, {"code": "unavailable"})
+                try:
+                    claims = jwt.decode(self.headers.get("Authorization", "").removeprefix("Bearer "),
+                                        lk.secret, algorithms=["HS256"], options={"verify_aud": False})
+                    grants = claims["video"]
+                    assert claims["iss"] == lk.key
+                    room = body.get("room") or body.get("name")
+                    assert grants.get("roomAdmin") and grants.get("roomCreate") and grants.get("room") == room
+                except Exception:  # noqa: BLE001
+                    return self._send(401, {"code": "unauthenticated", "msg": "permissions denied"})
+                lk.calls.append({"svc": svc, "method": method, "body": body, "claims": claims})
+                if method == "CreateRoom":
+                    lk.rooms.setdefault(body["name"], {"name": body["name"], **{
+                        k: body[k] for k in ("empty_timeout", "departure_timeout") if k in body}})
+                    return self._send(200, {"sid": "RM_x", "name": body["name"]})
+                if method == "ListParticipants":
+                    if body["room"] not in lk.rooms:
+                        return self._send(404, {"code": "not_found", "msg": "requested room does not exist"})
+                    ps = [{"identity": "agent-AJ_1"}] if body["room"] in lk.agents else []
+                    return self._send(200, {"participants": ps})
+                if method == "CreateDispatch":
+                    lk.rooms.setdefault(body["room"], {"name": body["room"]})
+                    return self._send(200, {"id": "AD_1", **body})
+                self._send(404, {"code": "not_found"})
+
+            def _send(self, code, obj):
+                data = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.srv.daemon_threads = True
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    @property
+    def url(self):
+        return f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+    def stop(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def dispatches(self):
+        return [c["body"] for c in self.calls if c["method"] == "CreateDispatch"]
+
+
 @pytest.fixture()
 def vw(world, monkeypatch):
     """A world with two ravens on distinct keys, a gateway that knows only those keys."""
@@ -120,6 +196,8 @@ def vw(world, monkeypatch):
         sec["data"]["OPENAI_API_KEY"] = base64.b64encode(key.encode()).decode()
     gw = FakeGateway({"sk-alice-rv", "sk-bob-rv"})
     monkeypatch.setenv("VOICE_GATEWAY_BASE", gw.base)
+    lk = FakeLiveKit(LK_KEY, LK_SECRET)
+    monkeypatch.setenv("LIVEKIT_API_URL", lk.url)
     audits: list[tuple] = []
 
     async def audit(actor, action, target=None, **detail):
@@ -127,11 +205,12 @@ def vw(world, monkeypatch):
         return "h"
 
     monkeypatch.setattr(db, "audit", audit)
-    world.gw, world.audits = gw, audits
+    world.gw, world.lk, world.audits = gw, lk, audits
     try:
         yield world
     finally:
         gw.stop()
+        lk.stop()
 
 
 def _api():
@@ -178,9 +257,8 @@ def test_pinning_writes_the_annotation_on_the_object_and_the_token_carries_it(vw
     assert ("alice", "agent.voice", "alice/rv", {"voice": "kokoro-emma"}) in vw.audits
     tok = portal_as("alice").post("/portal/api/voice/token", json={"raven": "rv"}).json()
     assert tok["voice"] == "kokoro-emma"
-    meta = json.loads(jwt.decode(tok["token"], LK_SECRET, algorithms=["HS256"],
-                                 options={"verify_aud": False})["roomConfig"]["agents"][0]["metadata"])
-    assert meta["voice"] == "bf_emma"
+    (dispatch,) = vw.lk.dispatches()
+    assert json.loads(dispatch["metadata"])["voice"] == "bf_emma"
 
 
 def test_a_voice_outside_the_catalogue_never_reaches_the_object(vw):
@@ -218,24 +296,59 @@ def test_a_pin_the_catalogue_no_longer_offers_falls_back_rather_than_crashing(vw
 
 # ------------------------------------------------------------------ the room token
 
-def _room_config(tok):
-    return jwt.decode(tok, LK_SECRET, algorithms=["HS256"], options={"verify_aud": False})["roomConfig"]
-
-
-def test_the_room_token_dispatches_the_worker_with_a_session_bound_to_this_room(vw):
+def test_the_worker_is_dispatched_server_side_with_a_session_bound_to_this_room(vw):
     r = portal_as("alice").post("/portal/api/voice/token", json={"raven": "rv"})
     assert r.status_code == 200, r.text
-    cfg = _room_config(r.json()["token"])
-    assert cfg["emptyTimeout"] == livekit_tokens.EMPTY_TIMEOUT_SECONDS
-    (dispatch,) = cfg["agents"]
-    assert dispatch["agentName"] == "eaf-voice"
+    calls = [(c["svc"], c["method"]) for c in vw.lk.calls]
+    assert calls == [("RoomService", "CreateRoom"), ("RoomService", "ListParticipants"),
+                     ("AgentDispatchService", "CreateDispatch")]
+    assert vw.lk.rooms["voice-alice.rv"]["empty_timeout"] == livekit_tokens.EMPTY_TIMEOUT_SECONDS
+    (dispatch,) = vw.lk.dispatches()
+    assert dispatch["agent_name"] == "eaf-voice" and dispatch["room"] == "voice-alice.rv"
     meta = json.loads(dispatch["metadata"])
     claims = jwt.decode(meta["session"], SESSION_SECRET, algorithms=["HS256"], audience="eaf-voice-session")
     assert (claims["sub"], claims["raven"], claims["room"]) == ("alice", "rv", "voice-alice.rv")
     assert meta["voice"] == "af_heart" and set(meta) == {"session", "voice"}, \
         "the worker is told the voice and the bearer, nothing it could spend or route by"
-    assert "sk-alice-rv" not in json.dumps(r.json()) and "sk-alice-rv" not in json.dumps(meta), \
-        "the Raven's gateway key must never leave the control plane"
+    # the admin calls are authorised by a short-lived token scoped to THIS room
+    admin = vw.lk.calls[0]["claims"]
+    assert admin["video"]["room"] == "voice-alice.rv" and admin["exp"] - admin["nbf"] <= 60
+    # what the BROWSER gets: a join token for the room and nothing that could spend
+    out = r.json()
+    join = jwt.decode(out["token"], LK_SECRET, algorithms=["HS256"], options={"verify_aud": False})
+    assert "roomConfig" not in join, "no dispatch rides the user's token"
+    assert meta["session"] not in json.dumps(out) and "sk-alice-rv" not in json.dumps(out), \
+        "neither the session bearer nor the Raven's gateway key reaches the browser"
+
+
+def test_a_user_who_rejoins_inside_the_empty_timeout_still_gets_an_agent(vw):
+    """The bug the token's own dispatch had: it fires only when the join CREATES the room, so
+    hang-up then Talk within the empty timeout joined a live room with no agent (measured on the
+    real server). The room is already there in this second call, as it was then."""
+    c = portal_as("alice")
+    assert c.post("/portal/api/voice/token", json={"raven": "rv"}).status_code == 200
+    assert "voice-alice.rv" in vw.lk.rooms
+    assert c.post("/portal/api/voice/token", json={"raven": "rv"}).status_code == 200
+    assert len(vw.lk.dispatches()) == 2
+
+
+def test_a_second_tab_does_not_send_a_second_agent_into_a_room_that_has_one(vw):
+    vw.lk.rooms["voice-alice.rv"] = {"name": "voice-alice.rv"}
+    vw.lk.agents.add("voice-alice.rv")
+    assert portal_as("alice").post("/portal/api/voice/token", json={"raven": "rv"}).status_code == 200
+    assert vw.lk.dispatches() == []
+
+
+def test_an_unreachable_voice_server_is_a_502_not_a_token_for_a_silent_room(vw):
+    vw.lk.down = True
+    r = portal_as("alice").post("/portal/api/voice/token", json={"raven": "rv"})
+    assert r.status_code == 502 and "token" not in r.json()
+
+
+def test_a_wrong_api_secret_is_refused_by_livekit_and_surfaces_as_a_502(vw, monkeypatch):
+    monkeypatch.setenv("LIVEKIT_API_SECRET", "not-the-secret-the-server-holds-32-chars-x")
+    r = portal_as("alice").post("/portal/api/voice/token", json={"raven": "rv"})
+    assert r.status_code == 502 and "token" not in r.json()
 
 
 def test_a_room_token_is_refused_for_a_raven_that_is_not_mine_or_not_a_raven(vw):
