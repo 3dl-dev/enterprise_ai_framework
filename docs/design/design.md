@@ -1523,7 +1523,10 @@ Stated plainly rather than papered over. Each names what would close it.
 
 Full design records: **`docs/design/records/agents-surface.md`** (Contracts 1/3/4/5/6, normative)
 and **`docs/design/records/agents-gateway-console.md`**, which **corrects** the residency and
-console model below. Epic `enterpriseaiframework-da7`.
+console model below. Epic `enterpriseaiframework-da7`. **`docs/design/records/agents-raven.md`**
+extends both with a third agent type, `raven` (EverMind Raven, a per-user host agent), an
+owner-scoped agent-manager token, a control-plane relay for Raven↔agent turns, and voice
+(Contracts E–H; proposed 2026-09-29).
 
 A fourth portal tab beside Chat and Code that lets a user fire up and manage named,
 persistent **gateway agents** — the Agents pillar is **hermes** (`nousresearch/hermes-agent`,
