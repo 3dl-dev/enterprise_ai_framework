@@ -117,6 +117,16 @@ DASHBOARD_PORT = int(os.environ.get("AGENT_DASHBOARD_PORT", "9119"))
 OPENCLAW_IMAGE = os.environ.get("AGENT_OPENCLAW_IMAGE", "ghcr.io/openclaw/openclaw:2026.9.6")
 OPENCLAW_PORT = int(os.environ.get("AGENT_OPENCLAW_PORT", "18789"))
 
+# The EAF hosted Raven image (deploy/raven/, agents-raven.md Contract E) and the port its nginx
+# serves the WebUI on. There is no public upstream image to default to, and a registry
+# literal is an operator identity (hoistable invariant #1), so the default is a bare name:
+# deploy.sh renders the real `<registry>/raven-hosted:<tag>` into AGENT_RAVEN_IMAGE.
+RAVEN_IMAGE = os.environ.get("AGENT_RAVEN_IMAGE", "raven-hosted:v0.2.3-eaf2")
+RAVEN_PORT = int(os.environ.get("AGENT_RAVEN_PORT", "18793"))
+# The model EverOS embeds memory with. It is a gateway model like any other (the same key,
+# so the calls land on the Raven's own line); which name the gateway serves is the operator's.
+RAVEN_EMBEDDING_MODEL = os.environ.get("AGENT_RAVEN_EMBEDDING_MODEL", "text-embedding-3-small")
+
 # The source range openclaw's `trusted-proxy` auth will accept identity headers from. The
 # control-plane pod's address is not stable, so this is the pod network; the NetworkPolicy
 # (66-agent-console-common.yaml) is what narrows it to the control-plane pod alone, and
@@ -161,6 +171,7 @@ _ASSET_FALLBACK = {
     "64-agent.template.yaml": _REPO / "deploy" / "k8s" / "64-agent.template.yaml",
     "65-agent-hermes.template.yaml": _REPO / "deploy" / "k8s" / "65-agent-hermes.template.yaml",
     "67-agent-openclaw.template.yaml": _REPO / "deploy" / "k8s" / "67-agent-openclaw.template.yaml",
+    "69-agent-raven.template.yaml": _REPO / "deploy" / "k8s" / "69-agent-raven.template.yaml",
     **{name: _REPO / "deploy" / "agent" / name for name in AGENT_FILES},
 }
 
@@ -675,6 +686,23 @@ async def console_target(user: str, name: str) -> dict:
             "user": user,
         }
 
+    if agent_type == "raven":
+        # Raven's WebUI on :18793. The proxy authenticates with the console token the
+        # provisioner wrote into the key Secret (X-Raven-Token); the browser never holds it.
+        token = _decode("RAVEN_SERVE_TOKEN")
+        if not token:
+            raise HTTPException(
+                503,
+                f"the raven agent {name!r} has no console token in Secret {obj}-key. "
+                "It is written at create time; re-provision the agent rather than attaching.",
+            )
+        return {
+            "type": "raven",
+            "host": obj,
+            "port": RAVEN_PORT,
+            "token": token,
+        }
+
     # The opencode/interim path: HTTP Basic on the resident daemon. Unchanged.
     encoded = data.get("OPENCODE_SERVER_PASSWORD")
     if not encoded:
@@ -946,6 +974,40 @@ def render_openclaw(user: str, name: str, *, image: str, model_source: str,
     docs = [d for d in yaml.safe_load_all(text) if d]
     if not docs:
         raise HTTPException(500, "the openclaw agent template rendered to nothing")
+    return docs
+
+
+def raven_env_config(model: str) -> dict[str, str]:
+    """The NON-SECRET pod env of a Raven, carried by its `-config` ConfigMap.
+
+    Every model endpoint is the gateway: the host LLM (`providers.custom`, asserted from
+    these by deploy/raven/hosted_seed.py on every boot), EverOS's `[llm]`, and EverOS's
+    embedding model. The keys are in the `-key` Secret, never here.
+    """
+    base = gateway_base()
+    return {
+        "AGENT_GATEWAY_BASE": base,
+        "RAVEN_MODEL": model,
+        "EVEROS_LLM__BASE_URL": base,
+        "EVEROS_LLM__MODEL": model,
+        "EVEROS_EMBEDDING__BASE_URL": base,
+        "EVEROS_EMBEDDING__MODEL": RAVEN_EMBEDDING_MODEL,
+    }
+
+
+def render_raven(user: str, name: str, *, image: str, model_source: str,
+                 key_secret: str, cfgsum: str, keysum: str) -> list[dict]:
+    """Render 69-agent-raven.template.yaml, exactly as render_openclaw() renders its own."""
+    text = asset("69-agent-raven.template.yaml")
+    for placeholder, value in (
+        ("__USER__", user), ("__NAME__", name), ("__IMAGE__", image),
+        ("__MODEL_SOURCE__", model_source), ("__KEY_SECRET__", key_secret),
+        ("__CFGSUM__", cfgsum), ("__KEYSUM__", keysum),
+    ):
+        text = text.replace(placeholder, value)
+    docs = [d for d in yaml.safe_load_all(text) if d]
+    if not docs:
+        raise HTTPException(500, "the raven agent template rendered to nothing")
     return docs
 
 
@@ -1257,6 +1319,34 @@ async def _provision_openclaw(client: httpx.AsyncClient, user: str, name: str, o
         await _apply(client, doc)
 
 
+async def _provision_raven(client: httpx.AsyncClient, user: str, name: str, obj: str,
+                           model: str, api_key: str, keysum: str) -> None:
+    """Apply the object set for a Raven host agent (agents-raven.md Contract E).
+
+    The key Secret carries the integrated key and the console token (`RAVEN_SERVE_TOKEN`,
+    presented by the proxy as X-Raven-Token; minted here, never shown to a person). The
+    ConfigMap carries only non-secret env. There is no agent-manager token here: that is
+    Contract F, a later item.
+    """
+    env = raven_env_config(model)
+    cfgsum = hashlib.sha256(json.dumps(env, sort_keys=True).encode()).hexdigest()[:16]
+    await _apply(client, _secret_object(f"{obj}-key", {
+        "OPENAI_API_KEY": api_key,
+        "RAVEN_SERVE_TOKEN": secrets.token_urlsafe(32),
+    }, labels={USER_LABEL: user, NAME_LABEL: name}))
+    await _apply(client, {
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": f"{obj}-config", "namespace": namespace(),
+                     "labels": {USER_LABEL: user, NAME_LABEL: name}},
+        "data": env,
+    })
+    for doc in render_raven(
+        user, name, image=RAVEN_IMAGE, model_source="integrated",
+        key_secret=f"{obj}-key", cfgsum=cfgsum, keysum=keysum,
+    ):
+        await _apply(client, doc)
+
+
 async def _provision_opencode_interim(client: httpx.AsyncClient, user: str, name: str,
                                       obj: str, model: str, agent_type: str,
                                       api_key: str, keysum: str) -> None:
@@ -1364,6 +1454,8 @@ async def create(
             await _provision_hermes(client, user, name, obj, model, api_key, keysum)
         elif agent_type == "openclaw":
             await _provision_openclaw(client, user, name, obj, model, api_key, keysum)
+        elif agent_type == "raven":
+            await _provision_raven(client, user, name, obj, model, api_key, keysum)
         else:  # pragma: no cover - AGENT_TYPES is checked above; a fail-closed guard
             raise HTTPException(400, f"no provisioner for agent type {agent_type!r}")
 

@@ -1,0 +1,158 @@
+# One named, resident RAVEN agent instance: the Agents pillar's host agent (agents-raven.md,
+# Contract E), the sibling of 65-agent-hermes.template.yaml and 67-agent-openclaw.template.yaml.
+# Rendered by control-plane/app/agents.py render_raven(); the placeholders are substituted
+# literally, so this file is not applyable on its own. (The design record calls it
+# 67-agent-raven.template.yaml; 67 was already taken by openclaw, so it is 69. 68 is the
+# namespace-wide raven-isolation policy this template's pods are selected by.)
+#
+#   __USER__          Keycloak username; with __NAME__ it forms every object name
+#   __NAME__          the user-chosen agent slug
+#   __IMAGE__         the EAF hosted Raven image (deploy/raven/, AGENT_RAVEN_IMAGE)
+#   __MODEL_SOURCE__  `integrated` or `byo` (agents-surface Contract 4) - provenance label
+#   __KEY_SECRET__    the Secret holding OPENAI_API_KEY (the integrated virtual key, alias
+#                     <user>::agents/<name>, Contract 1) and RAVEN_SERVE_TOKEN (the console
+#                     token the proxy presents as X-Raven-Token)
+#   __CFGSUM__        checksum of the non-secret env ConfigMap (agent-<user>-<name>-config)
+#   __KEYSUM__        checksum of the integrated key, so a real rotation rolls the pod
+#
+# WHAT DIFFERS FROM HERMES AND OPENCLAW (verified against the pinned hosted image, -f16):
+#
+#   * ONE container, ONE port: the image's nginx serves the WebUI on :18793 and proxies
+#     the engine, which stays on loopback (:18792). The WebUI's RPC is JSON-RPC 2.0 over a
+#     WebSocket at /rpc, on the same port. EverOS memory listens on loopback :18791.
+#   * NO seeded config file. deploy/raven/hosted_seed.py re-asserts the hosted invariants
+#     in config.json on EVERY boot from the pod env (providers.custom = the gateway on this
+#     agent's own key, Curator/Evolver absent, no third-party ACP rows, no A2A server, no
+#     skill hub), so there is nothing to seed first-boot-only and nothing a WebUI edit or a
+#     stale PVC can undo. The `-config` ConfigMap therefore carries the NON-SECRET pod env
+#     (model, gateway base, EverOS model names) rather than a config file; changing it
+#     changes the pod template through checksum/config.
+#   * Console auth is `X-Raven-Token`. RAVEN_SERVE_TOKEN pins the engine's token; the
+#     control-plane console proxy presents it, and the browser never holds it
+#     (RAVEN_AUTO_LOGIN=0 is baked into the image, so nginx hands nobody a session cookie).
+#   * The image runs as root (nginx master, engine) with its state under /data on the PVC:
+#     /data/.raven is RAVEN_HOME (config, sessions, roster) and holds the EverOS store.
+#   * Network: pods carrying `agent.enterprise-ai/type: raven` are governed by
+#     68-raven-common.yaml ALONE (63-agent-common.yaml excludes them), so a Raven has no
+#     route to the public internet or EverMind, only DNS, the model route and the control
+#     plane; its :18793 is admitted from the control-plane pod only.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-__USER__-__NAME__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-__USER__-__NAME__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+spec:
+  selector:
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+  ports:
+    - name: console
+      port: 18793
+      targetPort: 18793
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-__USER__-__NAME__
+  namespace: enterprise-ai
+  labels:
+    app.kubernetes.io/part-of: enterprise-ai-framework
+    app.kubernetes.io/component: agent
+    agent.enterprise-ai/user: "__USER__"
+    agent.enterprise-ai/name: "__NAME__"
+    agent.enterprise-ai/model-source: "__MODEL_SOURCE__"
+    agent.enterprise-ai/type: raven
+spec:
+  replicas: 1
+  # Recreate: the PVC is ReadWriteOnce and the engine and EverOS hold locks on their state.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: agent
+      agent.enterprise-ai/user: "__USER__"
+      agent.enterprise-ai/name: "__NAME__"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: enterprise-ai-framework
+        app.kubernetes.io/component: agent
+        agent.enterprise-ai/user: "__USER__"
+        agent.enterprise-ai/name: "__NAME__"
+        agent.enterprise-ai/model-source: "__MODEL_SOURCE__"
+        agent.enterprise-ai/type: raven
+      annotations:
+        checksum/config: "__CFGSUM__"
+        checksum/api-key: "__KEYSUM__"
+    spec:
+      serviceAccountName: agent
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: agent
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            # The integrated virtual key: every token, EverOS memory inference included,
+            # rides <user>::agents/<name> on the one bill (Contract 1/3).
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
+            - name: EVEROS_LLM__API_KEY
+              valueFrom:
+                secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
+            - name: EVEROS_EMBEDDING__API_KEY
+              valueFrom:
+                secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
+            # The console token the control-plane proxy presents as X-Raven-Token.
+            - name: RAVEN_SERVE_TOKEN
+              valueFrom:
+                secretKeyRef: { name: __KEY_SECRET__, key: RAVEN_SERVE_TOKEN }
+          envFrom:
+            # AGENT_GATEWAY_BASE, RAVEN_MODEL, EVEROS_{LLM,EMBEDDING}__{BASE_URL,MODEL}.
+            - configMapRef: { name: agent-__USER__-__NAME__-config }
+          ports:
+            - { name: console, containerPort: 18793 }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources:
+            requests: { cpu: "50m", memory: "512Mi", ephemeral-storage: "1Gi" }
+            limits:   { cpu: "2",   memory: "3Gi",   ephemeral-storage: "4Gi" }
+          # /health is answered by the engine through nginx, which starts only once the
+          # engine listens; a first boot builds the agent loop and the memory store first
+          # (measured ~1-2 minutes), hence the long startup budget.
+          startupProbe:
+            httpGet: { path: /health, port: 18793 }
+            periodSeconds: 5
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: { path: /health, port: 18793 }
+            periodSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: agent-__USER__-__NAME__ }

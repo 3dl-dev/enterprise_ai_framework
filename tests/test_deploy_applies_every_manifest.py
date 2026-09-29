@@ -50,6 +50,10 @@ EXPECTED_SKIPS = {
     # __USER__/__NAME__ placeholders, rendered per agent by control-plane/app/agents.py. Its
     # Control UI port (18789) is admitted by the same namespace-wide 66-agent-console-common.
     "67-agent-openclaw.template.yaml",
+    # The Raven host-agent template (enterpriseaiframework-f16): placeholders, rendered per
+    # agent by control-plane/app/agents.py. Its companions 68-raven-common.yaml and
+    # 66-agent-console-common.yaml are applied every deploy.
+    "69-agent-raven.template.yaml",
 }
 
 

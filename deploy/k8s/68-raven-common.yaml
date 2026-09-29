@@ -21,7 +21,7 @@
 #   NOT       the public internet, the Kubernetes API, Postgres, workspaces, other agents.
 #
 # The `type: raven` label is set on both the Deployment and its pod template by
-# deploy/k8s/67-agent-raven.template.yaml (enterpriseaiframework-f16).
+# deploy/k8s/69-agent-raven.template.yaml (enterpriseaiframework-f16).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

@@ -16,7 +16,7 @@ deploy/bin/kaniko-build.sh deploy/raven $RAIL_REGISTRY/raven-hosted:v0.2.3-eaf2 
 
 `KANIKO_CPU_REQUEST=100m` lowers the build pod's CPU request on a crowded node.
 
-Pod contract (what `67-agent-raven.template.yaml` must supply): `AGENT_GATEWAY_BASE`,
+Pod contract (what `69-agent-raven.template.yaml` must supply): `AGENT_GATEWAY_BASE`,
 `OPENAI_API_KEY` (the Raven's own integrated key), `RAVEN_MODEL`, `RAVEN_SERVE_TOKEN` (pins the
 console token the proxy presents as `X-Raven-Token`), `EVEROS_LLM__{BASE_URL,MODEL,API_KEY}` and
 `EVEROS_EMBEDDING__{BASE_URL,MODEL,API_KEY}` (all gateway), a PVC on `/data`, and the labels

@@ -442,7 +442,7 @@ def test_a_user_lists_stops_starts_and_deletes_their_own_agent(cluster):
 
     listed = alice.get("/portal/api/agents").json()
     assert [a["name"] for a in listed["agents"]] == ["scraper"]
-    assert listed["types"] == ["hermes", "openclaw"], (
+    assert listed["types"] == ["hermes", "openclaw", "raven"], (
         "the wizard builds its type select from this list; hermes leads because it is the "
         "default the create form preselects"
     )
@@ -560,6 +560,147 @@ def test_creating_an_openclaw_agent_renders_the_single_container_gateway_pod(clu
     assert cluster.get("configmaps", "agent-alice-claw-config") is None
     assert cluster.names("secrets") == []
 
+
+
+def test_creating_a_raven_agent_renders_the_hosted_host_agent_pod(cluster):
+    """Contract E (agents-raven.md, enterpriseaiframework-f16): one container on the hosted
+    Raven image, the WebUI on :18793, state on the PVC at /data, the integrated key as the
+    Raven's own AND EverOS's key, every model endpoint the gateway, and a console token the
+    proxy (never the browser) holds."""
+    created = client_as("alice").post(
+        "/portal/api/agents", json={"name": "rv", "type": "raven"})
+    assert created.status_code == 201, created.text
+    assert created.json()["type"] == "raven"
+    assert created.json()["console_url"] == "/agents/rv/"
+    assert created.json()["alias"] == "alice::agents/rv"
+
+    dep = cluster.get("deployments", "agent-alice-rv")
+    assert dep is not None, f"no Deployment applied; store holds {list(cluster.store)}"
+    rendered = json.dumps(dep) + json.dumps(cluster.get("services", "agent-alice-rv"))
+    # `__NAME__`-shaped only: the EverOS env names (EVEROS_LLM__API_KEY) legitimately carry "__".
+    import re
+    assert not re.search(r"__[A-Z]+__", rendered), (
+        f"unsubstituted placeholder reached the cluster: {rendered[:400]}")
+    labels = dep["metadata"]["labels"]
+    assert labels["agent.enterprise-ai/user"] == "alice"
+    assert labels["agent.enterprise-ai/name"] == "rv"
+    assert labels["agent.enterprise-ai/type"] == "raven"
+    pod_labels = dep["spec"]["template"]["metadata"]["labels"]
+    assert pod_labels["agent.enterprise-ai/type"] == "raven", (
+        "68-raven-common.yaml selects the POD by this label, and 63-agent-common.yaml "
+        "excludes by it: without it the pod would get the internet-egress policy")
+    assert pod_labels["app.kubernetes.io/component"] == "agent"
+
+    spec = dep["spec"]["template"]["spec"]
+    assert [c["name"] for c in spec["containers"]] == ["agent"]
+    agent = spec["containers"][0]
+    assert agent["image"] == agents.RAVEN_IMAGE
+    assert "command" not in agent, "the hosted image's own entrypoint boots nginx + the engine"
+    assert {"name": "console", "containerPort": 18793} in agent["ports"]
+    assert [p["port"] for p in cluster.get("services", "agent-alice-rv")["spec"]["ports"]] == [18793]
+    assert {m["mountPath"] for m in agent["volumeMounts"]} == {"/data"}
+    assert dep["spec"]["strategy"] == {"type": "Recreate"}
+    assert agent["startupProbe"]["httpGet"] == {"path": "/health", "port": 18793}
+
+    env = {e["name"]: e for e in agent["env"]}
+    key_ref = {"name": "agent-alice-rv-key", "key": "OPENAI_API_KEY"}
+    for name in ("OPENAI_API_KEY", "EVEROS_LLM__API_KEY", "EVEROS_EMBEDDING__API_KEY"):
+        assert env[name]["valueFrom"]["secretKeyRef"] == key_ref, (
+            f"{name} must be the Raven's own integrated key, so memory inference is on its line")
+    assert (env["RAVEN_SERVE_TOKEN"]["valueFrom"]["secretKeyRef"]
+            == {"name": "agent-alice-rv-key", "key": "RAVEN_SERVE_TOKEN"})
+    assert agent["envFrom"] == [{"configMapRef": {"name": "agent-alice-rv-config"}}]
+
+    # The non-secret env: every model endpoint (host LLM, EverOS llm, EverOS embeddings) is
+    # the gateway the key was minted for, and no credential is in the ConfigMap.
+    cm = cluster.get("configmaps", "agent-alice-rv-config")["data"]
+    assert cm["AGENT_GATEWAY_BASE"] == agents.gateway_base()
+    assert cm["EVEROS_LLM__BASE_URL"] == cm["EVEROS_EMBEDDING__BASE_URL"] == cm["AGENT_GATEWAY_BASE"]
+    assert cm["RAVEN_MODEL"] == cm["EVEROS_LLM__MODEL"] == agents.DEFAULT_MODEL
+    assert cm["EVEROS_EMBEDDING__MODEL"] == agents.RAVEN_EMBEDDING_MODEL
+    assert not any("KEY" in k or "TOKEN" in k for k in cm), "a credential in the ConfigMap"
+
+    # The REAL consumer of what was just applied: assemble the container's environment the
+    # way kubelet does (env + envFrom + secretKeyRef) and run the hosted image's own boot
+    # logic (deploy/raven/hosted_seed.py) over it. If the pod env drifts from the image's
+    # contract the seed refuses (SystemExit) or writes a provider that is not this agent's.
+    import importlib.util
+    spec_ = importlib.util.spec_from_file_location(
+        "raven_hosted_seed", Path(__file__).resolve().parents[2] / "deploy" / "raven" / "hosted_seed.py")
+    seed_mod = importlib.util.module_from_spec(spec_)
+    spec_.loader.exec_module(seed_mod)
+    kube_env = dict(cm)
+    for e in agent["env"]:
+        ref = e["valueFrom"]["secretKeyRef"]
+        kube_env[e["name"]] = base64.b64decode(
+            cluster.get("secrets", ref["name"])["data"][ref["key"]]).decode()
+    overlay = seed_mod.hosted_overlay(kube_env)
+    assert overlay["providers"]["custom"] == {
+        "apiKey": "sk-fake-alice-agents/rv", "apiBase": agents.gateway_base()}
+    assert overlay["agents"]["defaults"]["model"] == agents.DEFAULT_MODEL
+
+    secret = cluster.get("secrets", "agent-alice-rv-key")
+    assert set(secret["data"]) == {"OPENAI_API_KEY", "RAVEN_SERVE_TOKEN"}
+    assert base64.b64decode(secret["data"]["OPENAI_API_KEY"]).decode() == "sk-fake-alice-agents/rv"
+    assert len(base64.b64decode(secret["data"]["RAVEN_SERVE_TOKEN"])) >= 32
+    assert ISSUED == [("alice", "agents/rv", "alice")], "minted for the caller, as themselves"
+    assert ("alice", "agent.create", "alice/rv") in AUDIT
+
+    assert client_as("alice").get("/portal/api/agents").json()["agents"][0]["type"] == "raven"
+
+    # Stop / start scale the Deployment only; the PVC is untouched.
+    assert client_as("alice").post("/portal/api/agents/rv/stop").json()["status"] == "stopped"
+    assert cluster.get("deployments", "agent-alice-rv")["spec"]["replicas"] == 0
+    assert client_as("alice").post("/portal/api/agents/rv/start").status_code == 200
+    assert cluster.get("deployments", "agent-alice-rv")["spec"]["replicas"] == 1
+    assert cluster.get("persistentvolumeclaims", "agent-alice-rv") is not None
+
+    # Delete removes every object, revokes the key, and confirms the volume.
+    body = client_as("alice").request("DELETE", "/portal/api/agents/rv").json()
+    assert body["deleted"] is True and body["key_revoked"] == "alice::agents/rv"
+    for kind in ("deployments", "services", "configmaps", "secrets", "persistentvolumeclaims"):
+        assert cluster.names(kind) == [], f"delete left a {kind} object behind"
+
+
+def test_a_second_user_cannot_see_stop_start_delete_or_console_into_a_raven(cluster):
+    """The security surface of the new type: user B against user A's raven, through the real
+    portal routes and the real console proxy code (agents.console_target), not a stand-in."""
+    cluster.add_agent("alice", "rv", agent_type="raven")
+    cluster.put("secrets", {"apiVersion": "v1", "kind": "Secret",
+                            "metadata": {"name": "agent-alice-rv-key"},
+                            "data": {"RAVEN_SERVE_TOKEN": base64.b64encode(b"tok").decode()}})
+    mallory = client_as("mallory")
+    assert mallory.get("/portal/api/agents").json()["agents"] == []
+    for method, path in (("POST", "/portal/api/agents/rv/stop"),
+                         ("POST", "/portal/api/agents/rv/start"),
+                         ("DELETE", "/portal/api/agents/rv")):
+        resp = mallory.request(method, path)
+        assert resp.status_code == 404, f"{method} {path} as mallory answered {resp.status_code}"
+    dep = cluster.get("deployments", "agent-alice-rv")
+    assert dep is not None and dep["spec"]["replicas"] == 1
+    assert cluster.get("secrets", "agent-alice-rv-key") is not None
+    assert cluster.get("persistentvolumeclaims", "agent-alice-rv") is not None
+
+    import asyncio
+    from fastapi import HTTPException
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(HTTPException) as denied:
+            loop.run_until_complete(agents.console_target("mallory", "rv"))
+        assert denied.value.status_code == 404, "console_target must not confirm the agent exists"
+        target = loop.run_until_complete(agents.console_target("alice", "rv"))
+        assert target["type"] == "raven" and target["token"] == "tok"
+    finally:
+        loop.close()
+
+    # A raven created over the name mallory derives to alice's object is refused, not applied
+    # (the hyphen collision, on the new type's provisioner).
+    cluster.add_agent("alice-bot", "two", agent_type="raven")
+    refused = client_as("alice").post(
+        "/portal/api/agents", json={"name": "bot-two", "type": "raven"})
+    assert refused.status_code == 403, refused.text
+    assert cluster.get("deployments", "agent-alice-bot-two")["metadata"]["labels"][
+        "agent.enterprise-ai/user"] == "alice-bot"
 
 
 def test_an_agent_created_after_the_freerouter_flip_calls_freerouter_not_litellm(
