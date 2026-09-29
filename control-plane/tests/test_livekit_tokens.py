@@ -54,6 +54,21 @@ def voice_env(monkeypatch):
     monkeypatch.setenv("LIVEKIT_API_KEY", KEY)
     monkeypatch.setenv("LIVEKIT_API_SECRET", SECRET)
     monkeypatch.setenv("LIVEKIT_URL", URL)
+    # The endpoint now checks the raven exists and is the caller's (82e), so these tests run
+    # against a cluster that holds exactly the ravens they name.
+    from test_portal_agents import FakeCluster, _SA_DIR
+    from app import agent_usage, agents
+    cluster = FakeCluster()
+    monkeypatch.setattr(agents, "KUBE_API", cluster.url)
+    monkeypatch.setattr(agent_usage, "TOKEN_FILE", _SA_DIR / "token")
+    monkeypatch.setattr(agent_usage, "CA_FILE", _SA_DIR / "ca.crt")
+    monkeypatch.setattr(agent_usage, "NAMESPACE_FILE", _SA_DIR / "namespace")
+    # ("a","b-x") and ("a-b","x") name the SAME object (agent-a-b-x), so the platform can hold
+    # only one of them at a time; the collision test swaps them.
+    for user, raven in (("alice", "raven"), ("a", "b-x"), ("bob", "raven")):
+        cluster.add_agent(user, raven, agent_type="raven")
+    yield cluster
+    cluster.stop()
 
 
 def _client(peer="127.0.0.1"):
@@ -108,12 +123,16 @@ def test_a_room_that_shares_a_prefix_with_mine_is_still_not_mine(voice_env):
 
 def test_hyphenated_names_cannot_collide_into_one_room(voice_env):
     # The record's `voice-<user>-<raven>` gives BOTH of these `voice-a-b-x`.
+    cluster = voice_env
     room_a = _as("a", raven="b-x").json()["room"]
+    # the platform can hold only one of the two (same k8s object name): swap, then mint again
+    cluster.store.pop(("deployments", "agent-a-b-x"))
+    cluster.add_agent("a-b", "x", agent_type="raven")
     room_ab = _as("a-b", raven="x").json()["room"]
     assert room_a != room_ab
     # And each is refused the other's, through the real endpoint.
-    assert _as("a", raven="b-x", room=room_ab).status_code == 403
     assert _as("a-b", raven="x", room=room_a).status_code == 403
+    assert _as("a", raven="b-x", room=room_ab).status_code == 403
 
 
 def test_a_body_cannot_smuggle_an_identity(voice_env):
