@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import HTTPException, Request, WebSocket
@@ -58,6 +59,22 @@ _HOP = {
 # `hermes_session_*` cookies.
 _LOGIN_PATH = "/auth/password-login"
 _LOGIN_PROVIDER = "basic"
+
+
+def _session_rejected(resp: httpx.Response) -> bool:
+    """Did the dashboard refuse the cached session cookie?
+
+    Its API answers a dead session with 401, but a PAGE request gets a 302 to its own login
+    (`<prefix>/login?next=...`). Both mean the same thing — typically the agent restarted
+    and forgot the session — and both must trigger a re-login. Passing the redirect through
+    would strand the user on a login page they hold no credential for.
+    """
+    if resp.status_code == 401:
+        return True
+    if resp.is_redirect:
+        path = urlsplit(resp.headers.get("location", "")).path.rstrip("/")
+        return path.endswith("/login")
+    return False
 
 
 def _clean(headers, *, drop_cookie: bool = True) -> dict:
@@ -196,7 +213,7 @@ async def call(target: dict, method: str, path: str, *, json=None) -> httpx.Resp
 
     cookie = await _cookie_for(base, target["host"], target)
     resp = await _do(cookie)
-    if resp.status_code == 401:
+    if _session_rejected(resp):
         cookie = await _cookie_for(base, target["host"], target, force=True)
         resp = await _do(cookie)
     return resp
@@ -207,8 +224,9 @@ async def proxy_http(user: str, name: str, path: str, request: Request,
     """Forward one HTTP request to the caller's own hermes dashboard.
 
     Streams every response (the entry document included — hermes needs no rewrite). The
-    session cookie is injected on this hop; a 401 triggers exactly one re-login-and-retry
-    so an expired cookie is invisible to the user rather than a spuriously broken console.
+    session cookie is injected on this hop; a 401 or a redirect to login triggers exactly one
+    re-login-and-retry so an expired cookie is invisible to the user rather than a spuriously
+    broken console.
     """
     base = f"http://{target['host']}:{target['port']}"
     url = f"{base}{_upstream_path(request.scope, name, path)}"
@@ -234,8 +252,8 @@ async def proxy_http(user: str, name: str, path: str, request: Request,
 
     cookie = await _cookie_for(base, target["host"], target)
     client, upstream = await _send(cookie)
-    if upstream.status_code == 401:
-        # Stale session — log in again once and retry. A second 401 is a real failure.
+    if _session_rejected(upstream):
+        # Stale session — log in again once and retry. A second refusal is a real failure.
         await upstream.aclose()
         await client.aclose()
         cookie = await _cookie_for(base, target["host"], target, force=True)
