@@ -513,6 +513,21 @@ def test_creating_an_opencode_interim_agent_fills_every_placeholder(cluster):
     assert ("alice", "agent.create", "alice/helper") in AUDIT
 
 
+def test_an_agent_created_after_the_freerouter_flip_calls_freerouter_not_litellm(
+        cluster, monkeypatch):
+    """The key and the endpoint come from ONE backend. After GATEWAY_PROVIDER=freerouter the
+    key is an `fr-sk-` key, and a seed still naming the LiteLLM gateway 401s every turn
+    ("LiteLLM Virtual Key expected") — which is what a portal-created agent did."""
+    monkeypatch.setenv("GATEWAY_PROVIDER", "freerouter")
+    monkeypatch.delenv("AGENT_GATEWAY_BASE", raising=False)
+    monkeypatch.setenv("FREEROUTER_URL", "http://freerouter:8080")
+    created = client_as("alice").post("/portal/api/agents", json={"name": "athena"})
+    assert created.status_code == 201, created.text
+    seed_yaml = cluster.get("configmaps", "agent-alice-athena-config")["data"]["config.yaml"]
+    assert "http://freerouter:8080/v1" in seed_yaml
+    assert "gateway:4000" not in seed_yaml
+
+
 def test_creating_a_hermes_agent_renders_the_single_container_first_boot_seed_pod(cluster):
     """The default create path (Contracts A/B/D). A hermes agent is a SINGLE-container pod:
     the image's s6 runs `hermes gateway run` AND its own dashboard on :9119 together (via

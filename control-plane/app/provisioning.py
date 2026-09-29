@@ -25,6 +25,22 @@ def backend():
     return gateway
 
 
+# The LiteLLM gateway's OpenAI-compatible base, in-cluster. Pre-flip default.
+LITELLM_INFERENCE_BASE = "http://gateway:4000/v1"
+
+
+def inference_base() -> str:
+    """The OpenAI-compatible base URL a surface calls with a key minted by `backend()`.
+
+    The key and the endpoint MUST come from the same backend: a freerouter `fr-sk-` key
+    sent to the LiteLLM gateway is a 401 ("LiteLLM Virtual Key expected") on every turn.
+    So this follows GATEWAY_PROVIDER exactly as `backend()` does, read at call time.
+    """
+    if backend() is freerouter:
+        return f"{freerouter.base_url()}/v1"
+    return LITELLM_INFERENCE_BASE
+
+
 async def generate_key(*, username: str, surface: str, idp_user_id: str, max_budget):
     return await backend().generate_key(
         username=username, surface=surface, idp_user_id=idp_user_id, max_budget=max_budget

@@ -83,7 +83,14 @@ MAX_OBJECT_NAME = 63
 # request body ends up in a pod spec.
 DEFAULT_MODEL = os.environ.get("AGENT_MODEL", "fake-provider/fake-gpt-small")
 
-GATEWAY_BASE = os.environ.get("AGENT_GATEWAY_BASE", "http://gateway:4000/v1")
+def gateway_base() -> str:
+    """The inference endpoint a new agent is pointed at.
+
+    Follows `provisioning.inference_base()` — the SAME backend its key is minted by — so an
+    agent created after the freerouter flip never pairs a freerouter key with the LiteLLM
+    gateway. AGENT_GATEWAY_BASE remains an explicit per-deployment override.
+    """
+    return os.environ.get("AGENT_GATEWAY_BASE") or provisioning.inference_base()
 
 # The hermes image a gateway agent runs (agents-gateway-console.md). NOT the workspace
 # image — a gateway agent is the Agents pillar, not opencode — so it is a fixed, overridable
@@ -771,7 +778,7 @@ def hermes_seed_config(model: str) -> str:
         {
             "providers": {
                 "gateway": {
-                    "base_url": GATEWAY_BASE,
+                    "base_url": gateway_base(),
                     "key_env": "OPENAI_API_KEY",
                     "discover_models": True,
                 },
@@ -1123,7 +1130,7 @@ async def _provision_opencode_interim(client: httpx.AsyncClient, user: str, name
 
     sums = await _existing_connector_sums(client, obj)
     docs = render(
-        user, name, image=image, model=model, api_base=GATEWAY_BASE,
+        user, name, image=image, model=model, api_base=gateway_base(),
         connector_sums=sums,
         model_source="integrated", key_secret=f"{obj}-key",
         cfgsum=cfgsum, keysum=keysum,
