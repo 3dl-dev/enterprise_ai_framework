@@ -89,6 +89,45 @@ model_list:
     model_info:
       supports_vision: true
 
+  # ---- local speech (enterpriseaiframework-8cb) ---------------------------------
+  # /v1/audio/transcriptions and /v1/audio/speech, served by the in-cluster `speech`
+  # service (deploy/k8s/32-speech.yaml; the `speech` compose service): Whisper via
+  # faster-whisper for STT, Kokoro-82M for TTS — OSI/MIT/Apache defaults, no 3DL service
+  # and no third-party host in the path. NOT fakes: they stay in the catalogue when real
+  # upstreams are configured, because they are the OSS profile's actual audio backend.
+  #
+  # The upstream model ids are the OpenAI contract names `whisper-1` / `tts-1` ON PURPOSE:
+  # LiteLLM prices a call only when the model string is in its cost map, and a self-hosted
+  # id (Systran/faster-whisper-small, Kokoro) is not — measured on this gateway 2026-09-29,
+  # both metered at $0 with base_model tricks ignored. The speech server resolves those two
+  # names to the real weights (deploy/k8s/32-speech.yaml speech-aliases; the compose
+  # `speech` service mounts the same file), so the weights stay swappable in one place.
+  #
+  # Priced like every other entry, or the bill under-reports silently. Local inference has
+  # no provider invoice, so the rate is an operator-set internal chargeback (STT per second
+  # of audio, TTS per character); the numbers below mirror common hosted list prices so a
+  # switch to a hosted provider does not change the shape of the bill. Change them here.
+  - model_name: speech-stt
+    litellm_params:
+      model: openai/whisper-1
+      api_base: http://speech:8000/v1
+      api_key: local-speech-not-a-secret
+      # LiteLLM bills a transcription's seconds at the OUTPUT per-second rate, so both are
+      # set; input alone metered $0 (measured).
+      input_cost_per_second: 0.0001
+      output_cost_per_second: 0.0001
+    model_info:
+      mode: audio_transcription
+
+  - model_name: speech-tts
+    litellm_params:
+      model: openai/tts-1
+      api_base: http://speech:8000/v1
+      api_key: local-speech-not-a-secret
+      input_cost_per_character: 0.000015
+    model_info:
+      mode: audio_speech
+
   # ---- upstream models, generated ------------------------------------------------
   # bin/render-gateway-config.py replaces the marker below with one entry per model
   # from Forge's live catalog, priced from that catalog. Do not hand-edit: the doc is

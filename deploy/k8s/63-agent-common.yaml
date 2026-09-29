@@ -45,6 +45,12 @@ spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/component: agent
+    # Hosted Raven pods are governed by 68-raven-common.yaml ALONE. NetworkPolicies are
+    # additive, and this one grants public-internet egress, which a Raven must not have
+    # (no EverMind outbound). NotIn also matches pods with no type label, so every
+    # existing hermes/openclaw/opencode agent stays selected exactly as before.
+    matchExpressions:
+      - { key: agent.enterprise-ai/type, operator: NotIn, values: [raven] }
   policyTypes: [Ingress, Egress]
 
   ingress:

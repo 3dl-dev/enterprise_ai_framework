@@ -20,24 +20,55 @@ CONTEXT="${1:?usage: kaniko-build.sh <context-dir> <image-ref> [--build-arg K=V 
 IMAGE="${2:?usage: kaniko-build.sh <context-dir> <image-ref> [--build-arg K=V ...]}"
 shift 2
 
-[[ -f "${CONTEXT}/Dockerfile" ]] || { echo "no Dockerfile in ${CONTEXT}" >&2; exit 1; }
+# A remote context (URL#ref) is fetched by kaniko itself: no tarball, no ConfigMap, no
+# unpack step. This is how a large third-party tree (the Raven upstream image) is built.
+REMOTE=0
+case "$CONTEXT" in
+    git://*|https://*|http://*) REMOTE=1 ;;
+esac
+if (( REMOTE == 0 )); then
+    [[ -f "${CONTEXT}/Dockerfile" ]] || { echo "no Dockerfile in ${CONTEXT}" >&2; exit 1; }
+fi
 
 JOB="kaniko-$(echo -n "${IMAGE}" | sha256sum | cut -c1-8)-$(date +%s)"
 CM="${JOB}-ctx"
 TARBALL="$(mktemp -t kaniko-ctx-XXXXXX.tar.gz)"
 trap 'rm -f "$TARBALL"' EXIT
 
-tar -czf "$TARBALL" -C "$CONTEXT" .
-SIZE=$(stat -c %s "$TARBALL")
-if (( SIZE > 700000 )); then
-    echo "build context is ${SIZE} bytes; ConfigMaps cap near 1MiB. Use a git or https" >&2
-    echo "context instead of this script for a context this large." >&2
-    exit 1
+if (( REMOTE == 0 )); then
+    tar -czf "$TARBALL" -C "$CONTEXT" .
+    SIZE=$(stat -c %s "$TARBALL")
+    if (( SIZE > 700000 )); then
+        echo "build context is ${SIZE} bytes; ConfigMaps cap near 1MiB. Use a remote" >&2
+        echo "context (URL) instead of a directory for a context this large." >&2
+        exit 1
+    fi
+    echo "==> context ${CONTEXT} -> ${SIZE} bytes"
+    kubectl -n "$NS" create configmap "$CM" --from-file=context.tar.gz="$TARBALL" \
+        --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+    KCONTEXT="dir:///ctx"; KDOCKERFILE="/ctx/Dockerfile"
+    INITC="      initContainers:
+        - name: unpack
+          image: busybox:1.36
+          command: [\"sh\", \"-c\", \"tar -xzf /ctx-src/context.tar.gz -C /ctx && ls -la /ctx\"]
+          volumeMounts:
+            - { name: ctx-src, mountPath: /ctx-src }
+            - { name: ctx, mountPath: /ctx }
+          resources:
+            requests: { cpu: \"50m\", memory: \"64Mi\" }
+            limits:   { cpu: \"500m\", memory: \"256Mi\" }"
+    KVOLS="      volumes:
+        - name: ctx-src
+          configMap: { name: ${CM} }
+        - name: ctx
+          emptyDir: {}"
+    KMOUNT="          volumeMounts:
+            - { name: ctx, mountPath: /ctx }"
+else
+    echo "==> remote context ${CONTEXT}"
+    KCONTEXT="${CONTEXT}"; KDOCKERFILE="Dockerfile"
+    INITC=""; KVOLS=""; KMOUNT=""
 fi
-echo "==> context ${CONTEXT} -> ${SIZE} bytes"
-
-kubectl -n "$NS" create configmap "$CM" --from-file=context.tar.gz="$TARBALL" \
-    --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 BUILD_ARGS=""
 for a in "$@"; do
@@ -66,36 +97,22 @@ spec:
     spec:
       restartPolicy: Never
       automountServiceAccountToken: false
-      initContainers:
-        - name: unpack
-          image: busybox:1.36
-          command: ["sh", "-c", "tar -xzf /ctx-src/context.tar.gz -C /ctx && ls -la /ctx"]
-          volumeMounts:
-            - { name: ctx-src, mountPath: /ctx-src }
-            - { name: ctx, mountPath: /ctx }
-          resources:
-            requests: { cpu: "50m", memory: "64Mi" }
-            limits:   { cpu: "500m", memory: "256Mi" }
+${INITC}
       containers:
         - name: kaniko
           image: gcr.io/kaniko-project/executor:v1.23.2
           args:
-            - "--context=dir:///ctx"
-            - "--dockerfile=/ctx/Dockerfile"
+            - "--context=${KCONTEXT}"
+            - "--dockerfile=${KDOCKERFILE}"
             - "--destination=${IMAGE}"
             - "--insecure"
             - "--skip-tls-verify"
             - "--single-snapshot"${BUILD_ARGS}
-          volumeMounts:
-            - { name: ctx, mountPath: /ctx }
+${KMOUNT}
           resources:
-            requests: { cpu: "500m", memory: "2Gi", ephemeral-storage: "4Gi" }
+            requests: { cpu: "${KANIKO_CPU_REQUEST:-500m}", memory: "2Gi", ephemeral-storage: "4Gi" }
             limits:   { cpu: "3",    memory: "6Gi", ephemeral-storage: "20Gi" }
-      volumes:
-        - name: ctx-src
-          configMap: { name: ${CM} }
-        - name: ctx
-          emptyDir: {}
+${KVOLS}
 YAML
 
 echo "==> build job ${JOB}"
