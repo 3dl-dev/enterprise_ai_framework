@@ -45,6 +45,7 @@ workspace -> workspace.
 from __future__ import annotations
 
 import ipaddress
+import re
 from pathlib import Path
 
 import pytest
@@ -155,10 +156,58 @@ def _ingress_problems(spec: dict) -> list[str]:
     return problems
 
 
-@pytest.fixture(scope="module")
-def netpol_spec() -> dict:
+DEPLOY_SH = REPO / "deploy/bin/deploy.sh"
+BUNDLE_ENV = REPO / "bundle/.env"
+PLACEHOLDER = re.compile(r"__([A-Z][A-Z0-9_]*)__")
+
+
+def _deploy_defaults() -> dict[str, str]:
+    """The values deploy.sh substitutes when the instance sets none: `VAR="${VAR:-x}"`.
+
+    Read out of deploy.sh itself, so the manifest is checked exactly as a forker's first
+    deploy renders it rather than against a value this test made up.
+    """
+    return dict(re.findall(r'^([A-Z_]+)="\$\{\1:-([^}]*)\}"', DEPLOY_SH.read_text(), re.M))
+
+
+def _instance_values() -> dict[str, str]:
+    """This instance's overrides from bundle/.env (what deploy.sh sources first)."""
+    if not BUNDLE_ENV.exists():
+        return {}
+    out = {}
+    for line in BUNDLE_ENV.read_text().splitlines():
+        m = re.match(r"^([A-Z_]+)=(.*)$", line.strip())
+        if m:
+            out[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return out
+
+
+def _render(text: str, values: dict[str, str]) -> str:
+    """deploy.sh's apply-loop substitution. The manifest is a template: its OIDC-backchannel
+    egress is `__GATEWAY_LAN_IP__/32` until deploy renders it, so parsing it raw would feed
+    a placeholder to ipaddress rather than the CIDR the cluster actually gets."""
+    missing = sorted({m for m in PLACEHOLDER.findall(text) if m not in values})
+    assert not missing, (
+        f"{NETPOL_YAML.name} carries placeholder(s) {missing} that deploy.sh has no value "
+        f"for, so the policy the cluster receives would contain the literal placeholder"
+    )
+    return PLACEHOLDER.sub(lambda m: values[m.group(1)], text)
+
+
+def _render_profiles() -> list[tuple[str, dict[str, str]]]:
+    defaults = _deploy_defaults()
+    profiles = [("distributable-defaults", defaults)]
+    instance = _instance_values()
+    if any(k in instance for k in defaults):
+        profiles.append(("this-instance", {**defaults, **instance}))
+    return profiles
+
+
+@pytest.fixture(scope="module", params=_render_profiles(), ids=lambda p: p[0])
+def netpol_spec(request) -> dict:
+    _, values = request.param
     spec = None
-    for doc in yaml.safe_load_all(NETPOL_YAML.read_text()):
+    for doc in yaml.safe_load_all(_render(NETPOL_YAML.read_text(), values)):
         if doc and doc.get("kind") == "NetworkPolicy":
             spec = doc["spec"]
     assert spec is not None, f"no NetworkPolicy in {NETPOL_YAML}"
@@ -179,7 +228,7 @@ def test_the_workspace_can_egress_to_the_mcp_server(netpol_spec):
     )
 
 
-def test_the_in_cluster_egress_list_is_exactly_these_three_services(netpol_spec):
+def test_the_in_cluster_egress_list_is_exactly_these_four_services(netpol_spec):
     """The allowlist, pinned whole.
 
     A fourth in-cluster destination must fail here. This is the "verifiable by reading a
@@ -192,6 +241,10 @@ def test_the_in_cluster_egress_list_is_exactly_these_three_services(netpol_spec)
          (("TCP", 53), ("UDP", 53))),
         # The one route out for model traffic.
         ((("app", "gateway"),), (("TCP", 4000),)),
+        # The other model-traffic route: the freerouter spoke, used when the workspace's
+        # inference base points at it (GATEWAY_PROVIDER=freerouter). Granted by b651e40
+        # (#50) after workspaces were firewalled off from it; reason recorded in the manifest.
+        ((("app", "freerouter"),), (("TCP", 8080),)),
         # The tool servers chat uses. One line per server, deliberately.
         ((("app", "mcp-echo"),), (("TCP", 8080),)),
     }

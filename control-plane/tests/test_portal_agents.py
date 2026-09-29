@@ -64,7 +64,11 @@ sys.path.insert(0, str(ROOT))
 _SA_DIR = Path(tempfile.mkdtemp(prefix="fake-sa-"))
 (_SA_DIR / "token").write_text("fake-service-account-token")
 (_SA_DIR / "namespace").write_text("enterprise-ai")
-os.environ.setdefault("GATEWAY_MASTER_KEY", "sk-fake-master")
+# GATEWAY_MASTER_KEY is set per test in the `cluster` fixture, through monkeypatch — NOT
+# here with os.environ.setdefault. `make test` runs tests/ and control-plane/tests/ in ONE
+# pytest process, so a module-level write at collection time leaked "sk-fake-master" into
+# every later subprocess: the bundle tests' `docker compose up -d chat` recreated the
+# gateway with that as its LITELLM_MASTER_KEY, and every admin call after it was a 401.
 
 # The DRIVER is the shell, not the module. Same pattern as
 # control-plane/tests/test_agents_alias.py: the test venv carries no database driver
@@ -399,6 +403,7 @@ def cluster(monkeypatch):
     monkeypatch.setattr(agent_usage, "CA_FILE", _SA_DIR / "ca.crt")
     monkeypatch.setattr(agent_usage, "NAMESPACE_FILE", _SA_DIR / "namespace")
     monkeypatch.setenv("GATEWAY_URL", c.url)
+    monkeypatch.setenv("GATEWAY_MASTER_KEY", "sk-fake-master")
     AUDIT.clear()
     ISSUED.clear()
     try:
