@@ -8,6 +8,10 @@ on:
       host:
         description: public hostname to probe
         default: ai.3dl.one
+  push:
+    paths:
+      - .github/workflows/livekit-edge-probe.yml
+      - tests-live/test_livekit_exposure.py
   schedule:
     - cron: "17 6 * * *"
 permissions:
