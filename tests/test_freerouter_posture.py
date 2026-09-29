@@ -56,6 +56,8 @@ PUBLIC_INFERENCE_PATHS = {
     "/v1/embeddings",
     "/v1/embeddings/models",  # the embedding-model listing (freerouter-095), same envelope
     "/v1/models",
+    "/v1/audio/speech",  # streamed TTS, billed by characters against the key (d26)
+    "/v1/audio/transcriptions",  # multipart STT, billed by seconds against the key (d26)
 }
 
 MATCHER_RE = re.compile(r"^\s*@inference\s+path\s+(.+?)\s*$", re.MULTILINE)
