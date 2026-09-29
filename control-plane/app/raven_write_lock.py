@@ -4,7 +4,7 @@ Raven's WebUI is JSON-RPC 2.0 over one websocket. It can edit providers and chan
 would make it a second console for settings the control plane owns. Raven v0.2.3 has no
 upstream lock (verified in -39e), so the console proxy refuses those write RPCs. The rules
 are DATA (`raven_write_lock.json`, or the file named by RAVEN_WRITE_LOCK_FILE), read on every
-frame (cached by mtime), so a mutation of the data is a mutation of the fence.
+frame (re-parsed when its text changes), so a mutation of the data is a mutation of the fence.
 
 Fail closed, three ways:
   * a method inside a locked namespace (`model.`, `channels.`, `gateway.channels.`) that is
@@ -60,11 +60,13 @@ class _Rules:
 def _rules() -> _Rules | None:
     path = Path(os.environ.get("RAVEN_WRITE_LOCK_FILE") or _DEFAULT_FILE)
     try:
-        key = (str(path), path.stat().st_mtime_ns)
+        # Re-read every frame (a ~1KB file) and re-parse only when the TEXT changed: keyed on
+        # mtime, two edits inside one timestamp tick would leave the fence stale.
+        text = path.read_text(encoding="utf-8")
         with _lock:
-            if _cache["key"] != key:
-                _cache["rules"] = _Rules(json.loads(path.read_text(encoding="utf-8")))
-                _cache["key"] = key
+            if _cache["key"] != text:
+                _cache["rules"] = _Rules(json.loads(text))
+                _cache["key"] = text
             return _cache["rules"]
     except Exception as exc:  # noqa: BLE001 - an unreadable fence must close, not open
         _log.error("raven write-lock rules unreadable (%s): refusing every frame", exc)
