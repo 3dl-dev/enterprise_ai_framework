@@ -551,7 +551,7 @@ Raven's voice code is used**, so no Raven patch is needed.
   (`LIVEKIT_API_KEY`/`SECRET`) are held by the control plane and the worker only. Media needs
   UDP (RTP) and TCP/TLS fallback reachable by browsers, plus LiveKit's embedded TURN.
   **Exposure (NodePort/hostPort range, TURN on the public edge) is externally visible and is
-  RESERVED to Baron.** See *Open questions*, Q1.
+  ruled LAN/VPN only** (Q1, 2026-09-29).
 - **Room and token:** the portal mints a LiveKit access token from the **portal session**
   (`require_user`): identity = user, room = `voice-<user>-<raven>`, TTL minutes. The owner is
   derived exactly as the console derives it. There is no LiveKit console; LiveKit is configured,
@@ -662,7 +662,7 @@ fetches a model at runtime. The worker sets `HF_HUB_OFFLINE=1`. Use the plugin's
 | Noise cancellation | Krisp / ai-coustics / `livekit-plugins-noise-cancellation` | LiveKit Cloud or proprietary SDK (checked) | **forbidden** |
 | Hosted STT/LLM/TTS | LiveKit Inference | LiveKit Cloud service (checked) | **forbidden** |
 | STT, local | **Whisper (weights MIT) via an OpenAI-compatible server** | MIT | passes; the air-gap default |
-| STT, local alt | Kyutai STT 1B | code permissive; **weights CC-BY-4.0** | **documented swap, not default.** CC-BY-4.0 has no user/seat/revenue trigger, but it is not an OSI-approved licence, so it fails the letter of the rule (see Q3) |
+| STT, local alt | Kyutai STT 1B | code permissive; **weights CC-BY-4.0** | **may be the default** (Q3 ruled 2026-09-29: Baron's exception to the OSI-defaults rule for CC-BY-4.0 speech weights; attribution is required) |
 | STT, hosted | Deepgram Flux | proprietary **service** | allowed as a **provider** the tenant calls with the tenant's own credential, like any model API. Never bundled. Needs gateway WS or a direct worker call (Q4) |
 | TTS | **Qwen3-TTS** (local, or DeepInfra hosted) | Apache-2.0 weights | passes; the default |
 | TTS fallback | Kokoro-82M | Apache-2.0 | passes |
@@ -695,7 +695,7 @@ even when it is on (upstream #796). EAF does not rely on it. The boundary is the
 
 | Constraint | How this design complies | Residual |
 |---|---|---|
-| **Apache 2.0, OSI defaults, no tiered capability** | Raven Apache-2.0; LiveKit server and Agents Apache-2.0; Silero MIT; Whisper MIT; Qwen3-TTS and Kokoro Apache-2.0. LiveKit Cloud features (Inference, enhanced noise cancellation, the Cloud turn detector) are forbidden. Non-OSI items are swaps, not defaults (LiveKit turn-detector: LiveKit Model License; Kyutai weights: CC-BY-4.0). | `livekit-agents` ≥1.6.1 transitively installs LiveKit-Model-licensed `livekit-local-inference` (Q6). Raven's own dependency tree was not licence-audited, and EverMind SkillHub content is excluded (off). P1 and P3 run a licence scan of each image. |
+| **Apache 2.0, OSI defaults, no tiered capability** | Raven Apache-2.0; LiveKit server and Agents Apache-2.0; Silero MIT; Whisper MIT; Qwen3-TTS and Kokoro Apache-2.0. LiveKit Cloud features (Inference, enhanced noise cancellation, the Cloud turn detector) are forbidden. Non-OSI items are swaps, not defaults (LiveKit turn-detector: LiveKit Model License), except CC-BY-4.0 speech weights (Kyutai), which Baron allowed as defaults (Q3, 2026-09-29). | `livekit-agents` ≥1.6.1 transitively installs LiveKit-Model-licensed `livekit-local-inference` (Q6). Raven's own dependency tree was not licence-audited, and EverMind SkillHub content is excluded (off). P1 and P3 run a licence scan of each image. |
 | **No telemetry to 3DL, no 3DL-operated service in any data path** | The hoistable profiles serve `/v1/audio/*` from the bundled LiteLLM and local or tenant-credentialed speech; **freerouter is in the voice path only on the operated instance**. No EverMind service is called (SkillHub/updates off, measured live), and no LiveKit Cloud endpoint is called (the worker's egress admits only DNS, livekit and the control plane). | none known |
 | **Integrate, do not reimplement** | Raven, LiveKit, Whisper and Qwen3-TTS are integrated. Built here: a provisioner branch, a token verifier, a relay, a voice worker's glue. None of that is a chat UI, agent or inference engine. | The voice worker is new glue code; it stays configuration-shaped. |
 | **One control plane** | Raven's console is proxied and auth-delegated (Contract C), and LiveKit has no console. Every lifecycle action by person or Raven goes through `control-plane/app/agents.py`, audited in one table, and every Raven→agent turn goes through the relay. Voice pins and manager power are portal settings. Raven's provider and channel settings are read-only in hosted mode (Contract E). | Raven's WebUI keeps its other settings (persona, skills, cron), as hermes's dashboard does. The lock mechanism depends on what P1 finds in the image. |
@@ -809,14 +809,22 @@ even when it is on (upstream #796). EAF does not rely on it. The boundary is the
 
 ## Open questions
 
+**Rulings (Baron, 2026-09-29, gate `enterpriseaiframework-cfa`):**
+- **Q1: LiveKit is LAN/VPN only.** No public exposure of signalling or media. P3 deploys on the LAN/tailnet; TURN on the public edge is out of scope.
+- **Q2: delete is limited to the Raven's own `created-by` children.** Stop/start/set-model stay on all of the owner's agents. This narrows decision 2.
+- **Q3: CC-BY-4.0 speech weights may be defaults.** This is Baron's explicit exception to the OSI-defaults rule for speech models. Kyutai STT 1B may ship as the default local STT, with Whisper (MIT) still available.
+- **Q6: pin `livekit-agents` to 1.6.0** (the newest release without `livekit-local-inference`). File the dependency upstream as an optionality request, and re-rule when upstream moves.
+
+Q4 and Q5 keep the recommendations in the table.
+
 | # | Question | Recommendation | Absent an answer |
 |---|---|---|---|
-| Q1 | **LiveKit media exposure** (UDP/TURN on the edge). Externally visible, so **RESERVED to Baron.** | NodePort range on the LAN/tailnet only for dogfood, with TURN over TLS on the existing edge later | P3 stops at a LAN/tailnet-only deployment |
-| Q2 | Should delete be limited to the Raven's **own `created-by` children**? Decision 2 says "the user's own agents". Narrowing it is a scope change, so it is Baron's call. **Not decided.** | Yes. It bounds the one irreversible verb against prompt injection: delete removes the PVC, Raven auto-approves, and the token is in Raven's env. **The EAF owner's review (PR #55) endorses this limit.** Stop/start/set-model stay on all owned agents (all reversible). | Implement decision 2 as written, all owned agents |
-| Q3 | Is **CC-BY-4.0** (Kyutai weights) acceptable as a *default* under the OSI rule? | No. Keep it a swap. Whisper (MIT) is the default. | swap only |
+| Q1 | **LiveKit media exposure** (UDP/TURN on the edge). **RULED 2026-09-29: LAN/VPN only.** | NodePort range on the LAN/tailnet only for dogfood, with TURN over TLS on the existing edge later | P3 stops at a LAN/tailnet-only deployment |
+| Q2 | Should delete be limited to the Raven's **own `created-by` children**? Decision 2 says "the user's own agents". Narrowing it is a scope change, so it is Baron's call. **RULED 2026-09-29: yes, `created-by` children only.** | Yes. It bounds the one irreversible verb against prompt injection: delete removes the PVC, Raven auto-approves, and the token is in Raven's env. **The EAF owner's review (PR #55) endorses this limit.** Stop/start/set-model stay on all owned agents (all reversible). | Implement decision 2 as written, all owned agents |
+| Q3 | Is **CC-BY-4.0** (Kyutai weights) acceptable as a *default* under the OSI rule? **RULED 2026-09-29: yes (Baron's exception).** | No. Keep it a swap. Whisper (MIT) is the default. | swap only |
 | Q4 | Hosted streaming STT (Deepgram Flux) before the gateway has WebSocket: call direct from the worker (tenant credential, off-ledger, visible like BYO) or wait? | Wait. Utterance-segmented STT through the gateway keeps the bill whole. | wait |
 | Q5 | Detecting a Raven user who adds an off-gateway provider in Raven's UI (BYO by the back door) | Largely closed by the hosted-mode provider lock (Contract E). What remains is a lock that P1 cannot implement against the real image; then, the hermes posture: document it, and surface "model-source: integrated" as seeded-only | documented, not enforced |
-| Q6 | **`livekit-agents` ≥1.6.1 hard-depends on `livekit-local-inference`** (Apache-2.0 AND LiveKit Model License; a native wheel carrying the end-of-turn and VAD models), and `import livekit.agents` loads it. Shipping it puts non-OSI material in the default voice image even though EAF never calls it. A licensing call, so **Baron's**. | Pin the worker to the newest `livekit-agents` release without the dependency (1.6.0 at time of writing) for P3, file the dependency upstream as a request to make it optional, and re-rule when upstream moves. The alternative, accepting an uncalled non-OSI transitive dependency, is weaker against the "OSI defaults" rule. | pin to a release without it; P3 does not ship on ≥1.6.1 |
+| Q6 | **`livekit-agents` ≥1.6.1 hard-depends on `livekit-local-inference`** (Apache-2.0 AND LiveKit Model License; a native wheel carrying the end-of-turn and VAD models), and `import livekit.agents` loads it. Shipping it puts non-OSI material in the default voice image even though EAF never calls it. A licensing call, so **Baron's**. **RULED 2026-09-29: pin 1.6.0.** | Pin the worker to the newest `livekit-agents` release without the dependency (1.6.0 at time of writing) for P3, file the dependency upstream as a request to make it optional, and re-rule when upstream moves. The alternative, accepting an uncalled non-OSI transitive dependency, is weaker against the "OSI defaults" rule. | pin to a release without it; P3 does not ship on ≥1.6.1 |
 
 ---
 
