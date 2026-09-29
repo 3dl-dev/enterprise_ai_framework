@@ -54,6 +54,7 @@ PUBLIC_INFERENCE_PATHS = {
     "/v1/responses",
     "/v1/messages",
     "/v1/embeddings",
+    "/v1/embeddings/models",  # the embedding-model listing (freerouter-095), same envelope
     "/v1/models",
 }
 
