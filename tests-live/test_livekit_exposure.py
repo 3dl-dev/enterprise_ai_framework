@@ -45,7 +45,6 @@ def test_positive_control_a_genuinely_public_port_connects():
         pass
 
 
-@pytest.mark.parametrize("port", LIVEKIT_TCP_PORTS)
 def test_control_host_refuses_livekit_ports_through_the_same_probe():
     """Second half of the control: the identical connect_ex probe reports a LiveKit port on a
     reachable public host as NOT connected, so 'not connected' is a real signal, not a broken
@@ -59,6 +58,7 @@ def test_control_host_refuses_livekit_ports_through_the_same_probe():
         s.close()
 
 
+@pytest.mark.parametrize("port", LIVEKIT_TCP_PORTS)
 def test_no_livekit_port_answers_on_the_public_host(edge, port):
     s = socket.socket()
     s.settimeout(5)
