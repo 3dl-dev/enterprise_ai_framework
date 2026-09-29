@@ -1,0 +1,23 @@
+{
+  "_doc": "Hosted-mode lock on Raven's WebUI provider/channel WRITE RPCs (agents-raven.md Contract E; item enterpriseaiframework-250). Method names verified against the hosted image (raven v0.2.3, raven/rpc/methods/*.py). This file is DATA read by app/raven_write_lock.py on every frame; editing it changes what the console proxy refuses.",
+  "deny_methods": [
+    "model.save_key", "model.disconnect", "model.add_model", "model.add_models",
+    "model.set_fields", "model.remove_model", "model.set_protocol", "model.oauth_login",
+    "model.add_endpoint", "model.remove_endpoint",
+    "channels.configure", "channels.qr",
+    "gateway.channels.start", "gateway.channels.qr",
+    "settings.everos_set",
+    "subagents.add", "subagents.update", "subagents.toggle", "subagents.remove",
+    "plug.install", "plug.configure"
+  ],
+  "locked_namespaces": ["model.", "channels.", "gateway.channels."],
+  "allow_in_locked_namespaces": [
+    "model.options", "model.fetch_models", "model.endpoints",
+    "channels.status", "gateway.channels.live"
+  ],
+  "settings_set": {
+    "method": "settings.set",
+    "deny_key_patterns": ["^channels\\.", "^embedding", "provider"],
+    "deny_when_value_object_has_key_matching": ["provider"]
+  }
+}
