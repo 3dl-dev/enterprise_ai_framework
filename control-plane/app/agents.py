@@ -1079,6 +1079,9 @@ async def _provision_hermes(client: httpx.AsyncClient, user: str, name: str, obj
         # the user's behalf — one secret, never in the ConfigMap.
         "DASHBOARD_USERNAME": DASHBOARD_USERNAME,
         "DASHBOARD_PASSWORD": console_password,
+        # The hermes API server's own Bearer secret (enterpriseaiframework-147), distinct
+        # from the console password: the relay presents this, the browser never sees it.
+        "API_SERVER_KEY": secrets.token_urlsafe(32),
     }))
     # The FIRST-BOOT seed. The initContainer copies it onto the PVC iff there is none; after
     # that the agent's own config wins (Contract B — this is the clobber the record fixes).

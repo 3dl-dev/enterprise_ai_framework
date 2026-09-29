@@ -85,6 +85,13 @@ spec:
     - name: dashboard
       port: 9119
       targetPort: 9119
+    # The hermes API server (OpenAI-shaped, POST /v1/chat/completions), the target of the
+    # control plane's agent relay (agents-raven.md Contract G, enterpriseaiframework-147).
+    # Admitted from the control-plane pod ALONE by 66-agent-console-common.yaml, and it
+    # demands its own Bearer secret (API_SERVER_KEY, in the key Secret) on top of that.
+    - name: api
+      port: 8642
+      targetPort: 8642
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -201,6 +208,18 @@ spec:
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef: { name: __KEY_SECRET__, key: OPENAI_API_KEY }
+            # The hermes API server, enabled ONLY when the key Secret carries API_SERVER_KEY
+            # (hermes will not start it without a strong key; `optional: true` so an agent
+            # provisioned before this key existed simply leaves it off instead of failing to
+            # start). It has its OWN secret, distinct from the console password. Bound on
+            # 0.0.0.0 because the control plane reaches it over the pod network; the
+            # NetworkPolicy in 66-agent-console-common.yaml is the network boundary.
+            - { name: API_SERVER_ENABLED, value: "true" }
+            - { name: API_SERVER_HOST, value: "0.0.0.0" }
+            - { name: API_SERVER_PORT, value: "8642" }
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef: { name: __KEY_SECRET__, key: API_SERVER_KEY, optional: true }
             # The built-in s6 dashboard, co-located with the gateway.
             - { name: HERMES_DASHBOARD, value: "1" }
             - { name: HERMES_DASHBOARD_HOST, value: "0.0.0.0" }
@@ -262,6 +281,7 @@ spec:
             - secretRef: { name: agent-__USER__-__NAME__-discord, optional: true }
           ports:
             - { name: dashboard, containerPort: 9119 }
+            - { name: api, containerPort: 8642 }
           volumeMounts:
             - { name: data, mountPath: /opt/data }
           resources:
