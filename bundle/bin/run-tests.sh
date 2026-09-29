@@ -48,9 +48,15 @@ fi
 # codeapi's session-key isolation logic directly for two genuine, already-authenticated
 # users without needing to intercept LibreChat's own per-request token minting.
 "$VENV/bin/pip" install --quiet "pyjwt[crypto]==2.12.1"
-# playwright drives the browser suite (make test-browser). Kept here so the venv is
-# complete; the browser binaries are a separate `playwright install`.
-"$VENV/bin/pip" install --quiet playwright
+# playwright drives the browser suite (make test-browser) AND tests in this suite
+# (tests/test_chat_surface_version.py, tests/test_workspace_shell.py), so the browser is a
+# dependency of `make test`, not an optional extra. Pinned because each playwright release
+# expects exactly one chromium revision under ~/.cache/ms-playwright: unpinned, whatever
+# release a venv happened to be created with (1.61.0 -> chromium-1228) drifted away from the
+# browser actually installed (chromium-1234), and every browser test errored with
+# "Executable doesn't exist". The install below is a no-op when that revision is present.
+"$VENV/bin/pip" install --quiet playwright==1.62.0
+"$VENV/bin/playwright" install chromium
 
 # pymongo, pinned to the same version control-plane/requirements.txt runs, for
 # tests/test_workspace_memory_bridge.py (enterpriseaiframework-471). Unlike

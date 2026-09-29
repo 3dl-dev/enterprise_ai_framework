@@ -34,10 +34,34 @@ do_export() {
     mkdir -p "$OUT"
     echo "exporting to ${OUT}"
 
-    curl -sS -f "${AUTH[@]}" "${CP}/admin/export/manifest" > "${OUT}/manifest.json"
-    curl -sS -f "${AUTH[@]}" "${CP}/admin/export/audit"    > "${OUT}/audit.jsonl"
-    curl -sS -f "${AUTH[@]}" "${CP}/admin/export/spend"    > "${OUT}/spend.csv"
-    curl -sS -f "${AUTH[@]}" "${CP}/admin/export/keys"     > "${OUT}/keys.csv"
+    # The manifest and the files are four separate reads of a ledger that is still being
+    # written: the gateway flushes spend rows in batches, so a batch landing between the
+    # manifest and the spend dump made spend.csv longer than the manifest and failed the
+    # export (measured: 1 in 20 exports under live traffic; also seen in make test).
+    # So the manifest is read again AFTER the files. The ledger is append-only, so equal
+    # manifests on both sides mean nothing moved and the files are one consistent cut;
+    # otherwise the whole read is retried. The manifest stays an independent count taken
+    # before the data, so a truncated file still fails verification.
+    local attempt after="${OUT}/.manifest.after"
+    for attempt in 1 2 3 4 5; do
+        curl -sS -f "${AUTH[@]}" "${CP}/admin/export/manifest" > "${OUT}/manifest.json"
+        curl -sS -f "${AUTH[@]}" "${CP}/admin/export/audit"    > "${OUT}/audit.jsonl"
+        curl -sS -f "${AUTH[@]}" "${CP}/admin/export/spend"    > "${OUT}/spend.csv"
+        curl -sS -f "${AUTH[@]}" "${CP}/admin/export/keys"     > "${OUT}/keys.csv"
+        curl -sS -f "${AUTH[@]}" "${CP}/admin/export/manifest" > "$after"
+        if cmp -s "${OUT}/manifest.json" "$after"; then
+            break
+        fi
+        echo "the ledger moved during export (attempt ${attempt}); reading it again"
+        sleep "$attempt"
+    done
+    if ! cmp -s "${OUT}/manifest.json" "$after"; then
+        rm -f "$after"
+        echo "FAIL  the ledger kept changing across ${attempt} attempts; stop traffic" \
+             "through the gateway and re-run the export" >&2
+        exit 1
+    fi
+    rm -f "$after"
 
     echo
     ./bin/verify-export.py "$OUT"

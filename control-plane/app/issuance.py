@@ -182,10 +182,15 @@ async def issue(username: str, surface: str, *, actor: str) -> dict:
                 limit_usd=created.get("limit_usd"),
             )
 
+    # bool(), not .get(..., False): LiteLLM's /key/generate response carries its own
+    # `blocked` field and it is JSON null on a freshly minted key, so the default never
+    # applies there and None reached IssuedKey.blocked (a bool) — every admin issue on the
+    # LiteLLM backend answered 500. Observed on the compose bundle, 2026-09-29.
+    blocked = bool(created.get("blocked"))
     await db.audit(
         actor, "key.issue", username,
         surface=surface, rotated=existing is not None, max_budget=max_budget,
-        blocked=created.get("blocked", False),
+        blocked=blocked,
     )
     return {
         "username": username,
@@ -199,5 +204,5 @@ async def issue(username: str, surface: str, *, actor: str) -> dict:
         # disabled it the instant it was minted, rather than the caller receiving an
         # unlimited key. LiteLLM's own zero-budget key already spends nothing on its own
         # terms, so this is always False there; see provisioning.generate_key backends.
-        "blocked": created.get("blocked", False),
+        "blocked": blocked,
     }
