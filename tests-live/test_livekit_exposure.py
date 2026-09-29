@@ -4,7 +4,7 @@ BARON RULING 2026-09-29 (gate cfa): LiveKit is LAN/VPN only. This probes the PUB
 hostname from wherever the test runs (run it from outside the LAN/VPN, e.g. a cloud
 runner) and fails if any LiveKit port answers or if `/rtc` upgrades to a websocket.
 
-    EDGE_CONTROL_HOST=gateway.tailcb6ef9.ts.net EDGE_HOST=gateway.tailcb6ef9.ts.net,ai.3dl.one pytest tests-live/test_livekit_exposure.py
+    EDGE_CONTROL_HOST=github.com EDGE_HOST=ai.3dl.one pytest tests-live/test_livekit_exposure.py
 
 EDGE_HOST is required (comma-separated: the hostname and the public IP it resolves to); a
 missing value fails rather than skips. The gate is .github/workflows/livekit-edge-probe.yml,
@@ -35,9 +35,9 @@ def edge(request) -> str:
 
 
 def test_positive_control_a_genuinely_public_port_connects():
-    """The probe can tell reachable from unreachable. EDGE_CONTROL_HOST is the host whose 443
-    IS public (the Tailscale Funnel name); it must connect from this vantage point. If the
-    runner cannot reach anything, every 'refused' below is vacuous, so this fails the run."""
+    """The probe can tell reachable from unreachable. EDGE_CONTROL_HOST is a host whose :443 IS
+    public (github.com in CI; the edge itself once it has a public origin). It must connect
+    from this vantage point, else every 'refused' below is vacuous and the run fails."""
     control = os.environ.get("EDGE_CONTROL_HOST") or (_hosts() or [""])[0]
     if not control:
         pytest.fail("set EDGE_CONTROL_HOST (a host whose :443 is public) for the positive control")
@@ -46,6 +46,19 @@ def test_positive_control_a_genuinely_public_port_connects():
 
 
 @pytest.mark.parametrize("port", LIVEKIT_TCP_PORTS)
+def test_control_host_refuses_livekit_ports_through_the_same_probe():
+    """Second half of the control: the identical connect_ex probe reports a LiveKit port on a
+    reachable public host as NOT connected, so 'not connected' is a real signal, not a broken
+    probe. (github.com does not run LiveKit.)"""
+    control = os.environ.get("EDGE_CONTROL_HOST") or (_hosts() or [""])[0]
+    s = socket.socket()
+    s.settimeout(5)
+    try:
+        assert s.connect_ex((control, 7880)) != 0
+    finally:
+        s.close()
+
+
 def test_no_livekit_port_answers_on_the_public_host(edge, port):
     s = socket.socket()
     s.settimeout(5)

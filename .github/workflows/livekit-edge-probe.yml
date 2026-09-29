@@ -26,11 +26,15 @@ jobs:
       - run: pip install pytest httpx
       - name: probe from outside
         env:
-          HOST: ${{ github.event.inputs.host || 'gateway.tailcb6ef9.ts.net' }}
+          HOST: ${{ github.event.inputs.host || 'ai.3dl.one' }}
         run: |
-          # ai.3dl.one is a LAN name (public DNS answers 192.168.2.45); the internet-facing
-          # origin is the Tailscale Funnel name, whose :443 is the positive control.
-          fip=$(dig +short "$HOST" A | grep -E '^[0-9.]+$' | head -1)
-          echo "runner egress: $(curl -s https://api.ipify.org)  $HOST -> ${fip:-<none>}  ai.3dl.one -> $(dig +short ai.3dl.one A)"
-          EDGE_CONTROL_HOST="$HOST" EDGE_HOST="$HOST,$fip,ai.3dl.one" \
+          # As of 2026-09-29 public DNS answers 192.168.2.45 for ai.3dl.one and tailscaled (the
+          # Funnel) is stopped on the gateway, so there is no public origin. The probe still runs
+          # against whatever $HOST resolves to; it becomes a stronger check the day a public
+          # origin exists. EDGE_CONTROL_HOST=github.com proves this runner can make outbound TCP
+          # connects and that the probe tells "connected" from "refused/filtered".
+          ip=$(dig +short "$HOST" A | grep -E '^[0-9.]+$' | head -1)
+          echo "runner egress: $(curl -s https://api.ipify.org)  $HOST -> ${ip:-<none>}"
+          hosts="$HOST"; [ -n "$ip" ] && [ "$ip" != "$HOST" ] && hosts="$HOST,$ip"
+          EDGE_CONTROL_HOST=github.com EDGE_HOST="$hosts" \
             pytest tests-live/test_livekit_exposure.py -v -p no:cacheprovider
