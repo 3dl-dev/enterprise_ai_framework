@@ -44,7 +44,12 @@ _KUBECTL = r'''#!/usr/bin/env bash
 # Recording stand-in for kubectl. Every invocation is appended to $STUB_LOG; anything
 # applied from stdin is appended to $STUB_DIR/applied.yaml.
 set -u
-{ printf 'kubectl'; for a in "$@"; do printf ' %s' "$a"; done; printf '\n'; } >> "$STUB_LOG"
+# ONE write per record. The script under test pipes `kubectl create ... | kubectl apply`,
+# so two recorders run at once; word-at-a-time printfs interleaved on O_APPEND and
+# produced lines like `create secretkubectl generic ... apply` under load, which made
+# a test that greps this log fail about 1 run in 50 (measured).
+_rec=""; (( $# )) && printf -v _rec ' %s' "$@"
+printf 'kubectl%s\n' "$_rec" >> "$STUB_LOG"
 
 cmd=""
 args=("$@")
@@ -192,7 +197,12 @@ exit 0
 _CURL = r'''#!/usr/bin/env bash
 # Recording stand-in for the control plane. Only the two endpoints the script calls.
 set -u
-{ printf 'curl'; for a in "$@"; do printf ' %s' "$a"; done; printf '\n'; } >> "$STUB_LOG"
+# ONE write per record. The script under test pipes `kubectl create ... | kubectl apply`,
+# so two recorders run at once; word-at-a-time printfs interleaved on O_APPEND and
+# produced lines like `create secretkubectl generic ... apply` under load, which made
+# a test that greps this log fail about 1 run in 50 (measured).
+_rec=""; (( $# )) && printf -v _rec ' %s' "$@"
+printf 'curl%s\n' "$_rec" >> "$STUB_LOG"
 url=""
 body=""
 prev=""
