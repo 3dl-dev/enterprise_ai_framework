@@ -93,6 +93,15 @@ spec:
               value: /var/lib/enterprise-ai/freerouter/operator.key
             - name: FREEROUTER_MASTER_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_MASTER_KEY, optional: true } }
+            # The operator credit line freerouter seeds op-root with — the portal's operator view
+            # shows how much of it is left (freerouter exposes no floor over its API). And the
+            # operator-root key: when set, a FRESH install creates the control plane's tenant
+            # as a sub-account of op-root so every key draws on that tab, instead of a standalone
+            # prepaid signup whose empty balance 402s every agent.
+            - name: FREEROUTER_OPERATOR_TAB_MICRO
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_OPERATOR_TAB_MICRO, optional: true } }
+            - name: FREEROUTER_OPERATOR_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_OPERATOR_KEY, optional: true } }
             - name: IDP_URL
               value: http://identity:8080
             - name: IDP_REALM

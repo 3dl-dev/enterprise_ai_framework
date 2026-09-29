@@ -35,7 +35,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
-from . import agent_usage, agents, chat_identity, db, gateway, issuance, metering, metering_select, provisioning
+from . import agent_usage, agents, chat_identity, db, freerouter, gateway, issuance, metering, metering_select, provisioning
 from .analytics import report as analytics_report
 
 router = APIRouter()
@@ -681,9 +681,18 @@ async def admin_overview(since: str | None = None,
         agent_usage_error = ""
     except Exception as exc:  # noqa: BLE001
         agent_usage_rows, agent_usage_error = [], f"{type(exc).__name__}: {exc}"
+    # The pool every key draws on. Without this on the page the operator tab is invisible,
+    # and the first sign it is missing, unreachable or spent is an agent answering 402.
+    credit: dict | None = None
+    if provisioning.backend() is freerouter:
+        try:
+            credit = await freerouter.credit_line()
+        except Exception as exc:  # noqa: BLE001 - shown on the page, never swallowed
+            credit = {"status": "unknown", "error": f"{type(exc).__name__}: {exc}"}
     return {
         "since": since,
         "totals": await metering_select.totals(since),
+        "credit": credit,
         "people": sorted(people.values(), key=lambda p: -p["spend"]),
         # Usage quantities per agent — hours, CPU-core-hours, MB. No dollars: Baron's
         # ruling is that owned compute is metered, not priced (enterpriseaiframework-914).

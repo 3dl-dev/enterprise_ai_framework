@@ -72,6 +72,72 @@ async def _request(method: str, path: str, **kwargs) -> httpx.Response:
         return resp
 
 
+def operator_root_id() -> str:
+    """freerouter's operator-root account id — the account the operator TAB sits on."""
+    return os.environ.get("FREEROUTER_OPERATOR_ROOT_ID", "op-root").strip() or "op-root"
+
+
+def operator_tab_micro() -> int:
+    """The operator credit line (µUSD) freerouter was configured with; 0 when there is none.
+
+    Read from the SAME secret key freerouter seeds op-root's floor from
+    (FREEROUTER_OPERATOR_TAB_MICRO). freerouter exposes no floor over its API, so the
+    configured value is the only EAF-side source; freerouter applies it when op-root is
+    first created.
+    """
+    try:
+        return max(0, int(os.environ.get("FREEROUTER_OPERATOR_TAB_MICRO", "0").strip() or 0))
+    except ValueError:
+        return 0
+
+
+# Below this much headroom the operator is warned before agents start answering 402.
+LOW_HEADROOM_USD = float(os.environ.get("CREDIT_LOW_HEADROOM_USD", "5"))
+
+
+async def credit_line() -> dict:
+    """Where every EAF key's spend lands, and how much of the operator tab is left.
+
+    Every user/agent key is a sub-account of the control plane's tenant, so they all draw on
+    ONE billing terminus: whatever GET /api/v1/credits reports for the control plane's own
+    key. That terminus MUST be the operator root, or the tab is unreachable and every agent
+    402s ("insufficient credits") as soon as a standalone prepaid balance runs out — the
+    dead end found live on 2026-09-29. `status` says which case this is:
+
+      ok          on the tab, comfortable headroom
+      low         on the tab, headroom under LOW_HEADROOM_USD
+      exhausted   on the tab, nothing left — requests are being refused
+      not_on_tab  billing to some other (prepaid) account; the tab is not in play
+      no_tab      on the operator root but no tab is configured (prepaid only)
+    """
+    resp = await _request("GET", "/api/v1/credits")
+    data = resp.json().get("data") or {}
+    balance_micro = int(data.get("balance_micro") or 0)
+    account = str(data.get("billing_account_id") or "")
+    root = operator_root_id()
+    tab_micro = operator_tab_micro() if account == root else 0
+    headroom_micro = balance_micro + tab_micro
+    if account != root:
+        status = "not_on_tab"
+    elif tab_micro == 0:
+        status = "no_tab"
+    elif headroom_micro <= 0:
+        status = "exhausted"
+    elif headroom_micro < LOW_HEADROOM_USD * 1_000_000:
+        status = "low"
+    else:
+        status = "ok"
+    return {
+        "status": status,
+        "billing_account_id": account,
+        "operator_root_id": root,
+        "balance_usd": balance_micro / 1_000_000,
+        "credit_line_usd": tab_micro / 1_000_000,
+        "used_usd": max(0, -balance_micro) / 1_000_000,
+        "headroom_usd": headroom_micro / 1_000_000,
+    }
+
+
 def budget_to_monthly_usd(max_budget: float | None) -> int | None:
     """The LiteLLM budget as freerouter's per-key cap, or None for unlimited.
 
@@ -401,17 +467,35 @@ async def health() -> bool:
         return False
 
 
+CONTROL_PLANE_TENANT_NAME = "enterprise-ai-control-plane"
+
+
 async def _signup_operator_tenant() -> str:
     """Provision the control plane's own freerouter tenant, returning its one-time bearer.
 
-    freerouter has no admin key: the control plane is itself a tenant under op-root, created
-    by a one-time `POST /api/v1/signup` (requires FREEROUTER_SIGNUP=open on the spoke).
+    WHERE IT HANGS DECIDES WHO PAYS. Every user/agent key is a sub-account of this tenant, so
+    they all spend from this tenant's billing terminus. With FREEROUTER_OPERATOR_KEY (the key
+    freerouter registers for op-root) the tenant is created as a SUB-ACCOUNT of op-root — no
+    billing record of its own — so all spend resolves up to op-root and draws on the operator
+    tab (FREEROUTER_OPERATOR_TAB_MICRO). Without it, the only door is the open
+    `POST /api/v1/signup`, which makes a STANDALONE prepaid terminus with a zero floor: nothing
+    funds it, the tab is unreachable, and every agent 402s once it is empty (found live
+    2026-09-29). That fallback is kept for a bare personal gateway with no operator key, and
+    the portal's operator view flags it as `not_on_tab`.
     """
+    operator_key = os.environ.get("FREEROUTER_OPERATOR_KEY", "").strip()
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            f"{base_url()}/api/v1/signup",
-            json={"display_name": "enterprise-ai-control-plane"},
-        )
+        if operator_key:
+            resp = await client.post(
+                f"{base_url()}/api/v1/subaccounts",
+                headers={"Authorization": f"Bearer {operator_key}"},
+                json={"name": CONTROL_PLANE_TENANT_NAME},
+            )
+        else:
+            resp = await client.post(
+                f"{base_url()}/api/v1/signup",
+                json={"display_name": CONTROL_PLANE_TENANT_NAME},
+            )
         resp.raise_for_status()
         return resp.json()["data"]["api_key"]
 

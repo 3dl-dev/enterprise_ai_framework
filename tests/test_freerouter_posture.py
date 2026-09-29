@@ -139,3 +139,23 @@ def test_mainnet_settlement_key_is_secret_wired_never_a_manifest_literal():
             f"{key} must be optional so the shipped base stays a testnet-only air-gap gateway "
             "with no mainnet wiring present (guardrail bd6)."
         )
+
+
+def test_the_operator_key_reaches_freerouter_and_the_control_plane_from_one_secret():
+    """The control plane can only hang its tenant under op-root (and so draw on the operator
+    tab) with the key freerouter registers FOR op-root. Both must read the SAME optional
+    secret key, never a manifest literal — it is an operator credential (bd6)."""
+    expected = {"name": "enterprise-ai-secrets", "key": "FREEROUTER_OPERATOR_KEY", "optional": True}
+    env = {e["name"]: e for e in _freerouter_container_env()}
+    assert env["FREEROUTER_OPERATOR_KEY"]["valueFrom"]["secretKeyRef"] == expected
+    cp = REPO / "deploy" / "k8s" / "40-control-plane.yaml"
+    for doc in yaml.safe_load_all(cp.read_text()):
+        if doc and doc.get("kind") == "Deployment":
+            cp_env = {e["name"]: e for e in doc["spec"]["template"]["spec"]["containers"][0]["env"]}
+            assert cp_env["FREEROUTER_OPERATOR_KEY"]["valueFrom"]["secretKeyRef"] == expected
+            assert cp_env["FREEROUTER_OPERATOR_TAB_MICRO"]["valueFrom"]["secretKeyRef"] == {
+                "name": "enterprise-ai-secrets", "key": "FREEROUTER_OPERATOR_TAB_MICRO",
+                "optional": True}
+            break
+    else:
+        raise AssertionError("no control-plane Deployment in 40-control-plane.yaml")

@@ -121,6 +121,11 @@ spec:
             # no manifest edit — once the peer's 971 buyer half lands.
             - name: FREEROUTER_OPERATOR_TAB_MICRO
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_OPERATOR_TAB_MICRO, optional: true } }
+            # The operator-root key. freerouter registers it for op-root at boot; the control
+            # plane uses the SAME secret to create its own tenant as a sub-account of op-root on a
+            # fresh install, so every EAF key draws on the tab above. Overlay-only (bd6).
+            - name: FREEROUTER_OPERATOR_KEY
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_OPERATOR_KEY, optional: true } }
             - name: FREEROUTER_PEER_SERVE
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_PEER_SERVE, optional: true } }
             - name: FREEROUTER_PEER_TESTNET
