@@ -370,6 +370,12 @@ async def _agent_usage_beside_spend(user: str, by_surface: dict) -> tuple[list[d
     return out, ""
 
 
+# Surfaces whose key the user may mint or rotate themselves. Not chat: its key is seeded by the
+# operator into LibreChat's own credential store (chat_keyseed.py) and nothing re-seeds it on a
+# rotate, so a self-service rotation would silently break the user's chat.
+SELF_SERVICE_SURFACES = ("ide", "terminal")
+
+
 @router.get("/portal/api/keys")
 async def my_keys(user: str = Depends(require_user)):
     """The caller's own virtual keys. Never the secret — only what it is and what it may spend."""
@@ -383,10 +389,21 @@ async def my_keys(user: str = Depends(require_user)):
         out.append({
             "alias": alias,
             "surface": surface or "(unknown)",
+            "issued": True,
+            "self_service": surface in SELF_SERVICE_SURFACES,
             "max_budget": k.get("max_budget"),
             "spend": k.get("spend"),
             "created_at": str(k.get("created_at") or ""),
         })
+    # Every surface gets a row, issued or not. The page only offers an action on a row, so a
+    # user with no key yet was shown "No keys issued yet" and nothing to press — a feature
+    # that exists in the API and not in the product. `rotate` mints when there is no key.
+    have = {k["surface"] for k in out}
+    for surface in gateway.SURFACES:
+        if surface not in have:
+            out.append({"alias": gateway.surface_alias(user, surface), "surface": surface,
+                        "issued": False, "self_service": surface in SELF_SERVICE_SURFACES,
+                        "max_budget": None, "spend": None, "created_at": ""})
     return {"username": user, "keys": sorted(out, key=lambda x: x["surface"])}
 
 
@@ -401,6 +418,8 @@ async def rotate_my_key(body: dict, user: str = Depends(require_user)):
     surface = (body or {}).get("surface", "").strip()
     if surface not in gateway.SURFACES:
         raise HTTPException(400, f"unknown surface: {surface}")
+    if surface not in SELF_SERVICE_SURFACES:
+        raise HTTPException(400, f"the {surface} key is managed by that surface and cannot be rotated here")
     # actor is the user, principal is the user. Same call the operator API makes, so a
     # self-service rotation cannot skip the enabled check or leave the ledger's token
     # hash stale — the two failure modes that made this worth sharing rather than copying.

@@ -322,15 +322,22 @@ async function loadKeys() {
     const alias = document.createElement("div"); alias.className = "alias";
     alias.textContent = k.alias;
     const meta = document.createElement("div"); meta.className = "meta";
-    const budget = k.max_budget == null ? "no limit set" : `limit ${money(k.max_budget)}`;
-    const blurb = SURFACE_BLURB[k.surface] || "";
-    meta.textContent = blurb ? `${blurb} · ${budget}` : budget;
+    // null is "unknown here" (the freerouter backend keeps the cap in its own record), not
+    // "unlimited" — say nothing rather than claim there is no limit.
+    const parts = [SURFACE_BLURB[k.surface] || ""];
+    if (!k.issued) parts.push("no key yet");
+    else if (k.max_budget != null) parts.push(`limit ${money(k.max_budget)}`);
+    if (!k.self_service) parts.push("managed by the chat surface");
+    meta.textContent = parts.filter(Boolean).join(" · ");
     col.append(alias, meta);
-    const rot = document.createElement("button");
-    rot.className = "btn small";
-    rot.textContent = "Rotate";
-    rot.addEventListener("click", () => rotate(k.surface, k.alias));
-    li.append(col, rot);
+    li.append(col);
+    if (k.self_service) {
+      const rot = document.createElement("button");
+      rot.className = k.issued ? "btn small" : "btn small primary";
+      rot.textContent = k.issued ? "Rotate" : "Create key";
+      rot.addEventListener("click", () => rotate(k.surface, k.alias, k.issued));
+      li.append(rot);
+    }
     list.appendChild(li);
   }
   $("keys-empty").hidden = keys.length !== 0;
@@ -348,14 +355,16 @@ function confirmDialog({ title, body, danger }) {
   });
 }
 
-async function rotate(surface, alias) {
-  const ok = await confirmDialog({
-    title: `Rotate ${alias}?`,
-    body: "The current key stops working immediately. Anything still using it — including "
-        + "a running workspace — must be given the new one.",
-    danger: "Rotate it",
-  });
-  if (!ok) return;
+async function rotate(surface, alias, issued) {
+  if (issued) {
+    const ok = await confirmDialog({
+      title: `Rotate ${alias}?`,
+      body: "The current key stops working immediately. Anything still using it — including "
+          + "a running workspace — must be given the new one.",
+      danger: "Rotate it",
+    });
+    if (!ok) return;
+  }
   const { ok: good, data } = await post("/portal/api/keys/rotate", { surface });
   if (!good) { toast(data.detail || "Could not rotate that key.", false); return; }
   $("dlg-key-title").textContent = `New key for ${data.alias}`;
