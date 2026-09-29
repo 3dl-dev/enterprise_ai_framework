@@ -28,6 +28,7 @@ from . import (
     gateway,
     identity,
     issuance,
+    livekit_tokens,
     metering,
     metering_select,
     mirror,
@@ -131,6 +132,8 @@ app.include_router(workshop.router)
 # are the opposite of ttyd's spawn-per-websocket, and the agent port has no NodePort at
 # all, so this proxy is the only door to it. See agent_console.py.
 app.include_router(agent_console.router)
+# Owner-scoped LiveKit room tokens (enterpriseaiframework-7f6). See livekit_tokens.py.
+app.include_router(livekit_tokens.router)
 
 
 # ---------------------------------------------------------------- health
