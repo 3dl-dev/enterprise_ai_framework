@@ -701,3 +701,36 @@ def test_the_chat_and_code_tabs_are_untouched_by_the_wizard():
     assert 'frame.src = which === "code" ? "/workshop/" : (LINKS.chat || "/");' in js
     # The one-click create the camp uses is still one click.
     assert 'id="agent-create"' in index and 'id="agent-new"' in index
+
+
+# The names hermes's OWN gateway reads to turn a messaging platform on (its
+# gateway/config.py). A connector saved from the browser that does not arrive under these
+# names reaches the pod and still leaves the platform "unconfigured" in the hermes console.
+_HERMES_NATIVE = {
+    "discord": {"DISCORD_BOT_TOKEN": "AGENT_DISCORD_BOT_TOKEN"},
+    "slack": {"SLACK_BOT_TOKEN": "AGENT_SLACK_BOT_TOKEN",
+              "SLACK_APP_TOKEN": "AGENT_SLACK_APP_TOKEN"},
+    "email": {"EMAIL_ADDRESS": "AGENT_EMAIL_ADDRESS",
+              "EMAIL_PASSWORD": "AGENT_EMAIL_PASSWORD",
+              "EMAIL_IMAP_HOST": "AGENT_EMAIL_IMAP_HOST",
+              "EMAIL_SMTP_HOST": "AGENT_EMAIL_SMTP_HOST"},
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_HERMES_NATIVE))
+def test_a_hermes_agent_sees_its_connector_under_the_names_hermes_reads(kind):
+    docs = agents.render_hermes(
+        "alice", "athena", image="img", model_source="gateway",
+        key_secret="agent-alice-athena-key", cfgsum="c", keysum="k",
+    )
+    deployment = next(d for d in docs if d.get("kind") == "Deployment")
+    container = next(c for c in deployment["spec"]["template"]["spec"]["containers"]
+                     if c["name"] == "agent")
+    env = {e["name"]: e for e in container.get("env", [])}
+    spec = agents.CONNECTORS[kind]
+    for native, key in _HERMES_NATIVE[kind].items():
+        assert native in env, f"hermes reads {native} to enable {kind}; the pod never sets it"
+        ref = env[native]["valueFrom"]["secretKeyRef"]
+        assert ref["name"] == spec.secret_name("agent-alice-athena")
+        assert ref["key"] == key and key in spec.allowed
+        assert ref.get("optional") is True, "an agent with no such connector must still start"

@@ -213,6 +213,45 @@ spec:
             - name: HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
               valueFrom:
                 secretKeyRef: { name: __KEY_SECRET__, key: DASHBOARD_PASSWORD }
+            # hermes's OWN messaging platforms read its native names (DISCORD_BOT_TOKEN,
+            # SLACK_BOT_TOKEN, EMAIL_ADDRESS, ...), not the AGENT_<KIND>_* keys the portal's
+            # connector Secret carries for the agent-discord/-slack/-email tools. Without this
+            # mapping a connector saved from the browser reaches the pod and hermes still
+            # reports the platform unconfigured. Each ref is optional: a connector not set up
+            # leaves its platform off, exactly as before.
+            - name: DISCORD_BOT_TOKEN
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-discord, key: AGENT_DISCORD_BOT_TOKEN, optional: true }
+            - name: DISCORD_HOME_CHANNEL
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-discord, key: AGENT_DISCORD_DEFAULT_CHANNEL, optional: true }
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-slack, key: AGENT_SLACK_BOT_TOKEN, optional: true }
+            - name: SLACK_APP_TOKEN
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-slack, key: AGENT_SLACK_APP_TOKEN, optional: true }
+            - name: SLACK_HOME_CHANNEL
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-slack, key: AGENT_SLACK_DEFAULT_CHANNEL, optional: true }
+            - name: EMAIL_ADDRESS
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-email, key: AGENT_EMAIL_ADDRESS, optional: true }
+            - name: EMAIL_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-email, key: AGENT_EMAIL_PASSWORD, optional: true }
+            - name: EMAIL_IMAP_HOST
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-email, key: AGENT_EMAIL_IMAP_HOST, optional: true }
+            - name: EMAIL_IMAP_PORT
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-email, key: AGENT_EMAIL_IMAP_PORT, optional: true }
+            - name: EMAIL_SMTP_HOST
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-email, key: AGENT_EMAIL_SMTP_HOST, optional: true }
+            - name: EMAIL_SMTP_PORT
+              valueFrom:
+                secretKeyRef: { name: agent-__USER__-__NAME__-email, key: AGENT_EMAIL_SMTP_PORT, optional: true }
           # The tenant's own Slack/Discord/mailbox, reached with the tenant's own tokens.
           # There is no chat or mail server in this deployment — the same posture, Secrets
           # and `optional: true` additivity as the opencode agent. envFrom is applied before
