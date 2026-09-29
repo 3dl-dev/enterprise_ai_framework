@@ -205,19 +205,21 @@ def _settings():
 
 def test_settings_read_the_dispatch_metadata_and_take_the_base_from_the_environment_only():
     s = _settings()
-    meta = json.dumps({"session": "tok", "stt_model": "speech-stt", "tts_model": "speech-tts",
+    meta = json.dumps({"session": "tok", "stt_model": "gpt-4o-transcribe", "tts_model": "gpt-4o-mini-tts",
                        "voice": "af_heart", "base_url": "http://evil.example/v1"})
     cfg = s.load(meta, env={})
-    assert (cfg.session_token, cfg.stt_model, cfg.tts_model, cfg.voice) == (
-        "tok", "speech-stt", "speech-tts", "af_heart")
+    assert (cfg.session_token, cfg.voice) == ("tok", "af_heart")
+    # the plugin-side models are the contract names whatever the metadata says: tts-1 is what
+    # makes livekit-plugins-openai stream plain audio (any other name is parsed as SSE)
+    assert (cfg.stt_model, cfg.tts_model) == ("whisper-1", "tts-1")
     assert cfg.base_url == "http://control-plane:8000/voice/v1", "a metadata base_url is ignored"
     assert s.load(meta, env={"VOICE_AUDIO_BASE": "http://cp:8000/voice/v1/"}).base_url == \
         "http://cp:8000/voice/v1"
 
 
 @pytest.mark.parametrize("bad", ["", "not json", "{}", '{"session":"t"}', "[]",
-                                 json.dumps({"session": "", "stt_model": "a", "tts_model": "b", "voice": "c"}),
-                                 json.dumps({"session": "t", "stt_model": 1, "tts_model": "b", "voice": "c"})])
+                                 json.dumps({"session": "", "voice": "c"}),
+                                 json.dumps({"session": "t", "voice": 1})])
 def test_settings_refuse_metadata_that_is_not_a_voice_session(bad):
     with pytest.raises(ValueError):
         _settings().load(bad, env={})

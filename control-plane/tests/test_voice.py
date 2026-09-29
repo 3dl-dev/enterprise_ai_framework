@@ -232,7 +232,8 @@ def test_the_room_token_dispatches_the_worker_with_a_session_bound_to_this_room(
     meta = json.loads(dispatch["metadata"])
     claims = jwt.decode(meta["session"], SESSION_SECRET, algorithms=["HS256"], audience="eaf-voice-session")
     assert (claims["sub"], claims["raven"], claims["room"]) == ("alice", "rv", "voice-alice.rv")
-    assert meta["stt_model"] == "speech-stt" and meta["tts_model"] == "speech-tts"
+    assert meta["voice"] == "af_heart" and set(meta) == {"session", "voice"}, \
+        "the worker is told the voice and the bearer, nothing it could spend or route by"
     assert "sk-alice-rv" not in json.dumps(r.json()) and "sk-alice-rv" not in json.dumps(meta), \
         "the Raven's gateway key must never leave the control plane"
 
