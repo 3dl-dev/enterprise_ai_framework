@@ -43,3 +43,8 @@ spec:
       ports:
         - { protocol: TCP, port: 9119 }
         - { protocol: TCP, port: 18789 }
+        # The hermes API server (enterpriseaiframework-147): the agent relay's target
+        # (agents-raven.md Contract G). Same single allowed source. Agent pods and Raven pods
+        # are NOT the control-plane pod, so a connection from either is refused; that is
+        # measured live, not assumed (tests-live/test_hermes_api_server_isolation.py).
+        - { protocol: TCP, port: 8642 }
