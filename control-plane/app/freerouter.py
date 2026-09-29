@@ -357,9 +357,27 @@ async def update_budget(token_hash: str, max_budget: float) -> dict:
 
 
 async def list_keys() -> list[dict]:
-    """The control plane's sub-accounts as the operator subtree rollup reports them."""
+    """Every LIVE sub-account, in the shape `gateway.list_keys` returns and its callers read.
+
+    It used to hand back the raw rollup rows. Those carry `name`, not `key_alias`, and exist
+    only for accounts that have SPENT (see `alias_resolver`) — so after the flip the portal's
+    "Your API keys" matched nothing and showed an empty list with no way to mint a key, and the
+    operator overview lost every unspent user. The live set comes from `_account_ids_by_alias`
+    (our record wins over the rollup); the rollup contributes only spend. `max_budget` is None:
+    the cap lives in the mirror record, not here, and callers already treat None as unknown.
+    """
+    live = await _account_ids_by_alias()
     resp = await _request("GET", "/api/v1/usage/rollup")
-    return [a for a in resp.json().get("data", []) if isinstance(a, dict)]
+    spend = {
+        a["account_id"]: (a.get("spend_micro") or 0) / 1_000_000
+        for a in resp.json().get("data", [])
+        if isinstance(a, dict) and a.get("account_id")
+    }
+    return [
+        {"key_alias": alias, "token": account_id, "spend": spend.get(account_id, 0.0),
+         "max_budget": None, "created_at": ""}
+        for alias, account_id in sorted(live.items())
+    ]
 
 
 async def token_hashes_by_alias() -> dict[str, str]:
