@@ -483,10 +483,9 @@ def test_rolling_reprovision_covers_every_agent_and_tolerates_one_failure(world)
 
 
 def test_a_non_hermes_agent_stages_the_secret_without_a_live_push(world):
-    # openclaw (interim, opencode-rendered) has no console settings API yet (Contract D
-    # covers hermes only) — `set_model` gates on the identical condition for the identical
-    # reason.
-    world.cluster.add_agent("alice", "coder", agent_type="openclaw")
+    # A pre-dimension opencode agent (no type label) has no console settings API (Contract D
+    # covers hermes and openclaw). openclaw's live key push is a separate finding.
+    world.cluster.add_agent("alice", "coder", agent_type="")
     obj = "agent-alice-coder"
     world.cluster.put("secrets", {
         "apiVersion": "v1", "kind": "Secret",

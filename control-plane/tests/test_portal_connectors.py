@@ -357,11 +357,18 @@ def test_a_created_agent_gets_every_tool_its_connectors_need(cluster):
     """
     cluster.add_workspace_pod()
     # The `agent-entrypoint` tooling ConfigMap belongs to the opencode render (the shell
-    # tools its entrypoint puts on PATH). A hermes agent handles connectors natively and
-    # ships no such ConfigMap, so this Code-pillar assertion targets the interim opencode
-    # path explicitly (type=openclaw, pending enterpriseaiframework-ff7).
-    assert client_as("alice").post(
-        "/portal/api/agents", json={"name": "helper", "type": "openclaw"}).status_code == 201
+    # tools its entrypoint puts on PATH). Neither Agents-pillar type ships it (hermes and
+    # openclaw handle connectors natively), so create() no longer reaches the opencode
+    # provisioner; this assertion drives that provisioner directly.
+    import asyncio
+
+    async def _provision():
+        async with agents._client() as c:
+            await agents._provision_opencode_interim(
+                c, "alice", "helper", "agent-alice-helper", agents.DEFAULT_MODEL,
+                "opencode", "sk-fake", "keysum")
+
+    asyncio.run(_provision())
 
     shipped = cluster.get("configmaps", "agent-entrypoint")["data"]
     agent_dir = REPO / "deploy" / "agent"

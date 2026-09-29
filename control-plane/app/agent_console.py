@@ -225,7 +225,7 @@ async def agent_console_proxy(name: str, path: str, request: Request,
     # by a separate adapter that authenticates with a session cookie and needs no SPA shim
     # (agents-gateway-console.md Contract C). Only the opencode/interim path below runs
     # through this module's Basic-auth + entry-document rewrite.
-    if target.get("type") == "hermes":
+    if target.get("type") in ("hermes", "openclaw"):
         from . import agent_gateway_console
         return await agent_gateway_console.proxy_http(user, name, path, request, target)
 
@@ -319,7 +319,7 @@ async def agent_console_ws(ws: WebSocket, name: str, path: str):
         return
 
     # Gateway agents (hermes) bridge through their own adapter — cookie auth, no shim.
-    if target.get("type") == "hermes":
+    if target.get("type") in ("hermes", "openclaw"):
         from . import agent_gateway_console
         return await agent_gateway_console.proxy_ws(ws, user, name, path, target)
 
