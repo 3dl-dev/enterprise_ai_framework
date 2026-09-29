@@ -69,7 +69,7 @@
     # EXACT paths, never `/v1/*`. The spoke also serves /v1/operator/* (treasury panels) and
     # /api/v1/* (open signup, key minting, sub-accounts) — none of which may meet the
     # internet (guardrail a2f). tests/test_freerouter_posture.py pins this list.
-    @inference path /v1/chat/completions /v1/completions /v1/responses /v1/messages /v1/embeddings /v1/models
+    @inference path /v1/chat/completions /v1/completions /v1/responses /v1/messages /v1/embeddings /v1/embeddings/models /v1/models
     handle @inference {
         reverse_proxy NODE_IP:30480
     }
@@ -139,7 +139,7 @@ https://ai.example.org:443, https://ai.example.org:8443 {
         reverse_proxy NODE_IP:30460
     }
     # The inference API — same exact-path allowlist as the :8081 block, same reasons.
-    @inference path /v1/chat/completions /v1/completions /v1/responses /v1/messages /v1/embeddings /v1/models
+    @inference path /v1/chat/completions /v1/completions /v1/responses /v1/messages /v1/embeddings /v1/embeddings/models /v1/models
     handle @inference {
         reverse_proxy NODE_IP:30480
     }
