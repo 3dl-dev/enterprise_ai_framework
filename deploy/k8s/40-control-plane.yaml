@@ -177,6 +177,12 @@ spec:
             # and disappears entirely between two samples.
             - name: AGENT_USAGE_SAMPLE_SECONDS
               value: "60"
+            # The hosted Raven image a `type: raven` agent runs (deploy/raven/,
+            # agents-raven.md Contract E). There is no public upstream image, so deploy.sh
+            # renders `<registry>/raven-hosted:<tag>` here, from the same RAIL_REGISTRY that
+            # names every other image it deploys; the manifest carries no registry literal.
+            - name: AGENT_RAVEN_IMAGE
+              value: "__RAVEN_IMAGE__"
             # Behavioural-analytics collector: where the content-free records store lives
             # (on a PVC, so it survives restarts and the operator report is not blank after
             # a roll), and how often the collector rebuilds it from chat Mongo + the gateway

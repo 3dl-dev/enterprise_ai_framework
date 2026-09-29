@@ -117,7 +117,7 @@ MODEL_SOURCE_LABEL = "agent.enterprise-ai/model-source"
 # label rather than re-deriving it. `hermes` is the incumbent default; `openclaw` is the
 # sibling. `opencode` is deliberately NOT a value — that is the Code pillar, not an agent.
 TYPE_LABEL = "agent.enterprise-ai/type"
-AGENT_TYPES = ("hermes", "openclaw")
+AGENT_TYPES = ("hermes", "openclaw", "raven")  # raven: agents-raven.md Contract E
 DEFAULT_AGENT_TYPE = "hermes"
 
 CPU_METRIC = "container_cpu_usage_seconds_total"
