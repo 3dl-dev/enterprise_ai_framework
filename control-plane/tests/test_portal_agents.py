@@ -625,6 +625,17 @@ def test_creating_a_hermes_agent_renders_the_single_container_first_boot_seed_po
     assert base64.b64decode(secret["data"]["OPENAI_API_KEY"]).decode() == "sk-fake-alice-agents/athena"
     assert "DASHBOARD_PASSWORD" in secret["data"] and "DASHBOARD_USERNAME" in secret["data"]
 
+    # The hermes API server (-147): enabled on :8642, keyed by its OWN secret (not the console
+    # password), which the provisioner minted into the key Secret. The live measurement that
+    # only the control plane can reach it is tests-live/test_hermes_api_server_isolation.py.
+    assert {"name": "api", "containerPort": 8642} in agent["ports"]
+    assert env["API_SERVER_ENABLED"]["value"] == "true" and env["API_SERVER_PORT"]["value"] == "8642"
+    assert (env["API_SERVER_KEY"]["valueFrom"]["secretKeyRef"]["key"] == "API_SERVER_KEY"
+            and env["API_SERVER_KEY"]["valueFrom"]["secretKeyRef"]["name"] == "agent-alice-athena-key")
+    api_key = base64.b64decode(secret["data"]["API_SERVER_KEY"]).decode()
+    assert len(api_key) >= 32, "hermes refuses to start the API server on a weak key"
+    assert api_key != base64.b64decode(secret["data"]["DASHBOARD_PASSWORD"]).decode()
+
     # No opencode ConfigMap and no OPENCODE_SERVER_PASSWORD — that is the Code pillar.
     assert cluster.get("configmaps", "agent-entrypoint") is None
     assert "OPENCODE_SERVER_PASSWORD" not in secret["data"]
