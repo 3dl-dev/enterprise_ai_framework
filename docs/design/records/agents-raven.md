@@ -314,6 +314,15 @@ A new FastAPI dependency `require_agent_manager(request, creds) -> (owner, raven
    test pins that flag (below). The same origin check (a shared helper, not a copy) guards the P3
    voice routes `/voice/v1/*`, whose bearer is the voice session token.
 
+   **The pod-IP door is wider than "Raven only."** The control plane has no ingress
+   NetworkPolicy, so every pod in the namespace can reach :8000 over its pod IP (chat, gateway,
+   freerouter, keycloak, codeapi, the MCP pods), and only the bearer token stands between them
+   and `/agent-manager/*`. That is acceptable only because the token is the authority and is
+   hash-stored and owner-bound; live check 8 probes from a non-Raven pod to show a missing or
+   foreign token is refused there too. Adding an ingress NetworkPolicy that admits
+   `/agent-manager` traffic from Raven pods only is recommended hardening (it cannot filter by
+   path, so it admits :8000 from Raven pods plus today's legitimate callers).
+
    *Alternative weighed: a second uvicorn listener on its own port (say :8001) for
    `/agent-manager` and `/voice`, with the Service and the `67-` egress naming only that port.*
    It separates the doors by port instead of by peer address, but it adds a listener, a Service
@@ -587,6 +596,9 @@ realtime WebSocket. The base URL is config (`VOICE_AUDIO_BASE`) with that in-clu
 render test asserts no other STT/TTS/LLM plugin and no other base URL is configured, and the
 worker's egress policy (DNS, livekit, control-plane:8000 only) makes any other endpoint
 unreachable.
+A render test also asserts the voice worker's environment sets no `OTEL_EXPORTER_*` endpoint:
+`livekit-agents` 1.6.0 still depends on `opentelemetry-exporter-otlp`, and the no-telemetry
+invariant must not rest on its defaults.
 
 **The gateway behind `/v1/audio/*`, by profile.** Voice must not depend on the operated
 instance's freerouter: that instance runs on a 3DL hostname, and "no 3DL-operated service in
@@ -774,6 +786,8 @@ even when it is on (upstream #796). EAF does not rely on it. The boundary is the
    Raven pod does, a hermes pod still does not, and a Raven pod cannot reach any agent pod or the
    k8s API. **A connection from a Raven pod to a hermes pod's :8642 is refused** (the `-147`
    addition), as is one from another hermes pod.
+   From a non-Raven pod (e.g. the chat or codeapi pod), `/agent-manager/v1/agents` with no token
+   and with another owner's token both return 401/403 and write `agent-manager.denied`.
 8a. **Front-door replay:** signed in as a real user through the portal NodePort (:4180), send a
    request to `/agent-manager/v1/agents` carrying a valid live token (the second identity's
    Raven's). It returns 403 and the audit shows `agent-manager.denied` with a loopback peer.
