@@ -327,7 +327,9 @@ async function loadKeys() {
     const parts = [SURFACE_BLURB[k.surface] || ""];
     if (!k.issued) parts.push("no key yet");
     else if (k.max_budget != null) parts.push(`limit ${money(k.max_budget)}`);
-    if (!k.self_service) parts.push("managed by the chat surface");
+    if (!k.self_service) {
+      parts.push(k.surface.startsWith("agents/") ? "managed by the agent" : "managed by the chat surface");
+    }
     meta.textContent = parts.filter(Boolean).join(" · ");
     col.append(alias, meta);
     li.append(col);
