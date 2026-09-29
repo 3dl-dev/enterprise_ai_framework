@@ -16,6 +16,7 @@ against whatever origin the page happens to be on.
 """
 
 import asyncio
+import importlib
 import sys
 import types
 from pathlib import Path
@@ -29,10 +30,14 @@ sys.path.insert(0, str(ROOT))
 # Same trade as test_portal_auth.py: the siblings want a live database at import time and
 # none of them is on this path. A test that needs Postgres to prove a URL is a test nobody
 # runs.
-for name in ("app.db", "app.gateway", "app.metering", "app.issuance", "app.chat_identity"):
+# app.gateway is pure (os/re/httpx) and freerouter.py imports real functions from it, so it
+# must be the real module — not a bare stub another test file may have installed first.
+if not hasattr(sys.modules.get("app.gateway"), "parse_alias"):
+    sys.modules.pop("app.gateway", None)
+    importlib.import_module("app.gateway")
+for name in ("app.db", "app.metering", "app.issuance", "app.chat_identity"):
     if name not in sys.modules:
         sys.modules[name] = types.ModuleType(name)
-sys.modules["app.gateway"].SURFACES = ("chat", "ide", "terminal")
 
 from app import portal  # noqa: E402
 
@@ -69,6 +74,9 @@ def test_every_link_is_the_exact_url_it_is_supposed_to_be(configured):
         # silently downgrades "change your password" to "here is a console".
         "password": f"{BASE}/realms/{REALM}/account#/security/signingin",
         "signout": "/portal/oauth2/sign_out",
+        # The base_url a portal key works against off-platform (item 1b4) — the Caddy
+        # inference allowlist on this same origin.
+        "inference": f"{BASE}/v1",
     }
 
 
@@ -108,6 +116,7 @@ def test_an_unconfigured_deployment_emits_nothing_rather_than_half_a_url(monkeyp
     assert links["account"] == ""
     assert links["password"] == ""
     assert links["published"] == ""
+    assert links["inference"] == ""
     # Chat degrades to the origin root, which is where the chat surface is served.
     assert links["chat"] == "/"
     # These two are relative by design — they are paths on this very origin.

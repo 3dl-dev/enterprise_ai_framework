@@ -7,8 +7,13 @@ published the open-signup spoke through the internet-facing Caddy ingress, stran
 sign up tenants against it; combined with any float-granting slip that is the door to
 spending the operator's treasury (the failure mode behind freerouter-0d4).
 
-This test solders the invariant shut: the freerouter service and its NodePort must NOT
-appear in the internet-facing Caddyfile. It is a pure file check — no running bundle.
+The inference API IS published (enterpriseaiframework-1b4, approved 2026-09-29) so a user
+can call it from off-platform with their portal-issued key — the key is the boundary there,
+metered against the user's own sub-account. What stays sealed is everything else the spoke
+serves: /api/v1/* (open signup, key minting, sub-accounts) and /v1/operator/* (treasury).
+So the invariant is no longer "freerouter absent from the Caddyfile" but "the freerouter
+NodePort is reachable ONLY through an exact-path inference allowlist". It is a pure file
+check — no running bundle.
 """
 
 from __future__ import annotations
@@ -41,25 +46,75 @@ def test_freerouter_runs_with_open_signup_in_the_bundle():
     )
 
 
-def test_freerouter_is_not_published_through_the_internet_facing_caddy():
-    caddy = CADDYFILE.read_text()
-    assert "freerouter" not in caddy.lower(), (
-        "the open-signup freerouter spoke is reverse-proxied in the internet-facing "
-        "Caddyfile — that exposes tenant signup to the internet. Remove it: the spoke is "
-        "in-cluster / LAN-NodePort only (guardrail enterpriseaiframework-a2f)."
-    )
+# The ONLY spoke paths the internet may reach. Exact paths — a wildcard such as /v1/* would
+# also publish /v1/operator/*. Adding a path here is a posture decision, not a refactor.
+PUBLIC_INFERENCE_PATHS = {
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/responses",
+    "/v1/messages",
+    "/v1/embeddings",
+    "/v1/models",
+}
+
+MATCHER_RE = re.compile(r"^\s*@inference\s+path\s+(.+?)\s*$", re.MULTILINE)
+HANDLE_RE = re.compile(r"handle\s+@inference\s*\{\s*reverse_proxy\s+(\S+)\s*\}")
+# The internet-facing origin blocks are the ones serving the portal.
+ORIGIN_BLOCK_RE = re.compile(r"^(\S[^\n]*)\{\n(.*?)^\}", re.MULTILINE | re.DOTALL)
 
 
-def test_freerouter_nodeport_is_not_reverse_proxied_to_the_internet():
-    manifest = FREEROUTER_MANIFEST.read_text()
-    m = re.search(r"nodePort:\s*(\d+)", manifest)
+def _node_port() -> str:
+    m = re.search(r"nodePort:\s*(\d+)", FREEROUTER_MANIFEST.read_text())
     assert m, "31-freerouter.yaml has no NodePort — update this guard if the surface changed"
-    node_port = m.group(1)
+    return m.group(1)
+
+
+def test_freerouter_is_reached_only_through_the_inference_allowlist():
+    """Every route to the spoke's NodePort is a `handle @inference` — nothing else proxies it."""
     caddy = CADDYFILE.read_text()
-    assert node_port not in caddy, (
-        f"freerouter's NodePort {node_port} is routed in the internet-facing Caddyfile — "
-        "the open-signup spoke must never be reachable from the internet (a2f / 0d4)."
+    port = _node_port()
+    proxied = [line for line in caddy.splitlines()
+               if "reverse_proxy" in line and f":{port}" in line]
+    allowed = [up for up in HANDLE_RE.findall(caddy) if up.endswith(f":{port}")]
+    assert proxied, "the inference API is not routed to freerouter at all (item 1b4)"
+    assert len(proxied) == len(allowed), (
+        f"freerouter's NodePort {port} is reverse-proxied outside `handle @inference` — "
+        "that can publish open signup or the operator panels to the internet (a2f / 0d4)."
     )
+
+
+def test_the_inference_allowlist_is_exact_paths_only():
+    caddy = CADDYFILE.read_text()
+    matchers = MATCHER_RE.findall(caddy)
+    assert matchers, "no @inference matcher in the Caddyfile"
+    for m in matchers:
+        paths = set(m.split())
+        assert paths == PUBLIC_INFERENCE_PATHS, (
+            f"@inference publishes {sorted(paths)}; the allowlist is "
+            f"{sorted(PUBLIC_INFERENCE_PATHS)}. A wildcard or extra path can expose "
+            "/v1/operator/* or /api/v1/* — change PUBLIC_INFERENCE_PATHS deliberately if meant."
+        )
+
+
+def test_signup_keys_and_operator_routes_never_appear_in_the_ingress():
+    # Directives only: the comments explaining the allowlist name these paths on purpose.
+    caddy = "\n".join(line for line in CADDYFILE.read_text().splitlines()
+                      if not line.lstrip().startswith("#"))
+    for forbidden in ("/api/v1", "/v1/operator", "/v1/*", "signup", "subaccounts"):
+        assert forbidden not in caddy, (
+            f"{forbidden!r} appears in the internet-facing Caddyfile — the spoke's signup, "
+            "key-minting and operator routes stay in-cluster / LAN only (a2f)."
+        )
+
+
+def test_every_internet_origin_block_serves_the_inference_api():
+    """Both origin listeners (Funnel :8081 and the TLS hostname) must carry the route, or the
+    base_url the portal shows works on one path to the box and 404s on the other."""
+    origins = [body for _, body in ORIGIN_BLOCK_RE.findall(CADDYFILE.read_text())
+               if "handle /portal/*" in body]
+    assert len(origins) == 2, f"expected 2 portal-serving origin blocks, found {len(origins)}"
+    for body in origins:
+        assert "handle @inference" in body and "@inference path" in body
 
 
 def test_mainnet_settlement_key_is_secret_wired_never_a_manifest_literal():

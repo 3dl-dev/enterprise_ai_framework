@@ -61,6 +61,18 @@
     handle /agents/* {
         reverse_proxy NODE_IP:30460
     }
+    # The inference API — a user's portal-issued key used from off-platform, with
+    # `<origin>/v1` as an OpenAI-compatible base_url (enterpriseaiframework-1b4). The key is
+    # the security boundary: freerouter resolves the bearer to that user's sub-account and
+    # meters every call against its cap, exactly as it does in-cluster.
+    #
+    # EXACT paths, never `/v1/*`. The spoke also serves /v1/operator/* (treasury panels) and
+    # /api/v1/* (open signup, key minting, sub-accounts) — none of which may meet the
+    # internet (guardrail a2f). tests/test_freerouter_posture.py pins this list.
+    @inference path /v1/chat/completions /v1/completions /v1/responses /v1/messages /v1/embeddings /v1/models
+    handle @inference {
+        reverse_proxy NODE_IP:30480
+    }
     # The bare landing page is the portal wrapper (Chat/Code tabs, spend, keys, published
     # work), never raw LibreChat. enterpriseaiframework-6c9 follow-up. Only a top-level
     # browser navigation is redirected: the portal embeds chat in an iframe whose src is
@@ -125,6 +137,11 @@ https://ai.example.org:443, https://ai.example.org:8443 {
     # identity oauth2-proxy established, so there is nothing here to scope per user.
     handle /agents/* {
         reverse_proxy NODE_IP:30460
+    }
+    # The inference API — same exact-path allowlist as the :8081 block, same reasons.
+    @inference path /v1/chat/completions /v1/completions /v1/responses /v1/messages /v1/embeddings /v1/models
+    handle @inference {
+        reverse_proxy NODE_IP:30480
     }
     # The bare landing page is the portal wrapper (Chat/Code tabs, spend, keys, published
     # work), never raw LibreChat. enterpriseaiframework-6c9 follow-up. Only a top-level
