@@ -72,6 +72,14 @@ spec:
             # no thermostat) per guardrail bd6.
             - name: FREEROUTER_CATALOG_DIR
               value: /etc/freerouter/catalog
+            # Instance config, never a manifest literal (the base names no models):
+            # `alias=canonical,...` model aliases, listed in /v1/models; and the chat model an
+            # unknown model id routes to instead of 404 (freerouter-204). Both optional — unset
+            # means no aliases and today's 404.
+            - name: FREEROUTER_CATALOG_ALIASES
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_CATALOG_ALIASES, optional: true } }
+            - name: FREEROUTER_FALLBACK_MODEL
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_FALLBACK_MODEL, optional: true } }
             - name: FREEROUTER_ROUTER_TENANT_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FREEROUTER_ROUTER_TENANT_KEY, optional: true } }
             - name: FREEROUTER_REPLENISH_ENABLED
