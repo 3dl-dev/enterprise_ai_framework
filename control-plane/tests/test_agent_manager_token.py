@@ -289,7 +289,13 @@ def world(postgres, monkeypatch):
     sql(postgres, "DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
 
     cluster = ClusterAndGateway()
-    gw = FakeOpenclaw()
+    # Its own loopback address, so the fixed :18789 (the port the console proxy dials) never
+    # collides with a sibling suite's fake on 127.0.0.1. A bind failure FAILS this suite —
+    # FakeOpenclaw would otherwise skip it, and a skipped security proof is a missing one.
+    try:
+        gw = FakeOpenclaw(address="127.0.0.72")
+    except pytest.skip.Exception as exc:
+        pytest.fail(str(exc))
     idp = FakeKeycloak()
     hosts: dict[str, str] = {}
     real_getaddrinfo = socket.getaddrinfo
