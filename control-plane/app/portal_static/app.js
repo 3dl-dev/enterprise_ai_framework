@@ -648,6 +648,10 @@ function agentRow(a) {
     controls.append(msel, setm);
   }
 
+  // Talk to a Raven (Contract H): the mic joins the agent's LiveKit room and its voice comes
+  // back over the same connection. Ravens only: voice is a Raven capability.
+  if (a.type === "raven") controls.append(...voiceControls(a));
+
   const drop = document.createElement("button");
   drop.className = "btn small danger"; drop.textContent = "Delete";
   drop.addEventListener("click", () => deleteAgent(a.name));
@@ -655,6 +659,105 @@ function agentRow(a) {
 
   li.append(head, meta, controls);
   return li;
+}
+
+// ---- voice (agents-raven.md Contract H) --------------------------------------------------
+//
+// The browser gets a LiveKit room token from the control plane (which derives the room from
+// the signed-in user, never from this page) and joins it with the microphone on. The voice
+// worker joins the same room, listens, has the Raven answer, and speaks in the Raven's pinned
+// voice: that audio arrives as a remote track, which is attached to a hidden <audio> element.
+// livekit-client is vendored (Apache-2.0, /portal/static/livekit-client.umd.js): no CDN, so
+// an air-gapped install talks to nothing outside itself. The live state is on window.eafVoice
+// so an end-to-end test can read the received audio track.
+const LIVEKIT_ASSET_VERSION = "2.15.4";
+const VOICE = { room: null, agent: null, state: "idle", voice: null };
+window.eafVoice = VOICE;
+const VOICE_STATE_TEXT = { idle: "Talk", connecting: "Connecting…", live: "Hang up" };
+
+function loadLivekit() {
+  if (window.LivekitClient) return Promise.resolve(window.LivekitClient);
+  return new Promise((resolve, reject) => {
+    const el = document.createElement("script");
+    el.src = `/portal/static/livekit-client.umd.js?v=${LIVEKIT_ASSET_VERSION}`;
+    el.onload = () => resolve(window.LivekitClient);
+    el.onerror = () => reject(new Error("could not load the voice client"));
+    document.head.appendChild(el);
+  });
+}
+
+async function startVoice(name) {
+  VOICE.state = "connecting"; VOICE.agent = name; syncVoiceButtons();
+  try {
+    const { ok, data } = await post("/portal/api/voice/token", { raven: name });
+    if (!ok) throw new Error(data.detail || "Could not start a voice session.");
+    const LK = await loadLivekit();
+    const room = new LK.Room({ adaptiveStream: false, dynacast: false });
+    room.on(LK.RoomEvent.TrackSubscribed, (track) => {
+      if (track.kind !== LK.Track.Kind.Audio) return;
+      const el = track.attach();
+      el.dataset.voiceFrom = name;
+      $("voice-audio").appendChild(el);
+    });
+    room.on(LK.RoomEvent.Disconnected, () => endVoice(false));
+    await room.connect(data.url, data.token);
+    await room.localParticipant.setMicrophoneEnabled(true);
+    VOICE.room = room; VOICE.state = "live"; VOICE.voice = data.voice;
+    toast(`Listening. Speak to ${name} (voice: ${data.voice}).`);
+  } catch (e) {
+    VOICE.state = "idle"; VOICE.agent = null;
+    toast(e.message || "Voice failed.", false);
+  }
+  syncVoiceButtons();
+}
+
+async function endVoice(disconnect = true) {
+  const room = VOICE.room;
+  VOICE.room = null; VOICE.state = "idle"; VOICE.agent = null;
+  if (room && disconnect) { try { await room.disconnect(); } catch (_) { /* already gone */ } }
+  $("voice-audio").replaceChildren();
+  syncVoiceButtons();
+}
+
+function syncVoiceButtons() {
+  for (const b of document.querySelectorAll("button[data-voice-talk]")) {
+    const mine = VOICE.agent === b.dataset.voiceTalk;
+    const state = mine ? VOICE.state : "idle";
+    b.textContent = VOICE_STATE_TEXT[state];
+    b.disabled = VOICE.state !== "idle" && !mine;
+    b.classList.toggle("primary", state === "live");
+  }
+}
+
+function voiceControls(a) {
+  const talk = document.createElement("button");
+  talk.className = "btn small"; talk.dataset.voiceTalk = a.name;
+  talk.textContent = VOICE_STATE_TEXT.idle;
+  if (a.status !== "running") talk.classList.add("disabled");
+  talk.addEventListener("click", () => VOICE.agent === a.name && VOICE.state === "live"
+    ? endVoice() : startVoice(a.name));
+
+  const pick = document.createElement("select");
+  pick.className = "agent-model-pick";
+  pick.setAttribute("aria-label", `Voice for ${a.name}`);
+  const set = document.createElement("button");
+  set.className = "btn small ghost"; set.textContent = "Set voice";
+  get(`/portal/api/agents/${encodeURIComponent(a.name)}/voice`).then((v) => {
+    for (const id of v.voices) {
+      const opt = document.createElement("option");
+      opt.value = id; opt.textContent = id;
+      if (id === v.voice) opt.selected = true;
+      pick.appendChild(opt);
+    }
+  }).catch(() => { pick.hidden = true; set.hidden = true; });
+  set.addEventListener("click", async () => {
+    const { ok, data } = await post(
+      `/portal/api/agents/${encodeURIComponent(a.name)}/voice`, { voice: pick.value });
+    toast(ok ? `${a.name} will speak as ${pick.value} from its next conversation.`
+             : (data.detail || "Could not set the voice."), ok);
+  });
+  queueMicrotask(syncVoiceButtons);
+  return [talk, pick, set];
 }
 
 async function setAgentModel(name, model) {
