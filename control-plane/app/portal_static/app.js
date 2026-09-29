@@ -305,6 +305,7 @@ async function copyText(text, okMsg) {
 /* ---------------------------------------------------------------- keys */
 
 const SURFACE_BLURB = {
+  api: "For your own tools, from anywhere — use it with the base URL above.",
   chat: "Used by the chat surface on your behalf.",
   ide: "Held by your Workshop pod.",
   terminal: "For a terminal agent on your own machine.",

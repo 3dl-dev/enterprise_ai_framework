@@ -15,6 +15,14 @@ import httpx
 
 SURFACES = ("chat", "ide", "terminal")
 
+# The off-platform key (enterpriseaiframework-c8c): what a user holds to call
+# `<origin>/v1` from their own tools. A base surface in every respect but one — it is NOT in
+# SURFACES, because the IdP sync mints every SURFACES key for every user, and an external
+# credential nobody asked for is a live key with no owner-intent behind it. It is minted on
+# demand from the portal instead. It exists so that using the platform from outside never
+# means rotating the ide/terminal key a running workspace holds.
+API_SURFACE = "api"
+
 # ---------------------------------------------------------------- the agents surface
 #
 # Contract 1 of docs/design/records/agents-surface.md, and the whole of it. A user has ONE
@@ -77,7 +85,7 @@ def agent_key_alias(username: str, name: str) -> str:
 
 def is_known_surface(surface: str) -> bool:
     """Base surface or agent instance. The one predicate callers should use."""
-    return surface in SURFACES or agent_instance(surface) is not None
+    return surface in SURFACES or surface == API_SURFACE or agent_instance(surface) is not None
 
 
 def surface_alias(username: str, surface: str) -> str:
@@ -88,6 +96,8 @@ def surface_alias(username: str, surface: str) -> str:
     """
     if surface in SURFACES:
         return key_alias(username, surface)
+    if surface == API_SURFACE:
+        return f"{username}::{API_SURFACE}"
     name = agent_instance(surface)
     if name is None:
         raise ValueError(f"unknown surface: {surface}")

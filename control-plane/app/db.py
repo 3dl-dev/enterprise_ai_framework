@@ -29,13 +29,13 @@ CREATE TABLE IF NOT EXISTS principal (
 CREATE TABLE IF NOT EXISTS virtual_key (
     id            BIGSERIAL PRIMARY KEY,
     principal_id  BIGINT NOT NULL REFERENCES principal(id) ON DELETE CASCADE,
-    -- 'chat' | 'ide' | 'terminal' | 'agents/<name>'. A user has ONE of each base surface
+    -- 'chat' | 'ide' | 'terminal' | 'api' | 'agents/<name>'. A user has ONE of each base surface
     -- and MANY agents, so an agent's instance rides IN the surface field — see
     -- gateway.AGENT_SURFACE for why that, and not a third '::' field, is the grammar.
     -- UNIQUE (principal_id, surface) below therefore still means "one key per thing you
     -- can spend from", per agent rather than per agent family.
     surface       TEXT NOT NULL CHECK (
-        surface IN ('chat', 'ide', 'terminal')
+        surface IN ('chat', 'ide', 'terminal', 'api')
         OR surface ~ '^agents/[a-z0-9][a-z0-9-]{0,38}$'
     ),
     key_alias     TEXT UNIQUE NOT NULL,
@@ -90,7 +90,7 @@ UPDATE virtual_key SET gateway_token_hash = NULL WHERE gateway_token_hash LIKE '
 -- identical predicate under the identical name.
 ALTER TABLE virtual_key DROP CONSTRAINT IF EXISTS virtual_key_surface_check;
 ALTER TABLE virtual_key ADD CONSTRAINT virtual_key_surface_check CHECK (
-    surface IN ('chat', 'ide', 'terminal')
+    surface IN ('chat', 'ide', 'terminal', 'api')
     OR surface ~ '^agents/[a-z0-9][a-z0-9-]{0,38}$'
 );
 
