@@ -67,8 +67,12 @@ def voice_env(monkeypatch):
     # only one of them at a time; the collision test swaps them.
     for user, raven in (("alice", "raven"), ("a", "b-x"), ("bob", "raven")):
         cluster.add_agent(user, raven, agent_type="raven")
+    from test_voice import FakeLiveKit
+    lk = FakeLiveKit(KEY, SECRET)
+    monkeypatch.setenv("LIVEKIT_API_URL", lk.url)
     yield cluster
     cluster.stop()
+    lk.stop()
 
 
 def _client(peer="127.0.0.1"):
