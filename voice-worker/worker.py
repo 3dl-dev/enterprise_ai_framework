@@ -25,7 +25,7 @@ import settings
 logger = logging.getLogger("eaf-voice")
 AGENT_NAME = "eaf-voice"
 
-# One idle warm process by default rather than one per CPU: each holds a Silero VAD, and a
+# Two idle warm processes by default rather than one per CPU: each holds a Silero VAD, and a
 # session is one process, so this is a per-node concurrency knob, not a correctness one.
 server = AgentServer(num_idle_processes=int(os.environ.get("VOICE_IDLE_PROCESSES", "2")))
 
