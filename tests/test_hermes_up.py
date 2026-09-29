@@ -31,7 +31,6 @@ docs/design/records/agents-surface.md. Otherwise a typo shared by the script and
 would be green in both places.
 """
 
-import re
 from pathlib import Path
 
 import pytest
@@ -69,12 +68,10 @@ def _gateway_base_from_the_provisioner() -> str:
     provision-agent.sh sets GATEWAY_BASE and points OPENAI_API_BASE at it in integrated
     mode; hermes-up.sh only asserts that the pod really ended up there. Taking the expected
     value from the definition means a change to one side is a test failure rather than a
-    matched pair of edits nobody notices.
+    matched pair of edits nobody notices. Evaluated, not scraped: see
+    harness.provisioner_gateway_base.
     """
-    text = (REPO / "deploy/bin/provision-agent.sh").read_text()
-    match = re.search(r'^GATEWAY_BASE="([^"]+)"', text, re.M)
-    assert match, "provision-agent.sh no longer defines GATEWAY_BASE"
-    return match.group(1)
+    return harness.provisioner_gateway_base()
 
 
 GATEWAY_BASE = _gateway_base_from_the_provisioner()

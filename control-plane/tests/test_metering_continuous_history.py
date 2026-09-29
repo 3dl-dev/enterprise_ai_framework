@@ -204,7 +204,14 @@ def real_stack(tmp_path_factory):
         pytest.skip(f"could not start disposable postgres: {r.stderr}")
 
     def _pg_ready() -> bool:
-        return subprocess.run(["docker", "exec", container, "pg_isready", "-U", "eai"],
+        # Probe over TCP, not the default unix socket. The official image's entrypoint runs
+        # initdb behind a TEMPORARY server that listens on the unix socket only
+        # (listen_addresses=''), then stops it and starts the real one. A socket probe says
+        # "accepting" for that temporary server, and the confirming probe below then lands
+        # in the stop/start gap and reports "no response" -- which skipped this whole suite
+        # nondeterministically. Only the real server listens on TCP.
+        return subprocess.run(["docker", "exec", container, "pg_isready", "-U", "eai",
+                               "-h", "127.0.0.1"],
                               capture_output=True, timeout=5).returncode == 0
 
     deadline = time.time() + 60
