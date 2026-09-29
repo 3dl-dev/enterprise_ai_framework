@@ -166,10 +166,11 @@ def mint_session(user: str, raven: str, room: str, *, ttl: int | None = None,
 
 
 def dispatch_metadata(session: str, entry: dict) -> str:
-    """What the worker is told at dispatch: the bearer to use, and the registry entry so its
-    plugins are configured to match (the relay enforces the same values regardless)."""
-    return json.dumps({"session": session, "stt_model": entry["stt_model"],
-                       "tts_model": entry["tts_model"], "voice": entry["voice"]})
+    """What the worker is told at dispatch: the bearer to use and the pinned voice id, so its
+    TTS plugin is configured to match (the relay enforces the registry's voice and MODELS
+    regardless: the worker names only the OpenAI contract models `whisper-1` / `tts-1`, which
+    the relay maps to the registry's gateway model names)."""
+    return json.dumps({"session": session, "voice": entry["voice"]})
 
 
 class Session:
