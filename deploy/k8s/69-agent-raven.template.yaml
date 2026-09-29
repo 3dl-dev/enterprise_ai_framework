@@ -11,7 +11,8 @@
 #   __MODEL_SOURCE__  `integrated` or `byo` (agents-surface Contract 4) - provenance label
 #   __KEY_SECRET__    the Secret holding OPENAI_API_KEY (the integrated virtual key, alias
 #                     <user>::agents/<name>, Contract 1) and RAVEN_SERVE_TOKEN (the console
-#                     token the proxy presents as X-Raven-Token)
+#                     token the proxy presents as X-Raven-Token) and EAF_AGENT_MANAGER_TOKEN
+#                     (the Contract F agent-manager bearer)
 #   __CFGSUM__        checksum of the non-secret env ConfigMap (agent-<user>-<name>-config)
 #   __KEYSUM__        checksum of the integrated key, so a real rotation rolls the pod
 #
@@ -132,6 +133,13 @@ spec:
             - name: RAVEN_SERVE_TOKEN
               valueFrom:
                 secretKeyRef: { name: __KEY_SECRET__, key: RAVEN_SERVE_TOKEN }
+            # The owner-scoped agent-manager token (agents-raven.md, Contract F): a
+            # control-plane credential for /agent-manager/v1/* as this Raven's owner. Not a
+            # gateway key; it cannot run inference. This secretKeyRef on the Raven container
+            # is its ONLY consumer: never envFrom, never the ConfigMap, never the PVC.
+            - name: EAF_AGENT_MANAGER_TOKEN
+              valueFrom:
+                secretKeyRef: { name: __KEY_SECRET__, key: EAF_AGENT_MANAGER_TOKEN }
           envFrom:
             # AGENT_GATEWAY_BASE, RAVEN_MODEL, EVEROS_{LLM,EMBEDDING}__{BASE_URL,MODEL}.
             - configMapRef: { name: agent-__USER__-__NAME__-config }

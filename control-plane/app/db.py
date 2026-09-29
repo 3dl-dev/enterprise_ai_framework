@@ -188,6 +188,21 @@ ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS last_pod_phase    TEXT;
 ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS last_cpu_counter  DOUBLE PRECISION;
 ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS last_observed_at  TIMESTAMPTZ;
 ALTER TABLE agent_usage ADD COLUMN IF NOT EXISTS first_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now();
+
+-- The owner-scoped agent-manager token (docs/design/records/agents-raven.md, Contract F).
+-- A control-plane credential, NOT a gateway key: its own table so an authorization secret
+-- never sits in the spend ledger. HASH ONLY — the plaintext lives solely in the Raven's
+-- -key Secret. The partial unique index is "exactly one live token per Raven instance".
+CREATE TABLE IF NOT EXISTS agent_manager_token (
+    token_hash    TEXT PRIMARY KEY,
+    owner         TEXT NOT NULL,
+    raven_name    TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at    TIMESTAMPTZ,
+    last_used_at  TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_manager_token_live_idx
+    ON agent_manager_token (owner, raven_name) WHERE revoked_at IS NULL;
 """
 
 GENESIS_HASH = "0" * 64

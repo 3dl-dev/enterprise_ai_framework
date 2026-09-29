@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 
 from . import (
     agent_console,
+    agent_manager,
+    agent_manager_token,
     agent_usage,
     agents,
     chat_identity,
@@ -138,6 +140,9 @@ app.include_router(workshop.router)
 app.include_router(agent_console.router)
 # Owner-scoped LiveKit room tokens (enterpriseaiframework-7f6). See livekit_tokens.py.
 app.include_router(livekit_tokens.router)
+# The agent-manager API (agents-raven.md, Contract F): a Raven drives its owner's agents
+# with an owner-scoped bearer, pod-IP only (loopback, i.e. the portal's proxy, is refused).
+app.include_router(agent_manager.router)
 
 
 # ---------------------------------------------------------------- health
@@ -233,6 +238,17 @@ async def sync(default_budget: float | None = Query(default=None)):
                         reason="disabled_in_idp", count=len(stale),
                     )
                     details.append({"user": u["username"], "action": "revoked", "n": len(stale)})
+                # Contract F: the user's agent-manager tokens die too. UNCONDITIONAL, not
+                # inside `if stale:` — a user may hold no active gateway key and still have
+                # a live Raven token. Stored state, so re-enabling does not resurrect it.
+                n_mgr = await agent_manager_token.revoke_owner(conn, u["username"])
+                if n_mgr:
+                    await db.audit(
+                        "system", "agent-manager.revoke", u["username"],
+                        reason="disabled_in_idp", count=n_mgr,
+                    )
+                    details.append({"user": u["username"],
+                                    "action": "agent_manager_revoked", "n": n_mgr})
                 # The chat surface's per-user key lives in LibreChat's own store, which
                 # delete_by_aliases (a gateway operation) cannot reach. Remove it here — even
                 # when there was no active gateway key to revoke — so a disabled user's seeded
