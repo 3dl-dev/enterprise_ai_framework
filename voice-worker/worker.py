@@ -13,17 +13,30 @@ traps"; tests/test_voice_worker.py fails the build if any appears in this file):
 End of turn is Silero VAD, and interruption handling is pinned to VAD so the adaptive
 (cloud-backed) detector is never constructed.
 """
+import asyncio
 import logging
 import os
 
-from livekit import agents
-from livekit.agents import Agent, AgentServer, AgentSession, AutoSubscribe, JobContext
+from livekit import agents, rtc
+from livekit.agents import (
+    Agent,
+    AgentServer,
+    AgentSession,
+    AutoSubscribe,
+    JobContext,
+    room_io,
+)
 from livekit.plugins import openai, silero
 
 import settings
 
 logger = logging.getLogger("eaf-voice")
 AGENT_NAME = "eaf-voice"
+# After the user leaves, the session waits this long for them to come back before it ends. A
+# user who hangs up and presses Talk again at once must find the same agent still in the room:
+# the control plane sends no second one to a room that has one, and the framework's own
+# close-on-disconnect would end the session under a rejoining user.
+LINGER_SECONDS = float(os.environ.get("VOICE_LINGER_SECONDS", "6"))
 
 # Two idle warm processes by default rather than one per CPU: each holds a Silero VAD, and a
 # session is one process, so this is a per-node concurrency knob, not a correctness one.
@@ -51,13 +64,24 @@ async def entrypoint(ctx: JobContext) -> None:
         turn_handling={"turn_detection": "vad", "interruption": {"mode": "vad"}},
     )
     # The Raven has its own persona and memory; the voice layer adds no instructions of its own.
-    await session.start(agent=Agent(instructions=""), room=ctx.room)
+    await session.start(
+        agent=Agent(instructions=""), room=ctx.room,
+        room_options=room_io.RoomOptions(close_on_disconnect=False),
+    )
 
-    def on_disconnect(participant):
-        if participant.identity == ctx.room.local_participant.identity:
-            return
-        logger.info("user left room %s; ending the session", ctx.room.name)
-        ctx.shutdown(reason="user left")
+    def user_present() -> bool:
+        return any(p.kind != rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
+                   for p in ctx.room.remote_participants.values())
+
+    async def leave_unless_user_returns() -> None:
+        await asyncio.sleep(LINGER_SECONDS)
+        if not user_present():
+            logger.info("user left room %s and did not return; ending the session", ctx.room.name)
+            ctx.shutdown(reason="user left")
+
+    def on_disconnect(participant: rtc.RemoteParticipant) -> None:
+        if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_AGENT and not user_present():
+            asyncio.ensure_future(leave_unless_user_returns())
 
     ctx.room.on("participant_disconnected", on_disconnect)
 
