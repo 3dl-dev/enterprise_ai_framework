@@ -12,6 +12,9 @@ from pathlib import Path
 
 import yaml
 
+from netpol_eval import (admitted_peers, dest_from_template, load_policies,
+                         selector_matches as _selects)
+
 K8S = Path(__file__).resolve().parent.parent / "deploy" / "k8s"
 
 
@@ -28,23 +31,6 @@ def _template_pod_labels() -> dict:
 def _policy(fname: str, name: str) -> dict:
     return next(d for d in yaml.safe_load_all((K8S / fname).read_text())
                 if d and d["kind"] == "NetworkPolicy" and d["metadata"]["name"] == name)
-
-
-def _selects(selector: dict, labels: dict) -> bool:
-    for k, v in (selector.get("matchLabels") or {}).items():
-        if labels.get(k) != v:
-            return False
-    for expr in selector.get("matchExpressions") or []:
-        have, op, vals = labels.get(expr["key"]), expr["operator"], expr.get("values") or []
-        if op == "In" and have not in vals:
-            return False
-        if op == "NotIn" and have in vals:
-            return False
-        if op == "Exists" and expr["key"] not in labels:
-            return False
-        if op == "DoesNotExist" and expr["key"] in labels:
-            return False
-    return True
 
 
 def test_a_raven_pod_is_selected_by_the_raven_policy_and_not_by_the_internet_granting_one():
@@ -70,16 +56,19 @@ def test_the_selector_evaluator_is_not_a_rubber_stamp():
 
 
 def test_the_console_port_the_template_publishes_is_admitted_from_the_control_plane_only():
+    """Evaluated (-d7b): for the port the template's Service publishes, the peers admitted to a
+    Raven pod are exactly the control-plane pod in the platform namespace, no external address,
+    whichever policy spells the rule."""
     tmpl = (K8S / "69-agent-raven.template.yaml").read_text()
     svc = next(d for d in yaml.safe_load_all(tmpl.replace("__USER__", "a").replace("__NAME__", "b"))
                if d and d["kind"] == "Service")
     port = svc["spec"]["ports"][0]["port"]
-    for fname, pname in (("66-agent-console-common.yaml", "agent-console-isolation"),
-                         ("68-raven-common.yaml", "raven-isolation")):
-        rules = _policy(fname, pname)["spec"]["ingress"]
-        admitted = [r for r in rules
-                    if any(p["port"] == port for p in r["ports"])]
-        assert admitted, f"{pname} does not admit :{port}"
-        for r in admitted:
-            assert r["from"] == [{"podSelector": {"matchLabels": {"app": "control-plane"}}}], (
-                f"{pname} admits :{port} from something other than the control-plane pod")
+    files = sorted(f for f in K8S.glob("*.yaml") if "kind: NetworkPolicy" in f.read_text())
+    policies = load_policies(files, {"__LAN_CIDR__": "192.168.0.0/16",
+                                     "__GATEWAY_LAN_IP__": "192.168.2.42"})
+    raven = dest_from_template(K8S / "69-agent-raven.template.yaml")
+    pods, ips = admitted_peers(policies, raven, port, "TCP", [("enterprise-ai", {"app": "control-plane"})])
+    assert pods, f"nothing may reach the console port :{port}"
+    assert ips == []
+    assert all(p.namespace == "enterprise-ai" and dict(p.labels).get("app") == "control-plane"
+               for p in pods), f":{port} admitted from something other than the control-plane pod"

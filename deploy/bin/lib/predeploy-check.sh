@@ -4,7 +4,7 @@
 # deploy.sh is about to overwrite enterprise-ai-secrets. Before it does, compare every value
 # it would write with what the LIVE cluster holds, and refuse if a value the operated
 # instance depends on would change or go empty. This exists because a watcher run wrote
-# PUBLIC_BASE_URL=https://ai.example.org over https://ai.3dl.one and rolled a control plane
+# PUBLIC_BASE_URL=<placeholder domain> over the operated instance's real public URL and rolled a control plane
 # with no freerouter, from values that lived nowhere in the script.
 #
 # Two live sources, because the secret alone is not the truth:

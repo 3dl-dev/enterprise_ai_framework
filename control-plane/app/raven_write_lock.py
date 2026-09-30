@@ -1,32 +1,34 @@
-"""Hosted-mode lock on Raven's WebUI provider and channel writes (item -250, Contract E).
+"""Hosted-mode lock on Raven's WebUI (items -250 and -7cd, Contract E).
 
 Raven's WebUI is JSON-RPC 2.0 over one websocket. It can edit providers and channels, which
 would make it a second console for settings the control plane owns. Raven v0.2.3 has no
-upstream lock (verified in -39e), so the console proxy refuses those write RPCs. The rules
-are DATA (`raven_write_lock.json`, or the file named by RAVEN_WRITE_LOCK_FILE), read on every
-frame (re-parsed when its text changes), so a mutation of the data is a mutation of the fence.
+upstream lock (verified in -39e), so the console proxy decides, frame by frame, what reaches
+the agent. The rules are DATA (`raven_write_lock.json`, or the file named by
+RAVEN_WRITE_LOCK_FILE), read on every frame (re-parsed when its text changes), so a mutation
+of the data is a mutation of the fence.
 
-Fail closed, three ways:
-  * a method inside a locked namespace (`model.`, `channels.`, `gateway.channels.`) that is
-    not on the read allow-list is refused, so a method a later Raven adds is refused too;
-  * the method name is normalised (NFKC, case-folded, whitespace and zero-width characters
-    removed) before matching, and the allow-list matches the RAW name only;
-  * a frame that is not JSON, is not an object or array of objects, a method that is not a
-    string, a batch containing any refused call, or an unreadable rules file: refused.
-`settings.set` is the generic writer behind `channels.<n>.enabled` and the `*.provider`
-pins, so it is refused by key (and by a provider key inside an object value).
+It is an ALLOW-LIST (-7cd). The first version was a deny-list and was bypassed twice: by a
+dual-use method (`config.set {key: "model"}` rewrites agents.defaults.provider/model) and by an
+alias (`settings.everosSet`, registered beside the denied `settings.everos_set`). So:
+  * a call passes only if its method is EXACTLY a name in `allow`, or EXACTLY a name in
+    `allow_when_key` whose `params.key` is EXACTLY one of that method's keys. Raven routes on
+    the exact string (a dict lookup in its Dispatcher, `==` in its handlers), so an exact match
+    here is the normalised meaning: every other spelling is either a different registered
+    method (and must be classified on its own) or not a method at all;
+  * everything else is refused: unknown methods, aliases, case/separator/zero-width variants;
+  * a frame that is not JSON, is not an object or a non-empty array of objects, a method that
+    is not a string, a batch containing any refused call, or an unreadable rules file: refused.
+Notifications (no id) are judged the same way; the id only shapes the error.
 
-This is a one-control-plane lock, not a sandbox: the agent's own tools can still edit its
-config inside its pod.
+This is a one-control-plane lock, not a sandbox: the agent's own tools (and the WebUI's shell)
+can still edit its config inside its pod.
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-import re
 import threading
-import unicodedata
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
@@ -39,28 +41,24 @@ _lock = threading.Lock()
 _cache: dict = {"key": None, "rules": None}
 
 
-def _norm(name: str) -> str:
-    """Case-fold and drop whitespace and format (zero-width) characters."""
-    s = unicodedata.normalize("NFKC", name)
-    return "".join(c for c in s if not c.isspace() and unicodedata.category(c) != "Cf").casefold()
-
-
 class _Rules:
     def __init__(self, raw: dict):
-        self.deny = {_norm(m) for m in raw["deny_methods"]}
-        self.namespaces = tuple(_norm(n) for n in raw["locked_namespaces"])
-        self.allow = frozenset(raw["allow_in_locked_namespaces"])
-        ss = raw["settings_set"]
-        self.settings_method = _norm(ss["method"])
-        self.key_patterns = [re.compile(p, re.I) for p in ss["deny_key_patterns"]]
-        self.value_key_patterns = [re.compile(p, re.I)
-                                   for p in ss["deny_when_value_object_has_key_matching"]]
+        allow = raw["allow"]
+        keyed = raw["allow_when_key"]
+        if not (isinstance(allow, list) and all(isinstance(m, str) for m in allow)):
+            raise ValueError("allow must be a list of method names")
+        if not (isinstance(keyed, dict) and all(
+                isinstance(v, list) and all(isinstance(k, str) for k in v)
+                for v in keyed.values())):
+            raise ValueError("allow_when_key must map method names to lists of keys")
+        self.allow = frozenset(allow)
+        self.keyed = {m: frozenset(v) for m, v in keyed.items()}
 
 
 def _rules() -> _Rules | None:
     path = Path(os.environ.get("RAVEN_WRITE_LOCK_FILE") or _DEFAULT_FILE)
     try:
-        # Re-read every frame (a ~1KB file) and re-parse only when the TEXT changed: keyed on
+        # Re-read every frame (a few KB) and re-parse only when the TEXT changed: keyed on
         # mtime, two edits inside one timestamp tick would leave the fence stale.
         text = path.read_text(encoding="utf-8")
         with _lock:
@@ -81,23 +79,16 @@ def _denied_call(call, rules: _Rules) -> bool:
     method = call.get("method")
     if not isinstance(method, str):
         return True
-    norm = _norm(method)
-    if norm in rules.deny:
+    if method in rules.allow:
+        return False
+    keys = rules.keyed.get(method)
+    if keys is None:
         return True
-    if any(norm.startswith(ns) for ns in rules.namespaces) and method not in rules.allow:
+    params = call.get("params")
+    if not isinstance(params, dict):
         return True
-    if norm == rules.settings_method:
-        params = call.get("params")
-        if not isinstance(params, dict) or not isinstance(params.get("key"), str):
-            return True
-        nkey = _norm(params["key"])
-        if any(p.search(nkey) for p in rules.key_patterns):
-            return True
-        value = params.get("value")
-        if isinstance(value, dict) and any(
-                p.search(_norm(str(k))) for k in value for p in rules.value_key_patterns):
-            return True
-    return False
+    key = params.get("key")
+    return not (isinstance(key, str) and key in keys)
 
 
 def _error(call) -> dict:
