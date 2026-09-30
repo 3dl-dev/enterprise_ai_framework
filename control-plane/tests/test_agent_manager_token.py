@@ -123,7 +123,7 @@ def postgres():
             pytest.fail("disposable postgres never became ready")
         yield f"postgresql://eai:eaitest@127.0.0.1:{port}/eai"
     finally:
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
 
 
 def sql(dsn: str, query: str, *args):
