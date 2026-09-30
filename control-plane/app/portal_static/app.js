@@ -686,6 +686,14 @@ function loadLivekit() {
   });
 }
 
+// Signalling goes through THIS origin (wss://<portal origin>/rtc, proxied behind the portal's
+// oauth2-proxy; Baron ruling 2026-09-30), never to a LAN address: an https page cannot open ws://
+// (mixed content), and the mic needs a secure context. The client appends /rtc itself. Media
+// still flows over the LAN NodePorts named in the ICE candidates.
+function rtcSignalUrl() {
+  return `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/`;
+}
+
 async function startVoice(name) {
   VOICE.state = "connecting"; VOICE.agent = name; syncVoiceButtons();
   try {
@@ -700,7 +708,7 @@ async function startVoice(name) {
       $("voice-audio").appendChild(el);
     });
     room.on(LK.RoomEvent.Disconnected, () => endVoice(false));
-    await room.connect(data.url, data.token);
+    await room.connect(rtcSignalUrl(), data.token);
     await room.localParticipant.setMicrophoneEnabled(true);
     VOICE.room = room; VOICE.state = "live"; VOICE.voice = data.voice;
     toast(`Listening. Speak to ${name} (voice: ${data.voice}).`);

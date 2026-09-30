@@ -1,5 +1,7 @@
-# External vantage point for the LiveKit exposure ruling (gate cfa, items 7f6/4d2):
-# LiveKit signalling/media must NOT be reachable from the public edge. GitHub-hosted runners
+# External vantage point for the LiveKit exposure rulings (gate cfa, items 7f6/4d2/82e):
+# LiveKit MEDIA and every LiveKit port must NOT be reachable from the public edge, and the ONE
+# public piece, /rtc signalling (BARON RULING 2026-09-30), must demand authentication (302 to
+# oauth2-proxy sign-in, or 401/403) with no session: never absent, never reaching LiveKit. GitHub-hosted runners
 # sit outside the LAN/VPN. BARON RULING 2026-09-30: ai.3dl.one is not guaranteed LAN-only, and
 # public DNS answers a private IP for it, so probing the NAME alone is trivially true. This
 # job also probes the site's real WAN IP (Actions variable EDGE_WAN_IP, or the dispatch input;
