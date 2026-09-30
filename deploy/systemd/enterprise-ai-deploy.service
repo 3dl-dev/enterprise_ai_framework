@@ -7,6 +7,10 @@ Documentation=https://github.com/3dl-dev/enterprise_ai_framework
 [Service]
 Type=oneshot
 WorkingDirectory=%h/projects/enterprise_ai_framework
+# A systemd user manager hands services a bare PATH. The suite the watcher gates on needs
+# opencode (~/.local/bin) and go (/usr/local/go/bin); without them 9 tests ERROR and 4 SKIP,
+# and a skip is a failure. Pinned by tests/test_deploy_unit_environment.py.
+Environment=PATH=%h/.local/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=%h/projects/enterprise_ai_framework/deploy/bin/watch-and-deploy.sh
 # The suite plus a deploy is a long pass; a stuck one must not wedge the timer forever.
 TimeoutStartSec=45min

@@ -979,5 +979,12 @@ def test_losing_contact_retracts_the_booting_claim(page):
     """
     _make_project(page, "doomed project")
     page.wait_for_selector("#booting", state="visible", timeout=PAGE_TIMEOUT)
+    # Contact must actually be gone before the bar is revealed. Every SUCCESSFUL pulse poll
+    # (1 s cadence) re-hides #bar-lost, so revealing it against a live pulse races that
+    # poll against the 500 ms ticker and lost under load (watcher run 2026-09-29: #booting
+    # stayed up 15 s). Polls are sequential, so once one has FAILED no success is in
+    # flight, and a failure never hides the bar; the reveal below then holds.
+    page.route("**/api/pulse", lambda route: route.abort())
+    page.wait_for_event("requestfailed", timeout=PAGE_TIMEOUT)
     page.eval_on_selector("#bar-lost", "el => el.hidden = false")
     page.wait_for_selector("#booting", state="hidden", timeout=PAGE_TIMEOUT)
