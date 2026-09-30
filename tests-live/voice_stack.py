@@ -22,6 +22,7 @@ the shipped manifests:
     the shared gateway's label, and using that label would put our pod behind the shared Service).
 """
 import json
+import os
 import re
 import subprocess
 import time
@@ -36,7 +37,14 @@ NODE_IP = "192.168.2.44"
 NODEPORTS = (31780, 31781, 31782)  # signal, rtc tcp, rtc udp; 72-livekit.yaml uses 3078x
 MASTER_KEY = "sk-82e-master-throwaway"
 PG_URL = "postgresql://eaf:pg82e-not-a-secret@postgres-82e:5432"
-RAVEN_MODEL = "deepseek-v4-flash@deepinfra"
+# The Raven's model. If the shared gateway catalogue carries it, it is bridged there; otherwise (the
+# shared gateway is fake-upstream only since the Forge -> freerouter move) it is served through the
+# in-cluster freerouter with the operator tenant key read by the pod from the shared secret
+# (never through this process), so the Raven really answers and the spend lands in the THROWAWAY
+# gateway's ledger on the Raven's alias. A local llama.cpp Qwen was tried and rejected: its
+# /v1/responses cannot take the multi-turn history a Raven sends ("Cannot determine type of 'item'").
+RAVEN_MODEL = os.environ.get("VOICE_LIVE_RAVEN_MODEL", "deepseek-v4-flash@deepinfra")
+UPSTREAM_BASE = os.environ.get("VOICE_LIVE_UPSTREAM_BASE", "http://freerouter:8080/v1")
 USER = "baron"  # a principal the real IdP knows, so the control plane can mint the Raven's key
 
 
@@ -57,8 +65,16 @@ def gateway_config() -> dict:
     head = cfg.index("model_list:") + len("model_list:\n")
     cfg = cfg[:head] + block + cfg[head:]
     old = f"model: openai/{RAVEN_MODEL}"
-    assert cfg.count(old) == 1, f"{RAVEN_MODEL} is not (once) in the shared catalogue"
-    cfg = cfg.replace(old, f"model: hosted_vllm/{RAVEN_MODEL}")
+    if cfg.count(old) == 1:
+        cfg = cfg.replace(old, f"model: hosted_vllm/{RAVEN_MODEL}")
+    else:
+        assert f"model_name: {RAVEN_MODEL}\n" not in cfg, f"{RAVEN_MODEL} is in the catalogue in an unexpected shape"
+        head = cfg.index("model_list:") + len("model_list:\n")
+        cfg = cfg[:head] + (
+            f"  - model_name: {RAVEN_MODEL}\n    litellm_params:\n"
+            f"      model: hosted_vllm/{RAVEN_MODEL}\n      api_base: {UPSTREAM_BASE}\n"
+            "      api_key: os.environ/FREEROUTER_MASTER_KEY\n"
+            "      input_cost_per_token: 0.0000003\n      output_cost_per_token: 0.0000015\n\n") + cfg[head:]
     cm["data"]["config.yaml"] = cfg
     return {"apiVersion": "v1", "kind": "ConfigMap",
             "metadata": {"name": "gateway-config-82e", "namespace": NS}, "data": cm["data"]}
@@ -184,8 +200,10 @@ spec:
               valueFrom: {{secretKeyRef: {{name: live82e-secrets, key: LITELLM_SALT_KEY}}}}
             - {{name: DATABASE_URL, value: "{PG_URL}/litellm"}}
             - {{name: REDIS_URL, value: "redis://valkey-82e:6379"}}
+            - name: FREEROUTER_MASTER_KEY
+              valueFrom: {{secretKeyRef: {{name: enterprise-ai-secrets, key: FREEROUTER_MASTER_KEY, optional: true}}}}
             - name: FORGE_API_KEY
-              valueFrom: {{secretKeyRef: {{name: enterprise-ai-secrets, key: FORGE_API_KEY}}}}
+              valueFrom: {{secretKeyRef: {{name: enterprise-ai-secrets, key: FORGE_API_KEY, optional: true}}}}
           ports: [{{containerPort: 4000}}]
           readinessProbe:
             httpGet: {{path: /health/liveliness, port: 4000}}
@@ -222,6 +240,7 @@ spec:
     # throwaway Service from selecting anything else.
     metadata: {{labels: {{app: livekit, run: livekit-82e}}}}
     spec:
+      enableServiceLinks: false  # as 72-livekit.yaml: a `livekit` Service would inject LIVEKIT_PORT
       nodeSelector: {{kubernetes.io/hostname: {NODE}}}
       automountServiceAccountToken: false
       containers:

@@ -236,6 +236,8 @@ with sync_playwright() as p:
         f"--use-file-for-fake-audio-capture={mic}%noloop", "--autoplay-policy=no-user-gesture-required"])
     ctx = b.new_context(extra_http_headers={"X-Auth-Request-Preferred-Username": user}, permissions=["microphone"])
     page = ctx.new_page()
+    rep["ws"] = []
+    page.on("websocket", lambda w: rep["ws"].append(w.url))
     page.goto(portal + "/portal/", wait_until="load")
     page.click("#tab-agents")
     talk = page.locator(f'button[data-voice-talk="{agent}"]')
@@ -299,6 +301,11 @@ def test_a_user_says_a_sentence_and_hears_the_raven_answer_in_its_registered_voi
     assert "error" not in page, page
     assert page["button_before"] == "Talk" and page["button_live"] == "Hang up" and page["button_after"] == "Talk"
     assert page["voice_id"] == "kokoro-michael"
+    # SIGNALLING went through the portal origin's /rtc (Baron ruling 2026-09-30), read off the
+    # browser's own websocket list, never to a LiveKit address or NodePort
+    portal_ws = f"ws://localhost:{PORTS['cp']}/rtc"
+    assert page["ws"] and all(u.startswith(portal_ws) for u in page["ws"]), page["ws"]
+    assert not any(str(port) in u for u in page["ws"] for port in (7880, *vs.NODEPORTS)), page["ws"]
     got = heard(tmp_path / "male.webm")
     assert "paris" in got["text"].lower(), f"the Raven's answer did not come back as speech: {got}"
     assert got["f0"] and got["nearest"] == "am_michael" and abs(got["f0"] - got["refs"]["am_michael"]) < 12, got

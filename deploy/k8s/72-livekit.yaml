@@ -58,6 +58,11 @@ spec:
     metadata:
       labels: { app: livekit, app.kubernetes.io/component: livekit }
     spec:
+      # A Service named `livekit` makes kubelet inject LIVEKIT_PORT=tcp://<ip>:7880 into every pod in
+      # the namespace, and livekit-server reads LIVEKIT_PORT as the value of its --port flag and
+      # dies parsing it ("could not parse tcp://... as uint"): CrashLoopBackOff observed on the
+      # deployed cluster. The server reads config from its own body, not from service links.
+      enableServiceLinks: false
       automountServiceAccountToken: false
       containers:
         - name: livekit
