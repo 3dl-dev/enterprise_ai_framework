@@ -110,6 +110,19 @@ class _Conn:
     async def fetchrow(self, *a, **k):
         return None
 
+    def transaction(self):
+        # agent_manager_token.issue mints inside a transaction (Contract F). Nothing is
+        # stored here, so the transaction is only the context-manager shape.
+        return _Tx()
+
+
+class _Tx:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
 
 class _Acquire:
     async def __aenter__(self):
@@ -640,7 +653,14 @@ def test_creating_a_raven_agent_renders_the_hosted_host_agent_pod(cluster):
     assert overlay["agents"]["defaults"]["model"] == agents.DEFAULT_MODEL
 
     secret = cluster.get("secrets", "agent-alice-rv-key")
-    assert set(secret["data"]) == {"OPENAI_API_KEY", "RAVEN_SERVE_TOKEN"}
+    assert set(secret["data"]) == {"OPENAI_API_KEY", "RAVEN_SERVE_TOKEN",
+                                   "EAF_AGENT_MANAGER_TOKEN"}
+    # Contract F: the agent-manager token reaches the Raven container as a secretKeyRef
+    # env and nowhere else — never the ConfigMap (asserted above: no TOKEN key there).
+    assert (env["EAF_AGENT_MANAGER_TOKEN"]["valueFrom"]["secretKeyRef"]
+            == {"name": "agent-alice-rv-key", "key": "EAF_AGENT_MANAGER_TOKEN"})
+    assert base64.b64decode(secret["data"]["EAF_AGENT_MANAGER_TOKEN"]).decode().startswith(
+        "eafam_")
     assert base64.b64decode(secret["data"]["OPENAI_API_KEY"]).decode() == "sk-fake-alice-agents/rv"
     assert len(base64.b64decode(secret["data"]["RAVEN_SERVE_TOKEN"])) >= 32
     assert ISSUED == [("alice", "agents/rv", "alice")], "minted for the caller, as themselves"
