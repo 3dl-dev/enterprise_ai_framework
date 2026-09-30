@@ -7,7 +7,7 @@ one-command uninstall.
 ```bash
 op signin                                   # credentials come from 1Password via direnv
 direnv reload
-export PUBLIC_BASE_URL=https://ai.example.org
+# operated-instance values go in the deploy-only overlay, NOT the shell (see below)
 deploy/bin/deploy.sh
 deploy/bin/post-deploy.sh                   # realm redirect URIs, bootstrap user, key sync
 ```
@@ -17,6 +17,35 @@ verified end to end.
 
 Everything lives in the `enterprise-ai` namespace. `kubectl delete namespace enterprise-ai`
 is a complete uninstall.
+
+## Where deploy values come from: bundle/.env plus the operated overlay
+
+`deploy.sh` (and the `watch-and-deploy.sh` watcher) read exactly two files and never the caller's
+environment (`deploy.sh` re-execs itself under `env -i`):
+
+| File | Holds | Also read by |
+|---|---|---|
+| `bundle/.env` | shared secrets | the local compose test stack |
+| `~/.config/enterprise-ai/operated.env` (override: `DEPLOY_OVERLAY_FILE`) | operated-instance values: `PUBLIC_BASE_URL`, `GATEWAY_PROVIDER`, `IDP_REALM`, anything else that identifies the live instance | nothing; deploy-only |
+
+The overlay is sourced last, so it wins. Example contents:
+
+```
+PUBLIC_BASE_URL=https://ai.example.org
+GATEWAY_PROVIDER=freerouter
+```
+
+Why a separate file outside the repo: putting `PUBLIC_BASE_URL` and `GATEWAY_PROVIDER=freerouter`
+in `bundle/.env` made the local test control plane mint keys on freerouter and every key-issuance
+test returned 500. The overlay sits outside the repo, so compose (`--env-file bundle/.env`), the
+`bundle/bin` scripts, `git clean` and the watcher's `git checkout` never see it.
+`tests/test_deploy_instance_safety.py` pins that nothing under `bundle/` or the `Makefile` names it.
+
+Fail closed: `deploy.sh` and the watcher refuse if the overlay is missing or does not itself
+declare `PUBLIC_BASE_URL` and `GATEWAY_PROVIDER` (values in `bundle/.env` do not count). The watcher
+also refuses a non-https or placeholder URL, and the pre-deploy check still compares every operated
+value with the live cluster (`DEPLOY_CHECK_ONLY=1 deploy/bin/deploy.sh` runs it and mutates nothing;
+`ALLOW_OPERATED_CHANGE=KEY[,KEY]` overrides a deliberate change).
 
 ## Exposure
 
