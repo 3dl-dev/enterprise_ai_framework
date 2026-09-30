@@ -55,9 +55,6 @@ spec:
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: GATEWAY_DATABASE_URL } }
             - name: REDIS_URL
               value: redis://valkey:6379
-            # Forge agent key: runtime inference only, can spend but not mint keys.
-            - name: FORGE_API_KEY
-              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: FORGE_API_KEY } }
           ports: [{ containerPort: 4000 }]
           volumeMounts:
             - { name: config, mountPath: /app/config.yaml, subPath: config.yaml, readOnly: true }

@@ -17,13 +17,12 @@
 # in a real session, and a watcher that gets them wrong deploys on a false green, which is
 # strictly worse than not deploying at all:
 #
-#   * THE CATALOGUE HAS TWO MODES AND ONE FILE (enterpriseaiframework-7bb). The hermetic suite
-#     needs a fakes-only bundle/litellm/config.generated.yaml; production needs the real Forge
-#     catalogue. FORGE_API_KEY is ambient in the operator shell, so any unguarded render
-#     writes the real one, and every later hermetic run then fails EVERY chat turn with
-#     "illegal_model_request: fake-large" — after burning a 180s timeout each, turning a 6
-#     minute suite into 19. So: render fakes, test, render real, deploy. Verified both times,
-#     not assumed.
+#   * THE GATEWAY CATALOGUE IS FAKES-ONLY, ALWAYS (7bb, e7f). Forge is retired; the real model
+#     catalogue is freerouter's and is not rendered into the LiteLLM config. The render uses
+#     --no-upstream, which reads no FORGE_* value, so the file the suite tests is the file
+#     production deploys (7bb: a real 148-model catalogue made every hermetic chat turn fail
+#     on "illegal_model_request: fake-large" after a 180s timeout each). Before deploying,
+#     the guard asks LIVE freerouter for its catalogue and refuses a stub-only one.
 #   * THE SURFACE GOES STALE (enterpriseaiframework-af5). `make up` does not restart chat when
 #     only librechat.yaml changed, because LibreChat parses it once at startup. The suite then
 #     tests a pre-checkout config — which can go green over a broken change just as easily as
@@ -86,7 +85,7 @@ git merge --ff-only --quiet "$SHA"
 
 # --- 3. hermetic suite, on a catalogue we VERIFY is fakes-only --------------------------
 say "rendering fakes-only catalogue"
-env -u FORGE_API_KEY -u FORGE_ADMIN_KEY bundle/bin/render-gateway-config.py >>"$LOG" 2>&1
+bundle/bin/render-gateway-config.py --no-upstream >>"$LOG" 2>&1
 entries=$(grep -c 'model_name:' bundle/litellm/config.generated.yaml || echo 0)
 grep -q 'model_name: fake-large' bundle/litellm/config.generated.yaml \
     || give_up "the rendered catalogue has no fake-large (${entries} entries); every chat-turn test would fail on illegal_model_request after a 180s timeout each"
@@ -106,11 +105,12 @@ fi
 say "suite GREEN on ${SHA:0:9}"
 
 # --- 4. deploy, on the REAL catalogue ---------------------------------------------------
-say "rendering the production catalogue"
-bundle/bin/render-gateway-config.py >>"$LOG" 2>&1
-real_entries=$(grep -c 'model_name:' bundle/litellm/config.generated.yaml || echo 0)
-(( real_entries > 10 )) || give_up "the production render produced only ${real_entries} models; deploying that would replace the real catalogue with fakes"
-say "production catalogue: ${real_entries} models"
+# Forge is retired: production inference is freerouter's catalogue, and the gateway ships the
+# fakes-only render already on disk. The guard asks the live freerouter, so a deploy cannot
+# proceed into a cluster whose router has lost its providers.
+say "checking the production freerouter catalogue"
+fr_out=$(deploy/bin/check-freerouter-catalogue.sh 2>&1) || { say "$fr_out"; give_up "production freerouter does not serve a real catalogue; deploying would leave users on stubs"; }
+say "production catalogue: $fr_out"
 
 say "deploying"
 if ! PUBLIC_BASE_URL="$PUBLIC_BASE_URL" deploy/bin/deploy.sh >>"$LOG" 2>&1; then
@@ -122,7 +122,3 @@ fi
 # deploy.sh ends in smoke.sh, so reaching here means the cluster served a prompt.
 printf '%s\n' "$SHA" > "$STATE"
 say "=== deployed ${SHA:0:9} and it serves prompts ==="
-
-# Leave the checkout in the mode a human or a dispatch wave expects to find it.
-env -u FORGE_API_KEY -u FORGE_ADMIN_KEY bundle/bin/render-gateway-config.py >>"$LOG" 2>&1
-say "restored fakes-only catalogue for local work"

@@ -45,14 +45,12 @@ if [[ "$PUBLIC_BASE_URL" != https://* ]]; then
     echo "         but nobody will be able to log in: the OIDC client refuses plaintext." >&2
 fi
 
-# Same rule the catalogue generator enforces: never ship a model we cannot authenticate
-# to. Without this the gateway advertises every Forge model and returns 500 on each one,
-# which surfaces at request time instead of deploy time.
-if grep -q 'forge' bundle/litellm/config.generated.yaml 2>/dev/null && [[ -z "${FORGE_API_KEY:-}" ]]; then
-    echo "error: the generated catalogue contains Forge models but FORGE_API_KEY is empty." >&2
-    echo "       Deploying would advertise models that 500 on every request." >&2
-    echo "       Run 'op signin' then 'direnv reload', or regenerate a fakes-only" >&2
-    echo "       catalogue with: bundle/bin/render-gateway-config.py" >&2
+# The gateway catalogue must carry no upstream that needs a credential this script does not
+# hold: Forge is retired and real inference is served by freerouter. Refuse anything else,
+# rather than advertise models that 500 on every request.
+if grep -q 'os.environ/FORGE_' bundle/litellm/config.generated.yaml 2>/dev/null; then
+    echo "error: the generated gateway catalogue has entries authenticating with FORGE_* (Forge is retired)." >&2
+    echo "       Regenerate it with: bundle/bin/render-gateway-config.py --no-upstream" >&2
     exit 1
 fi
 
@@ -91,7 +89,6 @@ kubectl -n "$NS" create secret generic enterprise-ai-secrets \
     --from-literal=CHAT_VIRTUAL_KEY="${CHAT_VIRTUAL_KEY:-}" \
     --from-literal=PUBLIC_BASE_URL="$PUBLIC_BASE_URL" \
     --from-literal=OPENID_ISSUER="${PUBLIC_BASE_URL}/realms/${IDP_REALM:-enterprise-ai}" \
-    --from-literal=FORGE_API_KEY="${FORGE_API_KEY:-}" \
     --from-literal=CODEAPI_JWT_PRIVATE_KEY="$CODEAPI_JWT_PRIVATE_KEY" \
     --from-literal=CODEAPI_JWT_PUBLIC_KEY="$CODEAPI_JWT_PUBLIC_KEY" \
     --from-literal=CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY="$CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY" \

@@ -40,11 +40,11 @@ def test_the_watcher_exists_and_runs():
 
 
 def test_it_tests_on_fakes_and_deploys_on_the_real_catalogue_in_that_order():
-    """Render fakes -> test -> render real -> deploy. Any other order deploys a lie."""
+    """Render fakes -> test -> check freerouter catalogue -> deploy. Any other order deploys a lie."""
     b = body()
     fakes = b.index("rendering fakes-only catalogue")
     tested = b.index("running the full suite")
-    real = b.index("rendering the production catalogue")
+    real = b.index("checking the production freerouter catalogue")
     deployed = b.rindex("deploy/bin/deploy.sh")
     assert fakes < tested < real < deployed, (
         "the watcher's render/test/render/deploy order is wrong. Testing against the real "
@@ -69,7 +69,7 @@ def test_it_verifies_the_fakes_catalogue_rather_than_trusting_the_render():
 
 def test_it_refuses_to_deploy_a_fakes_only_catalogue_to_production():
     b = body()
-    assert re.search(r"real_entries.*>\s*10", b) or re.search(r"\(\(\s*real_entries\s*>", b), (
+    assert "deploy/bin/check-freerouter-catalogue.sh" in b, (
         "nothing stops the watcher deploying a fakes-only catalogue to the cluster, which "
         "would replace the real models with stubs for every user"
     )
@@ -114,5 +114,5 @@ def test_it_records_what_it_deployed():
 def test_a_red_suite_does_not_deploy():
     b = body()
     red = b.index("SUITE RED")
-    nxt = b.index("rendering the production catalogue")
+    nxt = b.index("checking the production freerouter catalogue")
     assert "exit 1" in b[red:nxt], "a red suite does not stop the watcher reaching the deploy"
