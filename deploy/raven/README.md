@@ -28,8 +28,10 @@ With manager power on, the pod also gets `EAF_AGENT_MANAGER_TOKEN` (Secret) and
 tool (`eaf_agents_mcp.py`: `list_agents`, `create_agent`, `send_to_agent`). It reaches the
 owner's agents only through the control plane: the agent-manager API and the agent relay
 (agents-raven.md, Contracts F/G). The token is read from the container env at call time and
-never written into `config.json`. Raven asks the owner to approve each call (its default for an
-MCP tool).
+never written into `config.json`. The two tools that only read or relay (`list_agents`,
+`send_to_agent`) are pre-approved in hosted mode, so voice and unattended use do not block on
+the owner; `create_agent` stays at Raven's `ask` tier. `hosted_seed.py` pins these under
+`permissions.tools` (`mcp_eaf-agents_<tool>`) on every boot; an owner's own `deny` survives.
 
 Proof: `tests/test_raven_hosted_config.py` (hermetic) and `tests-live/test_raven_hosted.py`
 (starts the real image on k3s, throwaway `--39e` resources).
