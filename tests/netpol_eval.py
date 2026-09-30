@@ -21,6 +21,10 @@ Rules implemented (k8s NetworkPolicy v1):
     policy has an `egress` key). Rules of all applying policies are unioned. A STRING (named)
     port in an egress rule cannot be resolved against the peer, so it is treated as admitting
     (worst case) unless `named_ports` says otherwise.
+  * IPv6: `0.0.0.0/0` covers no IPv6 address (only `::/0`, `2000::/3`... do), except that an
+    IPv4-mapped address is also tested as its embedded IPv4. build_universe seeds public, ULA,
+    link-local, loopback, multicast and IPv4-mapped IPv6 addresses plus each ipBlock's endpoints.
+    Callers iterate PROTOCOLS (TCP, UDP, SCTP), never TCP alone.
   * port entry: protocol defaults TCP; `port` omitted => every port of that protocol;
     `port` int with optional endPort => range; `port` string => named container port.
 """
@@ -31,6 +35,25 @@ from dataclasses import dataclass, field
 import yaml
 
 OTHER = "__someone-else__"
+
+# NetworkPolicy ports carry a protocol; a fence asserted on TCP alone says nothing about SCTP/UDP.
+PROTOCOLS = ("TCP", "UDP", "SCTP")
+
+# IPv6 (and v4-mapped) peers every universe contains, whatever the policies name (-1ed): an
+# ipBlock `0.0.0.0/0` does not cover any of these, `::/0` or `2000::/3` covers the public one.
+IPV6_SEEDS = (
+    "2001:4860:4860::8888",   # public global unicast (2000::/3)
+    "2606:4700:4700::1111",   # public global unicast, second /16
+    "fd00::1",                # ULA fc00::/7
+    "fdaa:1234::5",           # ULA, non-fd00 /16
+    "fe80::1",                # link-local fe80::/10
+    "::1",                    # loopback
+    "::",                     # unspecified
+    "ff02::1",                # multicast
+    "::ffff:8.8.8.8",         # IPv4-mapped ::ffff:0:0/96, public embedded v4
+    "::ffff:10.0.0.1",        # IPv4-mapped, private embedded v4
+    "::ffff:100.100.100.100",  # IPv4-mapped, tailnet embedded v4
+)
 
 
 @dataclass(frozen=True)
@@ -159,12 +182,13 @@ def build_universe(policies, dest_namespace, direction="ingress", seeds=()):
             for extra in ns_variants:
                 pods.append((Pod(n, tuple(sorted(pl.items()))), {NSNAME: n, **extra}))
     ips = {"8.8.8.8", "10.42.0.99", "10.43.0.1", "127.0.0.1", "192.168.1.1", "172.20.0.1",
-           "169.254.169.254", "100.100.100.100"}
+           "169.254.169.254", "100.100.100.100", *IPV6_SEEDS}
     for b in blocks:
         for c in [b["cidr"], *(b.get("except") or [])]:
             net = ipaddress.ip_network(c)
-            if net.version == 4:
-                ips.update({str(net.network_address), str(net.broadcast_address)})
+            ips.update({str(net.network_address), str(net[-1]), str(net[net.num_addresses // 2])})
+            if net.version == 6 and net.num_addresses > 2:
+                ips.add(str(net[1]))
     return pods, sorted(ips)
 
 
@@ -192,9 +216,18 @@ def _peer_admits(peer, policy_ns, src, src_ns_labels) -> bool:
         if not b:
             return False
         a = ipaddress.ip_address(src.addr)
-        if a not in ipaddress.ip_network(b["cidr"]):
-            return False
-        return not any(a in ipaddress.ip_network(x) for x in b.get("except") or [])
+        # A v4-mapped address is matched as BOTH its v6 form and its embedded v4 (Go's
+        # net.IPNet.Contains, which CNIs build on, folds ::ffff:a.b.c.d to a.b.c.d): worst case.
+        views = [a]
+        if a.version == 6 and a.ipv4_mapped is not None:
+            views.append(a.ipv4_mapped)
+
+        def hit(cidr, v):
+            net = ipaddress.ip_network(cidr)
+            return net.version == v.version and v in net
+
+        return any(hit(b["cidr"], v) and not any(hit(x, v) for x in b.get("except") or [])
+                   for v in views)
     if peer.get("ipBlock"):
         return False
     ps, ns = peer.get("podSelector"), peer.get("namespaceSelector")

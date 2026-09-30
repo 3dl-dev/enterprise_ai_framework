@@ -174,16 +174,71 @@ def test_agent_isolation_stops_selecting_raven_and_raven_isolation_has_no_intern
     assert raven_egress_violations(policies) == []
 
 
-def test_raven_webui_ingress_admits_the_control_plane_only():
-    from netpol_eval import admitted_peers, dest_from_template
+def webui_violations(policies) -> list:
+    """Empty iff the raven web-UI port admits exactly the control-plane pod over TCP, nobody but
+    it over UDP and SCTP, no external address (IPv4/IPv6) over any protocol, and an unlisted
+    port admits nobody on any protocol (-1ed: every protocol, not TCP alone)."""
+    from netpol_eval import PROTOCOLS, admitted_peers, dest_from_template
     raven = dest_from_template(K8S / "69-agent-raven.template.yaml")
     cp = [("enterprise-ai", {"app": "control-plane"})]
-    policies = _shipped_netpols()
-    pods, ips = admitted_peers(policies, raven, 18793, "TCP", cp)
-    assert pods and ips == []
-    assert all(p.namespace == "enterprise-ai" and dict(p.labels).get("app") == "control-plane"
-               for p in pods)
-    assert admitted_peers(policies, raven, 9999, "TCP", cp) == ([], [])
+    bad = []
+    for proto in PROTOCOLS:
+        pods, ips = admitted_peers(policies, raven, 18793, proto, cp)
+        others = [p for p in pods if not (p.namespace == "enterprise-ai"
+                                          and dict(p.labels).get("app") == "control-plane")]
+        if others or ips or (proto == "TCP" and not pods):
+            bad.append((proto, 18793, others[:2], ips[:2]))
+        if admitted_peers(policies, raven, 9999, proto, cp) != ([], []):
+            bad.append((proto, 9999))
+    return bad
+
+
+def test_raven_webui_ingress_admits_the_control_plane_only():
+    assert webui_violations(_shipped_netpols()) == []
+
+
+def _webui_mutated(tmp_path, edit):
+    import copy
+    import yaml as _y
+    from netpol_eval import load_policies
+    docs = copy.deepcopy(_shipped_netpols())
+    edit(docs)
+    f = tmp_path / "p.yaml"
+    f.write_text(_y.safe_dump_all(docs))
+    return load_policies([f])
+
+
+def _raven_ingress(docs):
+    return next(d for d in docs if d["metadata"]["name"] == "raven-isolation")["spec"]["ingress"]
+
+
+WEBUI_DRIFTS = {
+    "SCTP 18793 from every namespace": lambda d: _raven_ingress(d).append(
+        {"from": [{"namespaceSelector": {}}], "ports": [{"protocol": "SCTP", "port": 18793}]}),
+    "UDP 18793 from every namespace": lambda d: _raven_ingress(d).append(
+        {"from": [{"namespaceSelector": {}}], "ports": [{"protocol": "UDP", "port": 18793}]}),
+    "SCTP any port from podSelector {}": lambda d: _raven_ingress(d).append(
+        {"from": [{"podSelector": {}}], "ports": [{"protocol": "SCTP"}]}),
+    "TCP 18793 from ipBlock ::/0": lambda d: _raven_ingress(d).append(
+        {"from": [{"ipBlock": {"cidr": "::/0"}}], "ports": [{"port": 18793}]}),
+    "SCTP 18793 from ipBlock 2000::/3": lambda d: _raven_ingress(d).append(
+        {"from": [{"ipBlock": {"cidr": "2000::/3"}}], "ports": [{"protocol": "SCTP", "port": 18793}]}),
+    "TCP 18793 from ipBlock v4-mapped ::ffff:0:0/96": lambda d: _raven_ingress(d).append(
+        {"from": [{"ipBlock": {"cidr": "::ffff:0:0/96"}}], "ports": [{"port": 18793}]}),
+    "TCP 18793 from ipBlock 0.0.0.0/0": lambda d: _raven_ingress(d).append(
+        {"from": [{"ipBlock": {"cidr": "0.0.0.0/0"}}], "ports": [{"port": 18793}]}),
+    "TCP 18793 from every namespace": lambda d: _raven_ingress(d).append(
+        {"from": [{"namespaceSelector": {}}], "ports": [{"port": 18793}]}),
+    "ports of the cp rule emptied, peer widened": lambda d: _raven_ingress(d)[0].update(
+        {"ports": [], "from": [{"namespaceSelector": {}}]}),
+    "control plane relabelled (remove direction)": lambda d: _raven_ingress(d)[0]["from"][0][
+        "podSelector"]["matchLabels"].__setitem__("app", "control-plane-v2"),
+}
+
+
+@pytest.mark.parametrize("drift", sorted(WEBUI_DRIFTS))
+def test_every_drift_of_the_raven_webui_fence_is_caught(tmp_path, drift):
+    assert webui_violations(_webui_mutated(tmp_path, WEBUI_DRIFTS[drift])), drift
 
 
 def test_console_policy_admits_the_raven_webui_port():

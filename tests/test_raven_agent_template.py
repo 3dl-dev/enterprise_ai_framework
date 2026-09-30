@@ -67,8 +67,12 @@ def test_the_console_port_the_template_publishes_is_admitted_from_the_control_pl
     policies = load_policies(files, {"__LAN_CIDR__": "192.168.0.0/16",
                                      "__GATEWAY_LAN_IP__": "192.168.2.42"})
     raven = dest_from_template(K8S / "69-agent-raven.template.yaml")
-    pods, ips = admitted_peers(policies, raven, port, "TCP", [("enterprise-ai", {"app": "control-plane"})])
-    assert pods, f"nothing may reach the console port :{port}"
-    assert ips == []
-    assert all(p.namespace == "enterprise-ai" and dict(p.labels).get("app") == "control-plane"
-               for p in pods), f":{port} admitted from something other than the control-plane pod"
+    from netpol_eval import PROTOCOLS
+    for proto in PROTOCOLS:
+        pods, ips = admitted_peers(policies, raven, port, proto,
+                                   [("enterprise-ai", {"app": "control-plane"})])
+        if proto == "TCP":
+            assert pods, f"nothing may reach the console port :{port}"
+        assert ips == [], (proto, ips)
+        assert all(p.namespace == "enterprise-ai" and dict(p.labels).get("app") == "control-plane"
+                   for p in pods), f":{port}/{proto} admitted from something other than the control-plane pod"
