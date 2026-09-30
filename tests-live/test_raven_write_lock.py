@@ -25,7 +25,7 @@ branch image (label app=control-plane so the agent's ingress policy admits it, n
 probe so the shared Service never routes to it); the rules file is edited in that pod (and
 restored), which is why it must be a throwaway. The agent is owned by a synthetic user.
 """
-import hashlib
+import base64
 import json
 import os
 import subprocess
@@ -75,11 +75,15 @@ def _config() -> str:
     return _kubectl("exec", f"deploy/{OBJ}", "--", "cat", CONFIG)
 
 
-# Every settings-like file Raven keeps, hashed: config.json, everos.toml, the env mirror,
-# the sub-agent/plugin state. Logs, sessions, memory and caches churn on their own.
+# Every settings-like file Raven keeps, hashed: config.json, the env mirror, the sub-agent
+# roster and plugin state. Excluded are the files Raven's own background work rewrites with no
+# frame sent (observed on the first live run): EverOS's store (*/everos/*), the start-up
+# sub-agent capability probe (subagent_acp_capabilities.json, subagent_sessions/), plus logs,
+# sessions, caches and the workspace.
 _STATE = ("cd /data/.raven && find . -type f \\( -name '*.json' -o -name '*.toml' -o -name "
           "'env' -o -name '*.env' -o -name '*.yaml' \\) -not -path './sessions/*' -not -path "
-          "'./logs/*' -not -path './everos/*' -not -path '*/cache/*' -not -path './workspace/*' "
+          "'./logs/*' -not -path '*/everos/*' -not -path '*/cache/*' -not -path './workspace/*' "
+          "-not -path './subagent_sessions/*' -not -name 'subagent_acp_capabilities.json' "
           "-not -name '*.lock' -not -name 'serve*.json' | sort | xargs -r sha256sum")
 
 
@@ -159,9 +163,53 @@ def _set_model(id, kind="text"):
                  scope="default")
 
 
+# The synthetic owner, as a real IdP user (the portal resolves an owner through the IdP).
+# Admin credentials arrive on stdin; the script runs inside the control-plane pod, which
+# reaches the IdP by its in-cluster name.
+_IDP_USER = """
+import json, os, sys, httpx
+admin = json.loads(sys.stdin.read())
+idp, realm, action, user = os.environ["IDP_URL"], os.environ["IDP_REALM"], sys.argv[1], sys.argv[2]
+tok = httpx.post(f"{idp}/realms/master/protocol/openid-connect/token", timeout=30, data={
+    "grant_type": "password", "client_id": "admin-cli",
+    "username": admin["user"], "password": admin["password"]}).raise_for_status().json()["access_token"]
+h = {"Authorization": f"Bearer {tok}"}
+found = httpx.get(f"{idp}/admin/realms/{realm}/users", params={"username": user, "exact": "true"},
+                  headers=h, timeout=30).raise_for_status().json()
+for u in found:
+    httpx.delete(f"{idp}/admin/realms/{realm}/users/{u['id']}", headers=h, timeout=30).raise_for_status()
+if action == "create":
+    r = httpx.post(f"{idp}/admin/realms/{realm}/users", headers=h, timeout=30, json={
+        "username": user, "email": f"{user}@example.invalid", "firstName": "Sw", "lastName": "Test",
+        "enabled": True, "emailVerified": True, "requiredActions": []})
+    assert r.status_code == 201, r.text
+print(json.dumps({"removed": len(found)}))
+"""
+
+
+def _secret(name: str, key: str) -> str:
+    return base64.b64decode(_kubectl("get", "secret", name, "-o", f"jsonpath={{.data.{key}}}")).decode()
+
+
+def _idp_user(action: str) -> dict:
+    admin = json.dumps({"user": _secret("enterprise-ai-secrets", "IDP_ADMIN_USER"),
+                        "password": _secret("enterprise-ai-secrets", "IDP_ADMIN_PASSWORD")})
+    return json.loads(_kubectl("exec", "-i", _cp_pod(), "-c", "control-plane", "--", "python3",
+                               "-c", _IDP_USER, action, USER, stdin=admin))
+
+
 @pytest.fixture(scope="module")
-def raven():
+def owner():
     assert USER.startswith("swtest-"), "test agents are owned by a synthetic user"
+    _idp_user("create")
+    try:
+        yield USER
+    finally:
+        _idp_user("delete")
+
+
+@pytest.fixture(scope="module")
+def raven(owner):
 
     def teardown():
         _in_cp(_CREATE, "DELETE", f"/portal/api/agents/{NAME}", USER)
