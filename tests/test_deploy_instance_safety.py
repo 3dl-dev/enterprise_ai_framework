@@ -373,10 +373,22 @@ def test_compose_files_and_bundle_scripts_never_read_the_overlay():
         except (UnicodeDecodeError, OSError):
             continue
         offenders += [f"{f.relative_to(REPO)}: {n}" for n in OVERLAY_NAMES if n in text]
+    # Indirect forms that would reach the overlay without naming it: its directory, a glob over
+    # `.env*`/`.env.?*`, an `env_file:` key, or any `--env-file` other than the shared bundle/.env.
+    indirect = {"enterprise-ai/operated", ".config/enterprise-ai", "env_file:"}
+    sibling_ok = {".env.example", ".env.tmp"}
+    for f in files:
+        try:
+            text = f.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        offenders += [f"{f.relative_to(REPO)}: {n}" for n in indirect if n in text]
+        offenders += [f"{f.relative_to(REPO)}: glob {m}" for m in re.findall(r"\.env[*?\[]", text)]
+        offenders += [f"{f.relative_to(REPO)}: sibling {m}" for m in re.findall(r"\.env\.[A-Za-z*?_-]+", text)
+                      if m not in sibling_ok and not m.startswith(".env.ALLOW_")]
+        offenders += [f"{f.relative_to(REPO)}: --env-file {m}" for m in re.findall(r"--env-file[ =]+(\$\(BUNDLE\)/[^\s)]*|[^\s)\"';]+)", text)
+                      if m not in ("$(BUNDLE)/.env", "bundle/.env", ".env")]
     assert not offenders, offenders
-    # And the compose env sources are exactly the shared file, nothing globbed.
-    mk = (REPO / "Makefile").read_text()
-    assert "--env-file $(BUNDLE)/.env" in mk and ".env*" not in mk
 
 
 def test_the_overlay_default_path_is_not_inside_the_repo():
