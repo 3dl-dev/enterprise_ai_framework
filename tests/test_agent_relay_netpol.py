@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from netpol_eval import (admitted_egress_peers, admitted_peers, build_universe,
+from netpol_eval import (PROTOCOLS, admitted_egress_peers, admitted_peers, build_universe,
                          dest_from_template, load_policies, probe_ports)
 
 K8S = Path(__file__).resolve().parent.parent / "deploy" / "k8s"
@@ -64,7 +64,7 @@ def raven_egress_violations(policies) -> list:
     allow-list among the peer universe, and no external address at all."""
     bad = []
     universe = {p for p, _ in build_universe(policies, NS, "egress", SEEDS)[0]}
-    for proto in ("TCP", "UDP"):
+    for proto in PROTOCOLS:
         for port in probe_ports(policies, extra=(53, 4000, 8080, 8000, 8642, 443)):
             pods, ips = admitted_egress_peers(policies, RAVEN, port, proto, SEEDS)
             got = set(pods)
@@ -81,17 +81,21 @@ def _control_plane_only(pod) -> bool:
 
 def hermes_api_violations(policies) -> list:
     """Empty iff :8642 on a hermes pod and on a Raven pod admits exactly the control-plane pod
-    (in the platform namespace) and no external address."""
+    (in the platform namespace) over TCP, nobody but it over UDP and SCTP, and no external
+    address (IPv4 or IPv6) over any protocol."""
     bad = []
     universe = {p for p, _ in build_universe(policies, NS, "ingress", CP_SEED)[0]}
     want = {p for p in universe if _control_plane_only(p)}
     assert want, "the peer universe has no control-plane pod: the pin would be vacuous"
     for kind, dest in (("hermes", HERMES), ("raven", RAVEN)):
-        pods, ips = admitted_peers(policies, dest, 8642, "TCP", CP_SEED)
-        got = set(pods)
-        if got != want or ips:
-            bad.append((kind, sorted(map(str, got - want))[:2], sorted(map(str, want - got))[:2],
-                        ips[:2]))
+        for proto in PROTOCOLS:
+            pods, ips = admitted_peers(policies, dest, 8642, proto, CP_SEED)
+            got = set(pods)
+            # exact on TCP (the API); on UDP/SCTP nobody but the control plane may be admitted
+            missing = want - got if proto == "TCP" else set()
+            if got - want or missing or ips:
+                bad.append((kind, proto, sorted(map(str, got - want))[:2],
+                            sorted(map(str, missing))[:2], ips[:2]))
     return bad
 
 
@@ -228,6 +232,29 @@ RAVEN_DRIFTS = {
     "ipBlock 0.0.0.0/0 except private": _egress_rule({"to": [{"ipBlock": {
         "cidr": "0.0.0.0/0", "except": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]}}],
         "ports": [{"port": 443}]}),
+    # IPv6 and SCTP (-1ed): 0.0.0.0/0 and TCP/UDP-only probes never saw these
+    "ipBlock ::/0": _egress_rule({"to": [{"ipBlock": {"cidr": "::/0"}}]}),
+    "ipBlock ::/0 port 443": _egress_rule({"to": [{"ipBlock": {"cidr": "::/0"}}],
+                                           "ports": [{"port": 443}]}),
+    "ipBlock 2000::/3 (global unicast)": _egress_rule({"to": [{"ipBlock": {"cidr": "2000::/3"}}]}),
+    "ipBlock ULA fc00::/7": _egress_rule({"to": [{"ipBlock": {"cidr": "fc00::/7"}}]}),
+    "ipBlock link-local fe80::/10": _egress_rule({"to": [{"ipBlock": {"cidr": "fe80::/10"}}]}),
+    "ipBlock loopback ::1/128": _egress_rule({"to": [{"ipBlock": {"cidr": "::1/128"}}]}),
+    "ipBlock v4-mapped ::ffff:0:0/96": _egress_rule({"to": [{"ipBlock": {
+        "cidr": "::ffff:0:0/96"}}]}),
+    "ipBlock ::/0 except ULA": _egress_rule({"to": [{"ipBlock": {
+        "cidr": "::/0", "except": ["fc00::/7"]}}]}),
+    "SCTP egress to 0.0.0.0/0 :443": _egress_rule({"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}],
+                                                   "ports": [{"protocol": "SCTP", "port": 443}]}),
+    "SCTP egress to 0.0.0.0/0 all ports": _egress_rule({"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}],
+                                                        "ports": [{"protocol": "SCTP"}]}),
+    "SCTP egress to podSelector {}": _egress_rule({"to": [{"podSelector": {}}],
+                                                   "ports": [{"protocol": "SCTP", "port": 8000}]}),
+    "SCTP egress to namespaceSelector {}": _egress_rule({"to": [{"namespaceSelector": {}}],
+                                                         "ports": [{"protocol": "SCTP"}]}),
+    "cp rule + SCTP 8000": lambda d: _cp_rule(d)["ports"].append({"protocol": "SCTP", "port": 8000}),
+    "gateway rule + SCTP 4000": lambda d: _gw_rule(d)["ports"].append(
+        {"protocol": "SCTP", "port": 4000}),
     "ipBlock pod CIDR": _egress_rule({"to": [{"ipBlock": {"cidr": "10.42.0.0/16"}}]}),
     "ipBlock public /8": _egress_rule({"to": [{"ipBlock": {"cidr": "8.0.0.0/8"}}],
                                        "ports": [{"port": 443}]}),
@@ -307,6 +334,31 @@ HERMES_DRIFTS = {
     "second rule ipBlock 0.0.0.0/0": _add_66_rule(
         {"from": [{"ipBlock": {"cidr": "0.0.0.0/0"}}], "ports": [{"port": 8642}]}),
     "second rule {}": _add_66_rule({}),
+    # SCTP / UDP :8642 from every namespace (-1ed), the audit's named hole
+    "SCTP 8642 from every namespace": _add_66_rule(
+        {"from": [{"namespaceSelector": {}}], "ports": [{"protocol": "SCTP", "port": 8642}]}),
+    "SCTP all ports from every namespace": _add_66_rule(
+        {"from": [{"namespaceSelector": {}}], "ports": [{"protocol": "SCTP"}]}),
+    "SCTP 8642 from podSelector {}": _add_66_rule(
+        {"from": [{"podSelector": {}}], "ports": [{"protocol": "SCTP", "port": 8642}]}),
+    "SCTP 8000-8700 from every namespace": _add_66_rule(
+        {"from": [{"namespaceSelector": {}}],
+         "ports": [{"protocol": "SCTP", "port": 8000, "endPort": 8700}]}),
+    "UDP 8642 from every namespace": _add_66_rule(
+        {"from": [{"namespaceSelector": {}}], "ports": [{"protocol": "UDP", "port": 8642}]}),
+    "8642 from ipBlock ::/0": _add_66_rule(
+        {"from": [{"ipBlock": {"cidr": "::/0"}}], "ports": [{"port": 8642}]}),
+    "SCTP 8642 from ipBlock ::/0": _add_66_rule(
+        {"from": [{"ipBlock": {"cidr": "::/0"}}], "ports": [{"protocol": "SCTP", "port": 8642}]}),
+    "8642 from ipBlock 2000::/3": _add_66_rule(
+        {"from": [{"ipBlock": {"cidr": "2000::/3"}}], "ports": [{"port": 8642}]}),
+    "8642 from ipBlock fc00::/7": _add_66_rule(
+        {"from": [{"ipBlock": {"cidr": "fc00::/7"}}], "ports": [{"port": 8642}]}),
+    "8642 from ipBlock v4-mapped ::ffff:0:0/96": _add_66_rule(
+        {"from": [{"ipBlock": {"cidr": "::ffff:0:0/96"}}], "ports": [{"port": 8642}]}),
+    "cp rule gains SCTP 8642 and a wide peer": lambda d: (
+        _hermes_rule(d)["ports"].append({"protocol": "SCTP", "port": 8642}),
+        _hermes_rule(d)["from"].append({"namespaceSelector": {}})),
     "control-plane in every namespace": lambda d: _hermes_rule(d).__setitem__(
         "from", [{"namespaceSelector": {}, "podSelector": {"matchLabels": {"app": "control-plane"}}}]),
     "separate policy opens ingress to all agents": _extra_policy(
@@ -331,8 +383,11 @@ def test_every_drift_of_the_hermes_api_fence_is_caught(tmp_path, drift):
 GREEN = {
     "hermes: wide peer on an unrelated port range": _add_66_rule(
         {"from": [{"namespaceSelector": {}}], "ports": [{"port": 8000, "endPort": 8600}]}),
-    "hermes: wide UDP-only rule": _add_66_rule(
-        {"from": [{"namespaceSelector": {}}], "ports": [{"protocol": "UDP", "port": 8642}]}),
+    "hermes: SCTP from the control plane only": _add_66_rule(
+        {"from": [{"podSelector": {"matchLabels": {"app": "control-plane"}}}],
+         "ports": [{"protocol": "SCTP", "port": 8642}]}),
+    "hermes: v6 block on an unrelated port": _add_66_rule(
+        {"from": [{"ipBlock": {"cidr": "::/0"}}], "ports": [{"protocol": "TCP", "port": 9000}]}),
     "hermes: control-plane restated as matchExpressions": lambda d: _hermes_rule(d).__setitem__(
         "from", [{"podSelector": {"matchExpressions": [
             {"key": "app", "operator": "In", "values": ["control-plane"]}]}}]),

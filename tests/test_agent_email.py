@@ -597,19 +597,31 @@ def test_no_mail_server_component_exists_in_any_deploy_manifest():
     )
 
 
-def _agent_external_reach(policies, port):
+def _agent_external_reach(policies, port, proto="TCP"):
     """(reachable external addresses, the private/special ones among them) for a hermes agent
     pod on `port`, EVALUATED from every shipped NetworkPolicy (netpol_eval, -d7b)."""
     import ipaddress
     from netpol_eval import admitted_egress_peers, dest_from_template
     agent = dest_from_template(REPO / "deploy/k8s/65-agent-hermes.template.yaml")
-    _, ips = admitted_egress_peers(policies, agent, port)
+    _, ips = admitted_egress_peers(policies, agent, port, proto)
     # the cluster's own reach: RFC1918 (pods, services, LAN, nodes) and link-local (metadata).
     # 127/8, 0/8 and broadcast are unroutable off the pod, so they are not a route anywhere.
     fenced = [ipaddress.ip_network(n) for n in
               ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")]
-    private = [i for i in ips if any(ipaddress.ip_address(i) in n for n in fenced)]
+    def embedded(i):  # a v4-mapped IPv6 address is fenced by its embedded IPv4
+        a = ipaddress.ip_address(i)
+        return a.ipv4_mapped if a.version == 6 and a.ipv4_mapped else a
+    private = [i for i in ips if any(embedded(i) in n for n in fenced)]
     return ips, private
+
+
+def _agent_v6_reach(policies, port, proto):
+    """Native IPv6 addresses (not v4-mapped) an agent pod reaches: the posture is NONE, because
+    the agent egress grants are IPv4 CIDRs and no shipped policy names an IPv6 block."""
+    import ipaddress
+    ips, _ = _agent_external_reach(policies, port, proto)
+    return [i for i in ips if ipaddress.ip_address(i).version == 6
+            and ipaddress.ip_address(i).ipv4_mapped is None]
 
 
 def _shipped_agent_policies():
@@ -633,10 +645,27 @@ def test_the_agent_can_reach_an_external_mail_provider_but_still_not_the_cluster
         assert private == [], f":{port} reaches cluster/LAN/link-local addresses {private}: a route to the cluster"
 
 
+def test_the_agent_has_no_ipv6_egress_and_every_protocol_is_fenced_from_the_cluster():
+    """Agents get IPv4 internet egress via 0.0.0.0/0 (its `ports` is omitted, so every protocol:
+    UDP and SCTP to the public internet are granted too, deliberately). They get NO IPv6 egress
+    (a `0.0.0.0/0` rule covers no IPv6 address), and on TCP, UDP and SCTP alike no private,
+    link-local or CGNAT address, mapped into IPv6 or not, is reachable (-1ed)."""
+    policies = _shipped_agent_policies()
+    for port in (25, 53, 443, 587, 8642, 65535):
+        for proto in ("TCP", "UDP", "SCTP"):
+            assert _agent_v6_reach(policies, port, proto) == [], (proto, port)
+            ips, private = _agent_external_reach(policies, port, proto)
+            assert "8.8.8.8" in ips and private == [], (proto, port, private)
+
+
 def _external_rule(docs):
     pol = next(d for d in docs if d["metadata"]["name"] == "agent-isolation")
     return next(r for r in pol["spec"]["egress"]
                 if any("ipBlock" in t and t["ipBlock"]["cidr"] == "0.0.0.0/0" for t in r.get("to", [])))
+
+
+def _agent_iso(docs):
+    return next(d for d in docs if d["metadata"]["name"] == "agent-isolation")
 
 
 def _except(docs):
@@ -656,6 +685,23 @@ MAIL_DRIFTS = {
     "external rule removed": lambda d: next(
         x for x in d if x["metadata"]["name"] == "agent-isolation")["spec"]["egress"].remove(
             _external_rule(d)),
+    # IPv6 / SCTP forms (-1ed)
+    "ipv6 ::/0 added": lambda d: _agent_iso(d)["spec"]["egress"].append(
+        {"to": [{"ipBlock": {"cidr": "::/0"}}]}),
+    "ipv6 ::/0 added with SCTP only": lambda d: _agent_iso(d)["spec"]["egress"].append(
+        {"to": [{"ipBlock": {"cidr": "::/0"}}], "ports": [{"protocol": "SCTP"}]}),
+    "ipv6 ULA fc00::/7 added": lambda d: _agent_iso(d)["spec"]["egress"].append(
+        {"to": [{"ipBlock": {"cidr": "fc00::/7"}}]}),
+    "ipv6 v4-mapped ::ffff:0:0/96 added (folds to embedded v4 incl. 10/8)":
+    lambda d: _agent_iso(d)["spec"]["egress"].append({"to": [{"ipBlock": {
+        "cidr": "::ffff:0:0/96"}}]}),
+    "external rule gains ::/0 peer": lambda d: _external_rule(d)["to"].append(
+        {"ipBlock": {"cidr": "::/0"}}),
+    "2000::/3 added": lambda d: _agent_iso(d)["spec"]["egress"].append(
+        {"to": [{"ipBlock": {"cidr": "2000::/3"}}]}),
+    "SCTP-only rule to 10/8 (private space on another protocol)":
+    lambda d: _agent_iso(d)["spec"]["egress"].append(
+        {"to": [{"ipBlock": {"cidr": "10.0.0.0/8"}}], "ports": [{"protocol": "SCTP"}]}),
     "a second policy opens everything to agents": lambda d: d.append({
         "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
         "metadata": {"name": "wide", "namespace": "enterprise-ai"},
@@ -675,6 +721,8 @@ def test_every_drift_of_the_agent_mail_egress_is_caught(tmp_path, drift):
     policies = load_policies([f])
     broken = False
     for port in (25, 465, 587, 993):
-        ips, private = _agent_external_reach(policies, port)
-        broken |= "8.8.8.8" not in ips or bool(private)
+        for proto in ("TCP", "UDP", "SCTP"):
+            ips, private = _agent_external_reach(policies, port, proto)
+            broken |= "8.8.8.8" not in ips or bool(private)
+            broken |= bool(_agent_v6_reach(policies, port, proto))
     assert broken, drift
