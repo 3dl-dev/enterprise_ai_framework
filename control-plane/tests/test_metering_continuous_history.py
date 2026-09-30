@@ -295,17 +295,34 @@ def real_stack(tmp_path_factory):
         else:
             raise RuntimeError("freerouter never came up")
 
-        cp = httpx.post(f"{base}/api/v1/signup", json={"display_name": "cp"}, timeout=10).json()["data"]
+        # freerouter-4b5 (2026-09-30): signup must name the CURRENT terms version, which
+        # freerouter itself serves as the X-Terms-Version header of GET /terms, and creating
+        # a sub-tenant must affirm the ToS section-5 resale flow-down. This throwaway,
+        # loopback-only freerouter is the test's own fixture, so accepting here binds nobody.
+        # The version is read from the binary under test, never hard-coded; a freerouter
+        # older than 4b5 has no /terms and ignores both extra fields.
+        terms_version = httpx.get(f"{base}/terms", timeout=10).headers.get("X-Terms-Version", "")
+
+        def _data(resp):
+            # A refused call used to surface as a bare KeyError: 'data'. Say what refused.
+            assert resp.status_code in (200, 201), (
+                f"freerouter {resp.request.method} {resp.request.url.path} -> "
+                f"{resp.status_code}: {resp.text[:300]}"
+            )
+            return resp.json()["data"]
+
+        cp = _data(httpx.post(f"{base}/api/v1/signup", timeout=10, json={
+            "display_name": "cp", "accept_terms_version": terms_version}))
         cp_key = cp["api_key"]
         hdr = {"Authorization": f"Bearer {cp_key}"}
-        alice = httpx.post(f"{base}/api/v1/subaccounts", headers=hdr,
-                           json={"name": "alice::chat"}, timeout=10).json()["data"]
-        bob = httpx.post(f"{base}/api/v1/subaccounts", headers=hdr,
-                         json={"name": "bob::ide"}, timeout=10).json()["data"]
+        alice = _data(httpx.post(f"{base}/api/v1/subaccounts", headers=hdr, timeout=10, json={
+            "name": "alice::chat", "affirm_resale_flow_down": True}))
+        bob = _data(httpx.post(f"{base}/api/v1/subaccounts", headers=hdr, timeout=10, json={
+            "name": "bob::ide", "affirm_resale_flow_down": True}))
         for sub in (alice, bob):
-            httpx.post(f"{base}/api/v1/credits/topup",
-                      headers={"Authorization": f"Bearer {sub['api_key']}"},
-                      json={"amount_usd": 5}, timeout=10)
+            _data(httpx.post(f"{base}/api/v1/credits/topup",
+                             headers={"Authorization": f"Bearer {sub['api_key']}"},
+                             json={"amount_usd": 5}, timeout=10))
     finally:
         proc.terminate()
         proc.wait(timeout=10)
