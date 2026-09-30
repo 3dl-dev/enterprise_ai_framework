@@ -34,6 +34,11 @@
 #     that was in fact green.
 set -euo pipefail
 
+# Everything runs inside main() so bash has parsed the WHOLE script before the ff-merge below
+# can replace this very file on disk; otherwise a commit that edits the watcher corrupts the
+# run that deploys it (bash reads a script incrementally).
+main() {
+
 cd "$(dirname "$0")/../.."
 REPO="$PWD"
 
@@ -59,8 +64,9 @@ give_up() { say "STOP: $*"; exit 1; }
 say "=== watch-and-deploy starting ==="
 
 # --- 1. is there anything to do -------------------------------------------------------
-git fetch --quiet origin main
-SHA="$(git rev-parse origin/main)"
+REF="${WATCH_REF:-origin/main}"   # override only to prove a branch through the real watcher
+git fetch --quiet origin "${REF#origin/}"
+SHA="$(git rev-parse "$REF")"
 LAST="$(cat "$STATE" 2>/dev/null || echo none)"
 if [[ "$SHA" == "$LAST" && $FORCE -eq 0 ]]; then
     say "origin/main $SHA is already deployed; nothing to do"
@@ -122,3 +128,5 @@ fi
 # deploy.sh ends in smoke.sh, so reaching here means the cluster served a prompt.
 printf '%s\n' "$SHA" > "$STATE"
 say "=== deployed ${SHA:0:9} and it serves prompts ==="
+}
+main "$@"
