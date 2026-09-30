@@ -239,3 +239,40 @@ TTS per character), so per-key spend is real; rates live in `bundle/litellm/conf
 Swap options, not defaults: Kyutai STT 1B (CC-BY-4.0 weights, permitted as a default by the
 2026-09-29 ruling, attribution required) or Qwen3-TTS behind the same routes by repointing
 `api_base`. WebSocket streaming is not served through the gateway yet.
+
+## Voice — talk to a Raven from the portal (Contract H)
+
+A **Talk** button on a Raven's row in the portal's Agents tab joins a LiveKit room with the
+microphone on; the Raven answers aloud in its registered voice. Parts:
+
+| Part | Where |
+|---|---|
+| LiveKit server (SFU, LAN/VPN only, no TURN) | `deploy/k8s/72-livekit.yaml` |
+| Voice worker (LiveKit Agents `==1.6.0`, Silero VAD baked in, no cloud pieces) | `voice-worker/`, `deploy/k8s/73-voice-worker.yaml` |
+| Local STT/TTS the gateway routes to | `deploy/k8s/32-speech.yaml` |
+| Voice registry, session tokens, audio relay, Raven turn adapter | `control-plane/app/voice.py` |
+| Room token + server-side worker dispatch | `control-plane/app/livekit_tokens.py` |
+
+Build the worker image on the cluster (`deploy/bin/kaniko-build.sh voice-worker
+$RAIL_REGISTRY/eaf-voice-worker:<tag>`, then `VOICE_WORKER_TAG=<tag>` for `deploy.sh`). It needs
+`LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` and `LIVEKIT_URL` (the browser-facing signalling address) in
+`enterprise-ai-secrets`.
+
+The worker never talks to the gateway. Every call (STT, TTS, and the Raven as its LLM) goes to the
+control plane's `/voice/v1` with a per-session bearer, and the control plane spends the **Raven's**
+own key, so voice lands on `<user>::agents/<raven>` on the one bill. The relay pins the model and
+the voice to the agent's registry entry (`POST /portal/api/agents/<name>/voice`, catalogue
+`AGENT_VOICES`), so a worker cannot choose either.
+
+Known gaps:
+
+- **`ws://` from an `https://` page.** A browser blocks the signalling connection to a plain
+  `ws://<lan-ip>:30780` from a page served over `https://`. Voice works today from a page on the
+  same LAN/VPN over `http://` (or `localhost`); making it work from the public portal origin needs
+  a `wss://` front for LiveKit, which is public exposure and Baron-reserved (gate cfa).
+- **Raven on the LiteLLM (OSS) gateway.** The Raven speaks `/v1/responses`. LiteLLM forwards that
+  route to an `openai/…` upstream as-is; an upstream without it (Forge's) answers 404 and the turn
+  fails. A catalogue entry using the `hosted_vllm/` provider makes LiteLLM bridge it to chat
+  completions (what the live voice test does); the shipped catalogue is unchanged.
+- **Session tokens die with the control-plane process** unless `VOICE_SESSION_SECRET` is pinned;
+  a conversation in progress ends and the user presses Talk again.
