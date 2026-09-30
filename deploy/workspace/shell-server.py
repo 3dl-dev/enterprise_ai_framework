@@ -469,14 +469,24 @@ class Pulse:
             changed = [rel for rel, m, _ in fresh if m / 1e9 >= cutoff][:3]
 
         self._update_busy(now)
-        refs, keeps_running = self._index_facts(root / "index.html")
+        # has_index comes from the SAME scan as fp/rev, not from a second stat afterwards.
+        # A later is_file() let a page that landed between the scan and the check read as
+        # {has_index: true, rev: <not yet bumped>} for one window: the Ribbon said "Your
+        # turn" before "Made it", and a waiter on has_index saw rev bump after it (the
+        # test_git_and_node_modules_churn_does_not_bump_revision flake). The fallback covers
+        # the two cases the scan cannot see: a scan the cap cut short, and an index.html
+        # that is a symlink (the scan skips links; /preview follows one inside the project).
+        index = root / "index.html"
+        has_index = any(rel == "index.html" for rel, _, _ in entries) or (
+            (truncated or index.is_symlink()) and index.is_file())
+        refs, keeps_running = self._index_facts(index) if has_index else (0, False)
         snap = {
             "project": project,
             "rev": self._rev,
             "fp": fp,
             "changed": changed,
             "last_change_ms": last_change_ms,
-            "has_index": (root / "index.html").is_file(),
+            "has_index": has_index,
             "offline_refs": refs,
             # Whether the page keeps running once loaded. Drives which of the two run
             # buttons is the primary one; see LIVE_PAGE.
