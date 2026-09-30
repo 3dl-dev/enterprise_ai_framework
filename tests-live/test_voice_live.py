@@ -361,23 +361,37 @@ def probe(pod: str, host: str, port: int) -> str:
 
 def test_the_workers_network_fence_is_the_thing_that_refuses_and_only_three_peers_are_open(stack):
     worker = vs.kubectl("get", "pod", "-l", "app=voice-worker-82e", "-o", "jsonpath={.items[0].metadata.name}")
-    ctl = "cp-82e"  # no policy selects it: the positive control for every probe
-    targets = [("gateway-82e", 4000), ("speech-82e", 8000), ("1.1.1.1", 443)]
-    open_peers = [("cp-82e", 8000), ("livekit-82e", 7880)]
-    for host, port in targets:
+    ctl = "cp-82e"  # no policy governs it: the positive control for every probe
+    closed = [("gateway-82e", 4000), ("postgres-82e", 5432), ("1.1.1.1", 443),
+              (f"agent-{vs.USER}-{NAME}", 18793)]
+    for host, port in closed:
         assert probe(ctl, host, port) == "CONNECTED", f"control cannot reach {host}:{port}; the probe proves nothing"
         assert probe(worker, host, port) == "REFUSED", f"the worker reached {host}:{port}"
-    for host, port in open_peers:
+    for host, port in [("cp-82e", 8000), ("livekit-82e", 7880)]:
         assert probe(worker, host, port) == "CONNECTED", f"the worker cannot reach {host}:{port}"
-    # the refusal is the policy's: remove it and the gateway becomes reachable, restore it and it is not
+
+    # The refusal is the POLICY's. Mutation 1: remove it and the gateway becomes reachable.
     manifest = vs.kubectl("get", "networkpolicy", "voice-worker-isolation-82e", "-o", "yaml")
     vs.kubectl("delete", "networkpolicy", "voice-worker-isolation-82e")
     try:
-        time.sleep(6)
+        time.sleep(8)
         assert probe(worker, "gateway-82e", 4000) == "CONNECTED", "refusal was not caused by the policy"
     finally:
         vs.kubectl("apply", "-f", "-", inp=re.sub(r"\n  (uid|resourceVersion|creationTimestamp):.*", "", manifest))
-    time.sleep(6)
+    time.sleep(8)
+    assert probe(worker, "gateway-82e", 4000) == "REFUSED"
+    # Mutation 2, a different one: WIDEN the policy by one peer instead of removing it.
+    vs.kubectl("patch", "networkpolicy", "voice-worker-isolation-82e", "--type=json", "-p", json.dumps([
+        {"op": "add", "path": "/spec/egress/-", "value": {
+            "to": [{"podSelector": {"matchLabels": {"app": "gateway-82e"}}}],
+            "ports": [{"protocol": "TCP", "port": 4000}]}}]))
+    try:
+        time.sleep(8)
+        assert probe(worker, "gateway-82e", 4000) == "CONNECTED", "a widened policy did not open the gateway"
+        assert probe(worker, "postgres-82e", 5432) == "REFUSED", "widening one peer opened another"
+    finally:
+        vs.kubectl("apply", "-f", "-", inp=re.sub(r"\n  (uid|resourceVersion|creationTimestamp):.*", "", manifest))
+        time.sleep(8)
     assert probe(worker, "gateway-82e", 4000) == "REFUSED"
 
 
