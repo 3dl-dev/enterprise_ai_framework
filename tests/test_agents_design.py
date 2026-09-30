@@ -131,3 +131,92 @@ def test_the_resident_metering_ruling_is_recorded_as_usage_not_cost(record_text,
         "the record does not say where a cost basis would go if commodity cloud compute is "
         "ever added — without that, the ruling reads as an omission rather than a decision"
     )
+
+
+# ---------------------------------------------------------------------------------------
+# Raven attack-register evidence (enterpriseaiframework-9cec).
+#
+# design.md §10 rows R1-R6 claim a disposition. A disposition that cites a test which was
+# renamed, deleted or never written is a claim with no proof behind it, and prose cannot
+# notice. So every `path::test_name` the rows cite is resolved against the tree.
+#
+# WHERE THE EXPECTATION COMES FROM: the citations are read out of design.md, but what they
+# are checked AGAINST is the test source files on disk (independent of the document): a
+# `def <name>` must exist in the named file. The six ids are transcribed from the item.
+# A `pending-<item>:` prefix marks a test on an unmerged item branch: the file may be absent,
+# but if it is present the name must resolve, so a rename after merge turns this red.
+# ---------------------------------------------------------------------------------------
+
+import re
+
+RAVEN_ROWS = ["R1", "R2", "R3", "R4", "R5", "R6"]
+_CITATION = re.compile(r"`(?:(pending-\w+):)?([\w./-]+\.py)::(test_\w+)`")
+
+
+def _raven_rows(design_text: str) -> dict[str, str]:
+    """Row id -> the row's full markdown line, for the Raven attack-register table."""
+    rows = {}
+    for line in design_text.splitlines():
+        m = re.match(r"\|\s*\*\*(R\d+)\*\*\s*\|", line)
+        if m:
+            rows[m.group(1)] = line
+    return rows
+
+
+def citation_problems(design_text: str, repo: Path) -> list[str]:
+    """Every way the R1-R6 rows fail to cite a test that exists. Empty means all resolve."""
+    rows = _raven_rows(design_text)
+    problems = [f"{r}: row is missing from design.md" for r in RAVEN_ROWS if r not in rows]
+    for rid in RAVEN_ROWS:
+        line = rows.get(rid)
+        if line is None:
+            continue
+        cites = _CITATION.findall(line)
+        if not cites:
+            problems.append(f"{rid}: cites no test as `path::test_name`")
+        for pending, path, name in cites:
+            f = repo / path
+            if not f.is_file():
+                if not pending:
+                    problems.append(f"{rid}: {path} does not exist (cite it as pending-<item>: if unmerged)")
+                continue
+            if not re.search(rf"^\s*(?:async\s+)?def {re.escape(name)}\(", f.read_text(), re.M):
+                problems.append(f"{rid}: {path} has no test named {name}")
+    return problems
+
+
+def test_every_raven_disposition_cites_a_test_that_exists():
+    assert citation_problems(DESIGN.read_text(), REPO) == []
+
+
+def test_the_citation_guard_catches_the_ways_a_disposition_loses_its_proof():
+    """Both ways. The real document passes; each realistic corruption of the DATA it reads
+    (a renamed test, a moved file, an uncited row, a dropped row, an unmarked unmerged test)
+    is reported. Mutations are applied to design.md's text, not to the guard's code."""
+    text = DESIGN.read_text()
+    assert citation_problems(text, REPO) == [], "premise: the real document resolves"
+    real = "control-plane/tests/test_agent_manager_token.py::test_a_raven_cannot_create_a_raven"
+    assert real in text, "premise: the mutation target is cited"
+    # 1. a nearby wrong name (renamed test), 2. a moved file, 3. a wrong-directory path
+    for old, new in (
+        (real, real + "_v2"),
+        (real, real.replace("test_agent_manager_token.py", "test_agent_manager_tokens.py")),
+        (real, real.replace("control-plane/tests", "tests")),
+    ):
+        assert citation_problems(text.replace(old, new), REPO), (old, new)
+    # 4. a citation into a file that exists must name a test that exists in it
+    injected = text.replace(real, real.replace("control-plane/tests/test_agent_manager_token.py",
+                                               "tests/test_agents_design.py").replace(
+        "test_a_raven_cannot_create_a_raven", "test_no_such_test"))
+    assert any("no test named" in p for p in citation_problems(injected, REPO))
+    # 5. an unmerged test cited WITHOUT the pending marker is a fault
+    unmarked = text.replace("pending-82e:tests/test_voice_worker.py",
+                            "tests/test_voice_worker_missing.py", 1)
+    assert any("does not exist" in p for p in citation_problems(unmarked, REPO))
+    # 6. a row with its citations stripped, and a dropped row
+    lines = text.splitlines()
+    r2 = next(i for i, l in enumerate(lines) if l.startswith("| **R2**"))
+    stripped = "\n".join(lines[:r2] + [_CITATION.sub("", lines[r2])] + lines[r2 + 1:])
+    assert any(p.startswith("R2:") and "cites no test" in p for p in citation_problems(stripped, REPO))
+    dropped = "\n".join(lines[:r2] + lines[r2 + 1:])
+    assert any(p.startswith("R2:") and "missing" in p for p in citation_problems(dropped, REPO))

@@ -1,6 +1,6 @@
 # Design record: Raven, a per-user host agent that manages the user's own agents, with voice
 
-**Status:** design record, proposed 2026-09-29. It **extends**
+**Status:** design record, proposed 2026-09-29; **Revision 3 (as-built, 2026-09-30) below**. It **extends**
 `docs/design/records/agents-gateway-console.md` and adds a third value to its Contract A type
 dimension. It does not correct that record or `agents-surface.md`. Contracts **1 (alias), 3
 (metering), 4 (integrated vs BYO), 6 (Code-untouched)** of `agents-surface.md` and Contracts
@@ -43,6 +43,35 @@ from source and has not been installed or run. EAF was read at `988cf18`. Raven 
 references below come from that read (research notes, *Voice agent team switchboard /
 evermind_raven.md*). EAF references were checked in this tree. Every claim not checked against a
 running binary is marked **UNVERIFIED** and collected in *Could not verify*.
+
+---
+
+## As-built (Revision 3, 2026-09-30)
+
+Revision 3 brings this record up to what shipped in the P1/P2 waves and lands attack-register
+rows `R1`-`R6` (`design.md` §10) with the test that proves each. It **supersedes PR #55**, which
+carried Revisions 1-2 unchanged. Where a section above disagrees with an amendment here, **the
+amendment is normative**. Item: `enterpriseaiframework-9cec`.
+
+| # | Amendment | Was (this record, Revisions 1-2) | Evidence / owner item |
+|---|---|---|---|
+| **A1** | The voice room is **`voice-<user>.<raven>`**. The hyphen form collides: user `a` with Raven `b-x` and user `a-b` with Raven `x` would both get `voice-a-b-x`, and a "starts with my prefix" check would hand one user the other's room. `.` cannot occur in a slug (`gateway.AGENT_SLUG`), so a room name parses back to exactly one (user, Raven). A caller may name a room; it is honoured only if it equals the derived one. | `voice-<user>-<raven>` | `control-plane/tests/test_livekit_tokens.py::test_hyphenated_names_cannot_collide_into_one_room`; closes `-9c0` |
+| **A2** | **Raven reaches its child agents through the `eaf-agents` MCP tool, not roster rows.** The tool is a stdio MCP server (`deploy/raven/eaf_agents_mcp.py`: `list_agents`, `create_agent`, `send_to_agent`) registered by `deploy/raven/hosted_seed.py` under `tools.mcpServers`. Roster rows carry `api_key` in Raven's `config.json`; that file is on the PVC, and Contract F forbids the token on the PVC. The tool reads `EAF_AGENT_MANAGER_TOKEN` from the container env at call time; the seed entry holds the URL and nothing secret, is re-asserted on every boot (a WebUI edit is pulled back), and is removed when the token is absent. Relay target today: hermes only (openclaw answers 501 until `-b12`). The tool exposes list, create and relay-send; the start/stop/set-model/delete verbs exist on the API (Contract F) but have no tool. | `kind: openai` roster row with `api_key = EAF_AGENT_MANAGER_TOKEN` | `tests/test_raven_hosted_config.py::test_manager_power_registers_the_eaf_agents_tool_without_the_token` and `::test_a_webui_edit_of_the_tool_is_pulled_back_and_other_servers_survive` (both land with `-692`) |
+| **A3** | **LiveKit signalling goes through the portal origin** (`wss://<portal>/rtc`, proxied by the portal edge behind oauth2-proxy, so authenticated, on 443). **Media stays LAN-only** on the NodePorts: no TURN, no public UDP. Baron's ruling, 2026-09-30; it supersedes the *signalling* half of the 2026-09-29 Q1 ruling (LAN/VPN only) and leaves the media half in force. Reason: a browser on the https portal cannot open `ws://` signalling (mixed content), and the http LAN origin is not a secure context for the microphone. | Q1: no public exposure of signalling or media | built on `work/enterpriseaiframework-82e` (unmerged at this revision); exposure checker `-f2b` |
+| **A4** | **The WebUI lock is a one-control-plane UX lock, not an isolation boundary.** The console proxy refuses the WebUI's provider and channel write RPCs, so settings the control plane owns are not edited in two places. It does not stop the agent's own tools from editing its config inside its pod, and it is not what keeps a Raven on the one bill: that is the egress seal (A7). | "read-only in hosted mode" (Contract E), read as a control | `control-plane/app/raven_write_lock.py` docstring; `-941` (the WebUI `/file` route serves pod files) |
+| **A5** | **Contract F remainder is parked**: the portal manager-power toggle, `POST /admin/agent-manager/revoke`, and the portal's last-used display are not built. What is built and tested: issue at create, hash-only storage, revoke on delete, revoke on IdP disable, verifier re-checks. Until `-60f` lands, an operator revokes by deleting the Raven or the row. | Contract F, *Revocation* (toggle, operator) and *Issuance* (portal shows last-used) | `-60f` (parked; Baron decides whether it is descoped) |
+| **A6** | **Approval defaults for the eaf-agents tools (decided 2026-09-30, under Baron's autonomy grant): the tools that read or relay (`list_agents`, `send_to_agent`) are pre-approved in hosted mode, so voice and unattended use do not block; the lifecycle tool (`create_agent`, and any later start/stop/set-model/delete tool) stays at Raven's `ask` tier (owner approval).** This is **not yet built**: as shipped, Raven asks the owner to approve every call (its default for an MCP tool). | Silent | follow-up alongside `-35d` / `-b12`; the seed's tool entry is where it lands |
+| **A7** | **Network as built**: the Raven policy is `deploy/k8s/68-raven-common.yaml` and the template `69-agent-raven.template.yaml` (`67-` is the openclaw template). `63-agent-common.yaml`'s `agent-isolation` now excludes `type: raven`, and `raven-isolation` grants **no internet at all**: DNS, gateway:4000, freerouter:8080 and control-plane:8000 only, ingress :18793 from the control plane only. The design accepted Raven inheriting internet egress for channels; as built it does not, so a Raven pod has no channel egress and connectors configured on it are not consumed (`-ff0`). This is stronger than the design on R6 and narrower on channels. | Egress "accepted, as for hermes" (*Security*) | `tests/test_raven_hosted_config.py::test_agent_isolation_stops_selecting_raven_and_raven_isolation_has_no_internet` |
+| **A8** | **Delete is limited to the Raven's own `created-by` children** (Q2 ruling), enforced in `agents.py` beside every other per-user decision, not in the router. Stop/start/set-model stay on all the owner's agents. | Decision 2 as written (all owned agents) | `control-plane/tests/test_agent_manager_token.py::test_delete_is_limited_to_the_ravens_own_created_by_children` |
+
+### Attack-register evidence
+
+The rows in `design.md` §10 (`R1`-`R6`) cite tests by `path::name`. `tests/test_agents_design.py`
+checks every such citation against the tree: a cited file must contain a test of that name, and a
+row must cite at least one. A citation written `pending-<item>` names a test on an unmerged item
+branch (`-692` relay, `-82e` voice); the guard resolves it as soon as the file exists in the tree,
+so a rename after merge turns it red. Live tests are cited for what they prove but are run by
+their own items on throwaway stacks, not by `make test`.
 
 ---
 
@@ -179,7 +208,7 @@ Raven's reconfiguration of its children follows the same rule (Contract F `set-m
 `<user>::agents/<name>` key, minted before the pod exists, as today), `RAVEN_CONSOLE_TOKEN` (the
 WebUI token the proxy injects), and `EAF_AGENT_MANAGER_TOKEN` (Contract F). The seed ConfigMap
 carries **no credential**, only `providers.custom` pointing at the gateway by env reference, the
-hosted-mode switches below, and the roster rows for Contract G.
+hosted-mode switches below. (Revision 3: the roster rows for Contract G were not built; see *As-built* A2.)
 
 **Hosted-mode configuration, seeded and asserted by render tests:**
 
@@ -484,7 +513,7 @@ additive, so Raven's egress cannot be made narrower than a hermes agent's while 
   target's `-key` Secret. Raven never holds another agent's credential.
 - Inference performed by the target bills to the target's own `<owner>::agents/<n>` key, because
   the target runs its own model. The relay itself spends nothing.
-- Raven sees each remote agent as a **`kind: openai` roster row**: `base_url =
+- **Superseded by *As-built* A2 (Revision 3): Raven reaches children through the `eaf-agents` MCP tool, not roster rows.** As designed, Raven saw each remote agent as a **`kind: openai` roster row**: `base_url =
   http://control-plane:8000/agent-manager/v1/agents/<n>/relay/v1`, `api_key =
   EAF_AGENT_MANAGER_TOKEN`, `model = <n>`. When Raven creates a child, the eaf-agents tool adds
   the row. Raven's `turn.send {target}` direct turns then reach the user's real instance.
@@ -551,9 +580,10 @@ Raven's voice code is used**, so no Raven patch is needed.
   (`LIVEKIT_API_KEY`/`SECRET`) are held by the control plane and the worker only. Media needs
   UDP (RTP) and TCP/TLS fallback reachable by browsers, plus LiveKit's embedded TURN.
   **Exposure (NodePort/hostPort range, TURN on the public edge) is externally visible and is
-  ruled LAN/VPN only** (Q1, 2026-09-29).
+  ruled LAN/VPN only** (Q1, 2026-09-29). **Revision 3: media stays LAN-only; signalling was
+  re-ruled 2026-09-30 to go through the portal origin (*As-built* A3).**
 - **Room and token:** the portal mints a LiveKit access token from the **portal session**
-  (`require_user`): identity = user, room = `voice-<user>-<raven>`, TTL minutes. The owner is
+  (`require_user`): identity = user, room = `voice-<user>.<raven>` (Revision 3: the hyphen form collides, see *As-built* A1), TTL minutes. The owner is
   derived exactly as the console derives it. There is no LiveKit console; LiveKit is configured,
   not administered (one control plane).
 - **Voice worker** (LiveKit Agents, Apache-2.0): one Deployment `voice-worker`, dispatched per
@@ -842,7 +872,7 @@ the phase is not done until the live check has been observed rather than inferre
   `agents/<raven>`, and live test 8b shows no EverMind outbound.
 - **P2: agent-manager token and attachment.** Contract F (table, verifier with the loopback
   refusal, router, audit with the `agent-manager:` actor, revoke including IdP-disable sync,
-  portal toggle), Contract G (the `67-` egress, the `66-` ports, the relay with its stream
+  portal toggle, **parked, see *As-built* A5**), Contract G (the `67-` egress (built as `68-raven-common.yaml`), the `66-` ports, the relay with its stream
   rules, `-147` as the hermes target), the eaf-agents Raven tool. Hermes targets first; openclaw
   targets when `-ff7` lands. Rule `-f39` first; Q2 should be ruled before the delete verb ships.
   **Done when** the owner-scoping and origin tests (1, 1a) are green and fault-injected, the relay
