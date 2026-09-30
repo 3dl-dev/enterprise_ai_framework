@@ -164,10 +164,39 @@ CADDYFILE = REPO / "deploy" / "caddy" / "Caddyfile"
 ALLOWED_NODEPORTS = {30780, 30781, 30782}
 
 
-def _exposure_violations(manifest: Path, caddyfile: Path) -> list[str]:
+K8S_DIR = REPO / "deploy" / "k8s"
+ROUTE_KINDS = {"Ingress", "IngressRoute", "IngressRouteTCP", "IngressRouteUDP", "HTTPRoute",
+               "GRPCRoute", "TCPRoute", "UDPRoute", "TLSRoute", "Gateway"}
+LIVEKIT_MARKERS = ("livekit", "7880", "7881", "7882", "30780", "30781", "30782", "/rtc")
+
+
+def _routing_violations(k8s_dir: Path) -> list[str]:
+    """Any object in ANY manifest that routes to LiveKit from beyond the node: an Ingress /
+    Gateway-API route naming livekit, its ports or /rtc, or a LoadBalancer/externalIPs Service
+    that selects the livekit pods. Files are not assumed to be the livekit file."""
+    bad = []
+    for f in sorted(k8s_dir.glob("*.y*ml")):
+        for d in yaml.safe_load_all(f.read_text()):
+            if not d:
+                continue
+            kind, spec = d.get("kind"), d.get("spec") or {}
+            blob = yaml.safe_dump(d).lower()
+            if kind in ROUTE_KINDS and any(m in blob for m in LIVEKIT_MARKERS):
+                bad.append(f"{f.name}: {kind} routes to livekit")
+            if kind == "Service" and "livekit" in blob and (
+                spec.get("type") in ("LoadBalancer", "ExternalName") or spec.get("externalIPs")
+            ):
+                bad.append(f"{f.name}: Service {spec.get('type') or 'externalIPs'} exposes livekit")
+    return bad
+
+
+def _exposure_violations(manifest: Path, caddyfile: Path, k8s_dir: Path = K8S_DIR) -> list[str]:
     """Every way the files put LiveKit on the public edge, or reach for a LiveKit-Cloud piece."""
     docs = [d for d in yaml.safe_load_all(manifest.read_text()) if d]
-    bad = []
+    bad = _routing_violations(k8s_dir)
+    for d in docs:
+        if d["kind"] in ROUTE_KINDS:
+            bad.append(f"{d['kind']} in the livekit manifest")
     for d in docs:
         spec = d.get("spec", {})
         if d["kind"] == "Service":
@@ -202,7 +231,7 @@ def _exposure_violations(manifest: Path, caddyfile: Path) -> list[str]:
         if any(cloud in ln for ln in text.splitlines() if not ln.strip().startswith("#")):
             bad.append(f"cloud/non-OSI piece referenced: {cloud}")
     edge = caddyfile.read_text().lower()
-    for token in ("livekit", "7880", "7881", "7882", "30780", "30781", "30782", "3478", "5349"):
+    for token in ("livekit", "/rtc", "7880", "7881", "7882", "30780", "30781", "30782", "3478", "5349"):
         if token in edge:
             bad.append(f"the public edge routes {token}")
     return bad
@@ -245,3 +274,69 @@ def test_control_plane_manifest_hands_the_voice_env_to_the_token_endpoint():
     cp = next(c for c in dep["spec"]["template"]["spec"]["containers"] if c["name"] == "control-plane")
     names = {e["name"] for e in cp["env"]}
     assert {"LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "LIVEKIT_URL"} <= names
+
+
+def _k8s_copy(tmp_path):
+    import shutil
+    d = tmp_path / "k8s"
+    shutil.copytree(K8S_DIR, d)
+    return d
+
+
+INGRESS_TO_LIVEKIT = """apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: rtc, namespace: enterprise-ai}
+spec:
+  rules:
+    - http:
+        paths:
+          - {path: /rtc, pathType: Prefix, backend: {service: {name: livekit, port: {number: 7880}}}}
+"""
+
+
+def test_checker_flags_an_ingress_routing_rtc_to_livekit_in_a_new_manifest(tmp_path):
+    d = _k8s_copy(tmp_path)
+    (d / "99-rtc-ingress.yaml").write_text(INGRESS_TO_LIVEKIT)
+    assert any("Ingress routes to livekit" in b for b in _exposure_violations(LIVEKIT_MANIFEST, CADDYFILE, d))
+
+
+def test_checker_flags_a_nearby_ingress_by_port_only(tmp_path):
+    # second mutation: no "livekit" word, backend named otherwise, only the LiveKit port
+    d = _k8s_copy(tmp_path)
+    (d / "99-x.yaml").write_text(INGRESS_TO_LIVEKIT.replace("/rtc", "/ws").replace("livekit", "voice"))
+    assert any("Ingress" in b for b in _exposure_violations(LIVEKIT_MANIFEST, CADDYFILE, d))
+
+
+def test_checker_flags_a_loadbalancer_service_for_livekit_in_another_file(tmp_path):
+    d = _k8s_copy(tmp_path)
+    (d / "99-lb.yaml").write_text(
+        "apiVersion: v1\nkind: Service\nmetadata: {name: lk-public}\n"
+        "spec:\n  type: LoadBalancer\n  selector: {app: livekit}\n  ports: [{port: 7880}]\n")
+    assert any("exposes livekit" in b for b in _exposure_violations(LIVEKIT_MANIFEST, CADDYFILE, d))
+
+
+def test_checker_flags_a_caddy_rtc_route_without_naming_livekit(tmp_path):
+    edge = tmp_path / "Caddyfile"
+    edge.write_text(CADDYFILE.read_text() + "\nhandle /rtc* {\n    reverse_proxy voice:9000\n}\n")
+    assert any("/rtc" in b for b in _exposure_violations(LIVEKIT_MANIFEST, edge))
+
+
+def _caddy_with_block(tmp_path, block: str):
+    edge = tmp_path / "Caddyfile"
+    edge.write_text(CADDYFILE.read_text() + "\n" + block + "\n")
+    return edge
+
+
+def test_checker_flags_a_public_site_block_proxying_to_the_livekit_service(tmp_path):
+    edge = _caddy_with_block(tmp_path, "https://voice.example.org:443 {\n    reverse_proxy livekit.enterprise-ai.svc:80\n}")
+    assert any("livekit" in b for b in _exposure_violations(LIVEKIT_MANIFEST, edge))
+
+
+def test_checker_flags_a_public_site_block_proxying_to_a_livekit_nodeport(tmp_path):
+    # second mutation: no livekit word, no /rtc path, only a node IP + NodePort
+    edge = _caddy_with_block(tmp_path, "https://ai.example.org:443 {\n    handle /call* {\n        reverse_proxy 192.168.2.44:30781\n    }\n}")
+    assert any("30781" in b for b in _exposure_violations(LIVEKIT_MANIFEST, edge))
+
+
+def test_checker_is_clean_on_the_real_caddyfile():
+    assert _exposure_violations(LIVEKIT_MANIFEST, CADDYFILE) == []
