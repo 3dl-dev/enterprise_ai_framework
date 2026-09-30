@@ -30,7 +30,6 @@ A missing image, ffmpeg or browser FAILS the run; it never skips.
 """
 import array
 import base64
-import hashlib
 import json
 import os
 import re
@@ -209,8 +208,12 @@ def ravens_key() -> str:
 
 def ledger() -> tuple[dict, set]:
     """(per call type: rows and spend, aliases seen), from the gateway's own spend log, scoped to
-    the Raven's key hash server-side."""
-    h = hashlib.sha256(ravens_key().encode()).hexdigest()
+    the Raven's key hash server-side. The hash comes from the gateway's own /key/info (the key
+    identifies itself), never computed here from the plaintext key."""
+    s, info = http("GET", f"http://localhost:{PORTS['gw']}/key/info",
+                   {"Authorization": f"Bearer {ravens_key()}"}, timeout=60)
+    assert s == 200, info
+    h = info["info"].get("token") or info["key"]
     s, rows = http("GET", f"http://localhost:{PORTS['gw']}/spend/logs?api_key={h}",
                    {"Authorization": f"Bearer {vs.MASTER_KEY}"}, timeout=120)
     assert s == 200, rows
