@@ -1,10 +1,11 @@
 # External vantage point for the LiveKit exposure ruling (gate cfa, items 7f6/4d2):
 # LiveKit signalling/media must NOT be reachable from the public edge. GitHub-hosted runners
-# sit outside the LAN/VPN. BARON RULING 2026-09-30: ai.3dl.one is not guaranteed LAN-only, and
-# public DNS answers a private IP for it, so probing the NAME alone is trivially true. This
+# sit outside the LAN/VPN. The site hostname is not guaranteed LAN-only, and public DNS may
+# answer a private IP for it, so probing the NAME alone is trivially true. This
 # job also probes the site's real WAN IP (Actions variable EDGE_WAN_IP, or the dispatch input;
-# discover with `ssh gateway.stealth.baron.local curl -s https://ifconfig.me`). It is fail-closed:
-# no WAN IP configured = red. The schedule is active once this file is on the default branch, so a
+# discover it with `curl -s https://ifconfig.me` from a host on the site network). The edge
+# hostname comes from the Actions variable EDGE_HOST (or the dispatch input). Fail-closed:
+# no host or no WAN IP configured = red. The schedule is active once this file is on the default branch, so a
 # future public exposure turns the daily run red. The static exposure checker
 # (control-plane/tests/test_livekit_tokens.py) remains the primary guarantee.
 name: livekit-edge-probe
@@ -12,8 +13,8 @@ on:
   workflow_dispatch:
     inputs:
       host:
-        description: public hostname to probe
-        default: ai.3dl.one
+        description: public hostname to probe (defaults to the EDGE_HOST repo variable)
+        default: ""
       wan_ip:
         description: site WAN IP (defaults to the EDGE_WAN_IP repo variable)
         default: ""
@@ -35,11 +36,15 @@ jobs:
       - run: pip install pytest httpx
       - name: probe the hostname and the WAN IP from outside
         env:
-          HOST: ${{ github.event.inputs.host || 'ai.3dl.one' }}
+          HOST: ${{ github.event.inputs.host || vars.EDGE_HOST }}
           WAN_IP: ${{ github.event.inputs.wan_ip || vars.EDGE_WAN_IP }}
         run: |
+          if [ -z "$HOST" ]; then
+            echo "::error::EDGE_HOST is not set: set the EDGE_HOST Actions variable to the public hostname"
+            exit 1
+          fi
           if [ -z "$WAN_IP" ]; then
-            echo "::error::EDGE_WAN_IP is not set: without the real WAN IP this probe only tests private DNS (Baron ruling 2026-09-30)"
+            echo "::error::EDGE_WAN_IP is not set: without the real WAN IP this probe only tests private DNS"
             exit 1
           fi
           ip=$(dig +short "$HOST" A | grep -E '^[0-9.]+$' | head -1)
@@ -47,7 +52,7 @@ jobs:
           hosts="$HOST,$WAN_IP"; [ -n "$ip" ] && hosts="$hosts,$ip"
           # Positive controls: github.com:443 connects (and refuses :7880 through the same probe),
           # a public STUN server answers the same UDP datagram. Nothing public is served by the
-          # site itself today, so github.com is the reachability control (Baron: do not expose
+          # site itself today, so github.com is the reachability control (do not expose
           # anything to manufacture one).
           EDGE_CONTROL_HOST=github.com EDGE_SNI="$HOST" EDGE_HOST="$hosts" \
             pytest tests-live/test_livekit_exposure.py -v -p no:cacheprovider
