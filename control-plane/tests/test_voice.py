@@ -460,20 +460,31 @@ def test_a_raven_with_no_gateway_key_is_a_503_not_an_unauthenticated_call(vw):
 # ------------------------------------------------------------------ the Raven as the LLM node
 
 def _raven_ws(world, replies, seen):
+    """A Raven's /rpc. The frame shapes are RECORDED from the real hosted image (82e): the
+    subscribe result carries `subscription_id`; events are `method: "event"` with the
+    `subscription_id` they belong to; and the real Raven delivers each event once per
+    subscription EVER opened on the session, to whichever socket is talking. The fake reproduces
+    that (a stale subscription echoes every event) so a turn read naively arrives twice."""
     async def handler(conn):
         seen["headers"] = {k.lower(): v for k, v in conn.request.headers.items()}
         seen["path"] = conn.request.path
         async for message in conn:
             call = json.loads(message)
             seen.setdefault("calls", []).append(call)
-            await conn.send(json.dumps({"jsonrpc": "2.0", "id": call["id"],
-                                        "result": {"accepted": True}}))
+            result = {"accepted": True}
+            if call["method"] == "turn.subscribe":
+                result = {"subscription_id": "sub-mine", "running": False}
+            elif call["method"] == "turn.unsubscribe":
+                result = {"unsubscribed": True}
+            await conn.send(json.dumps({"jsonrpc": "2.0", "id": call["id"], "result": result}))
             if call["method"] == "turn.send":
+                async def emit(ev):
+                    for sub in ("sub-stale-1", "sub-mine", "sub-stale-2"):
+                        await conn.send(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {
+                            "subscription_id": sub, "event": ev}}))
                 for text in replies:
-                    await conn.send(json.dumps({"jsonrpc": "2.0", "method": "turn.event", "params": {
-                        "event": {"type": "token.delta", "payload": {"text": text}}}}))
-                await conn.send(json.dumps({"jsonrpc": "2.0", "method": "turn.event", "params": {
-                    "event": {"type": "message.complete", "payload": {}}}}))
+                    await emit({"type": "token.delta", "payload": {"text": text}})
+                await emit({"type": "message.complete", "payload": {}})
 
     loop = _serve_ws(world, handler)
     world.hosts["agent-alice-rv"] = "127.0.0.2"
@@ -508,6 +519,9 @@ def test_the_raven_answers_the_turn_over_its_rpc_and_streams_openai_chunks(vw):
         assert send["content"].endswith("what is the weather") and "earlier" not in send["content"]
         assert "spoken conversation" in send["content"]
         assert ("alice", "voice.turn", "alice/rv") == vw.audits[-1][:3]
+        # the turn closes the subscription it opened, and only that one
+        unsub = [c for c in seen["calls"] if c["method"] == "turn.unsubscribe"]
+        assert [c["params"] for c in unsub] == [{"subscription_id": "sub-mine"}]
     finally:
         loop.call_soon_threadsafe(loop.stop)
 

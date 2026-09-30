@@ -43,7 +43,7 @@ PG_URL = "postgresql://eaf:pg82e-not-a-secret@postgres-82e:5432"
 # (never through this process), so the Raven really answers and the spend lands in the THROWAWAY
 # gateway's ledger on the Raven's alias. A local llama.cpp Qwen was tried and rejected: its
 # /v1/responses cannot take the multi-turn history a Raven sends ("Cannot determine type of 'item'").
-RAVEN_MODEL = os.environ.get("VOICE_LIVE_RAVEN_MODEL", "deepseek-v4-flash@deepinfra")
+RAVEN_MODEL = os.environ.get("VOICE_LIVE_RAVEN_MODEL", "glm-5.2@deepinfra")
 UPSTREAM_BASE = os.environ.get("VOICE_LIVE_UPSTREAM_BASE", "http://freerouter:8080/v1")
 USER = "baron"  # a principal the real IdP knows, so the control plane can mint the Raven's key
 
@@ -192,7 +192,10 @@ spec:
       containers:
         - name: litellm
           image: ghcr.io/berriai/litellm:main-v1.77.3-stable
-          args: ["--config", "/app/config.yaml", "--port", "4000"]
+          # The freerouter tenant bearer lives in the control plane's PVC (the secret's copy is empty),
+          # so it is read by THIS pod at start into the env var the catalogue names; this process never
+          # sees it.
+          command: ["sh", "-c", "export FREEROUTER_MASTER_KEY=$(cat /freerouter/operator.key); exec litellm --config /app/config.yaml --port 4000"]
           env:
             - name: LITELLM_MASTER_KEY
               valueFrom: {{secretKeyRef: {{name: live82e-secrets, key: LITELLM_MASTER_KEY}}}}
@@ -200,8 +203,6 @@ spec:
               valueFrom: {{secretKeyRef: {{name: live82e-secrets, key: LITELLM_SALT_KEY}}}}
             - {{name: DATABASE_URL, value: "{PG_URL}/litellm"}}
             - {{name: REDIS_URL, value: "redis://valkey-82e:6379"}}
-            - name: FREEROUTER_MASTER_KEY
-              valueFrom: {{secretKeyRef: {{name: enterprise-ai-secrets, key: FREEROUTER_MASTER_KEY, optional: true}}}}
             - name: FORGE_API_KEY
               valueFrom: {{secretKeyRef: {{name: enterprise-ai-secrets, key: FORGE_API_KEY, optional: true}}}}
           ports: [{{containerPort: 4000}}]
@@ -213,8 +214,11 @@ spec:
           volumeMounts:
 {''.join(f'''            - {{mountPath: /app/{f}, name: config, readOnly: true, subPath: {f}}}
 ''' for f in ("config.yaml", "strip_reasoning.py", "require_principal.py",
-              "flush_spend_on_shutdown.py", "allow_reasoning_effort.py"))}          resources: {{requests: {{cpu: 30m, memory: 512Mi}}, limits: {{memory: 2Gi}}}}
-      volumes: [{{name: config, configMap: {{name: gateway-config-82e}}}}]
+              "flush_spend_on_shutdown.py", "allow_reasoning_effort.py"))}            - {{mountPath: /freerouter, name: freerouter-key, readOnly: true}}
+          resources: {{requests: {{cpu: 30m, memory: 512Mi}}, limits: {{memory: 2Gi}}}}
+      volumes:
+        - {{name: config, configMap: {{name: gateway-config-82e}}}}
+        - {{name: freerouter-key, persistentVolumeClaim: {{claimName: freerouter-operator-key, readOnly: true}}}}
 ---
 apiVersion: v1
 kind: Service

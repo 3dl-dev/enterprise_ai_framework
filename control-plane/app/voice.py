@@ -354,26 +354,46 @@ async def raven_turn(target: dict, session_key: str, text: str):
                 if m.get("id") == i:
                     return m
 
-        await call(1, "turn.subscribe", {"session_key": session_key})
-        sent = await call(2, "turn.send", {"session_key": session_key, "content": text})
-        if not (sent.get("result") or {}).get("accepted"):
-            raise RuntimeError(f"raven refused the turn: {sent}")
-        deadline = time.monotonic() + TURN_TIMEOUT
-        while True:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise TimeoutError("the raven did not finish its turn in time")
-            m = json.loads(await asyncio.wait_for(ws.recv(), left))
-            ev = (m.get("params") or {}).get("event") or {}
-            if ev.get("type") == "token.delta":
-                yield ev["payload"]["text"]
-            elif ev.get("type") == "message.complete":
-                return
-            elif ev.get("type") == "error":
-                # The turn failed inside the Raven (its model call, most often). Without this the
-                # socket stays open and the caller waits out the whole turn timeout in silence.
-                p = ev.get("payload") or {}
-                raise RuntimeError(f"raven turn_failed: {p.get('message')}: {str(p.get('detail'))[:200]}")
+        # A Raven keeps every subscription ever opened on a session and (measured against the real
+        # image, 82e) delivers each event on all of them to whichever socket is talking, so the Nth
+        # turn of a conversation arrived N times over ("Blue.Blue.Blue."). Each event carries the
+        # subscription_id it belongs to: keep only ours, and close it when the turn ends.
+        subscribed = await call(1, "turn.subscribe", {"session_key": session_key})
+        mine = (subscribed.get("result") or {}).get("subscription_id")
+        try:
+            sent = await call(2, "turn.send", {"session_key": session_key, "content": text})
+            if not (sent.get("result") or {}).get("accepted"):
+                raise RuntimeError(f"raven refused the turn: {sent}")
+            async for piece in _turn_events(ws, mine):
+                yield piece
+        finally:
+            if mine:
+                try:
+                    await asyncio.wait_for(call(3, "turn.unsubscribe", {"subscription_id": mine}), 5)
+                except Exception:  # noqa: BLE001 - best effort; the turn's outcome is already decided
+                    pass
+
+
+async def _turn_events(ws, mine):
+    """The `token.delta` texts of one turn, from the frames of subscription `mine` only."""
+    deadline = time.monotonic() + TURN_TIMEOUT
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("the raven did not finish its turn in time")
+        m = json.loads(await asyncio.wait_for(ws.recv(), left))
+        if mine and (m.get("params") or {}).get("subscription_id") not in (None, mine):
+            continue
+        ev = (m.get("params") or {}).get("event") or {}
+        if ev.get("type") == "token.delta":
+            yield ev["payload"]["text"]
+        elif ev.get("type") == "message.complete":
+            return
+        elif ev.get("type") == "error":
+            # The turn failed inside the Raven (its model call, most often). Without this the
+            # socket stays open and the caller waits out the whole turn timeout in silence.
+            p = ev.get("payload") or {}
+            raise RuntimeError(f"raven turn_failed: {p.get('message')}: {str(p.get('detail'))[:200]}")
 
 
 def _chunk(cid: str, model: str, delta: dict, finish: str | None = None) -> str:
