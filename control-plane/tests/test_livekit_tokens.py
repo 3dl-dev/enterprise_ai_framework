@@ -319,3 +319,24 @@ def test_checker_flags_a_caddy_rtc_route_without_naming_livekit(tmp_path):
     edge = tmp_path / "Caddyfile"
     edge.write_text(CADDYFILE.read_text() + "\nhandle /rtc* {\n    reverse_proxy voice:9000\n}\n")
     assert any("/rtc" in b for b in _exposure_violations(LIVEKIT_MANIFEST, edge))
+
+
+def _caddy_with_block(tmp_path, block: str):
+    edge = tmp_path / "Caddyfile"
+    edge.write_text(CADDYFILE.read_text() + "\n" + block + "\n")
+    return edge
+
+
+def test_checker_flags_a_public_site_block_proxying_to_the_livekit_service(tmp_path):
+    edge = _caddy_with_block(tmp_path, "https://voice.example.org:443 {\n    reverse_proxy livekit.enterprise-ai.svc:80\n}")
+    assert any("livekit" in b for b in _exposure_violations(LIVEKIT_MANIFEST, edge))
+
+
+def test_checker_flags_a_public_site_block_proxying_to_a_livekit_nodeport(tmp_path):
+    # second mutation: no livekit word, no /rtc path, only a node IP + NodePort
+    edge = _caddy_with_block(tmp_path, "https://ai.example.org:443 {\n    handle /call* {\n        reverse_proxy 192.168.2.44:30781\n    }\n}")
+    assert any("30781" in b for b in _exposure_violations(LIVEKIT_MANIFEST, edge))
+
+
+def test_checker_is_clean_on_the_real_caddyfile():
+    assert _exposure_violations(LIVEKIT_MANIFEST, CADDYFILE) == []
