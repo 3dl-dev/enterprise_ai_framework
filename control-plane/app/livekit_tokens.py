@@ -72,7 +72,7 @@ def mint(api_key: str, api_secret: str, *, identity: str, room: str,
 
 def api_url() -> str:
     """Where the CONTROL PLANE reaches the LiveKit server (Twirp API): the in-cluster Service,
-    not the browser-facing LIVEKIT_URL (which is the LAN/VPN signalling address)."""
+    not the LAN LIVEKIT_URL (browsers reach signalling through the portal origin, rtc_proxy.py)."""
     return (os.environ.get("LIVEKIT_API_URL") or "http://livekit:7880").rstrip("/")
 
 
