@@ -566,6 +566,9 @@ async def owned_raven(user: str, name: str) -> dict:
     return dep
 
 
+RELAY_TYPES = ("hermes", "openclaw")
+
+
 async def relay_target(user: str, name: str, via_raven: str) -> dict:
     """Where a Raven's relayed turn goes, and the credential to present (Contract G).
 
@@ -576,9 +579,13 @@ async def relay_target(user: str, name: str, via_raven: str) -> dict:
     never holds another agent's key and cannot name an address.
 
       * not itself (403, as every other self-targeting verb);
-      * a hermes agent: its API server on :8642. openclaw is Contract G's second target and
-        is not wired yet (501); a raven, an opencode agent or anything unlabelled is not a
-        relay target (404, the same answer as "no such agent");
+      * a hermes agent: its API server on :8642, presented with ITS `-key` Secret's
+        API_SERVER_KEY. An openclaw agent: its gateway's OpenAI-compatible endpoint on
+        :18789 (enterpriseaiframework-b12), which has no key to present: the gateway runs
+        `trusted-proxy` auth, so the credential is the owner identity this control plane
+        asserts, and `user` here is the owner read from the label-verified Deployment, never
+        from the request. A raven, an opencode agent or anything unlabelled is not a relay
+        target (404, the same answer as "no such agent");
       * running: a stopped or still-starting agent is 404 with a reason, never a hang on a
         Service with no endpoints.
     """
@@ -587,14 +594,13 @@ async def relay_target(user: str, name: str, via_raven: str) -> dict:
     async with _client() as client:
         deployment = await _owned_deployment(client, user, name)
         agent_type = ((deployment.get("metadata") or {}).get("labels") or {}).get(TYPE_LABEL, "")
-        if agent_type == "openclaw":
-            raise HTTPException(501, f"relaying to the openclaw agent {name!r} is not "
-                                     "supported yet; hermes agents are")
-        if agent_type != "hermes":
-            raise HTTPException(404, f"you have no hermes agent called {name!r}")
+        if agent_type not in RELAY_TYPES:
+            raise HTTPException(404, f"you have no hermes or openclaw agent called {name!r}")
         phases = await _pod_phases(client, user)
         if _status_of(deployment, phases.get(name)) != RUNNING:
             raise HTTPException(404, f"the agent {name!r} is not running; start it first")
+        if agent_type == "openclaw":
+            return {"type": "openclaw", "host": obj, "port": OPENCLAW_PORT, "user": user}
         secret = await _get(client, "v1", "Secret", f"{obj}-key")
     raw = ((secret or {}).get("data") or {}).get("API_SERVER_KEY")
     if not raw:
@@ -1048,6 +1054,10 @@ def openclaw_seed_config(user: str, name: str, model: str) -> str:
             },
         },
         "controlUi": {"basePath": f"/agents/{name}"},
+        # The OpenAI-compatible endpoint the agent relay drives (agents-raven.md Contract G,
+        # enterpriseaiframework-b12). Off by default in openclaw; same listener, same
+        # trusted-proxy auth, so it is reachable only from the control-plane pod.
+        "http": {"endpoints": {"chatCompletions": {"enabled": True}}},
     }
     public = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
     if public:

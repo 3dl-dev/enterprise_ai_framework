@@ -1,4 +1,10 @@
-"""The agent relay: a Raven's turn to its owner's hermes agent (agents-raven.md, Contract G).
+"""The agent relay: a Raven's turn to its owner's hermes or openclaw agent (agents-raven.md,
+Contract G).
+
+openclaw (enterpriseaiframework-b12) differs only at the upstream: its gateway's OpenAI-
+compatible endpoint on :18789 takes the owner's trusted-proxy identity, not a bearer key, and
+reads `model` as an agent selector (pinned to its default agent). Everything below, the timeouts,
+cancel, cap, header allow-list, derived session key and audit, is target-independent.
 
     Raven pod ──:8000──▶ control plane ──:8642──▶ the owner's hermes agent's API server
                  (68-raven-common.yaml)     (66-agent-console-common.yaml: control plane only)
@@ -60,6 +66,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import db
+from .agent_gateway_console import openclaw_trusted_headers
 
 # Only these inbound headers are forwarded. Everything else, Authorization and X-Hermes-*
 # included, is dropped by construction rather than by a deny list that can miss a name.
@@ -227,8 +234,28 @@ async def relay(turn: Turn, target: dict, request: Request) -> Response:
     turn.bytes_in = len(body)
 
     headers = {k: v for k, v in request.headers.items() if k.lower() in _FORWARD_REQUEST}
-    headers["authorization"] = f"Bearer {target['key']}"
-    headers["x-hermes-session-key"] = session_key(turn.mgr.owner, turn.mgr.raven, turn.name)
+    skey = session_key(turn.mgr.owner, turn.mgr.raven, turn.name)
+    if target["type"] == "openclaw":
+        # openclaw's gateway has no per-agent key: it runs trusted-proxy auth, so what it
+        # accepts is the OWNER identity, asserted here from `target["user"]` (the label-
+        # verified owner of the Deployment, agents.relay_target), never from the request.
+        # The `model` field is an agent selector there, not a provider model: the Raven's
+        # `model: <agent-name>` (which hermes ignores) would be an unknown agent, so it is
+        # pinned to the gateway's default agent; the agent's own configured model answers.
+        try:
+            payload = json.loads(body)
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict):
+            await turn.finish("bad_request")
+            raise HTTPException(400, "a relay turn's body must be a JSON object")
+        payload["model"] = "openclaw"
+        body = json.dumps(payload).encode()
+        headers.update(openclaw_trusted_headers(target["user"]))
+        headers["x-openclaw-session-key"] = skey
+    else:
+        headers["authorization"] = f"Bearer {target['key']}"
+        headers["x-hermes-session-key"] = skey
     headers["accept-encoding"] = "identity"
     url = f"http://{target['host']}:{target['port']}/v1/chat/completions"
 

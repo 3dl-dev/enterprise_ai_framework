@@ -115,6 +115,14 @@ def _openclaw_identity(user: str) -> dict:
     return {"x-forwarded-user": user, "x-forwarded-for": _PROXY_CLIENT_ADDR}
 
 
+def openclaw_trusted_headers(user: str) -> dict:
+    """Everything openclaw's `trusted-proxy` auth needs to accept a request as `user`: the
+    identity, the synthetic client address and the two headers the seed requires. Shared by
+    the admin RPC and the agent relay (Contract G) so there is one statement of it."""
+    return {**_openclaw_identity(user),
+            "x-forwarded-proto": "https", "x-forwarded-host": "control-plane"}
+
+
 def _is_openclaw(target: dict) -> bool:
     return target.get("type") == "openclaw"
 
@@ -159,9 +167,7 @@ async def openclaw_rpc(target: dict, method: str, params: dict) -> dict:
     the console uses; `target` is owner-scoped by `console_target`.
     """
     headers = {
-        **_openclaw_identity(target["user"]),
-        "x-forwarded-proto": "https",
-        "x-forwarded-host": "control-plane",
+        **openclaw_trusted_headers(target["user"]),
         "content-type": "application/json",
     }
     try:
