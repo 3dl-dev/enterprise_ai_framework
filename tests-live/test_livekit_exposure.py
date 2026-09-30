@@ -7,7 +7,9 @@ LiveKit port and media path must stay closed.
 BARON RULING 2026-09-30: "we do not guarantee that ai.3dl.one is LAN only." Private DNS is NOT
 a protection, so this probes as if the name were public: EDGE_HOST lists the hostname AND the
 site's real WAN IP (discovered at runtime, never committed: `ssh gateway curl -s
-https://ifconfig.me`, then the EDGE_WAN_IP Actions variable). The Host/SNI sent to a bare IP is
+https://ifconfig.me`, then the EDGE_WAN_IP Actions variable). Targets that do not answer from the
+probe's vantage are reported UNREACHABLE (skips), never counted as passing the auth check; the
+Actions variable EDGE_REQUIRE_REACHABLE (default empty) names targets that MUST answer. The Host/SNI sent to a bare IP is
 EDGE_SNI (default ai.3dl.one), so the request is the one a browser would make.
 
     EDGE_CONTROL_HOST=github.com EDGE_HOST=ai.3dl.one,<wan-ip> pytest tests-live/test_livekit_exposure.py
@@ -25,6 +27,7 @@ guarantee; this probe is the runtime backstop.
 
 import os
 import socket
+import socketserver
 import struct
 
 import httpx
@@ -111,10 +114,12 @@ def test_no_livekit_udp_port_answers_stun_on_the_edge(edge, port):
     assert not stun_answers(edge, port), f"{edge}:{port}/udp answered a STUN binding request"
 
 
-def _get_rtc(edge: str, scheme: str):
+def _get_rtc(edge: str, scheme: str, port: int | None = None):
     """GET /rtc as a browser would (Host/SNI = SNI) against the edge target, websocket-upgrade
-    headers included. None when the target does not answer HTTP at all from this vantage."""
-    port = 443 if scheme == "https" else 80
+    headers included. None when the target does not answer HTTP at all from this vantage: the
+    caller MUST treat that as UNREACHABLE (see `_unreachable`), never as a pass."""
+    # EDGE_HTTPS_PORT/EDGE_HTTP_PORT exist so the probe can be pointed at a local stub in a sandbox.
+    port = port or int(os.environ.get(f"EDGE_{scheme.upper()}_PORT", 443 if scheme == "https" else 80))
     try:
         with httpx.Client(verify=False, timeout=10, follow_redirects=False) as c:
             return c.get(
@@ -125,6 +130,23 @@ def _get_rtc(edge: str, scheme: str):
             )
     except httpx.TransportError:
         return None
+
+
+def _required_reachable() -> set[str]:
+    return {h.strip() for h in os.environ.get("EDGE_REQUIRE_REACHABLE", "").split(",") if h.strip()}
+
+
+def _unreachable(edge: str, scheme: str) -> None:
+    """A target that did not answer HTTP proved NOTHING about /rtc: it is reported as UNREACHABLE,
+    never as a pass. A target named in EDGE_REQUIRE_REACHABLE (the site's WAN IP, in the workflow)
+    must answer https, so an unreachable one FAILS; any other (the name, which public DNS may map
+    to a private IP) is reported as a skip with the reason, not a green. EDGE_REQUIRE_REACHABLE is
+    empty by default (nothing is publicly reachable today): then every target that DOES answer must
+    demand authentication, and the ones that do not are only reported."""
+    msg = f"UNREACHABLE: {edge} did not answer {scheme} /rtc from this vantage; nothing was verified"
+    if edge in _required_reachable() and scheme == "https":
+        pytest.fail(msg + " (listed in EDGE_REQUIRE_REACHABLE)")
+    pytest.skip(msg)
 
 
 def _assert_not_livekit(r) -> None:
@@ -149,21 +171,12 @@ def _demands_authentication(r) -> bool:
 def test_rtc_signalling_path_demands_authentication_and_never_reaches_livekit(edge, scheme):
     r = _get_rtc(edge, scheme)
     if r is None:
-        return  # not answering HTTP from here; the aggregate test below requires one that does
+        _unreachable(edge, scheme)
     _assert_not_livekit(r)
     if scheme == "https":
         assert _demands_authentication(r), (
             f"{edge} answered /rtc with {r.status_code} (location={r.headers.get('location')!r}); "
             "expected a demand for authentication (302 to oauth2-proxy sign-in, or 401/403)")
-
-
-def test_rtc_is_present_and_demands_authentication_on_at_least_one_edge_target():
-    """A silent edge cannot be told from an absent route, and absent is now a defect: at least one
-    probed target must actually answer /rtc over https with the authentication demand."""
-    answered = {h: _get_rtc(h, "https") for h in _hosts()}
-    ok = [h for h, r in answered.items() if r is not None and _demands_authentication(r)]
-    seen = {h: (r.status_code if r is not None else None) for h, r in answered.items()}
-    assert ok, f"no edge target demanded authentication for /rtc: {seen}"
 
 
 def test_demand_classifier_tells_a_sign_in_redirect_from_livekit_and_from_absence():
@@ -220,5 +233,77 @@ def test_rtc_probe_can_tell_a_livekit_like_responder_from_the_catch_all():
         r = httpx.get(f"http://127.0.0.1:{srv.server_port}/rtc", timeout=5, follow_redirects=False)
         with pytest.raises(AssertionError, match="health body"):
             _assert_not_livekit(r)
+    finally:
+        srv.shutdown()
+
+
+def _serve_raw(reply: bytes):
+    """A real TCP responder that writes `reply` verbatim to whatever connects (so status codes and
+    headers reach the probe over the wire, exactly as an edge's would). Returns (server, port)."""
+    import threading
+
+    class H(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(4096)
+            self.request.sendall(reply)
+
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), H)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1]
+
+
+def test_rtc_probe_flags_a_websocket_upgrade_and_livekit_marks_and_passes_a_plain_refusal():
+    """Both-ways control for the `!= 101`, health-body and livekit-mark assertions, driven through
+    the same `_get_rtc` + `_assert_not_livekit` the live probe uses, against real HTTP on the wire:
+    a 101 Switching Protocols, a body/header naming livekit, and a 302 to sign-in are told apart."""
+    cases = {
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n": "upgraded",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nlivekit here": "livekit",
+        b"HTTP/1.1 200 OK\r\nServer: livekit\r\nContent-Length: 2\r\n\r\nno": "livekit",
+    }
+    for reply, expect in cases.items():
+        srv, port = _serve_raw(reply)
+        try:
+            r = _get_rtc("127.0.0.1", "http", port)
+            assert r is not None, "the local responder must be reachable"
+            with pytest.raises(AssertionError) as e:
+                _assert_not_livekit(r)
+            assert expect in str(e.value).lower() or expect in r.text.lower() or expect in str(r.headers).lower()
+        finally:
+            srv.shutdown()
+    srv, port = _serve_raw(b"HTTP/1.1 302 Found\r\nLocation: /oauth2/sign_in?rd=/rtc\r\nContent-Length: 0\r\n\r\n")
+    try:
+        r = _get_rtc("127.0.0.1", "http", port)
+        _assert_not_livekit(r)  # a plain sign-in redirect is NOT flagged
+        assert _demands_authentication(r)
+    finally:
+        srv.shutdown()
+
+
+def _closed_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_an_unreachable_rtc_target_is_reported_unreachable_not_passed(monkeypatch):
+    """Both-ways control for the unreachable handling: the same probe against a port nothing listens
+    on yields None; `_unreachable` then SKIPS with the UNREACHABLE reason for an ordinary target and
+    FAILS for one in EDGE_REQUIRE_REACHABLE. A reachable target does not take this path."""
+    assert _get_rtc("127.0.0.1", "https", _closed_port()) is None
+    monkeypatch.delenv("EDGE_REQUIRE_REACHABLE", raising=False)
+    with pytest.raises(pytest.skip.Exception, match="UNREACHABLE"):
+        _unreachable("203.0.113.9", "https")
+    monkeypatch.setenv("EDGE_REQUIRE_REACHABLE", "203.0.113.9")
+    with pytest.raises(pytest.fail.Exception, match="UNREACHABLE"):
+        _unreachable("203.0.113.9", "https")
+    with pytest.raises(pytest.skip.Exception):  # http :80 on a required host is not required
+        _unreachable("203.0.113.9", "http")
+    srv, port = _serve_raw(b"HTTP/1.1 302 Found\r\nLocation: /oauth2/sign_in\r\nContent-Length: 0\r\n\r\n")
+    try:
+        assert _get_rtc("127.0.0.1", "http", port) is not None
     finally:
         srv.shutdown()
