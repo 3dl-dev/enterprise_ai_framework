@@ -101,6 +101,8 @@ def worker_violations(path: Path) -> list[str]:
     if len(auth_assigns) != 1 or ast.unparse(auth_assigns[0].value) != \
             "dict(base_url=cfg.base_url, api_key=cfg.session_token)":
         bad.append("`auth` is not exactly the settings' base_url and session token")
+    if "close_on_disconnect=False" not in src:
+        bad.append("close_on_disconnect is not False: the session closes on the first disconnect and a quick rejoin finds no agent")
     if "use_realtime=False" not in src:
         bad.append("STT may use the realtime websocket")
     if 'turn_handling={"turn_detection": "vad", "interruption": {"mode": "vad"}}' not in src:
@@ -286,8 +288,16 @@ def test_checker_catches_livekit_inference_a_second_base_and_a_turn_detector(tmp
     assert worker_violations(p)
     p.write_text(src.replace('"interruption": {"mode": "vad"}', '"interruption": {"mode": "adaptive"}'))
     assert any("pinned to VAD" in v for v in worker_violations(p))
-    p.write_text(src.replace("from livekit.agents import Agent,", "from livekit.agents import inference, Agent,"))
+    mutated = src.replace("from livekit.agents import (\n", "from livekit.agents import (\n    inference,\n")
+    assert mutated != src, "the mutation must actually change the file"
+    p.write_text(mutated)
     assert worker_violations(p)
+    # and a nearby wrong value: the same fault as a separate statement
+    p.write_text(src.replace("import settings\n", "import settings\nfrom livekit.agents import inference\n"))
+    assert any("inference" in v for v in worker_violations(p))
+    # the session must not end under a rejoining user
+    p.write_text(src.replace("close_on_disconnect=False", "close_on_disconnect=True"))
+    assert any("close_on_disconnect" in v for v in worker_violations(p))
 
 
 def test_checker_catches_a_dockerfile_that_fetches_or_loads_online(tmp_path):
