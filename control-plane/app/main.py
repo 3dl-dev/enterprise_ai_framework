@@ -31,6 +31,7 @@ from . import (
     identity,
     issuance,
     livekit_tokens,
+    rtc_proxy,
     voice,
     metering,
     metering_select,
@@ -146,6 +147,8 @@ app.include_router(livekit_tokens.router)
 app.include_router(agent_manager.router)
 # The voice registry, session tokens and the /voice/v1 relay the worker calls (-82e). See voice.py.
 app.include_router(voice.router)
+# LiveKit signalling on the portal origin, behind oauth2-proxy (-82e). See rtc_proxy.py.
+app.include_router(rtc_proxy.router)
 
 
 # ---------------------------------------------------------------- health

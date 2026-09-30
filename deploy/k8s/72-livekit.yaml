@@ -1,12 +1,16 @@
 # Self-hosted LiveKit server (Apache-2.0): the SFU behind the Raven voice front end
 # (docs/design/records/agents-raven.md, item enterpriseaiframework-7f6).
 #
-# EXPOSURE: LAN / VPN ONLY. BARON RULING 2026-09-29 (gate cfa). There is no public
-# NodePort, no LoadBalancer, no externalIPs, no hostNetwork and NO TURN. The NodePorts
+# EXPOSURE: MEDIA is LAN / VPN only (Baron ruling 2026-09-29, gate cfa). SIGNALLING is reached
+# only through the portal origin (Baron ruling 2026-09-30): the browser dials wss://<portal
+# origin>/rtc, Caddy sends that to the portal's oauth2-proxy, and the control plane bridges it
+# to the `signal` port below (app/rtc_proxy.py). The `signal` NodePort stays a LAN address and
+# is NOT what browsers use. There is no public NodePort, no LoadBalancer, no externalIPs, no hostNetwork and NO TURN. The NodePorts
 # below bind the k3s node's addresses, which are LAN/tailnet addresses; the public edge is
-# the gateway VM's Caddy, which routes an explicit allowlist of paths and has no LiveKit
-# route (tests/test_livekit_exposure.py pins both facts, tests-live probes the edge).
-# Browsers off the LAN/VPN cannot connect, by design. Do not "fix" that by adding TURN or
+# the gateway VM's Caddy, which routes an explicit allowlist of paths whose only /rtc route
+# points at the authenticated portal port, never at LiveKit (tests/test_livekit_exposure.py pins both facts, tests-live probes the edge).
+# Browsers off the LAN/VPN can sign in and open the signalling socket but cannot carry media,
+# by design. Do not "fix" that by adding TURN or
 # an ingress rule: that is public exposure and is Baron-reserved.
 #
 # WHAT IS DELIBERATELY ABSENT
