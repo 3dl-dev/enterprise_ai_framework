@@ -52,6 +52,16 @@
     handle /workshop/* {
         reverse_proxy NODE_IP:30460
     }
+    # Voice signalling (enterpriseaiframework-82e; Baron ruling 2026-09-30). The browser's
+    # wss://<this origin>/rtc goes to the SAME authenticated upstream as /portal/*: the portal's
+    # oauth2-proxy, which redirects an unauthenticated request to sign-in and only then lets the
+    # control plane bridge the socket to the voice server. There is deliberately no route to the
+    # voice server's own port here, and media never crosses this edge (LAN NodePorts only, no
+    # TURN). tests/test_livekit_tokens.py pins this: /rtc may only ever point at the portal port.
+    @rtc path /rtc /rtc/*
+    handle @rtc {
+        reverse_proxy NODE_IP:30460
+    }
     # An agent's console, attached by the portal at /agents/<name>/. Same upstream again,
     # and it must be listed: without this rule the path falls through to `handle` below
     # and lands on LibreChat, which answers its own 404 — a console that "does not exist"
@@ -127,6 +137,16 @@ https://ai.example.org:443, https://ai.example.org:8443 {
     # separate site on a LAN address. Same upstream as /portal/* — the control plane
     # serves both, and its oauth2-proxy authenticates this path too.
     handle /workshop/* {
+        reverse_proxy NODE_IP:30460
+    }
+    # Voice signalling (enterpriseaiframework-82e; Baron ruling 2026-09-30). The browser's
+    # wss://<this origin>/rtc goes to the SAME authenticated upstream as /portal/*: the portal's
+    # oauth2-proxy, which redirects an unauthenticated request to sign-in and only then lets the
+    # control plane bridge the socket to the voice server. There is deliberately no route to the
+    # voice server's own port here, and media never crosses this edge (LAN NodePorts only, no
+    # TURN). tests/test_livekit_tokens.py pins this: /rtc may only ever point at the portal port.
+    @rtc path /rtc /rtc/*
+    handle @rtc {
         reverse_proxy NODE_IP:30460
     }
     # An agent's console, attached by the portal at /agents/<name>/. Same upstream again,

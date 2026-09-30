@@ -1,12 +1,15 @@
-# External vantage point for the LiveKit exposure ruling (gate cfa, items 7f6/4d2):
-# LiveKit signalling/media must NOT be reachable from the public edge. GitHub-hosted runners
-# sit outside the LAN/VPN. The site hostname is not guaranteed LAN-only, and public DNS may
-# answer a private IP for it, so probing the NAME alone is trivially true. This
-# job also probes the site's real WAN IP (Actions variable EDGE_WAN_IP, or the dispatch input;
-# discover it with `curl -s https://ifconfig.me` from a host on the site network). The edge
-# hostname comes from the Actions variable EDGE_HOST (or the dispatch input). Fail-closed:
-# no host or no WAN IP configured = red. The schedule is active once this file is on the default branch, so a
-# future public exposure turns the daily run red. The static exposure checker
+# External vantage point for the LiveKit exposure rulings (gate cfa, items 7f6/4d2/82e):
+# LiveKit MEDIA and every LiveKit port must NOT be reachable from the public edge, and the ONE
+# public piece, /rtc signalling (BARON RULING 2026-09-30), must demand authentication (302 to
+# oauth2-proxy sign-in, or 401/403) with no session, never reaching LiveKit. GitHub-hosted runners
+# sit outside the LAN/VPN. Semantics: for every target that IS reachable, /rtc must demand
+# authentication; a target that does not answer is reported UNREACHABLE in the job summary and is
+# never counted as passing the auth check. Nothing is publicly reachable today (the host name
+# resolves to a LAN address and the WAN IP serves nothing on 443), so the Actions variable
+# EDGE_REQUIRE_REACHABLE defaults to empty; when set (comma list of hosts/IPs) those targets
+# MUST answer https /rtc or the job fails. No operator literals here: the host comes from the
+# Actions variable EDGE_HOST (or the dispatch input), the WAN IP from EDGE_WAN_IP (discover from the gateway host:
+# `curl -s https://ifconfig.me` run there). The static exposure checker
 # (control-plane/tests/test_livekit_tokens.py) remains the primary guarantee.
 name: livekit-edge-probe
 on:
@@ -38,21 +41,28 @@ jobs:
         env:
           HOST: ${{ github.event.inputs.host || vars.EDGE_HOST }}
           WAN_IP: ${{ github.event.inputs.wan_ip || vars.EDGE_WAN_IP }}
+          REQUIRE_REACHABLE: ${{ vars.EDGE_REQUIRE_REACHABLE }}
         run: |
+          set -o pipefail
           if [ -z "$HOST" ]; then
             echo "::error::EDGE_HOST is not set: set the EDGE_HOST Actions variable to the public hostname"
             exit 1
           fi
-          if [ -z "$WAN_IP" ]; then
-            echo "::error::EDGE_WAN_IP is not set: without the real WAN IP this probe only tests private DNS"
-            exit 1
-          fi
           ip=$(dig +short "$HOST" A | grep -E '^[0-9.]+$' | head -1)
-          echo "runner egress: $(curl -s https://api.ipify.org)  $HOST -> ${ip:-<none>}  (WAN IP configured)"
-          hosts="$HOST,$WAN_IP"; [ -n "$ip" ] && hosts="$hosts,$ip"
+          echo "runner egress: $(curl -s https://api.ipify.org)  $HOST -> ${ip:-<none>}"
+          hosts="$HOST"; [ -n "$WAN_IP" ] && hosts="$hosts,$WAN_IP"; [ -n "$ip" ] && hosts="$hosts,$ip"
           # Positive controls: github.com:443 connects (and refuses :7880 through the same probe),
-          # a public STUN server answers the same UDP datagram. Nothing public is served by the
-          # site itself today, so github.com is the reachability control (do not expose
-          # anything to manufacture one).
-          EDGE_CONTROL_HOST=github.com EDGE_SNI="$HOST" EDGE_HOST="$hosts" \
-            pytest tests-live/test_livekit_exposure.py -v -p no:cacheprovider
+          # a public STUN server answers the same UDP datagram (Baron: do not expose anything to
+          # manufacture a control). Unreachable targets are skips (-rs) and are copied to the job
+          # summary; the ones in EDGE_REQUIRE_REACHABLE (default empty) fail instead.
+          rc=0
+          EDGE_CONTROL_HOST=github.com EDGE_SNI="$HOST" EDGE_HOST="$hosts" EDGE_REQUIRE_REACHABLE="$REQUIRE_REACHABLE" \
+            pytest tests-live/test_livekit_exposure.py -v -rs -p no:cacheprovider 2>&1 | tee probe.log || rc=$?
+          {
+            echo "### livekit-edge-probe"
+            echo "targets: \`$hosts\`; required reachable: \`${REQUIRE_REACHABLE:-<none>}\`"
+            echo '```'
+            grep -E "UNREACHABLE|passed|failed" probe.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
