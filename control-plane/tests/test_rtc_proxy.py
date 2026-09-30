@@ -37,7 +37,7 @@ def livekit_like(monkeypatch):
     box = {}
 
     async def handler(ws):
-        seen.append(ws.request.path)
+        seen.append(ws.path)
         async for m in ws:
             await ws.send(m)
 

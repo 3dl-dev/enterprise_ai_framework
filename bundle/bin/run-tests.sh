@@ -75,6 +75,11 @@ fi
 # itself skips (not fails) when docker is unavailable.
 "$VENV/bin/pip" install --quiet asyncpg==0.30.0
 
+# python-multipart, pinned to control-plane/requirements.txt, for control-plane/tests/test_voice.py
+# (enterpriseaiframework-82e): the STT-forward and TTS-limits routes take Form/UploadFile, and
+# FastAPI refuses to register them (500) without it. Installed every run like the rest.
+"$VENV/bin/pip" install --quiet python-multipart==0.0.20
+
 # control-plane/tests/ is not under tests/ and pytest.ini's testpaths is overridden by any
 # explicit path given here, so it must be listed alongside tests/ or it silently never
 # runs — which is exactly how it sat green-by-never-executing before this line existed.
