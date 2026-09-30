@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from netpol_eval import Dest, admitted_peers, build_universe, load_policies
+from netpol_eval import PROTOCOLS, Dest, admitted_peers, build_universe, load_policies
 
 K8S = Path(__file__).resolve().parent.parent / "deploy/k8s"
 NS = "enterprise-ai"
@@ -53,18 +53,22 @@ def _control_plane_only(pod) -> bool:  # hand-written expectation, independent o
 
 
 def violations(policies) -> list:
-    """Empty iff, for every agent pod shape and port, admitted == control-plane-in-ns exactly."""
+    """Empty iff, for every agent pod shape and port, admitted == control-plane-in-ns exactly on
+    TCP (the API is TCP), and on UDP and SCTP admitted is a subset of the control plane: nobody
+    else, on any protocol (-1ed). No external address (IPv4 or IPv6) is ever admitted."""
     universe = {p for p, _ in build_universe(policies, NS)[0]}
     want = {p for p in universe if _control_plane_only(p)}
     assert want, "universe must contain control-plane peers or the pin is vacuous"
     bad = []
     for kind, dest in DESTS.items():
-        for port in PORTS:
-            pods, ips = admitted_peers(policies, dest, port)
-            got = set(pods)
-            if got != want or ips:
-                bad.append((kind, port, sorted(map(str, got - want))[:2],
-                            sorted(map(str, want - got))[:2], ips[:2]))
+        for proto in PROTOCOLS:
+            for port in PORTS:
+                pods, ips = admitted_peers(policies, dest, port, proto)
+                got = set(pods)
+                missing = want - got if proto == "TCP" else set()
+                if got - want or missing or ips:
+                    bad.append((kind, port, proto, sorted(map(str, got - want))[:2],
+                                sorted(map(str, missing))[:2], ips[:2]))
     return bad
 
 
@@ -96,7 +100,8 @@ def test_shipped_policies_admit_exactly_the_control_plane():
 def test_agent_pods_are_isolated_and_unlisted_ports_admit_nobody():
     # Guard against a vacuous pass: an isolated pod admits nobody on a port no rule names.
     for dest in DESTS.values():
-        assert admitted_peers(_shipped(), dest, 9999) == ([], [])
+        for proto in PROTOCOLS:
+            assert admitted_peers(_shipped(), dest, 9999, proto) == ([], [])
 
 
 def _rule(frm, ports):
@@ -149,6 +154,14 @@ WIDE_FROMS = {
     "ipBlock-0.0.0.0/0-except-private": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": [
         "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]}}],
     "ipBlock-pod-cidr": [{"ipBlock": {"cidr": "10.42.0.0/16"}}],
+    # IPv6 forms (-1ed): 0.0.0.0/0 never covered these, so they were invisible
+    "ipBlock-::/0": [{"ipBlock": {"cidr": "::/0"}}],
+    "ipBlock-2000::/3": [{"ipBlock": {"cidr": "2000::/3"}}],
+    "ipBlock-ULA-fc00::/7": [{"ipBlock": {"cidr": "fc00::/7"}}],
+    "ipBlock-linklocal-fe80::/10": [{"ipBlock": {"cidr": "fe80::/10"}}],
+    "ipBlock-loopback-::1/128": [{"ipBlock": {"cidr": "::1/128"}}],
+    "ipBlock-v4mapped-::ffff:0:0/96": [{"ipBlock": {"cidr": "::ffff:0:0/96"}}],
+    "ipBlock-::/0-except-ULA": [{"ipBlock": {"cidr": "::/0", "except": ["fc00::/7"]}}],
 }
 ALL_PORT_FORMS = {
     "ports-omitted": ...,
@@ -156,6 +169,8 @@ ALL_PORT_FORMS = {
     "ports-null": None,
     "port-omitted-in-entry": [{"protocol": "TCP"}],
     "empty-entry": [{}],
+    "sctp-all-ports": [{"protocol": "SCTP"}],
+    "udp-all-ports": [{"protocol": "UDP"}],
 }
 API_PORT_FORMS = {
     "int-8642": [{"protocol": "TCP", "port": 8642}],
@@ -165,6 +180,10 @@ API_PORT_FORMS = {
     "named-api": [{"protocol": "TCP", "port": "api"}],
     "int-18793": [{"protocol": "TCP", "port": 18793}],
     "range-18000-19000": [{"protocol": "TCP", "port": 18000, "endPort": 19000}],
+    "sctp-8642": [{"protocol": "SCTP", "port": 8642}],
+    "sctp-range-8000-9000": [{"protocol": "SCTP", "port": 8000, "endPort": 9000}],
+    "udp-8642": [{"protocol": "UDP", "port": 8642}],
+    "sctp-18793": [{"protocol": "SCTP", "port": 18793}],
 }
 
 
@@ -187,7 +206,7 @@ def test_whole_rule_empty_is_red(tmp_path):
 
 
 @pytest.mark.parametrize("fname", ["from-omitted", "podSelector-{}", "namespaceSelector-{}",
-                                   "ipBlock-0.0.0.0/0"])
+                                   "ipBlock-0.0.0.0/0", "ipBlock-::/0"])
 @pytest.mark.parametrize("sel", [None, {}, {"matchExpressions": [
     {"key": "app.kubernetes.io/component", "operator": "In", "values": ["agent"]}]}],
     ids=["matchLabels-component", "empty-selector-all-pods", "matchExpressions-In"])
@@ -228,8 +247,12 @@ GREEN = {
     .__setitem__("ports", []),
     "wide-peer-but-other-port": _add_rule_to_66(_rule(
         [{"podSelector": {}}], [{"protocol": "TCP", "port": 9000}])),
-    "wide-peer-udp-only": _add_rule_to_66(_rule(
-        [{"podSelector": {}}], [{"protocol": "UDP", "port": 8642}])),
+    # (wide-peer-udp-only moved to WIDE_FROMS x API_PORT_FORMS: -1ed makes every protocol count)
+    "sctp-from-control-plane-only": _add_rule_to_66(_rule(
+        [{"podSelector": {"matchLabels": {"app": "control-plane"}}}],
+        [{"protocol": "SCTP", "port": 8642}])),
+    "v6-block-on-unrelated-port": _add_rule_to_66(_rule(
+        [{"ipBlock": {"cidr": "::/0"}}], [{"protocol": "TCP", "port": 9000}])),
     "wide-peer-range-misses-both": _add_rule_to_66(_rule(
         [{"podSelector": {}}], [{"port": 8643, "endPort": 9000}])),
     "wide-peer-unrelated-named-port": _add_rule_to_66(_rule(
@@ -252,3 +275,11 @@ GREEN = {
 @pytest.mark.parametrize("name", GREEN)
 def test_benign_additions_stay_green(tmp_path, name):
     assert violations(_mutate(tmp_path, GREEN[name])) == []
+
+
+@pytest.mark.parametrize("proto", ["SCTP", "UDP"])
+def test_second_mutation_every_namespace_on_8642_by_non_tcp_protocol_is_red(tmp_path, proto):
+    """The audit's named hole: :8642 ingress from every namespace, on a protocol other than TCP."""
+    rule = _rule([{"namespaceSelector": {}}], [{"protocol": proto, "port": 8642}])
+    bad = violations(_mutate(tmp_path, _add_rule_to_66(rule)))
+    assert any(b[2] == proto for b in bad), bad

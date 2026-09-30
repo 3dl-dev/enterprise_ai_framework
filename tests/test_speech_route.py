@@ -98,16 +98,17 @@ def _speech_netpol_violations(policies) -> list:
     """Evaluated (-d7b), not pattern-matched. Hand-written expectation: the speech pod reaches
     only kube-dns-labelled pods on :53 (either protocol), no external address; and on its
     ingress only the gateway pod (platform namespace) on :8000."""
-    from netpol_eval import (Dest, admitted_egress_peers, admitted_peers, build_universe,
-                             probe_ports)
+    from netpol_eval import (PROTOCOLS, Dest, admitted_egress_peers, admitted_peers,
+                             build_universe, probe_ports)
     speech = Dest("enterprise-ai", {"app": "speech"})
     bad = []
     eg = {p for p, _ in build_universe(policies, "enterprise-ai", "egress", SPEECH_SEEDS)[0]}
     ing = {p for p, _ in build_universe(policies, "enterprise-ai", "ingress", SPEECH_SEEDS)[0]}
-    for proto in ("TCP", "UDP"):
+    for proto in PROTOCOLS:
         for port in probe_ports(policies, extra=(53, 8000, 443)):
             pods, ips = admitted_egress_peers(policies, speech, port, proto, SPEECH_SEEDS)
-            want = {p for p in eg if port == 53 and dict(p.labels).get("k8s-app") == "kube-dns"}
+            want = {p for p in eg if port == 53 and proto in ("TCP", "UDP")
+                    and dict(p.labels).get("k8s-app") == "kube-dns"}
             if set(pods) != want or ips:
                 bad.append(("egress", proto, port))
             pods, ips = admitted_peers(policies, speech, port, proto, SPEECH_SEEDS)
@@ -149,6 +150,23 @@ SPEECH_DRIFTS = {
     "egress to [] + 443": lambda d: d[0]["spec"]["egress"].append({"to": [], "ports": [{"port": 443}]}),
     "egress ipBlock 0.0.0.0/0": lambda d: d[0]["spec"]["egress"].append(
         {"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}]}),
+    # IPv6 and SCTP forms (-1ed)
+    "egress ipBlock ::/0": lambda d: d[0]["spec"]["egress"].append({"to": [{"ipBlock": {"cidr": "::/0"}}]}),
+    "egress ipBlock 2000::/3 :443": lambda d: d[0]["spec"]["egress"].append(
+        {"to": [{"ipBlock": {"cidr": "2000::/3"}}], "ports": [{"port": 443}]}),
+    "egress ipBlock fc00::/7": lambda d: d[0]["spec"]["egress"].append({"to": [{"ipBlock": {"cidr": "fc00::/7"}}]}),
+    "egress ipBlock v4-mapped": lambda d: d[0]["spec"]["egress"].append(
+        {"to": [{"ipBlock": {"cidr": "::ffff:0:0/96"}}]}),
+    "egress SCTP to 0.0.0.0/0": lambda d: d[0]["spec"]["egress"].append(
+        {"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}], "ports": [{"protocol": "SCTP", "port": 443}]}),
+    "egress SCTP to podSelector {}": lambda d: d[0]["spec"]["egress"].append(
+        {"to": [{"podSelector": {}}], "ports": [{"protocol": "SCTP"}]}),
+    "egress dns + SCTP 53": lambda d: d[0]["spec"]["egress"][0]["ports"].append(
+        {"protocol": "SCTP", "port": 53}),
+    "ingress SCTP 8000 from any pod": lambda d: d[0]["spec"]["ingress"].append(
+        {"from": [{"podSelector": {}}], "ports": [{"protocol": "SCTP", "port": 8000}]}),
+    "ingress 8000 from ipBlock ::/0": lambda d: d[0]["spec"]["ingress"].append(
+        {"from": [{"ipBlock": {"cidr": "::/0"}}], "ports": [{"port": 8000}]}),
     "egress dns ports []": lambda d: d[0]["spec"]["egress"][0].__setitem__("ports", []),
     "egress dns port range 1-1024": lambda d: d[0]["spec"]["egress"][0]["ports"].append(
         {"port": 1, "endPort": 1024}),
