@@ -1,45 +1,52 @@
-"""LIVE: the console proxy refuses a real Raven's provider and channel write RPCs.
+"""LIVE: the console proxy's allow-list refuses every Raven WebUI write outside it.
 
-Item enterpriseaiframework-250 (agents-raven.md Contract E, hosted-mode lock). Nothing here
-mocks the proxy, the gateway or the Kubernetes API: a Raven is created through the portal's
-real `POST /portal/api/agents`, and real JSON-RPC 2.0 frames go over the console proxy's
-WebSocket (`/agents/<name>/rpc`) to the real hosted Raven image. The independent evidence is
-`/data/.raven/config.json` INSIDE the Raven pod, read with kubectl before and after; the
-refusal frames are the proxy's answer, the file is the truth about whether anything changed.
+Items enterpriseaiframework-250 and -7cd (agents-raven.md Contract E, hosted-mode lock).
+Nothing here mocks the proxy, the gateway or the Kubernetes API: a Raven is created through
+the portal's real `POST /portal/api/agents`, and real JSON-RPC 2.0 frames go over the console
+proxy's WebSocket (`/agents/<name>/rpc`) to the real hosted Raven image. The independent
+evidence is Raven's own state INSIDE the pod, read with kubectl before and after
+(`/data/.raven/config.json`, plus a digest of every file under /data/.raven that is not a
+log/session/cache); the refusal frames are the proxy's answer, the files are the truth.
 
-Claims, each proved both ways (fence closed -> refused and file byte-identical; the rules DATA
-poisoned -> the same write goes through and the file changes):
+Claims, each proved both ways (fence closed -> refused and files byte-identical; the rules DATA
+poisoned -> the same write goes through and config.json changes):
 
-  * a provider write (`model.save_key`) and a channel write (`channels.configure`) are refused;
-  * reads (`model.options`, `channels.status`) still work through the proxy;
-  * realistic bypasses are refused by the fence, file unchanged: case/whitespace/zero-width
-    spellings, an UNKNOWN `model.*` method, a batched array, a binary frame, the generic
-    `settings.set` route to a channel;
-  * poisoning the rules the gate reads (removing the method from the deny list AND from the
-    namespace lock) opens exactly that write, and a second, different poison (dropping the
-    channel namespace) opens the channel write.
+  * the registrations the tests classify are the pod's real ones (the dump script re-run in
+    the live pod equals control-plane/tests/fixtures/raven_v0.2.3_rpc_methods.json);
+  * the audit's two bypasses -- `config.set {key: "model"}` and `settings.everosSet` -- and
+    every other refused write, in their equivalent forms (case, separator, alias, whitespace,
+    zero-width, JSON escapes, duplicate members, notification, batch, binary opcode,
+    fragmented message, params nesting), are refused BY THIS FENCE (error data
+    refused_by=eaf-console-proxy) and change nothing;
+  * normal WebUI reads, and a whitelisted setting write, still reach Raven and work.
 
-RAVEN_CP_POD names the control-plane pod to drive. This branch is not deployed, so point it at
-a throwaway pod running the branch image (label app=control-plane, never-ready probe):
-    RAVEN_CP_POD=cp-250 pytest tests-live/test_raven_write_lock.py
-The rules file is edited in that pod (and restored), which is why a throwaway pod is required.
+RAVEN_CP_POD names the control-plane pod to drive. Point it at a throwaway pod running the
+branch image (label app=control-plane so the agent's ingress policy admits it, never-ready
+probe so the shared Service never routes to it); the rules file is edited in that pod (and
+restored), which is why it must be a throwaway. The agent is owned by a synthetic user.
 """
+import base64
 import json
 import os
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
 NS = "enterprise-ai"
-USER = "baron"
-NAME = "e250"
+USER = os.environ.get("RAVEN_LIVE_USER", "swtest-7cd")
+NAME = "e7cd"
 OBJ = f"agent-{USER}-{NAME}"
 RULES = "/srv/app/raven_write_lock.json"
 CONFIG = "/data/.raven/config.json"
 MODEL = os.environ.get("RAVEN_LIVE_MODEL", "anthropic/claude-haiku-4-5")
-CANARY_KEY = "sk-e250-canary-provider-key"
-CANARY_TOKEN = "e250-canary-telegram-token"
+REPO = Path(__file__).resolve().parents[1]
+DUMP = REPO / "deploy" / "raven" / "dump_rpc_methods.py"
+FIXTURE = REPO / "control-plane" / "tests" / "fixtures" / "raven_v0.2.3_rpc_methods.json"
+CANARY_KEY = "sk-e7cd-canary-provider-key"
+CANARY_TOKEN = "e7cd-canary-telegram-token"
+CANARY_MODEL = "swtest-7cd-canary-model"
 
 
 def _run(*args, check=True, timeout=600, stdin=None):
@@ -54,8 +61,9 @@ def _kubectl(*args, check=True, timeout=300, stdin=None):
 
 
 def _cp_pod() -> str:
-    return os.environ.get("RAVEN_CP_POD") or _kubectl(
-        "get", "pod", "-l", "app=control-plane", "-o", "jsonpath={.items[0].metadata.name}").strip()
+    pod = os.environ.get("RAVEN_CP_POD")
+    assert pod, "RAVEN_CP_POD must name a THROWAWAY control-plane pod running this branch"
+    return pod
 
 
 def _in_cp(script: str, *argv: str, timeout=400) -> str:
@@ -67,6 +75,22 @@ def _config() -> str:
     return _kubectl("exec", f"deploy/{OBJ}", "--", "cat", CONFIG)
 
 
+# Every settings-like file Raven keeps, hashed: config.json, the env mirror, the sub-agent
+# roster and plugin state. Excluded are the files Raven's own background work rewrites with no
+# frame sent (observed on the first live run): EverOS's store (*/everos/*), the start-up
+# sub-agent capability probe (subagent_acp_capabilities.json, subagent_sessions/), plus logs,
+# sessions, caches and the workspace.
+_STATE = ("cd /data/.raven && find . -type f \\( -name '*.json' -o -name '*.toml' -o -name "
+          "'env' -o -name '*.env' -o -name '*.yaml' \\) -not -path './sessions/*' -not -path "
+          "'./logs/*' -not -path '*/everos/*' -not -path '*/cache/*' -not -path './workspace/*' "
+          "-not -path './subagent_sessions/*' -not -name 'subagent_acp_capabilities.json' "
+          "-not -name '*.lock' -not -name 'serve*.json' | sort | xargs -r sha256sum")
+
+
+def _state() -> str:
+    return _kubectl("exec", f"deploy/{OBJ}", "--", "sh", "-c", _STATE)
+
+
 _CREATE = """
 import json, sys, httpx
 r = httpx.request(sys.argv[1], "http://127.0.0.1:8000" + sys.argv[2],
@@ -75,7 +99,8 @@ r = httpx.request(sys.argv[1], "http://127.0.0.1:8000" + sys.argv[2],
 print(json.dumps({"status": r.status_code, "body": r.text[:300]}))
 """
 
-# Sends each frame over the console proxy's socket and reports the reply that carries its id.
+# Sends each frame over the console proxy's socket and reports the reply that carries its
+# id. kind: text | bin | frag (one message split into several websocket continuation frames).
 _SEND = """
 import asyncio, json, sys, websockets
 user, name, frames = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
@@ -89,9 +114,15 @@ async def main():
     out = []
     async with conn as ws:
         for f in frames:
-            await ws.send(f["data"].encode() if f["kind"] == "bin" else f["data"])
+            d = f["data"]
+            if f["kind"] == "bin":
+                await ws.send(d.encode())
+            elif f["kind"] == "frag":
+                await ws.send([d[i:i + 7] for i in range(0, len(d), 7)])
+            else:
+                await ws.send(d)
             loop = asyncio.get_event_loop()
-            end, got = loop.time() + 10, None
+            end, got = loop.time() + f.get("timeout", 10), None
             while got is None and loop.time() < end:
                 try:
                     m = json.loads(await asyncio.wait_for(ws.recv(), max(end - loop.time(), 0.1)))
@@ -106,30 +137,80 @@ asyncio.run(main())
 """
 
 
-def _text(method, id, **params):
-    return {"kind": "text", "wait": id, "data": json.dumps(
+def _text(method, id, kind="text", **params):
+    return {"kind": kind, "wait": id, "data": json.dumps(
         {"jsonrpc": "2.0", "id": id, "method": method, "params": params})}
+
+
+def _raw(data, wait, kind="text"):
+    return {"kind": kind, "wait": wait, "data": data}
 
 
 def send(*frames):
     return json.loads(_in_cp(_SEND, USER, NAME, json.dumps(list(frames))))
 
 
-def _is_refusal(reply) -> bool:
+def _by_fence(reply) -> bool:
     items = reply if isinstance(reply, list) else [reply]
-    return all(isinstance(i, dict) and (i.get("error") or {}).get("code") == -32001 for i in items)
+    return bool(items) and all(
+        isinstance(i, dict) and (i.get("error") or {}).get("code") == -32001
+        and (i["error"].get("data") or {}).get("refused_by") == "eaf-console-proxy"
+        for i in items)
 
 
-def _provider_write(id=3):
-    return _text("model.save_key", id, slug="openrouter", api_key=CANARY_KEY)
+def _set_model(id, kind="text"):
+    return _text("config.set", id, kind, key="model", value=CANARY_MODEL, provider="custom",
+                 scope="default")
 
 
-def _channel_write(id=4):
-    return _text("channels.configure", id, name="telegram", fields={"token": CANARY_TOKEN})
+# The synthetic owner, as a real IdP user (the portal resolves an owner through the IdP).
+# Admin credentials arrive on stdin; the script runs inside the control-plane pod, which
+# reaches the IdP by its in-cluster name.
+_IDP_USER = """
+import json, os, sys, httpx
+admin = json.loads(sys.stdin.read())
+idp, realm, action, user = os.environ["IDP_URL"], os.environ["IDP_REALM"], sys.argv[1], sys.argv[2]
+tok = httpx.post(f"{idp}/realms/master/protocol/openid-connect/token", timeout=30, data={
+    "grant_type": "password", "client_id": "admin-cli",
+    "username": admin["user"], "password": admin["password"]}).raise_for_status().json()["access_token"]
+h = {"Authorization": f"Bearer {tok}"}
+found = httpx.get(f"{idp}/admin/realms/{realm}/users", params={"username": user, "exact": "true"},
+                  headers=h, timeout=30).raise_for_status().json()
+for u in found:
+    httpx.delete(f"{idp}/admin/realms/{realm}/users/{u['id']}", headers=h, timeout=30).raise_for_status()
+if action == "create":
+    r = httpx.post(f"{idp}/admin/realms/{realm}/users", headers=h, timeout=30, json={
+        "username": user, "email": f"{user}@example.invalid", "firstName": "Sw", "lastName": "Test",
+        "enabled": True, "emailVerified": True, "requiredActions": []})
+    assert r.status_code == 201, r.text
+print(json.dumps({"removed": len(found)}))
+"""
+
+
+def _secret(name: str, key: str) -> str:
+    return base64.b64decode(_kubectl("get", "secret", name, "-o", f"jsonpath={{.data.{key}}}")).decode()
+
+
+def _idp_user(action: str) -> dict:
+    admin = json.dumps({"user": _secret("enterprise-ai-secrets", "IDP_ADMIN_USER"),
+                        "password": _secret("enterprise-ai-secrets", "IDP_ADMIN_PASSWORD")})
+    return json.loads(_kubectl("exec", "-i", _cp_pod(), "-c", "control-plane", "--", "python3",
+                               "-c", _IDP_USER, action, USER, stdin=admin))
 
 
 @pytest.fixture(scope="module")
-def raven():
+def owner():
+    assert USER.startswith("swtest-"), "test agents are owned by a synthetic user"
+    _idp_user("create")
+    try:
+        yield USER
+    finally:
+        _idp_user("delete")
+
+
+@pytest.fixture(scope="module")
+def raven(owner):
+
     def teardown():
         _in_cp(_CREATE, "DELETE", f"/portal/api/agents/{NAME}", USER)
     teardown()
@@ -142,6 +223,12 @@ def raven():
     assert out["status"] == 201, out
     try:
         _kubectl("rollout", "status", f"deployment/{OBJ}", "--timeout=600s", timeout=630)
+        end = time.time() + 180   # the page's socket comes up after the pod turns Ready
+        while time.time() < end:
+            (r,) = send(_text("system.ping", 1))
+            if r and "result" in r:
+                break
+            time.sleep(5)
         yield
     finally:
         teardown()
@@ -165,69 +252,120 @@ def rules():
                  stdin=original)
 
 
-def test_reads_pass_and_the_provider_and_channel_writes_are_refused_and_config_is_unchanged(raven):
+def test_the_classified_registrations_are_the_live_pods_real_ones(raven):
+    live = json.loads(_kubectl("exec", "-i", f"deploy/{OBJ}", "--", "python", "-",
+                               stdin=DUMP.read_text()))
+    assert live == json.loads(FIXTURE.read_text())["methods"]
+    for m in ("config.set", "settings.everosSet", "settings.everos_set", "model.save_key"):
+        assert m in live
+
+
+def test_reads_and_a_whitelisted_setting_still_work_through_the_proxy(raven):
     before = _config()
-    assert CANARY_KEY not in before and CANARY_TOKEN not in before
-    opts, status, prov, chan = send(_text("model.options", 1), _text("channels.status", 2),
-                                    _provider_write(3), _channel_write(4))
-    assert opts["result"]["provider"] == "custom", "reads still work through the proxy"
+    opts, status, cfg, sget, sessions, theme = send(
+        _text("model.options", 1), _text("channels.status", 2), _text("config.get", 3),
+        _text("settings.get", 4), _text("session.list", 5),
+        _text("config.set", 6, key="tui.theme", value="swtest7cd"))
+    assert opts["result"]["provider"] == "custom", opts
     assert any(c["name"] == "telegram" for c in status["result"]["channels"])
-    assert _is_refusal(prov) and prov["id"] == 3 and prov["error"]["data"]["method"] == "model.save_key"
-    assert _is_refusal(chan) and chan["id"] == 4
-    assert _config() == before, "config.json in the raven pod must be byte-identical"
-
-
-def test_realistic_bypasses_are_refused_by_the_fence_and_config_is_unchanged(raven):
-    before = _config()
-    bypasses = [
-        _text("MODEL.SAVE_KEY", 11, slug="openrouter", api_key=CANARY_KEY),
-        _text(" model.save_key ", 12, slug="openrouter", api_key=CANARY_KEY),
-        _text("model.save​_key", 13, slug="openrouter", api_key=CANARY_KEY),
-        _text("model.some_future_write", 14, slug="openrouter", api_key=CANARY_KEY),
-        _text("Channels.Configure", 15, name="telegram", fields={"token": CANARY_TOKEN}),
-        _text("settings.set", 16, key="channels.telegram.enabled", value=True),
-        _text("settings.set", 17, key="embedding", value={"model": "m", "provider": "openrouter"}),
-        {"kind": "text", "wait": 18, "data": json.dumps([
-            {"jsonrpc": "2.0", "id": 18, "method": "model.options", "params": {}},
-            {"jsonrpc": "2.0", "id": 19, "method": "model.save_key",
-             "params": {"slug": "openrouter", "api_key": CANARY_KEY}}])},
-        {"kind": "bin", "wait": 20, "data": json.dumps(
-            {"jsonrpc": "2.0", "id": 20, "method": "model.save_key",
-             "params": {"slug": "openrouter", "api_key": CANARY_KEY}})},
-    ]
-    replies = send(*bypasses)
-    for frame, reply in zip(bypasses, replies):
-        assert reply is not None and _is_refusal(reply), (frame["data"][:80], reply)
+    assert "result" in cfg and "result" in sget and "result" in sessions, (cfg, sget, sessions)
+    assert theme.get("result", {}).get("applied") is True, theme
     after = _config()
-    assert after == before and CANARY_KEY not in after and CANARY_TOKEN not in after
+    # The detector is live: an ALLOWED write does change the file the refusals are judged by.
+    assert after != before and json.loads(after)["tui"]["theme"] == "swtest7cd"
 
 
-def test_poisoning_the_provider_rule_data_lets_the_provider_write_through(raven, rules):
+REFUSED_WRITES = [
+    ("model.save_key", {"slug": "openrouter", "api_key": CANARY_KEY}),
+    ("model.set_fields", {"slug": "custom", "fields": {"apiBase": "http://evil.invalid"}}),
+    ("model.add_endpoint", {"slug": "openrouter", "api_key": CANARY_KEY}),
+    ("model.disconnect", {"slug": "custom"}), ("model.set_protocol", {"slug": "custom", "protocol": "x"}),
+    ("model.add_model", {"slug": "custom", "model": CANARY_MODEL}),
+    ("model.remove_model", {"slug": "custom", "model": MODEL}),
+    ("channels.configure", {"name": "telegram", "fields": {"token": CANARY_TOKEN}}),
+    ("channels.qr", {"name": "whatsapp"}),
+    ("settings.everos_set", {"section": "llm", "model": CANARY_MODEL, "provider": "openrouter"}),
+    ("settings.everosSet", {"section": "llm", "model": CANARY_MODEL, "provider": "openrouter"}),
+    ("subagents.add", {"preset": "claude-code"}), ("subagents.toggle", {"name": "x", "enabled": True}),
+    ("subagents.instance.set_model", {"agent": "x", "model": CANARY_MODEL}),
+    ("cli.dispatch", {"argv": ["provider", "add", "openrouter", "--api-key", CANARY_KEY], "width": 80}),
+    ("slash.exec", {"command": f"/provider add openrouter --api-key {CANARY_KEY}"}),
+    ("command.dispatch", {"command": "provider"}), ("system.upgrade", {}),
+    ("plug.install", {"name": "x"}),
+]
+
+
+def test_both_bypasses_and_every_refused_write_are_refused_by_the_fence_and_change_nothing(raven):
+    before_cfg, before_state = _config(), _state()
+    frames = [_set_model(10), _set_model(11, "frag"), _set_model(12, "bin"),
+              _text("config.set", 13, key="model", value=CANARY_MODEL, provider="custom",
+                    session_id="s-7cd"),
+              _text("config.set", 14, key="agents.defaults.provider", value="openrouter"),
+              _text("config.unset", 15, key="model"),
+              _text("settings.set", 16, key="embedding", value={"model": "m", "provider": "openrouter"}),
+              _text("settings.set", 17, key="channels.telegram.enabled", value=True),
+              _text("settings.set", 18, key="sessionTitle.provider", value="openrouter"),
+              _text("settings.set", 19, key="tools.web.search.apiKey", value=CANARY_KEY)]
+    frames += [_text(m, 100 + i, **p) for i, (m, p) in enumerate(REFUSED_WRITES)]
+    frames += [
+        _text("settings.EverosSet", 201, section="llm", model=CANARY_MODEL, provider="openrouter"),
+        _text("settings.everos-set", 202), _text("Config.set", 203, key="language", value="en"),
+        _text("config.set ", 204, key="language", value="en"),
+        _text("model.save​_key", 205, slug="openrouter", api_key=CANARY_KEY),
+        _text("MODEL.SAVE_KEY", 206, slug="openrouter", api_key=CANARY_KEY),
+        _text("model.some_future_write", 207, slug="openrouter", api_key=CANARY_KEY),
+        _raw('{"jsonrpc":"2.0","id":208,"method":"config.set","params":{"key":"\\u006dodel",'
+             f'"value":"{CANARY_MODEL}","provider":"custom","scope":"default"}}}}', 208),
+        _raw('{"jsonrpc":"2.0","id":209,"method":"config.set","params":{"key":"language",'
+             f'"key":"model","value":"{CANARY_MODEL}","provider":"custom","scope":"default"}}}}', 209),
+        _raw('{"jsonrpc":"2.0","id":210,"method":"config.get","method":"settings.everosSet",'
+             f'"params":{{"section":"llm","model":"{CANARY_MODEL}","provider":"openrouter"}}}}', 210),
+        _raw(json.dumps({"jsonrpc": "2.0", "id": 211, "method": "config.set",
+                         "params": {"params": {"key": "model", "value": CANARY_MODEL}}}), 211),
+        _raw(json.dumps([{"jsonrpc": "2.0", "id": 212, "method": "model.options", "params": {}},
+                         json.loads(_set_model(213)["data"])]), 212),
+    ]
+    replies = send(*frames)
+    for f, reply in zip(frames, replies):
+        assert reply is not None and _by_fence(reply), (f["data"][:100], reply)
+    # A notification gets no reply by design; judged by the files alone.
+    notif = json.dumps({"jsonrpc": "2.0", "method": "config.set", "params": {
+        "key": "model", "value": CANARY_MODEL, "provider": "custom", "scope": "default"}})
+    send(_raw(notif, "none", "text") | {"timeout": 3})
+    time.sleep(2)
+    after = _config()
+    assert after == before_cfg, "config.json in the raven pod must be byte-identical"
+    assert _state() == before_state, "no settings file under /data/.raven may change"
+    for canary in (CANARY_KEY, CANARY_TOKEN, CANARY_MODEL):
+        assert canary not in after
+
+
+def test_poisoning_the_rules_to_allow_config_set_lets_the_model_bypass_through(raven, rules):
     before = _config()
-    # Half the edit (out of the deny list only) does not open it: the namespace rule holds.
-    rules(lambda r: r["deny_methods"].remove("model.save_key"))
-    (reply,) = send(_provider_write(31))
-    assert _is_refusal(reply) and _config() == before
-
-    def open_it(r):
-        r["deny_methods"].remove("model.save_key")
-        r["allow_in_locked_namespaces"].append("model.save_key")
-    rules(open_it)
-    prov, other = send(_provider_write(32), _text("model.set_fields", 33, slug="custom", fields={}))
-    assert "result" in prov, prov
-    assert CANARY_KEY in _config() and _config() != before, "the write really changed config.json"
-    assert _is_refusal(other), "only the removed method opened"
+    (r,) = send(_set_model(31))
+    assert _by_fence(r) and _config() == before
+    rules(lambda raw: raw["allow"].append("config.set"))
+    (r,) = send(_set_model(32))
+    assert "result" in r and r["result"].get("applied") is True, r
+    after = json.loads(_config())
+    assert _config() != before and CANARY_MODEL in after["agents"]["defaults"]["model"], after
 
 
-def test_a_different_poison_dropping_the_channel_namespace_lets_the_channel_write_through(
-        raven, rules):
+def test_a_second_poison_widening_the_key_list_lets_the_same_write_through(raven, rules):
     before = _config()
-    assert CANARY_TOKEN not in before
+    rules(lambda raw: raw["allow_when_key"]["config.set"].append("model"))
+    (r,) = send(_text("config.set", 41, key="model", value=CANARY_MODEL + "-2",
+                      provider="custom", scope="default"))
+    assert "result" in r, r
+    assert _config() != before and CANARY_MODEL + "-2" in _config()
 
-    def open_it(r):
-        r["deny_methods"].remove("channels.configure")
-        r["locked_namespaces"].remove("channels.")
-    rules(open_it)
-    (chan,) = send(_channel_write(41))
-    assert "result" in chan, chan
-    assert CANARY_TOKEN in _config() and _config() != before
+
+def test_a_third_poison_allowing_the_alias_lets_it_reach_raven(raven, rules):
+    rules(lambda raw: raw["allow"].append("settings.everosSet"))
+    (alias, twin) = send(
+        _text("settings.everosSet", 51, section="llm", model=CANARY_MODEL, provider="custom"),
+        _text("settings.everos_set", 52, section="llm", model=CANARY_MODEL, provider="custom"))
+    # Raven answers the alias itself (a result, or its own refusal: the hosted pod pins the
+    # EverOS roles by env) -- either way it was not this fence. The twin stays fenced.
+    assert alias is not None and not _by_fence(alias), alias
+    assert _by_fence(twin), twin

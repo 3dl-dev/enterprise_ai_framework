@@ -322,8 +322,10 @@ def test_every_browser_frame_passes_the_gate_seam_and_a_refusal_never_reaches_th
     try:
         world.add_agent(OWNER, "rv")
         world.hosts["agent-alice-rv"] = "127.0.0.2"
-        # today's real gate: pass-through
-        assert agent_gateway_console.raven_frame_gate('{"method":"anything"}') is None
+        # the real gate (-7cd) is an allow-list: a reviewed method passes, an unknown one
+        # does not (the full classification is test_agent_raven_write_lock.py)
+        assert agent_gateway_console.raven_frame_gate('{"method":"turn.send"}') is None
+        assert agent_gateway_console.raven_frame_gate('{"method":"anything"}') is not None
 
         def gate(frame):
             if json.loads(frame)["method"] == "settings.set":
