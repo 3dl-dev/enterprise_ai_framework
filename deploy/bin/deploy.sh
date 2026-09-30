@@ -5,7 +5,19 @@
 # cannot drift into different credentials. Nothing secret is written to the repo — Secrets
 # are created directly against the API.
 #
-#   PUBLIC_BASE_URL=https://ai.example.org deploy/bin/deploy.sh
+#   deploy/bin/deploy.sh
+#
+# THE INSTANCE SOURCE. Every operated-instance value this script writes (PUBLIC_BASE_URL,
+# GATEWAY_PROVIDER, the realm behind OPENID_ISSUER, ...) comes from ONE untracked file,
+# bundle/.env (override the path with DEPLOY_ENV_FILE) - never from the caller's shell. The
+# script re-execs itself with a scrubbed environment so an ambient PUBLIC_BASE_URL or
+# GATEWAY_PROVIDER (a watcher default, a direnv export) cannot reach the cluster
+# (enterpriseaiframework-e7f: a watcher default overwrote the live issuer). A value missing
+# from the file is missing, and a PRE-DEPLOY SAFETY CHECK refuses to blank or change what
+# the live cluster holds (deploy/bin/lib/predeploy-check.sh).
+#
+# Controls let through the scrub: DEPLOY_ENV_FILE, ALLOW_OPERATED_CHANGE, and
+# DEPLOY_CHECK_ONLY=1 (run everything up to and including the safety check, mutate nothing).
 #
 # PUBLIC_BASE_URL must be the URL a *browser* will use. The chat surface's OIDC client
 # refuses plaintext discovery and validates that the issuer matches what it requested, so
@@ -15,12 +27,25 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+if [[ -z "${DEPLOY_SANITIZED:-}" ]]; then
+    exec env -i DEPLOY_SANITIZED=1 \
+        PATH="$PATH" HOME="${HOME:-/root}" USER="${USER:-}" LANG="${LANG:-C.UTF-8}" \
+        ${KUBECONFIG:+KUBECONFIG="$KUBECONFIG"} ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} \
+        ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"} ${TMPDIR:+TMPDIR="$TMPDIR"} \
+        ${DEPLOY_ENV_FILE:+DEPLOY_ENV_FILE="$DEPLOY_ENV_FILE"} \
+        ${ALLOW_OPERATED_CHANGE:+ALLOW_OPERATED_CHANGE="$ALLOW_OPERATED_CHANGE"} \
+        ${DEPLOY_CHECK_ONLY:+DEPLOY_CHECK_ONLY="$DEPLOY_CHECK_ONLY"} \
+        bash "$0" "$@"
+fi
+
 NS=enterprise-ai
 IMAGE_NAME="enterprise-ai-control-plane"
 TAG="$(git rev-parse --short HEAD 2>/dev/null || echo latest)"
 
-[[ -f bundle/.env ]] || { echo "bundle/.env missing — run 'make up' locally first" >&2; exit 1; }
-set -a; . ./bundle/.env; set +a
+ENV_FILE="${DEPLOY_ENV_FILE:-bundle/.env}"
+case "$ENV_FILE" in /*) ;; *) ENV_FILE="./$ENV_FILE" ;; esac
+[[ -f "$ENV_FILE" ]] || { echo "$ENV_FILE missing - it is the declared instance source (run 'make up' locally first)" >&2; exit 1; }
+set -a; . "$ENV_FILE"; set +a
 
 # Instance profile — operator-agnostic DEFAULTS; the instance overrides these in bundle/.env
 # (see docs/design/hoistable-and-operated.md). Defined AFTER sourcing bundle/.env so the
@@ -37,7 +62,7 @@ LAN_CIDR="${LAN_CIDR:-127.0.0.0/8}"
 
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 if [[ -z "$PUBLIC_BASE_URL" ]]; then
-    echo "error: PUBLIC_BASE_URL is required (e.g. https://ai.example.org)" >&2
+    echo "error: PUBLIC_BASE_URL is required and unset in $ENV_FILE (e.g. https://ai.example.org). There is no default: a placeholder here overwrites the live issuer." >&2
     exit 1
 fi
 if [[ "$PUBLIC_BASE_URL" != https://* ]]; then
@@ -54,57 +79,72 @@ if grep -q 'os.environ/FORGE_' bundle/litellm/config.generated.yaml 2>/dev/null;
     exit 1
 fi
 
+# Everything this deploy writes into enterprise-ai-secrets, declared once so the pre-deploy
+# safety check compares exactly what `create` will write.
+PGUSER="${POSTGRES_USER:-eai}"
+SECRET_LITERALS=(
+    --from-literal=POSTGRES_USER="$PGUSER"
+    --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD"
+    --from-literal=CONTROL_PLANE_DATABASE_URL="postgresql://${PGUSER}:${POSTGRES_PASSWORD}@postgres:5432/controlplane"
+    --from-literal=GATEWAY_DATABASE_URL="postgresql://${PGUSER}:${POSTGRES_PASSWORD}@postgres:5432/gateway"
+    --from-literal=FREEROUTER_METER_DSN="postgresql://${PGUSER}:${POSTGRES_PASSWORD}@postgres:5432/freerouter"
+    --from-literal=GATEWAY_PROVIDER="${GATEWAY_PROVIDER:-}"
+    --from-literal=FREEROUTER_MASTER_KEY="${FREEROUTER_MASTER_KEY:-}"
+    --from-literal=FREEROUTER_OPERATOR_TAB_MICRO="${FREEROUTER_OPERATOR_TAB_MICRO:-}"
+    --from-literal=FREEROUTER_PEER_SERVE="${FREEROUTER_PEER_SERVE:-}"
+    --from-literal=FREEROUTER_PEER_TESTNET="${FREEROUTER_PEER_TESTNET:-}"
+    --from-literal=FREEROUTER_PEER_SETTLEMENT_CHAIN_ID="${FREEROUTER_PEER_SETTLEMENT_CHAIN_ID:-}"
+    --from-literal=FREEROUTER_PEER_ALLOWLIST="${FREEROUTER_PEER_ALLOWLIST:-}"
+    --from-literal=FREEROUTER_PEER_UPSTREAMS="${FREEROUTER_PEER_UPSTREAMS:-}"
+    --from-literal=FREEROUTER_PEER_RELAY_URL="${FREEROUTER_PEER_RELAY_URL:-}"
+    --from-literal=GATEWAY_MASTER_KEY="$GATEWAY_MASTER_KEY"
+    --from-literal=GATEWAY_SALT_KEY="$GATEWAY_SALT_KEY"
+    --from-literal=CONTROL_PLANE_ADMIN_TOKEN="$CONTROL_PLANE_ADMIN_TOKEN"
+    --from-literal=IDP_ADMIN_USER="${IDP_ADMIN_USER:-admin}"
+    --from-literal=IDP_ADMIN_PASSWORD="$IDP_ADMIN_PASSWORD"
+    --from-literal=IDP_CLIENT_SECRET="$IDP_CLIENT_SECRET"
+    --from-literal=CHAT_CLIENT_SECRET="$CHAT_CLIENT_SECRET"
+    --from-literal=CHAT_SESSION_SECRET="$CHAT_SESSION_SECRET"
+    --from-literal=CHAT_JWT_SECRET="$CHAT_JWT_SECRET"
+    --from-literal=CHAT_JWT_REFRESH_SECRET="$CHAT_JWT_REFRESH_SECRET"
+    --from-literal=CHAT_CREDS_KEY="$CHAT_CREDS_KEY"
+    --from-literal=CHAT_CREDS_IV="$CHAT_CREDS_IV"
+    --from-literal=CHAT_VIRTUAL_KEY="${CHAT_VIRTUAL_KEY:-}"
+    --from-literal=PUBLIC_BASE_URL="$PUBLIC_BASE_URL"
+    --from-literal=OPENID_ISSUER="${PUBLIC_BASE_URL}/realms/${IDP_REALM:-enterprise-ai}"
+    --from-literal=CODEAPI_JWT_PRIVATE_KEY="$CODEAPI_JWT_PRIVATE_KEY"
+    --from-literal=CODEAPI_JWT_PUBLIC_KEY="$CODEAPI_JWT_PUBLIC_KEY"
+    --from-literal=CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY="$CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY"
+    --from-literal=SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY="$SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY"
+    --from-literal=CODEAPI_INTERNAL_SERVICE_TOKEN="$CODEAPI_INTERNAL_SERVICE_TOKEN"
+    --from-literal=CODEAPI_EGRESS_GRANT_SECRET="$CODEAPI_EGRESS_GRANT_SECRET"
+    --from-literal=CODEAPI_REDIS_PASSWORD="$CODEAPI_REDIS_PASSWORD"
+    --from-literal=MINIO_ROOT_USER="$MINIO_ROOT_USER"
+    --from-literal=MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD"
+    --from-literal=WEBFETCH_TOKEN="${WEBFETCH_TOKEN:?WEBFETCH_TOKEN is unset — run bundle/bin/render-env.sh}"
+    --from-literal=RERANK_TOKEN="${RERANK_TOKEN:?RERANK_TOKEN is unset — run bundle/bin/render-env.sh}"
+    --from-literal=SEARXNG_SECRET="${SEARXNG_SECRET:?SEARXNG_SECRET is unset — run bundle/bin/render-env.sh}"
+    --from-literal=MEILI_MASTER_KEY="${MEILI_MASTER_KEY:?MEILI_MASTER_KEY is unset — run bundle/bin/render-env.sh}"
+    --from-literal=RAGVECTOR_USER="${RAGVECTOR_USER:-ragapi}"
+    --from-literal=RAGVECTOR_PASSWORD="${RAGVECTOR_PASSWORD:?RAGVECTOR_PASSWORD is unset — run bundle/bin/render-env.sh}"
+    --from-literal=RAG_VIRTUAL_KEY="${RAG_VIRTUAL_KEY:-}"
+)
+
+# PRE-DEPLOY SAFETY CHECK (e7f): refuse before ANY mutation if an operated value would change
+# or blank against the live cluster. See deploy/bin/lib/predeploy-check.sh.
+source deploy/bin/lib/predeploy-check.sh
+echo "==> pre-deploy safety check (live secret + running pods vs the declared instance source)"
+predeploy_check "$NS" "${SECRET_LITERALS[@]}" || exit 1
+if [[ -n "${DEPLOY_CHECK_ONLY:-}" ]]; then
+    echo "DEPLOY_CHECK_ONLY set: stopping before any change"
+    exit 0
+fi
+
 echo "==> namespace"
 kubectl apply -f deploy/k8s/00-namespace.yaml
 
 echo "==> secrets"
-PGUSER="${POSTGRES_USER:-eai}"
-kubectl -n "$NS" create secret generic enterprise-ai-secrets \
-    --from-literal=POSTGRES_USER="$PGUSER" \
-    --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
-    --from-literal=CONTROL_PLANE_DATABASE_URL="postgresql://${PGUSER}:${POSTGRES_PASSWORD}@postgres:5432/controlplane" \
-    --from-literal=GATEWAY_DATABASE_URL="postgresql://${PGUSER}:${POSTGRES_PASSWORD}@postgres:5432/gateway" \
-    --from-literal=FREEROUTER_METER_DSN="postgresql://${PGUSER}:${POSTGRES_PASSWORD}@postgres:5432/freerouter" \
-    --from-literal=GATEWAY_PROVIDER="${GATEWAY_PROVIDER:-}" \
-    --from-literal=FREEROUTER_MASTER_KEY="${FREEROUTER_MASTER_KEY:-}" \
-    --from-literal=FREEROUTER_OPERATOR_TAB_MICRO="${FREEROUTER_OPERATOR_TAB_MICRO:-}" \
-    --from-literal=FREEROUTER_PEER_SERVE="${FREEROUTER_PEER_SERVE:-}" \
-    --from-literal=FREEROUTER_PEER_TESTNET="${FREEROUTER_PEER_TESTNET:-}" \
-    --from-literal=FREEROUTER_PEER_SETTLEMENT_CHAIN_ID="${FREEROUTER_PEER_SETTLEMENT_CHAIN_ID:-}" \
-    --from-literal=FREEROUTER_PEER_ALLOWLIST="${FREEROUTER_PEER_ALLOWLIST:-}" \
-    --from-literal=FREEROUTER_PEER_UPSTREAMS="${FREEROUTER_PEER_UPSTREAMS:-}" \
-    --from-literal=FREEROUTER_PEER_RELAY_URL="${FREEROUTER_PEER_RELAY_URL:-}" \
-    --from-literal=GATEWAY_MASTER_KEY="$GATEWAY_MASTER_KEY" \
-    --from-literal=GATEWAY_SALT_KEY="$GATEWAY_SALT_KEY" \
-    --from-literal=CONTROL_PLANE_ADMIN_TOKEN="$CONTROL_PLANE_ADMIN_TOKEN" \
-    --from-literal=IDP_ADMIN_USER="${IDP_ADMIN_USER:-admin}" \
-    --from-literal=IDP_ADMIN_PASSWORD="$IDP_ADMIN_PASSWORD" \
-    --from-literal=IDP_CLIENT_SECRET="$IDP_CLIENT_SECRET" \
-    --from-literal=CHAT_CLIENT_SECRET="$CHAT_CLIENT_SECRET" \
-    --from-literal=CHAT_SESSION_SECRET="$CHAT_SESSION_SECRET" \
-    --from-literal=CHAT_JWT_SECRET="$CHAT_JWT_SECRET" \
-    --from-literal=CHAT_JWT_REFRESH_SECRET="$CHAT_JWT_REFRESH_SECRET" \
-    --from-literal=CHAT_CREDS_KEY="$CHAT_CREDS_KEY" \
-    --from-literal=CHAT_CREDS_IV="$CHAT_CREDS_IV" \
-    --from-literal=CHAT_VIRTUAL_KEY="${CHAT_VIRTUAL_KEY:-}" \
-    --from-literal=PUBLIC_BASE_URL="$PUBLIC_BASE_URL" \
-    --from-literal=OPENID_ISSUER="${PUBLIC_BASE_URL}/realms/${IDP_REALM:-enterprise-ai}" \
-    --from-literal=CODEAPI_JWT_PRIVATE_KEY="$CODEAPI_JWT_PRIVATE_KEY" \
-    --from-literal=CODEAPI_JWT_PUBLIC_KEY="$CODEAPI_JWT_PUBLIC_KEY" \
-    --from-literal=CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY="$CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY" \
-    --from-literal=SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY="$SANDBOX_EXECUTION_MANIFEST_PUBLIC_KEY" \
-    --from-literal=CODEAPI_INTERNAL_SERVICE_TOKEN="$CODEAPI_INTERNAL_SERVICE_TOKEN" \
-    --from-literal=CODEAPI_EGRESS_GRANT_SECRET="$CODEAPI_EGRESS_GRANT_SECRET" \
-    --from-literal=CODEAPI_REDIS_PASSWORD="$CODEAPI_REDIS_PASSWORD" \
-    --from-literal=MINIO_ROOT_USER="$MINIO_ROOT_USER" \
-    --from-literal=MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
-    --from-literal=WEBFETCH_TOKEN="${WEBFETCH_TOKEN:?WEBFETCH_TOKEN is unset — run bundle/bin/render-env.sh}" \
-    --from-literal=RERANK_TOKEN="${RERANK_TOKEN:?RERANK_TOKEN is unset — run bundle/bin/render-env.sh}" \
-    --from-literal=SEARXNG_SECRET="${SEARXNG_SECRET:?SEARXNG_SECRET is unset — run bundle/bin/render-env.sh}" \
-    --from-literal=MEILI_MASTER_KEY="${MEILI_MASTER_KEY:?MEILI_MASTER_KEY is unset — run bundle/bin/render-env.sh}" \
-    --from-literal=RAGVECTOR_USER="${RAGVECTOR_USER:-ragapi}" \
-    --from-literal=RAGVECTOR_PASSWORD="${RAGVECTOR_PASSWORD:?RAGVECTOR_PASSWORD is unset — run bundle/bin/render-env.sh}" \
-    --from-literal=RAG_VIRTUAL_KEY="${RAG_VIRTUAL_KEY:-}" \
+kubectl -n "$NS" create secret generic enterprise-ai-secrets "${SECRET_LITERALS[@]}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
 # The realm JSON carries client secrets, hence a Secret. Rendered by the compose bundle;

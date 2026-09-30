@@ -47,7 +47,13 @@ STATE="$STATE_DIR/last-deployed-sha"
 LOCK="$STATE_DIR/watch-and-deploy.lock"
 LOG="$STATE_DIR/watch-and-deploy.log"
 MIN_FREE_GB="${MIN_FREE_GB:-8}"
-PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://ai.example.org}"
+# THE INSTANCE SOURCE (e7f). The operated instance's values come from ONE untracked file,
+# never from this process's environment and never from a default here. A placeholder default
+# for PUBLIC_BASE_URL used to live on this line; under systemd (empty env) it always won and
+# deploy.sh wrote https://ai.example.org over the live issuer. deploy.sh scrubs its own
+# environment and reads the same file; this script only proves the file is fit to deploy from.
+ENV_FILE="${DEPLOY_ENV_FILE:-bundle/.env}"
+case "$ENV_FILE" in /*) ;; *) ENV_FILE="./$ENV_FILE" ;; esac
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 
@@ -78,6 +84,15 @@ say "candidate ${SHA:0:9} (last deployed: ${LAST:0:9})"
 [[ -z "$(git status --porcelain)" ]] || give_up "working tree is dirty; refusing to deploy from it"
 
 # --- 2. preconditions ------------------------------------------------------------------
+# FAIL CLOSED on the instance source: no file, or no https PUBLIC_BASE_URL in it, means we do
+# not know which instance this is, so we do not touch any. Checked before the 6-minute suite.
+[[ -f "$ENV_FILE" ]] || give_up "instance source $ENV_FILE is missing; refusing to deploy an instance I cannot identify"
+pbu=$( ( set +u; unset PUBLIC_BASE_URL; set -a; . "$ENV_FILE" >/dev/null 2>&1; printf '%s' "${PUBLIC_BASE_URL:-}" ) )
+[[ -n "$pbu" ]] || give_up "PUBLIC_BASE_URL is not set in $ENV_FILE; there is no default (a placeholder overwrites the live issuer)"
+[[ "$pbu" == https://* ]] || give_up "PUBLIC_BASE_URL in $ENV_FILE is not https (${pbu%%/*}//...); nobody could log in"
+[[ "$pbu" != *example.org* && "$pbu" != *localhost* ]] || give_up "PUBLIC_BASE_URL in $ENV_FILE is a placeholder/local value; refusing"
+say "instance source $ENV_FILE declares PUBLIC_BASE_URL=$pbu"
+
 free_gb=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
 (( free_gb >= MIN_FREE_GB )) || give_up "only ${free_gb}GB free (need ${MIN_FREE_GB}); a run needs room for images and would risk an ENOSPC outage"
 say "disk ${free_gb}GB free"
@@ -119,7 +134,7 @@ fr_out=$(deploy/bin/check-freerouter-catalogue.sh 2>&1) || { say "$fr_out"; give
 say "production catalogue: $fr_out"
 
 say "deploying"
-if ! PUBLIC_BASE_URL="$PUBLIC_BASE_URL" deploy/bin/deploy.sh >>"$LOG" 2>&1; then
+if ! deploy/bin/deploy.sh >>"$LOG" 2>&1; then
     say "DEPLOY FAILED on ${SHA:0:9} — the cluster may be part-way. Tail of $LOG:"
     tail -40 "$LOG" >&2
     exit 1
