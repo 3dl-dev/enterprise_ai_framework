@@ -130,6 +130,15 @@ OPENCLAW_PORT = int(os.environ.get("AGENT_OPENCLAW_PORT", "18789"))
 # deploy.sh renders the real `<registry>/raven-hosted:<tag>` into AGENT_RAVEN_IMAGE.
 RAVEN_IMAGE = os.environ.get("AGENT_RAVEN_IMAGE", "raven-hosted:v0.2.3-eaf2")
 RAVEN_PORT = int(os.environ.get("AGENT_RAVEN_PORT", "18793"))
+# Where a Raven reaches the agent-manager API and the agent relay (Contracts F/G): the
+# control-plane Service, which 68-raven-common.yaml's :8000 egress rule admits. Non-secret, so
+# it rides the Raven's `-config` ConfigMap; the hosted image hands it to the eaf-agents tool.
+AGENT_MANAGER_URL = os.environ.get("AGENT_MANAGER_URL",
+                                   "http://control-plane:8000/agent-manager/v1")
+# The hermes API server's port (enterpriseaiframework-147): the agent relay's hermes target
+# (agents-raven.md, Contract G). 66-agent-console-common.yaml admits it from the control
+# plane only; the per-agent Service publishes it.
+HERMES_API_PORT = int(os.environ.get("AGENT_HERMES_API_PORT", "8642"))
 # The model EverOS embeds memory with. It is a gateway model like any other (the same key,
 # so the calls land on the Raven's own line); which name the gateway serves is the operator's.
 RAVEN_EMBEDDING_MODEL = os.environ.get("AGENT_RAVEN_EMBEDDING_MODEL", "text-embedding-3-small")
@@ -555,6 +564,47 @@ async def owned_raven(user: str, name: str) -> dict:
     if ((dep.get("metadata") or {}).get("labels") or {}).get(TYPE_LABEL) != "raven":
         raise HTTPException(404, f"you have no raven agent called {name!r}")
     return dep
+
+
+async def relay_target(user: str, name: str, via_raven: str) -> dict:
+    """Where a Raven's relayed turn goes, and the credential to present (Contract G).
+
+    The whole owner-scoping of the agent relay, beside every other per-user decision: the
+    SAME `_owned_deployment` guard (404 for "not yours" and "not there" alike), then the
+    relay's own rules. The upstream is resolved from the cluster object and never from the
+    request, and the target's API credential is read from ITS `-key` Secret, so the Raven
+    never holds another agent's key and cannot name an address.
+
+      * not itself (403, as every other self-targeting verb);
+      * a hermes agent: its API server on :8642. openclaw is Contract G's second target and
+        is not wired yet (501); a raven, an opencode agent or anything unlabelled is not a
+        relay target (404, the same answer as "no such agent");
+      * running: a stopped or still-starting agent is 404 with a reason, never a hang on a
+        Service with no endpoints.
+    """
+    _refuse_self(name, via_raven, "relay a turn to")
+    obj = object_name(user, name)
+    async with _client() as client:
+        deployment = await _owned_deployment(client, user, name)
+        agent_type = ((deployment.get("metadata") or {}).get("labels") or {}).get(TYPE_LABEL, "")
+        if agent_type == "openclaw":
+            raise HTTPException(501, f"relaying to the openclaw agent {name!r} is not "
+                                     "supported yet; hermes agents are")
+        if agent_type != "hermes":
+            raise HTTPException(404, f"you have no hermes agent called {name!r}")
+        phases = await _pod_phases(client, user)
+        if _status_of(deployment, phases.get(name)) != RUNNING:
+            raise HTTPException(404, f"the agent {name!r} is not running; start it first")
+        secret = await _get(client, "v1", "Secret", f"{obj}-key")
+    raw = ((secret or {}).get("data") or {}).get("API_SERVER_KEY")
+    if not raw:
+        raise HTTPException(
+            503,
+            f"the hermes agent {name!r} has no API server credential in Secret {obj}-key "
+            "(it predates enterpriseaiframework-147); re-provision it to relay to it.",
+        )
+    return {"type": "hermes", "host": obj, "port": HERMES_API_PORT,
+            "key": base64.b64decode(raw).decode()}
 
 
 # ---------------------------------------------------------------- status
@@ -1054,6 +1104,8 @@ def raven_env_config(model: str) -> dict[str, str]:
         "EVEROS_LLM__MODEL": model,
         "EVEROS_EMBEDDING__BASE_URL": base,
         "EVEROS_EMBEDDING__MODEL": RAVEN_EMBEDDING_MODEL,
+        # The agent-manager API base the eaf-agents tool calls (the token is in the Secret).
+        "EAF_AGENT_MANAGER_URL": AGENT_MANAGER_URL,
     }
 
 
