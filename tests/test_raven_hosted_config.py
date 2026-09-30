@@ -219,7 +219,7 @@ def test_the_image_ships_the_tool_where_the_seed_points():
     assert (RAVEN / "eaf_agents_mcp.py").is_file()
 
 
-# --- tool standing: read/relay pre-approved, everything that changes what exists asks (b12) ---
+# --- tool standing: only read pre-approved, everything that changes what exists asks (b12) ---
 # Names are Raven's `mcp_<server>_<tool>` (raven/mcp/naming.py, hyphens survive sanitising),
 # written out by hand; the tiers are the item's ruling, not read back from hosted_seed.py.
 
@@ -228,31 +228,37 @@ LIST, SEND, CREATE = ("mcp_eaf-agents_list_agents", "mcp_eaf-agents_send_to_agen
 MANAGER = {"EAF_AGENT_MANAGER_URL": MANAGER_URL, "EAF_AGENT_MANAGER_TOKEN": MANAGER_TOKEN}
 
 
-def test_reading_and_relaying_are_preapproved_and_creating_still_asks(tmp_path):
+def test_only_reading_is_preapproved_relaying_and_creating_ask(tmp_path):
     assert _run_seed(tmp_path, **MANAGER).returncode == 0
     tiers = _cfg(tmp_path)["permissions"]["tools"]
-    assert tiers[LIST] == "allow" and tiers[SEND] == "allow"
-    assert tiers[CREATE] == "ask"
+    assert tiers[LIST] == "allow"
+    assert tiers[SEND] == "ask" and tiers[CREATE] == "ask"
 
 
 def test_a_drifted_pvc_cannot_loosen_the_ask_tier_but_a_stricter_choice_survives(tmp_path):
     """The PVC outlives the image: an older file, or a WebUI 'always allow', that made
-    create_agent allow is pulled back to ask; an owner's own deny on send is left alone, and
+    create_agent allow is pulled back to ask; an owner's own deny is left alone (next test), and
     unrelated tool rules survive."""
     (tmp_path / "config.json").write_text(json.dumps({"permissions": {"mode": "ask", "tools": {
-        CREATE: "allow", SEND: "deny", LIST: "ask", "exec": {"git *": "allow"}, "web_fetch": "deny"}}}))
+        CREATE: "allow", SEND: "allow", LIST: "ask", "exec": {"git *": "allow"}, "web_fetch": "deny"}}}))
     assert _run_seed(tmp_path, **MANAGER).returncode == 0
     perms = _cfg(tmp_path)["permissions"]
     assert perms["tools"][CREATE] == "ask"      # loosened -> pulled back
     assert perms["tools"][LIST] == "allow"      # tightened by drift -> the pre-approval restored
-    assert perms["tools"][SEND] == "deny"       # the owner's own stricter choice stands
+    assert perms["tools"][SEND] == "ask"        # WebUI-edited allow on the relay -> pulled back
     assert perms["tools"]["exec"] == {"git *": "allow"} and perms["tools"]["web_fetch"] == "deny"
     assert perms["mode"] == "ask"
 
 
+def test_an_owners_own_deny_survives_the_seed(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"permissions": {"tools": {SEND: "deny"}}}))
+    assert _run_seed(tmp_path, **MANAGER).returncode == 0
+    assert _cfg(tmp_path)["permissions"]["tools"][SEND] == "deny"
+
+
 def test_no_manager_power_leaves_no_standing_grant_for_the_absent_tool(tmp_path):
     assert _run_seed(tmp_path, **MANAGER).returncode == 0
-    assert _cfg(tmp_path)["permissions"]["tools"][SEND] == "allow"
+    assert _cfg(tmp_path)["permissions"]["tools"][SEND] == "ask"
     assert _run_seed(tmp_path, EAF_AGENT_MANAGER_TOKEN=None).returncode == 0
     tiers = _cfg(tmp_path)["permissions"]["tools"]
     assert not {LIST, SEND, CREATE} & set(tiers)

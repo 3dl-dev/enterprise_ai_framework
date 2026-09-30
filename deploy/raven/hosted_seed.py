@@ -126,12 +126,14 @@ def enforce(config: dict, env: dict[str, str]) -> dict:
 
 # Raven registers an MCP tool as `mcp_<server>_<tool>` (raven/mcp/naming.py; hyphens survive
 # sanitising) and reads its standing from `permissions.tools`. Unlisted MCP tools ask the
-# owner each time, which blocks voice and unattended use on the two verbs that only read or
-# relay; the verbs that change what exists stay at `ask`. Pinned every boot, like the tool
+# owner each time, which blocks voice and unattended use on the one verb that only reads;
+# everything that relays or changes what exists stays at `ask`. Pinned every boot, like the tool
 # itself, so a stale PVC cannot loosen the ask tier. A stricter `deny` the owner chose
 # survives: this seed never turns a deny into anything else.
-EAF_AGENTS_ALLOWED = ("list_agents", "send_to_agent")   # read / relay
-EAF_AGENTS_ASKED = ("create_agent",)                    # changes what exists
+# send_to_agent asks too: a pre-approved relay would hand a prompt-injected Raven the owner's
+# full authority over their openclaw agent. Only the read-only verb is pre-approved.
+EAF_AGENTS_ALLOWED = ("list_agents",)                        # read only
+EAF_AGENTS_ASKED = ("send_to_agent", "create_agent")         # relay / changes what exists
 
 
 def _tier_name(tool: str) -> str:
