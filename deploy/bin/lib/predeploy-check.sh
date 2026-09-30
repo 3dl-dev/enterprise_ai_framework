@@ -99,7 +99,7 @@ for k, v in json.loads(sys.stdin.read()).get("data", {}).items():
     if (( ${#refused[@]} )); then
         echo "predeploy: REFUSING to deploy; these operated values would regress the live instance:" >&2
         for n in "${refused[@]}"; do echo "    - $n" >&2; done
-        echo "predeploy: fix the instance source (bundle/.env), or override deliberately with ALLOW_OPERATED_CHANGE=KEY[,KEY...]|all" >&2
+        echo "predeploy: fix the operated-instance overlay (~/.config/enterprise-ai/operated.env), or override deliberately with ALLOW_OPERATED_CHANGE=KEY[,KEY...]|all" >&2
         return 1
     fi
     echo "predeploy: ok - no operated value changes or blanks against the live cluster"

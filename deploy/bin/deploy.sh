@@ -7,16 +7,19 @@
 #
 #   deploy/bin/deploy.sh
 #
-# THE INSTANCE SOURCE. Every operated-instance value this script writes (PUBLIC_BASE_URL,
-# GATEWAY_PROVIDER, the realm behind OPENID_ISSUER, ...) comes from ONE untracked file,
-# bundle/.env (override the path with DEPLOY_ENV_FILE) - never from the caller's shell. The
+# THE INSTANCE SOURCE. Every value this script writes comes from two untracked files, never from
+# the caller's shell: bundle/.env (shared secrets, override DEPLOY_ENV_FILE) layered under the
+# deploy-only OVERLAY ~/.config/enterprise-ai/operated.env (override DEPLOY_OVERLAY_FILE) holding
+# the operated-instance values (PUBLIC_BASE_URL, GATEWAY_PROVIDER, the realm behind
+# OPENID_ISSUER, ...); the overlay wins. Compose never reads the overlay. Both files are required
+# (deploy/bin/lib/instance-source.sh; deploy/README.md). The
 # script re-execs itself with a scrubbed environment so an ambient PUBLIC_BASE_URL or
 # GATEWAY_PROVIDER (a watcher default, a direnv export) cannot reach the cluster
 # (enterpriseaiframework-e7f: a watcher default overwrote the live issuer). A value missing
 # from the file is missing, and a PRE-DEPLOY SAFETY CHECK refuses to blank or change what
 # the live cluster holds (deploy/bin/lib/predeploy-check.sh).
 #
-# Controls let through the scrub: DEPLOY_ENV_FILE, ALLOW_OPERATED_CHANGE, and
+# Controls let through the scrub: DEPLOY_ENV_FILE, DEPLOY_OVERLAY_FILE, ALLOW_OPERATED_CHANGE, and
 # DEPLOY_CHECK_ONLY=1 (run everything up to and including the safety check, mutate nothing).
 #
 # PUBLIC_BASE_URL must be the URL a *browser* will use. The chat surface's OIDC client
@@ -33,6 +36,7 @@ if [[ -z "${DEPLOY_SANITIZED:-}" ]]; then
         ${KUBECONFIG:+KUBECONFIG="$KUBECONFIG"} ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} \
         ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"} ${TMPDIR:+TMPDIR="$TMPDIR"} \
         ${DEPLOY_ENV_FILE:+DEPLOY_ENV_FILE="$DEPLOY_ENV_FILE"} \
+        ${DEPLOY_OVERLAY_FILE:+DEPLOY_OVERLAY_FILE="$DEPLOY_OVERLAY_FILE"} \
         ${ALLOW_OPERATED_CHANGE:+ALLOW_OPERATED_CHANGE="$ALLOW_OPERATED_CHANGE"} \
         ${DEPLOY_CHECK_ONLY:+DEPLOY_CHECK_ONLY="$DEPLOY_CHECK_ONLY"} \
         bash "$0" "$@"
@@ -42,12 +46,15 @@ NS=enterprise-ai
 IMAGE_NAME="enterprise-ai-control-plane"
 TAG="$(git rev-parse --short HEAD 2>/dev/null || echo latest)"
 
-ENV_FILE="${DEPLOY_ENV_FILE:-bundle/.env}"
-case "$ENV_FILE" in /*) ;; *) ENV_FILE="./$ENV_FILE" ;; esac
-[[ -f "$ENV_FILE" ]] || { echo "$ENV_FILE missing - it is the declared instance source (run 'make up' locally first)" >&2; exit 1; }
-set -a; . "$ENV_FILE"; set +a
+. deploy/bin/lib/instance-source.sh
+instance_source_paths
+ENV_FILE="$INSTANCE_ENV_FILE"
+[[ -f "$ENV_FILE" ]] || { echo "$ENV_FILE missing - it is the declared source of shared secrets (run 'make up' locally first)" >&2; exit 1; }
+instance_overlay_check || exit 1
+# Overlay last, so the operated values win over anything bundle/.env (or compose) carries.
+set -a; . "$ENV_FILE"; . "$INSTANCE_OVERLAY_FILE"; set +a
 
-# Instance profile — operator-agnostic DEFAULTS; the instance overrides these in bundle/.env
+# Instance profile — operator-agnostic DEFAULTS; the instance overrides these in bundle/.env or the overlay
 # (see docs/design/hoistable-and-operated.md). Defined AFTER sourcing bundle/.env so the
 # instance's values win. The manifests carry __GATEWAY_LAN_IP__/__GATEWAY_TAILNET_HOST__
 # placeholders (the OIDC-backchannel hostAlias), substituted in the apply loop below.
@@ -65,7 +72,7 @@ LAN_CIDR="${LAN_CIDR:-127.0.0.0/8}"
 
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 if [[ -z "$PUBLIC_BASE_URL" ]]; then
-    echo "error: PUBLIC_BASE_URL is required and unset in $ENV_FILE (e.g. https://ai.example.org). There is no default: a placeholder here overwrites the live issuer." >&2
+    echo "error: PUBLIC_BASE_URL is required and unset in $INSTANCE_OVERLAY_FILE (e.g. https://ai.example.org). There is no default: a placeholder here overwrites the live issuer." >&2
     exit 1
 fi
 if [[ "$PUBLIC_BASE_URL" != https://* ]]; then

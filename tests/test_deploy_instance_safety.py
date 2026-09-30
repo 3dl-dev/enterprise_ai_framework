@@ -109,10 +109,24 @@ def cluster(tmp_path):
     return c
 
 
-def run_deploy(tmp_path, cluster, env_values, ambient=None):
-    envfile = _write_env(tmp_path / "instance.env", {**BASE_ENV, **env_values})
+OPERATED_KEYS = set(OPERATED)   # live in the deploy-only overlay, never in bundle/.env
+
+
+def split_sources(tmp_path, env_values):
+    """bundle/.env-style shared file + the operated overlay, written the way production has them."""
+    merged = {**BASE_ENV, **env_values}
+    shared = _write_env(tmp_path / "instance.env", {k: v for k, v in merged.items() if k not in OPERATED_KEYS})
+    overlay = _write_env(tmp_path / "operated.env", {k: v for k, v in merged.items() if k in OPERATED_KEYS})
+    return shared, overlay
+
+
+def run_deploy(tmp_path, cluster, env_values, ambient=None, overlay=True):
+    envfile, overlay_file = split_sources(tmp_path, env_values)
+    if not overlay:
+        overlay_file.unlink()
     env = {"PATH": f"{cluster.bin}:{os.environ['PATH']}", "HOME": str(tmp_path),
-           "DEPLOY_ENV_FILE": str(envfile), "DEPLOY_CHECK_ONLY": "1", **(ambient or {})}
+           "DEPLOY_ENV_FILE": str(envfile), "DEPLOY_OVERLAY_FILE": str(overlay_file),
+           "DEPLOY_CHECK_ONLY": "1", **(ambient or {})}
     return subprocess.run([str(DEPLOY)], capture_output=True, text=True, env=env, cwd=REPO)
 
 
@@ -143,12 +157,18 @@ def test_a_public_base_url_that_differs_from_live_is_refused_by_name(tmp_path, c
     assert_no_mutation(cluster)
 
 
-@pytest.mark.parametrize("gp", [None, ""])   # key absent from the file, and set-but-empty
-def test_a_missing_gateway_provider_is_refused_because_the_running_pod_has_it(tmp_path, cluster, gp):
+@pytest.mark.parametrize("gp", [None, ""])   # key absent from the overlay, and set-but-empty
+def test_a_missing_gateway_provider_fails_closed(tmp_path, cluster, gp):
     r = run_deploy(tmp_path, cluster, {**OPERATED, "GATEWAY_PROVIDER": gp})
     assert r.returncode != 0
-    assert "GATEWAY_PROVIDER (running control-plane pod has it set; deploy would blank it)" in r.stderr
-    assert_no_mutation(cluster)
+    assert "GATEWAY_PROVIDER is not set in the operated-instance overlay" in r.stderr
+    assert cluster.verbs() == [], "fail-closed must come before any cluster call"
+
+
+def test_the_predeploy_pod_check_still_refuses_a_blank_when_the_provider_is_allowed_through(tmp_path, cluster):
+    # The overlay has a provider, but one that would change what the running pod holds.
+    r = run_deploy(tmp_path, cluster, {**OPERATED, "GATEWAY_PROVIDER": "litellm"})
+    assert r.returncode != 0 and "running control-plane pod differs" in r.stderr
 
 
 def test_a_wrong_gateway_provider_is_refused(tmp_path, cluster):
@@ -177,7 +197,7 @@ def test_ambient_shell_env_never_reaches_the_cluster_values(tmp_path, cluster):
     r = run_deploy(tmp_path, cluster, {"IDP_REALM": "enterprise-ai"},
                    ambient={"PUBLIC_BASE_URL": LIVE_URL, "GATEWAY_PROVIDER": "freerouter"})
     assert r.returncode != 0
-    assert "PUBLIC_BASE_URL is required and unset" in r.stderr
+    assert "PUBLIC_BASE_URL is not set in the operated-instance overlay" in r.stderr
 
 
 def test_ambient_wrong_values_do_not_override_the_file(tmp_path, cluster):
@@ -222,6 +242,8 @@ def watcher_repo(tmp_path):
     repo = tmp_path / "repo"
     (repo / "deploy/bin").mkdir(parents=True)
     shutil.copy(WATCHER, repo / "deploy/bin/watch-and-deploy.sh")
+    (repo / "deploy/bin/lib").mkdir()
+    shutil.copy(REPO / "deploy/bin/lib/instance-source.sh", repo / "deploy/bin/lib/instance-source.sh")
     g = lambda *a: subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True)
     g("init", "-q", "-b", "main"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
     (repo / ".gitignore").write_text("bundle/.env\n")
@@ -230,12 +252,14 @@ def watcher_repo(tmp_path):
     return repo
 
 
-def run_watcher(repo, tmp_path, env_values, ambient=None, write_file=True):
+def run_watcher(repo, tmp_path, env_values, ambient=None, write_file=True, shared_values=None):
     envfile = tmp_path / "instance.env"
+    overlay = tmp_path / "operated.env"
+    _write_env(envfile, shared_values or {})
     if write_file:
-        _write_env(envfile, env_values)
+        _write_env(overlay, env_values)
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "WATCH_STATE_DIR": str(tmp_path / "state"),
-           "DEPLOY_ENV_FILE": str(envfile),
+           "DEPLOY_ENV_FILE": str(envfile), "DEPLOY_OVERLAY_FILE": str(overlay),
            # A floor no disk meets: a run that gets past the instance checks stops here, before
            # `make up`, so this test can never start a real stack or deploy.
            "MIN_FREE_GB": "999999999", **(ambient or {})}
@@ -250,19 +274,36 @@ def run_watcher(repo, tmp_path, env_values, ambient=None, write_file=True):
 ])
 def test_watcher_fails_closed_without_a_real_public_base_url(watcher_repo, tmp_path, values, why):
     # Ambient carries the incident's default AND the live value: neither may rescue an unset file.
-    r = run_watcher(watcher_repo, tmp_path, values, ambient={"PUBLIC_BASE_URL": LIVE_URL})
+    r = run_watcher(watcher_repo, tmp_path, {"GATEWAY_PROVIDER": "freerouter", **values}, ambient={"PUBLIC_BASE_URL": LIVE_URL})
     out = r.stdout + r.stderr
     assert r.returncode == 1 and "STOP:" in out and "PUBLIC_BASE_URL" in out, (why, out)
     assert "disk" not in out, "reached the disk check: the instance check did not come first"
 
 
 def test_watcher_fails_closed_when_the_instance_file_is_missing(watcher_repo, tmp_path):
-    r = run_watcher(watcher_repo, tmp_path, {}, write_file=False)
-    assert r.returncode == 1 and "instance source" in r.stdout + r.stderr
+    r = run_watcher(watcher_repo, tmp_path, {}, write_file=False, ambient={"PUBLIC_BASE_URL": LIVE_URL, "GATEWAY_PROVIDER": "freerouter"})
+    out = r.stdout + r.stderr
+    assert r.returncode == 1 and "operated-instance overlay" in out and "missing" in out
+    assert "disk" not in out
+
+
+def test_watcher_fails_closed_when_the_overlay_lacks_a_gateway_provider(watcher_repo, tmp_path):
+    r = run_watcher(watcher_repo, tmp_path, {"PUBLIC_BASE_URL": LIVE_URL})
+    out = r.stdout + r.stderr
+    assert r.returncode == 1 and "STOP:" in out and "GATEWAY_PROVIDER is not set in the operated-instance overlay" in out
+    assert "disk" not in out
+
+
+def test_watcher_does_not_accept_operated_values_from_the_shared_file_alone(watcher_repo, tmp_path):
+    # The incident shape inverted: operated values sitting in bundle/.env (compose reads it) do not
+    # satisfy a missing overlay; they must be declared in the overlay.
+    r = run_watcher(watcher_repo, tmp_path, {}, write_file=False,
+                    shared_values={"PUBLIC_BASE_URL": LIVE_URL, "GATEWAY_PROVIDER": "freerouter"})
+    assert r.returncode == 1 and "operated-instance overlay" in r.stdout + r.stderr
 
 
 def test_watcher_with_a_declared_https_url_gets_past_the_instance_check(watcher_repo, tmp_path):
-    r = run_watcher(watcher_repo, tmp_path, {"PUBLIC_BASE_URL": LIVE_URL})
+    r = run_watcher(watcher_repo, tmp_path, {"PUBLIC_BASE_URL": LIVE_URL, "GATEWAY_PROVIDER": "freerouter"})
     out = r.stdout + r.stderr
     assert f"declares PUBLIC_BASE_URL={LIVE_URL}" in out
     assert "only " in out and "GB free" in out, out   # stopped at the (unmeetable) disk floor, nothing deployed
@@ -272,6 +313,87 @@ def test_watcher_carries_no_placeholder_default_and_passes_nothing_ambient_to_de
     b = WATCHER.read_text()
     assert "ai.example.org" not in re.sub(r"#.*", "", b).replace('*example.org*', "")
     assert 'PUBLIC_BASE_URL="$PUBLIC_BASE_URL" deploy/bin/deploy.sh' not in b
+
+
+# ---------------------------------------------------------------- the overlay
+
+def test_overlay_wins_over_the_shared_file(tmp_path, cluster):
+    # bundle/.env carries a stale (wrong) URL and provider; the overlay carries the live ones.
+    shared, overlay = split_sources(tmp_path, OPERATED)
+    with shared.open("a") as f:
+        f.write("PUBLIC_BASE_URL=https://ai.example.org\nGATEWAY_PROVIDER=litellm\n")
+    env = {"PATH": f"{cluster.bin}:{os.environ['PATH']}", "HOME": str(tmp_path), "DEPLOY_ENV_FILE": str(shared),
+           "DEPLOY_OVERLAY_FILE": str(overlay), "DEPLOY_CHECK_ONLY": "1"}
+    r = subprocess.run([str(DEPLOY)], capture_output=True, text=True, env=env, cwd=REPO)
+    assert r.returncode == 0, r.stdout + r.stderr   # would be REFUSING if the shared file won
+    assert_no_mutation(cluster)
+
+
+def test_a_missing_overlay_fails_closed_before_any_cluster_call(tmp_path, cluster):
+    r = run_deploy(tmp_path, cluster, OPERATED, overlay=False,
+                   ambient={"PUBLIC_BASE_URL": LIVE_URL, "GATEWAY_PROVIDER": "freerouter"})
+    assert r.returncode != 0 and "operated-instance overlay" in r.stderr and "missing" in r.stderr
+    assert cluster.verbs() == []
+
+
+def test_operated_values_in_the_shared_file_alone_do_not_satisfy_deploy(tmp_path, cluster):
+    shared, overlay = split_sources(tmp_path, {})
+    overlay.write_text("")
+    with shared.open("a") as f:
+        f.write(f"PUBLIC_BASE_URL={LIVE_URL}\nGATEWAY_PROVIDER=freerouter\n")
+    env = {"PATH": f"{cluster.bin}:{os.environ['PATH']}", "HOME": str(tmp_path), "DEPLOY_ENV_FILE": str(shared),
+           "DEPLOY_OVERLAY_FILE": str(overlay), "DEPLOY_CHECK_ONLY": "1"}
+    r = subprocess.run([str(DEPLOY)], capture_output=True, text=True, env=env, cwd=REPO)
+    assert r.returncode != 0 and "not set in the operated-instance overlay" in r.stderr
+
+
+def test_default_overlay_path_is_outside_the_repo_and_under_home(tmp_path, cluster):
+    # No DEPLOY_OVERLAY_FILE: the script must look in $HOME/.config/enterprise-ai/operated.env.
+    shared, _ = split_sources(tmp_path, OPERATED)
+    (tmp_path / ".config/enterprise-ai").mkdir(parents=True)
+    _write_env(tmp_path / ".config/enterprise-ai/operated.env", OPERATED)
+    env = {"PATH": f"{cluster.bin}:{os.environ['PATH']}", "HOME": str(tmp_path), "DEPLOY_ENV_FILE": str(shared),
+           "DEPLOY_CHECK_ONLY": "1"}
+    r = subprocess.run([str(DEPLOY)], capture_output=True, text=True, env=env, cwd=REPO)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+OVERLAY_NAMES = ("operated.env", "DEPLOY_OVERLAY_FILE", ".env.operated", "instance-source.sh")
+
+
+def test_compose_files_and_bundle_scripts_never_read_the_overlay():
+    """The incident: operated values in a file compose reads flipped the local stack to freerouter."""
+    offenders = []
+    roots = [REPO / "bundle", REPO / "Makefile"]
+    files = [f for r in roots for f in ([r] if r.is_file() else r.rglob("*")) if f.is_file()]
+    assert any(f.name == "docker-compose.yml" for f in files) and any(f.parent.name == "bin" for f in files)
+    for f in files:
+        try:
+            text = f.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        offenders += [f"{f.relative_to(REPO)}: {n}" for n in OVERLAY_NAMES if n in text]
+    # Indirect forms that would reach the overlay without naming it: its directory, a glob over
+    # `.env*`/`.env.?*`, an `env_file:` key, or any `--env-file` other than the shared bundle/.env.
+    indirect = {"enterprise-ai/operated", ".config/enterprise-ai", "env_file:"}
+    sibling_ok = {".env.example", ".env.tmp"}
+    for f in files:
+        try:
+            text = f.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        offenders += [f"{f.relative_to(REPO)}: {n}" for n in indirect if n in text]
+        offenders += [f"{f.relative_to(REPO)}: glob {m}" for m in re.findall(r"\.env[*?\[]", text)]
+        offenders += [f"{f.relative_to(REPO)}: sibling {m}" for m in re.findall(r"\.env\.[A-Za-z*?_-]+", text)
+                      if m not in sibling_ok and not m.startswith(".env.ALLOW_")]
+        offenders += [f"{f.relative_to(REPO)}: --env-file {m}" for m in re.findall(r"--env-file[ =]+(\$\(BUNDLE\)/[^\s)]*|[^\s)\"';]+)", text)
+                      if m not in ("$(BUNDLE)/.env", "bundle/.env", ".env")]
+    assert not offenders, offenders
+
+
+def test_the_overlay_default_path_is_not_inside_the_repo():
+    lib = (REPO / "deploy/bin/lib/instance-source.sh").read_text()
+    assert '${HOME:-/root}/.config/enterprise-ai/operated.env' in lib
 
 
 # ---------------------------------------------------------------- manifests
