@@ -17,13 +17,12 @@
 # in a real session, and a watcher that gets them wrong deploys on a false green, which is
 # strictly worse than not deploying at all:
 #
-#   * THE CATALOGUE HAS TWO MODES AND ONE FILE (enterpriseaiframework-7bb). The hermetic suite
-#     needs a fakes-only bundle/litellm/config.generated.yaml; production needs the real Forge
-#     catalogue. FORGE_API_KEY is ambient in the operator shell, so any unguarded render
-#     writes the real one, and every later hermetic run then fails EVERY chat turn with
-#     "illegal_model_request: fake-large" — after burning a 180s timeout each, turning a 6
-#     minute suite into 19. So: render fakes, test, render real, deploy. Verified both times,
-#     not assumed.
+#   * THE GATEWAY CATALOGUE IS FAKES-ONLY, ALWAYS (7bb, e7f). Forge is retired; the real model
+#     catalogue is freerouter's and is not rendered into the LiteLLM config. The render uses
+#     --no-upstream, which reads no FORGE_* value, so the file the suite tests is the file
+#     production deploys (7bb: a real 148-model catalogue made every hermetic chat turn fail
+#     on "illegal_model_request: fake-large" after a 180s timeout each). Before deploying,
+#     the guard asks LIVE freerouter for its catalogue and refuses a stub-only one.
 #   * THE SURFACE GOES STALE (enterpriseaiframework-af5). `make up` does not restart chat when
 #     only librechat.yaml changed, because LibreChat parses it once at startup. The suite then
 #     tests a pre-checkout config — which can go green over a broken change just as easily as
@@ -35,6 +34,11 @@
 #     that was in fact green.
 set -euo pipefail
 
+# Everything runs inside main() so bash has parsed the WHOLE script before the ff-merge below
+# can replace this very file on disk; otherwise a commit that edits the watcher corrupts the
+# run that deploys it (bash reads a script incrementally).
+main() {
+
 cd "$(dirname "$0")/../.."
 REPO="$PWD"
 
@@ -43,7 +47,13 @@ STATE="$STATE_DIR/last-deployed-sha"
 LOCK="$STATE_DIR/watch-and-deploy.lock"
 LOG="$STATE_DIR/watch-and-deploy.log"
 MIN_FREE_GB="${MIN_FREE_GB:-8}"
-PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://ai.example.org}"
+# THE INSTANCE SOURCE (e7f). The operated instance's values come from ONE untracked file,
+# never from this process's environment and never from a default here. A placeholder default
+# for PUBLIC_BASE_URL used to live on this line; under systemd (empty env) it always won and
+# deploy.sh wrote https://ai.example.org over the live issuer. deploy.sh scrubs its own
+# environment and reads the same file; this script only proves the file is fit to deploy from.
+ENV_FILE="${DEPLOY_ENV_FILE:-bundle/.env}"
+case "$ENV_FILE" in /*) ;; *) ENV_FILE="./$ENV_FILE" ;; esac
 FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 
@@ -60,8 +70,9 @@ give_up() { say "STOP: $*"; exit 1; }
 say "=== watch-and-deploy starting ==="
 
 # --- 1. is there anything to do -------------------------------------------------------
-git fetch --quiet origin main
-SHA="$(git rev-parse origin/main)"
+REF="${WATCH_REF:-origin/main}"   # override only to prove a branch through the real watcher
+git fetch --quiet origin "${REF#origin/}"
+SHA="$(git rev-parse "$REF")"
 LAST="$(cat "$STATE" 2>/dev/null || echo none)"
 if [[ "$SHA" == "$LAST" && $FORCE -eq 0 ]]; then
     say "origin/main $SHA is already deployed; nothing to do"
@@ -73,6 +84,15 @@ say "candidate ${SHA:0:9} (last deployed: ${LAST:0:9})"
 [[ -z "$(git status --porcelain)" ]] || give_up "working tree is dirty; refusing to deploy from it"
 
 # --- 2. preconditions ------------------------------------------------------------------
+# FAIL CLOSED on the instance source: no file, or no https PUBLIC_BASE_URL in it, means we do
+# not know which instance this is, so we do not touch any. Checked before the 6-minute suite.
+[[ -f "$ENV_FILE" ]] || give_up "instance source $ENV_FILE is missing; refusing to deploy an instance I cannot identify"
+pbu=$( ( set +u; unset PUBLIC_BASE_URL; set -a; . "$ENV_FILE" >/dev/null 2>&1; printf '%s' "${PUBLIC_BASE_URL:-}" ) )
+[[ -n "$pbu" ]] || give_up "PUBLIC_BASE_URL is not set in $ENV_FILE; there is no default (a placeholder overwrites the live issuer)"
+[[ "$pbu" == https://* ]] || give_up "PUBLIC_BASE_URL in $ENV_FILE is not https (${pbu%%/*}//...); nobody could log in"
+[[ "$pbu" != *example.org* && "$pbu" != *localhost* ]] || give_up "PUBLIC_BASE_URL in $ENV_FILE is a placeholder/local value; refusing"
+say "instance source $ENV_FILE declares PUBLIC_BASE_URL=$pbu"
+
 free_gb=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
 (( free_gb >= MIN_FREE_GB )) || give_up "only ${free_gb}GB free (need ${MIN_FREE_GB}); a run needs room for images and would risk an ENOSPC outage"
 say "disk ${free_gb}GB free"
@@ -86,7 +106,7 @@ git merge --ff-only --quiet "$SHA"
 
 # --- 3. hermetic suite, on a catalogue we VERIFY is fakes-only --------------------------
 say "rendering fakes-only catalogue"
-env -u FORGE_API_KEY -u FORGE_ADMIN_KEY bundle/bin/render-gateway-config.py >>"$LOG" 2>&1
+bundle/bin/render-gateway-config.py --no-upstream >>"$LOG" 2>&1
 entries=$(grep -c 'model_name:' bundle/litellm/config.generated.yaml || echo 0)
 grep -q 'model_name: fake-large' bundle/litellm/config.generated.yaml \
     || give_up "the rendered catalogue has no fake-large (${entries} entries); every chat-turn test would fail on illegal_model_request after a 180s timeout each"
@@ -106,14 +126,15 @@ fi
 say "suite GREEN on ${SHA:0:9}"
 
 # --- 4. deploy, on the REAL catalogue ---------------------------------------------------
-say "rendering the production catalogue"
-bundle/bin/render-gateway-config.py >>"$LOG" 2>&1
-real_entries=$(grep -c 'model_name:' bundle/litellm/config.generated.yaml || echo 0)
-(( real_entries > 10 )) || give_up "the production render produced only ${real_entries} models; deploying that would replace the real catalogue with fakes"
-say "production catalogue: ${real_entries} models"
+# Forge is retired: production inference is freerouter's catalogue, and the gateway ships the
+# fakes-only render already on disk. The guard asks the live freerouter, so a deploy cannot
+# proceed into a cluster whose router has lost its providers.
+say "checking the production freerouter catalogue"
+fr_out=$(deploy/bin/check-freerouter-catalogue.sh 2>&1) || { say "$fr_out"; give_up "production freerouter does not serve a real catalogue; deploying would leave users on stubs"; }
+say "production catalogue: $fr_out"
 
 say "deploying"
-if ! PUBLIC_BASE_URL="$PUBLIC_BASE_URL" deploy/bin/deploy.sh >>"$LOG" 2>&1; then
+if ! deploy/bin/deploy.sh >>"$LOG" 2>&1; then
     say "DEPLOY FAILED on ${SHA:0:9} — the cluster may be part-way. Tail of $LOG:"
     tail -40 "$LOG" >&2
     exit 1
@@ -122,7 +143,5 @@ fi
 # deploy.sh ends in smoke.sh, so reaching here means the cluster served a prompt.
 printf '%s\n' "$SHA" > "$STATE"
 say "=== deployed ${SHA:0:9} and it serves prompts ==="
-
-# Leave the checkout in the mode a human or a dispatch wave expects to find it.
-env -u FORGE_API_KEY -u FORGE_ADMIN_KEY bundle/bin/render-gateway-config.py >>"$LOG" 2>&1
-say "restored fakes-only catalogue for local work"
+}
+main "$@"

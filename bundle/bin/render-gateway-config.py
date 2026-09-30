@@ -37,9 +37,13 @@ credential. The admin key is never written to .env and never reaches a container
 response is cached so re-rendering does not require it again.
 
 Usage:
-    render-gateway-config.py [--offline]
+    render-gateway-config.py [--offline | --no-upstream]
 
-    --offline   use the cached price list and catalog; do not call Forge
+    --offline      use the cached price list and catalog; do not call Forge
+    --no-upstream  fakes-only catalogue, unconditionally: reads no FORGE_* value from the
+                   environment or bundle/.env, calls nothing. This is what the deploy path
+                   uses — Forge is retired and the operated instance's real catalogue is
+                   served by freerouter, not rendered into this LiteLLM config.
 """
 
 import json
@@ -233,6 +237,10 @@ def yaml_entry(model: dict, price: dict, base_url: str) -> str:
 
 def main(argv) -> int:
     offline = "--offline" in argv
+    if "--no-upstream" in argv:
+        OUT.write_text(BASE.read_text().replace(MARKER + "\n", "").replace(MARKER, ""))
+        print("no-upstream — generated fake-provider-only catalog")
+        return 0
     env = read_env()
     base_url = env.get("FORGE_BASE_URL", "https://forge.example.org").rstrip("/")
 
