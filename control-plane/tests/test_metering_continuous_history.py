@@ -194,7 +194,7 @@ def real_stack(tmp_path_factory):
     # --- disposable Postgres (plain docker run, random port) ------------------------
     pg_port = _free_port()
     container = f"eaf730pg-{pg_port}"
-    subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+    subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True)
     r = subprocess.run([
         "docker", "run", "--rm", "-d", "--name", container,
         "-e", "POSTGRES_PASSWORD=eaitest", "-e", "POSTGRES_USER=eai", "-e", "POSTGRES_DB=eai",
@@ -218,7 +218,7 @@ def real_stack(tmp_path_factory):
     while time.time() < deadline and not _pg_ready():
         time.sleep(1)
     if not _pg_ready():
-        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True)
         pytest.skip("disposable postgres never became ready")
 
     # Minimal LiteLLM schema -- just the columns metering.py's real SQL reads.
@@ -260,7 +260,7 @@ def real_stack(tmp_path_factory):
             break
         time.sleep(2)
     if psql is None or psql.returncode != 0:
-        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True)
         pytest.skip(f"could not seed LiteLLM fixture: {psql.stderr if psql else 'no attempt ran'}")
 
     # --- real freerouter: signup, subaccounts, topup, real Reserve/Settle usage -----
@@ -325,7 +325,7 @@ def real_stack(tmp_path_factory):
     seed = subprocess.run([str(seed_bin), str(fr_dsn)], input=json.dumps(events),
                           capture_output=True, text=True, timeout=30)
     if seed.returncode != 0 or "ok" not in seed.stdout:
-        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True)
         pytest.skip(f"could not seed real freerouter usage: {seed.stderr}")
 
     proc = _spawn()
@@ -349,7 +349,7 @@ def real_stack(tmp_path_factory):
     finally:
         proc.terminate()
         proc.wait(timeout=10)
-        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True)
 
 
 @pytest.fixture

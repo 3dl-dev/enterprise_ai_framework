@@ -174,7 +174,7 @@ def _start(conf_text: str, tree: Path, name: str) -> Server:
     conf = tree.parent / "default.conf"
     conf.write_text(conf_text)
     port = _free_port()
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
     run = subprocess.run(
         ["docker", "run", "-d", "--name", name, "-p", f"127.0.0.1:{port}:8080",
          "-v", f"{tree}:{_mount_path()}:ro",
@@ -211,7 +211,7 @@ def served(tree) -> Server:
     name = "eaf-test-published"
     srv = _start(_nginx_conf(), tree, name)
     yield srv
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
 
 
 # --------------------------------------------------------------- the negative case
