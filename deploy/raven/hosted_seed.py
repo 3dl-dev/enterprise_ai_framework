@@ -63,6 +63,31 @@ def hosted_overlay(env: dict[str, str]) -> dict:
     }
 
 
+# The eaf-agents tool (deploy/raven/eaf_agents_mcp.py): the Raven's way to its owner's other
+# agents, through the agent-manager API and the control-plane relay (Contracts F/G).
+EAF_AGENTS_SERVER = "eaf-agents"
+EAF_AGENTS_SCRIPT = "/opt/eaf/eaf_agents_mcp.py"
+EAF_AGENTS_PYTHON = "/app/.venv/bin/python"
+# Above the relay's total per-turn timeout (900 s), which is the real bound on a turn.
+EAF_AGENTS_TOOL_TIMEOUT = 960
+
+
+def eaf_agents_server(env: dict[str, str]) -> dict | None:
+    """The `tools.mcpServers` entry for eaf-agents, or None when this Raven has no manager
+    power (no token in its env) or no agent-manager URL.
+
+    The entry carries the URL and nothing secret: the token is read by the tool from the
+    container env at call time and is never written into config.json (Contract F: never the
+    PVC).
+    """
+    base = env.get("EAF_AGENT_MANAGER_URL", "").strip()
+    if not base or not env.get("EAF_AGENT_MANAGER_TOKEN", "").strip():
+        return None
+    return {"type": "stdio", "command": EAF_AGENTS_PYTHON,
+            "args": [EAF_AGENTS_SCRIPT, "--base-url", base],
+            "env": {}, "enabled": True, "toolTimeout": EAF_AGENTS_TOOL_TIMEOUT}
+
+
 def _merge(dst: dict, src: dict) -> dict:
     for k, v in src.items():
         if isinstance(v, dict) and isinstance(dst.get(k), dict):
@@ -83,6 +108,18 @@ def enforce(config: dict, env: dict[str, str]) -> dict:
             row["enabled"] = False
     subs["agents"] = rows
     subs.pop("thirdParty", None)
+    # The eaf-agents tool: present exactly when manager power is on, re-asserted every boot
+    # (so a WebUI edit cannot repoint it), and removed when the token is gone.
+    tools = config.setdefault("tools", {})
+    servers = tools.get("mcpServers", tools.get("mcp_servers"))
+    servers = servers if isinstance(servers, dict) else {}
+    tools.pop("mcp_servers", None)
+    entry = eaf_agents_server(env)
+    if entry is None:
+        servers.pop(EAF_AGENTS_SERVER, None)
+    else:
+        servers[EAF_AGENTS_SERVER] = entry
+    tools["mcpServers"] = servers
     return config
 
 

@@ -38,6 +38,8 @@ RUN sed -i 's/^\(\s*\)listen 80;/\1listen 18793;/' /etc/nginx/templates/raven.co
 
 COPY hosted_seed.py /opt/eaf/hosted_seed.py
 COPY hosted-entrypoint.sh /opt/eaf/hosted-entrypoint.sh
+# The eaf-agents MCP tool (Contracts F/G): hosted_seed.py registers it when manager power is on.
+COPY eaf_agents_mcp.py /opt/eaf/eaf_agents_mcp.py
 RUN chmod +x /opt/eaf/hosted-entrypoint.sh
 
 # Hosted-mode switches. These are DEFAULTS baked into the image so a pod that forgets to
