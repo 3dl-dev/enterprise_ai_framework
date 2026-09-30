@@ -11,7 +11,8 @@ Raven (`agent_manager_token`). This file is only the door:
     created-by children) are in `agents.py` too. Nothing here decides who may do what;
   * every call, allowed or refused, is audited with actor `agent-manager:<owner>/<raven>`.
 
-Scope is the router: it mounts list/create/start/stop/model/delete and nothing else. No
+Scope is the router: it mounts list/create/start/stop/model/delete and the agent relay
+(Contract G, `agent_relay`) and nothing else. No
 connector, key, BYO, admin or portal route exists here, so none can be reached.
 
 WHY LOOPBACK IS REFUSED
@@ -30,7 +31,7 @@ from dataclasses import dataclass
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from . import agent_manager_token, agents, db, portal
+from . import agent_manager_token, agent_relay, agents, db, portal
 
 router = APIRouter(prefix="/agent-manager/v1")
 
@@ -43,6 +44,9 @@ UNKNOWN_ACTOR = "agent-manager:unknown"
 class Manager:
     owner: str
     raven: str
+    # SHA-256 of the presented bearer: the key of the relay's per-token stream cap. The
+    # plaintext never leaves require_agent_manager.
+    token_hash: str = ""
 
     @property
     def actor(self) -> str:
@@ -88,7 +92,7 @@ async def require_agent_manager(
                                           else "owner_disabled"),
             token, "invalid or revoked agent-manager token",
         )
-    mgr = Manager(row["owner"], row["raven_name"])
+    mgr = Manager(row["owner"], row["raven_name"], agent_manager_token.token_hash(token))
     # 2. The Raven must still exist, be the owner's, and be a raven. A token whose Raven
     #    was deleted underneath it is dead even if revocation somehow failed.
     try:
@@ -176,3 +180,24 @@ async def delete_agent(name: str, request: Request,
                        mgr: Manager = Depends(require_agent_manager)):
     return await _guarded(mgr, request, "agent.delete", name,
                           lambda: agents.delete(mgr.owner, name, via_raven=mgr.raven))
+
+
+@router.post("/agents/{name}/relay/v1/chat/completions")
+async def relay_chat_completions(name: str, request: Request,
+                                 mgr: Manager = Depends(require_agent_manager)):
+    """Contract G: one turn from this Raven to its owner's named hermes agent.
+
+    The per-token stream cap is checked first (it guards connections, so it must not wait on
+    anything); then the target is resolved by `agents.relay_target` behind the same owner
+    guard as every other verb, and a refusal there is audited as `agent-manager.denied`
+    exactly like theirs. Everything after that is `agent_relay`: timeouts, disconnect
+    cancel, header allow-listing, the derived session key and the per-turn audit row.
+    """
+    turn = await agent_relay.open_turn(mgr, name, request)
+    try:
+        target = await _guarded(mgr, request, "agent.relay", name,
+                                lambda: agents.relay_target(mgr.owner, name, mgr.raven))
+    except BaseException:
+        turn.abandon()
+        raise
+    return await agent_relay.relay(turn, target, request)

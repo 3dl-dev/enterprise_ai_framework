@@ -23,5 +23,13 @@ console token the proxy presents as `X-Raven-Token`), `EVEROS_LLM__{BASE_URL,MOD
 `component: agent` + `agent.enterprise-ai/type: raven` (so `68-raven-common.yaml` governs it and
 `63-agent-common.yaml` does not).
 
+With manager power on, the pod also gets `EAF_AGENT_MANAGER_TOKEN` (Secret) and
+`EAF_AGENT_MANAGER_URL` (ConfigMap), and `hosted_seed.py` registers the **eaf-agents** stdio MCP
+tool (`eaf_agents_mcp.py`: `list_agents`, `create_agent`, `send_to_agent`). It reaches the
+owner's agents only through the control plane: the agent-manager API and the agent relay
+(agents-raven.md, Contracts F/G). The token is read from the container env at call time and
+never written into `config.json`. Raven asks the owner to approve each call (its default for an
+MCP tool).
+
 Proof: `tests/test_raven_hosted_config.py` (hermetic) and `tests-live/test_raven_hosted.py`
 (starts the real image on k3s, throwaway `--39e` resources).
