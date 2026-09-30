@@ -120,7 +120,40 @@ def enforce(config: dict, env: dict[str, str]) -> dict:
     else:
         servers[EAF_AGENTS_SERVER] = entry
     tools["mcpServers"] = servers
+    _enforce_tool_tiers(config, entry is not None)
     return config
+
+
+# Raven registers an MCP tool as `mcp_<server>_<tool>` (raven/mcp/naming.py; hyphens survive
+# sanitising) and reads its standing from `permissions.tools`. Unlisted MCP tools ask the
+# owner each time, which blocks voice and unattended use on the one verb that only reads;
+# everything that relays or changes what exists stays at `ask`. Pinned every boot, like the tool
+# itself, so a stale PVC cannot loosen the ask tier. A stricter `deny` the owner chose
+# survives: this seed never turns a deny into anything else.
+# send_to_agent asks too: a pre-approved relay would hand a prompt-injected Raven the owner's
+# full authority over their openclaw agent. Only the read-only verb is pre-approved.
+EAF_AGENTS_ALLOWED = ("list_agents",)                        # read only
+EAF_AGENTS_ASKED = ("send_to_agent", "create_agent")         # relay / changes what exists
+
+
+def _tier_name(tool: str) -> str:
+    return f"mcp_{EAF_AGENTS_SERVER}_{tool}"
+
+
+def _enforce_tool_tiers(config: dict, manager_power: bool) -> None:
+    perms = config.get("permissions")
+    if not isinstance(perms, dict):
+        perms = config["permissions"] = {}
+    tiers = perms.get("tools")
+    if not isinstance(tiers, dict):
+        tiers = perms["tools"] = {}
+    for tool, tier in ([(t, "allow") for t in EAF_AGENTS_ALLOWED]
+                       + [(t, "ask") for t in EAF_AGENTS_ASKED]):
+        key = _tier_name(tool)
+        if not manager_power:
+            tiers.pop(key, None)  # the tool is gone; leave no standing grant behind
+        elif tiers.get(key) != "deny":
+            tiers[key] = tier
 
 
 def main() -> int:

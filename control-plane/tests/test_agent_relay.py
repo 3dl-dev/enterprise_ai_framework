@@ -83,6 +83,13 @@ class FakeHermes:
 
     def __init__(self, keys: dict[str, str]):
         self.keys = keys  # expected Bearer per agent host, read from the real Secrets
+        # openclaw agents (enterpriseaiframework-b12): host -> the owner whose identity the
+        # gateway will accept. They have no key; the policy below is the one the SHIPPED seed
+        # config asks a real gateway to enforce (agents.openclaw_seed_config), not restated.
+        self.claws: dict[str, str] = {}
+        seed = json.loads(agents.openclaw_seed_config("owner", "claw", agents.DEFAULT_MODEL))
+        self.claw_policy = seed["gateway"]["auth"]["trustedProxy"]
+        self.claw_chat_enabled = seed["gateway"]["http"]["endpoints"]["chatCompletions"]["enabled"]
         self.seen: list[dict] = []
         self.cancelled: list[str] = []
         self.active = 0
@@ -124,7 +131,29 @@ class FakeHermes:
                 if self.path != "/v1/chat/completions":
                     self.send_error(404)
                     return
-                if self.headers.get("Authorization") != f"Bearer {fake.keys.get(host, '')}":
+                if host in fake.claws:
+                    h = {k.lower(): v for k, v in self.headers.items()}
+                    pol = fake.claw_policy
+                    # allowUsers in the real seed names the owner the agent was rendered for.
+                    ok = (fake.claw_chat_enabled
+                          and h.get(pol["userHeader"]) == fake.claws[host]
+                          and all(r in h for r in pol["requiredHeaders"])
+                          and h.get("x-forwarded-for", "127.0.0.1") != "127.0.0.1")
+                    if not ok:
+                        self.send_response(401)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error":{"message":"unauthorized"}}')
+                        return
+                    # openclaw treats `model` as an AGENT TARGET (docs/gateway/openai-http-api.md
+                    # in the 2026.9.6 image): anything but these is an unknown agent.
+                    if body.get("model") not in ("openclaw", "openclaw/default"):
+                        self.send_response(404)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(b'{"error":{"message":"unknown agent target"}}')
+                        return
+                elif self.headers.get("Authorization") != f"Bearer {fake.keys.get(host, '')}":
                     out = json.dumps({"error": {"message": "Invalid API key"}}).encode()
                     self.send_response(401)
                     self.send_header("Content-Type", "application/json")
@@ -223,6 +252,23 @@ class RelayWorld(World):
         assert made.status_code == 201, made.text
         return self._wire(user, name)
 
+    def openclaw_child(self, token: str, user: str, name: str) -> None:
+        made = self.pod(token).post("/agent-manager/v1/agents",
+                                    json={"name": name, "type": "openclaw"})
+        assert made.status_code == 201, made.text
+        self._wire_claw(user, name)
+
+    def portal_openclaw(self, user: str, name: str) -> None:
+        made = self.portal(user).post("/portal/api/agents", json={"name": name, "type": "openclaw"})
+        assert made.status_code == 201, made.text
+        self._wire_claw(user, name)
+
+    def _wire_claw(self, user: str, name: str) -> None:
+        obj = f"agent-{user}-{name}"
+        self.hermes.claws[obj] = user
+        self.hosts[obj] = "127.0.0.1"
+        self.run_pod(user, name)
+
     def portal_hermes(self, user: str, name: str) -> str:
         made = self.portal(user).post("/portal/api/agents", json={"name": name, "type": "hermes"})
         assert made.status_code == 201, made.text
@@ -263,6 +309,7 @@ def world(postgres, monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     monkeypatch.setattr(agents, "KUBE_API", cluster.url)
     monkeypatch.setattr(agents, "HERMES_API_PORT", hermes.port)
+    monkeypatch.setattr(agents, "OPENCLAW_PORT", hermes.port)
     monkeypatch.setattr(agent_usage, "TOKEN_FILE", _SA_DIR / "token")
     monkeypatch.setattr(agent_usage, "CA_FILE", _SA_DIR / "ca.crt")
     monkeypatch.setattr(agent_usage, "NAMESPACE_FILE", _SA_DIR / "namespace")
@@ -470,11 +517,12 @@ def test_self_stopped_starting_non_hermes_and_keyless_targets_are_refused(world)
     world.run_pod("alice", "sleepy")
     assert world.turn(token, "sleepy", "reply:awake").status_code == 200
 
-    # An openclaw target is not wired yet: 501, not a silent attempt on another port.
+    # An opencode-typed agent is not a relay target: the same 404 as "no such agent".
     made = world.pod(token).post("/agent-manager/v1/agents", json={"name": "claw", "type": "openclaw"})
     assert made.status_code == 201, made.text
     world.run_pod("alice", "claw")
-    assert world.turn(token, "claw", "reply:x").status_code == 501
+    world.cluster.get("deployments", "agent-alice-claw")["metadata"]["labels"]["agent.enterprise-ai/type"] = "opencode"
+    assert world.turn(token, "claw", "reply:x").status_code == 404
 
     # A hermes agent from before -147 has no API_SERVER_KEY: 503 naming the fix.
     secret = world.cluster.get("secrets", "agent-alice-sleepy-key")
@@ -715,3 +763,100 @@ def test_an_oversized_request_is_refused_and_audited(world, monkeypatch):
     assert row["detail"]["outcome"] == "too_large"
     # And the slot was given back.
     assert world.turn(token, "h", "reply:small").status_code == 200
+
+
+# ================================================================ openclaw targets (b12)
+
+
+def test_a_ravens_turn_reaches_its_openclaw_child_as_the_owner_and_the_reply_streams_back(world):
+    token = world.create_raven("alice", "rv")
+    world.openclaw_child(token, "alice", "claw")
+
+    # The Raven names the agent in `model` (as the tool does) and tries to forge the caller.
+    r = world.turn(token, "claw", "reply:hello from claw", **{
+        "X-Forwarded-User": "bob", "X-Openclaw-Scopes": "operator.admin",
+        "X-Openclaw-Model": "gateway/expensive", "X-Hermes-Session-Key": "mine"})
+    assert r.status_code == 200, r.text
+    frames = _sse_frames(r.text)
+    assert "".join(f["choices"][0]["delta"]["content"] for f in frames if f != "[DONE]") \
+        == "hello from claw"
+
+    (seen,) = world.hermes.seen
+    h = seen["headers"]
+    assert h["x-forwarded-user"] == "alice", "the identity is the OWNER's, not the request's"
+    assert "authorization" not in h and token not in json.dumps(seen)
+    assert h["x-openclaw-session-key"] == expected_session_key("alice", "rv", "claw")
+    for smuggled in ("x-openclaw-scopes", "x-openclaw-model", "x-hermes-session-key"):
+        assert smuggled not in h, smuggled
+    assert seen["body"]["model"] == "openclaw"  # an agent target, not the Raven's `claw`
+    assert seen["body"]["messages"] == [{"role": "user", "content": "reply:hello from claw"}]
+    assert "x-hermes-session-id" not in {k.lower() for k in r.headers}
+
+    j = world.turn(token, "claw", "reply:plain json", stream=False)
+    assert j.status_code == 200 and j.json()["choices"][0]["message"]["content"] == "plain json"
+    rows = _wait_audit(world, "agent.relay.turn", 2)
+    assert {r["target"] for r in rows} == {"alice/claw"}
+    assert {r["detail"]["outcome"] for r in rows} == {"ok"}
+    assert "hello from claw" not in json.dumps(world.audit(), default=str)
+
+
+def test_another_users_openclaw_agent_is_refused_and_never_contacted(world):
+    """The owner tests for openclaw: alice's Raven cannot relay to bob's openclaw agent, by
+    name, by hyphen collision or by a forged identity, and bob's own Raven can."""
+    token_a = world.create_raven("alice", "rv")
+    world.openclaw_child(token_a, "alice", "mine")
+    world.portal_openclaw("bob", "bobs")
+    token_b = world.create_raven("bob", "brv")
+
+    r = world.turn(token_a, "bobs", "reply:should never arrive")
+    assert r.status_code == 404, r.text
+    forged = world.turn(token_a, "bobs", "reply:x", **{
+        "X-Auth-Request-Preferred-Username": "bob", "X-Forwarded-User": "bob"})
+    assert forged.status_code == 404
+    assert world.hermes.seen == [], "the owner guard refused it before any upstream contact"
+
+    world.idp.users.append({"id": "kc-ab", "username": "alice-bot", "email": "ab@x", "enabled": True})
+    sql(world.dsn, "INSERT INTO principal (idp_user_id, username, email, enabled) VALUES "
+                   "('kc-ab','alice-bot','ab@x',TRUE)")
+    world.portal_openclaw("alice-bot", "two")
+    assert world.turn(token_a, "bot-two", "reply:crossed").status_code == 404
+    assert world.hermes.seen == []
+
+    ok = world.turn(token_b, "bobs", "reply:bob here")
+    assert ok.status_code == 200 and "bob" in ok.text
+    assert world.hermes.seen[-1]["headers"]["x-forwarded-user"] == "bob"
+    assert [d["detail"]["status"] for d in world.audit("agent-manager.denied")] == [404, 404, 404]
+
+
+def test_the_shipped_openclaw_seed_enables_the_endpoint_the_relay_drives():
+    seed = json.loads(agents.openclaw_seed_config("alice", "claw", agents.DEFAULT_MODEL))
+    assert seed["gateway"]["http"]["endpoints"]["chatCompletions"] == {"enabled": True}
+    # ...and still authenticates by trusted-proxy identity for the owner alone.
+    assert seed["gateway"]["auth"]["mode"] == "trusted-proxy"
+    assert seed["gateway"]["auth"]["trustedProxy"]["allowUsers"] == ["alice"]
+
+
+def test_a_stopped_openclaw_agent_and_a_non_object_body_are_refused(world):
+    token = world.create_raven("alice", "rv")
+    world.openclaw_child(token, "alice", "claw")
+    assert world.pod(token).post("/agent-manager/v1/agents/claw/stop").status_code == 200
+    world.cluster.store.pop(("pods", "agent-alice-claw-0"))
+    r = world.turn(token, "claw", "reply:x")
+    assert r.status_code == 404 and "not running" in r.text
+    assert world.pod(token).post("/agent-manager/v1/agents/claw/start").status_code == 200
+    world.run_pod("alice", "claw")
+    bad = world.pod(token).post(world.relay_path("claw"), content=b"[1,2]",
+                                headers={"Content-Type": "application/json"})
+    assert bad.status_code == 400
+    assert world.hermes.seen == []
+    assert world.turn(token, "claw", "reply:awake").status_code == 200
+
+
+def test_the_raven_side_tool_talks_to_an_openclaw_child_by_name(world, monkeypatch):
+    token = world.create_raven("alice", "rv")
+    base = f"http://{world.pod_ip}:{world.port}/agent-manager/v1"
+    monkeypatch.setenv("EAF_AGENT_MANAGER_TOKEN", token)
+    made = json.loads(eaf_agents_mcp.create_agent(base, "scout", "openclaw"))
+    assert made["created"] == "scout" and made["type"] == "openclaw"
+    world._wire_claw("alice", "scout")
+    assert eaf_agents_mcp.send_to_agent(base, "scout", "reply:claw scouting done") == "claw scouting done"
