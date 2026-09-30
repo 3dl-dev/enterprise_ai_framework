@@ -43,7 +43,7 @@ import httpx
 from fastapi import HTTPException, Request, WebSocket
 from fastapi.responses import Response, StreamingResponse
 
-from . import agents
+from . import agents, raven_write_lock
 
 _log = logging.getLogger("agent-gateway-console")
 
@@ -141,17 +141,14 @@ def _raven_identity_headers(target: dict) -> dict:
 
 
 def raven_frame_gate(frame: str) -> str | None:
-    """THE SEAM for the WebUI provider/channel write lock (item enterpriseaiframework-250).
+    """The WebUI provider/channel write lock (item enterpriseaiframework-250).
 
-    Called with every text frame the BROWSER sends up the /rpc socket, before it reaches the
-    agent. Return None to forward the frame; return a JSON-RPC error frame (a string) to
-    answer the browser with it instead and drop the frame. Pass-through today: the write
-    lock's method deny-list (fail-closed on unknown methods in the provider and channel
-    namespaces) attaches HERE, parsing `json.loads(frame)["method"]`, and nowhere else. The
-    RPC method names seen in the shipped SPA include `settings.set`, `config.set` and
-    `channels.configure`.
+    Called with every frame the BROWSER sends up the /rpc socket, before it reaches the
+    agent. None forwards the frame; a string is a JSON-RPC error frame that answers the
+    browser instead while the frame is dropped. The rules are data (raven_write_lock.json);
+    see app/raven_write_lock.py.
     """
-    return None
+    return raven_write_lock.gate_frame(frame)
 
 
 async def openclaw_rpc(target: dict, method: str, params: dict) -> dict:
@@ -474,6 +471,17 @@ async def proxy_ws(ws: WebSocket, user: str, name: str, path: str, target: dict)
                     if msg["type"] == "websocket.disconnect":
                         return
                     if (data := msg.get("bytes")) is not None:
+                        if raven:
+                            # A binary frame is gated as the text it carries: the lock must
+                            # not be bypassed by changing the frame opcode. Undecodable
+                            # bytes are refused (the SPA speaks JSON text only).
+                            try:
+                                as_text = data.decode("utf-8")
+                            except UnicodeDecodeError:
+                                as_text = "\x00"
+                            if (refusal := raven_frame_gate(as_text)) is not None:
+                                await ws.send_text(refusal)
+                                continue
                         await upstream.send(data)
                     elif (text := msg.get("text")) is not None:
                         if raven and (refusal := raven_frame_gate(text)) is not None:
