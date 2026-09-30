@@ -24,6 +24,7 @@ the shipped manifests:
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import yaml
@@ -355,17 +356,31 @@ def apply(cp_image: str, worker_image: str, registry: str) -> None:
 
 
 def teardown() -> None:
-    """Every object this stack (and the Raven it creates) made, by the -82e names."""
-    for kind, names in (
-        ("pod", ["cp-82e"]), ("svc", ["cp-82e", "speech-82e", "gateway-82e", "livekit-82e",
-                                      "postgres-82e", "valkey-82e", "agent-baron-r82e"]),
+    """Every object this stack (and the Raven it creates) made, by the -82e names, and it WAITS:
+    a PVC still Terminating from the last run would swallow the next apply and leave a pod
+    Pending for good (found the hard way: the first live run timed out on exactly that)."""
+    workloads = (
+        ("pod", ["cp-82e"]),
         ("deploy", ["voice-worker-82e", "speech-82e", "gateway-82e", "livekit-82e", "postgres-82e",
-                    "valkey-82e", "agent-baron-r82e"]),
+                    "valkey-82e", f"agent-{USER}-r82e"]),
         ("job", ["speech-models-82e-fetch-82e"]),
+    )
+    rest = (
+        ("svc", ["cp-82e", "speech-82e", "gateway-82e", "livekit-82e", "postgres-82e", "valkey-82e",
+                 f"agent-{USER}-r82e"]),
         ("cm", ["gateway-config-82e", "agent-assets-82e", "postgres-init-82e", "speech-aliases-82e",
-                "agent-baron-r82e-config"]),
-        ("secret", ["live82e-secrets", "agent-baron-r82e-key"]),
+                f"agent-{USER}-r82e-config"]),
+        ("secret", ["live82e-secrets", f"agent-{USER}-r82e-key"]),
         ("networkpolicy", ["voice-worker-isolation-82e", "speech-sealed-82e", "raven-egress-gateway-82e"]),
-        ("pvc", ["speech-models-82e", "agent-baron-r82e"]),
-    ):
-        kubectl("delete", kind, *names, "--ignore-not-found", "--wait=false", check=False)
+        ("pvc", ["speech-models-82e", f"agent-{USER}-r82e"]),
+    )
+    for kind, names in workloads + rest:
+        kubectl("delete", kind, *names, "--ignore-not-found", "--wait=true", "--timeout=180s", check=False)
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        left = [f"{k}/{n}" for k, names in workloads + rest for n in names
+                if kubectl("get", k, n, "-o", "name", check=False).strip()]
+        if not left:
+            return
+        time.sleep(3)
+    raise AssertionError(f"teardown left objects behind: {left}")
