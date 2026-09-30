@@ -722,6 +722,7 @@ async function startVoice(name) {
 async function endVoice(disconnect = true) {
   const room = VOICE.room;
   VOICE.room = null; VOICE.state = "idle"; VOICE.agent = null;
+  syncVoiceButtons();  // the button reads "Talk" at once, not after the socket finishes closing
   if (room && disconnect) { try { await room.disconnect(); } catch (_) { /* already gone */ } }
   $("voice-audio").replaceChildren();
   syncVoiceButtons();
