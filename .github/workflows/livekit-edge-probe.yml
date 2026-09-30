@@ -54,5 +54,7 @@ jobs:
           # a public STUN server answers the same UDP datagram. Nothing public is served by the
           # site itself today, so github.com is the reachability control (do not expose
           # anything to manufacture one).
-          EDGE_CONTROL_HOST=github.com EDGE_SNI="$HOST" EDGE_HOST="$hosts" \
-            pytest tests-live/test_livekit_exposure.py -v -p no:cacheprovider
+          # The WAN IP must answer https /rtc: an unreachable required target FAILS (it verified
+          # nothing). Other targets that do not answer are reported as UNREACHABLE skips (-rs).
+          EDGE_CONTROL_HOST=github.com EDGE_SNI="$HOST" EDGE_HOST="$hosts" EDGE_REQUIRE_REACHABLE="$WAN_IP" \
+            pytest tests-live/test_livekit_exposure.py -v -rs -p no:cacheprovider
