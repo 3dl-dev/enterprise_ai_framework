@@ -131,13 +131,13 @@ def mongo():
             time.sleep(0.3)
     if client is None:
         logs = subprocess.run(["docker", "logs", name], capture_output=True, text=True)
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
         pytest.fail(f"mongo:7 never became reachable:\n{logs.stdout}\n{logs.stderr}")
 
     yield {"url": url, "client": client}
 
     client.close()
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
 
 
 @pytest.fixture()

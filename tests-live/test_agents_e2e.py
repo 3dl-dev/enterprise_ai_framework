@@ -649,7 +649,7 @@ def _start_greenmail(host: str) -> Mail:
         except Exception as exc:  # noqa: BLE001 - retried until the deadline
             last = f"{type(exc).__name__}: {exc}"
             time.sleep(2)
-    _run("docker", "rm", "-f", name, check=False, timeout=120)
+    _run("docker", "rm", "-f", "-v", name, check=False, timeout=120)
     raise AssertionError(f"GreenMail never came up on {host}:{smtp}/{imap} — {last}")
 
 
@@ -815,7 +815,7 @@ def live():
     finally:
         stack.close()
         if mail is not None:
-            _run("docker", "rm", "-f", mail.container, check=False, timeout=180)
+            _run("docker", "rm", "-f", "-v", mail.container, check=False, timeout=180)
         _teardown_agents()
         if applied_rbac:
             _run("kubectl", "delete", "-f", str(RBAC_MANIFEST), "--ignore-not-found",

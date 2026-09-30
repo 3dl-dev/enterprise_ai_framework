@@ -207,7 +207,7 @@ def mail(tmp_path_factory):
 
     ports = {name: _free_port() for name in ("smtp", "imap", "smtps", "imaps")}
     container = f"agent-email-fixture-{uuid.uuid4().hex[:10]}"
-    subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=120)
+    subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True, timeout=120)
 
     opts = " ".join([
         "-Dgreenmail.setup.test.all",
@@ -240,7 +240,7 @@ def mail(tmp_path_factory):
         _wait_until_serving(fixture)
         yield fixture
     finally:
-        subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=180)
+        subprocess.run(["docker", "rm", "-f", "-v", container], capture_output=True, timeout=180)
 
 
 def _make_certificates(workdir: Path) -> None:

@@ -138,12 +138,12 @@ def mcp_echo_container():
         time.sleep(0.2)
     if not up:
         logs = subprocess.run(["docker", "logs", name], capture_output=True, text=True)
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
         pytest.fail(f"mcp-echo never became healthy:\n{logs.stdout}\n{logs.stderr}")
 
     yield {"port": port, "name": name}
 
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
     subprocess.run(["docker", "rmi", "-f", tag], capture_output=True)
 
 

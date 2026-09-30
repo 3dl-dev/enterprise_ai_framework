@@ -270,7 +270,7 @@ def postgres():
     failure = asyncio.run(wait())
     if failure is not None:
         logs = subprocess.run(["docker", "logs", name], capture_output=True, text=True)
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
         pytest.fail(
             f"postgres never became reachable at {dsn}: "
             f"{type(failure).__name__}: {failure}\n{logs.stdout}\n{logs.stderr}"
@@ -278,7 +278,7 @@ def postgres():
 
     yield dsn
 
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    subprocess.run(["docker", "rm", "-f", "-v", name], capture_output=True)
 
 
 # ---------------------------------------------------------------- the world under test
