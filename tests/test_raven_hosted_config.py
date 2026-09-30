@@ -147,28 +147,55 @@ def test_image_bakes_the_hosted_defaults():
     assert "evermind" not in env["RAVEN_SKILLHUB_URL"]
 
 
+def _shipped_netpols():
+    from netpol_eval import load_policies
+    files = sorted(p for p in K8S.glob("*.yaml") if "kind: NetworkPolicy" in p.read_text())
+    return load_policies(files, {"__LAN_CIDR__": "192.168.0.0/16", "__GATEWAY_LAN_IP__": "192.168.2.42"})
+
+
 def test_agent_isolation_stops_selecting_raven_and_raven_isolation_has_no_internet():
     """NetworkPolicies are additive: if 63's internet-egress policy still selected raven pods
-    the raven policy could not take anything away."""
-    docs = {d["metadata"]["name"]: d for d in yaml.safe_load_all((K8S / "63-agent-common.yaml").read_text()) if d}
-    sel = docs["agent-isolation"]["spec"]["podSelector"]
-    assert {"key": "agent.enterprise-ai/type", "operator": "NotIn", "values": ["raven"]} in sel["matchExpressions"]
+    the raven policy could not take anything away. Evaluated, not pattern-matched (-d7b): the
+    selector is run against the raven pod's REAL labels (from the template), and the raven pod's
+    whole egress, unioned over every shipped policy, must be exactly DNS + gateway:4000 +
+    freerouter:8080 + control-plane:8000 and no external address."""
+    from netpol_eval import dest_from_template, selector_matches
+    from test_agent_relay_netpol import raven_egress_violations
 
-    raven = yaml.safe_load((K8S / "68-raven-common.yaml").read_text())
-    assert raven["spec"]["podSelector"]["matchLabels"]["agent.enterprise-ai/type"] == "raven"
-    assert set(raven["spec"]["policyTypes"]) == {"Ingress", "Egress"}
-    for rule in raven["spec"]["egress"]:
-        for to in rule["to"]:
-            assert "ipBlock" not in to, "a raven egress rule reaches outside the cluster"
-    ingress_ports = [p["port"] for r in raven["spec"]["ingress"] for p in r["ports"]]
-    assert ingress_ports == [18793]
-    assert raven["spec"]["ingress"][0]["from"] == [{"podSelector": {"matchLabels": {"app": "control-plane"}}}]
+    policies = _shipped_netpols()
+    raven = dest_from_template(K8S / "69-agent-raven.template.yaml")
+    hermes = dest_from_template(K8S / "65-agent-hermes.template.yaml")
+    by_name = {p["metadata"]["name"]: p for p in policies}
+    isolation = by_name["agent-isolation"]["spec"]["podSelector"]
+    assert not selector_matches(isolation, raven.labels), "63 agent-isolation re-selects raven pods"
+    assert selector_matches(isolation, hermes.labels), "63 agent-isolation no longer selects hermes"
+    assert selector_matches(by_name["raven-isolation"]["spec"]["podSelector"], raven.labels)
+    assert set(by_name["raven-isolation"]["spec"]["policyTypes"]) == {"Ingress", "Egress"}
+    assert raven_egress_violations(policies) == []
+
+
+def test_raven_webui_ingress_admits_the_control_plane_only():
+    from netpol_eval import admitted_peers, dest_from_template
+    raven = dest_from_template(K8S / "69-agent-raven.template.yaml")
+    cp = [("enterprise-ai", {"app": "control-plane"})]
+    policies = _shipped_netpols()
+    pods, ips = admitted_peers(policies, raven, 18793, "TCP", cp)
+    assert pods and ips == []
+    assert all(p.namespace == "enterprise-ai" and dict(p.labels).get("app") == "control-plane"
+               for p in pods)
+    assert admitted_peers(policies, raven, 9999, "TCP", cp) == ([], [])
 
 
 def test_console_policy_admits_the_raven_webui_port():
-    doc = yaml.safe_load((K8S / "66-agent-console-common.yaml").read_text())
-    ports = [p["port"] for r in doc["spec"]["ingress"] for p in r["ports"]]
-    assert 18793 in ports and 9119 in ports and 18789 in ports
+    """The console policy (66) admits the raven, hermes and openclaw console ports from the
+    control-plane pod, evaluated on a real hermes pod (which has no policy but 63/66 on it)."""
+    from netpol_eval import admitted_peers, dest_from_template
+    hermes = dest_from_template(K8S / "65-agent-hermes.template.yaml")
+    cp = [("enterprise-ai", {"app": "control-plane"})]
+    for port in (18793, 9119, 18789):
+        pods, ips = admitted_peers(_shipped_netpols(), hermes, port, "TCP", cp)
+        assert ips == [] and pods, port
+        assert all(dict(p.labels).get("app") == "control-plane" for p in pods), port
 
 
 # --- the eaf-agents tool (Contracts F/G, enterpriseaiframework-692) -----------------------
