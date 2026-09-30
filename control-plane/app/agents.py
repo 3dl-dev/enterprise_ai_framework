@@ -61,7 +61,7 @@ import httpx
 import yaml
 from fastapi import HTTPException
 
-from . import agent_usage, catalog, db, gateway, issuance, provisioning
+from . import agent_manager_token, agent_usage, catalog, db, gateway, issuance, provisioning
 
 # One source for the in-cluster credential and the API address. See the module docstring.
 KUBE_API = agent_usage.KUBE_API
@@ -71,6 +71,13 @@ NAME_LABEL = agent_usage.NAME_LABEL
 MODEL_SOURCE_LABEL = agent_usage.MODEL_SOURCE_LABEL
 TYPE_LABEL = agent_usage.TYPE_LABEL
 AGENT_TYPES = agent_usage.AGENT_TYPES
+# Provenance of an agent a Raven created through the agent-manager API (agents-raven.md,
+# Contract F). On the Deployment and the pod template, never the selector. It is also the
+# delete scope: a Raven may delete only agents stamped with its own name (BARON RULING,
+# gate cfa, 2026-09-29).
+CREATED_BY_LABEL = "agent.enterprise-ai/created-by"
+# The agent types a Raven may create. Not `raven`: no recursion, no token minting a token.
+MANAGER_CREATABLE_TYPES = ("hermes", "openclaw")
 DEFAULT_AGENT_TYPE = agent_usage.DEFAULT_AGENT_TYPE
 
 # The k8s object-name budget. `agent-<user>-<name>` must fit inside RFC 1123's 63
@@ -510,6 +517,46 @@ async def _owned_deployment(client: httpx.AsyncClient, user: str, name: str) -> 
     return obj
 
 
+# ---------------------------------------------------------------- agent-manager scope
+#
+# Contract F's Raven-specific refusals live HERE, beside the owner check, and not in the
+# agent-manager router: every per-user decision is made in this file, so there is no second
+# scope implementation to drift. `via_raven` is the acting Raven's name, taken by the router
+# from the verified token record and never from the request; None means the owner acted
+# from the portal and none of these rules apply.
+
+
+def manager_actor(user: str, via_raven: str) -> str:
+    """The audit actor for a call a Raven made: the owner did not press the button."""
+    return f"agent-manager:{user}/{via_raven}"
+
+
+def _actor_and_detail(user: str, via_raven: str | None) -> tuple[str, dict]:
+    if via_raven is None:
+        return user, {}
+    return manager_actor(user, via_raven), {
+        "via": "agent-manager", "owner": user, "raven": via_raven}
+
+
+def _refuse_self(name: str, via_raven: str | None, verb: str) -> None:
+    if via_raven is not None and name == via_raven:
+        raise HTTPException(
+            403, f"a Raven cannot {verb} itself; its owner can, from the portal.")
+
+
+async def owned_raven(user: str, name: str) -> dict:
+    """The caller's own RAVEN Deployment, or 404 — the verifier's liveness re-check.
+
+    A token whose Raven was deleted, relabelled or re-typed underneath it is dead even if
+    revocation somehow failed. Same `_owned_deployment` guard as every other path.
+    """
+    async with _client() as client:
+        dep = await _owned_deployment(client, user, name)
+    if ((dep.get("metadata") or {}).get("labels") or {}).get(TYPE_LABEL) != "raven":
+        raise HTTPException(404, f"you have no raven agent called {name!r}")
+    return dep
+
+
 # ---------------------------------------------------------------- status
 
 
@@ -792,6 +839,21 @@ def _stamp_agent_type(docs: list[dict], agent_type: str) -> None:
             .setdefault("metadata", {})
         )
         pod_meta.setdefault("labels", {})[TYPE_LABEL] = agent_type
+
+
+def _stamp_created_by(docs: list[dict], raven: str | None) -> None:
+    """Carry `agent.enterprise-ai/created-by` on the Deployment and its pod template.
+
+    Not on the selector: provenance must not change which pods a Deployment owns.
+    """
+    if not raven:
+        return
+    for doc in docs:
+        if doc.get("kind") != "Deployment":
+            continue
+        doc.setdefault("metadata", {}).setdefault("labels", {})[CREATED_BY_LABEL] = raven
+        (doc.setdefault("spec", {}).setdefault("template", {})
+         .setdefault("metadata", {}).setdefault("labels", {}))[CREATED_BY_LABEL] = raven
 
 
 # ---------------------------------------------------------------- hermes (Agents pillar)
@@ -1252,7 +1314,8 @@ async def configure_connector(user: str, name: str, kind: str, values: dict) -> 
 
 
 async def _provision_hermes(client: httpx.AsyncClient, user: str, name: str, obj: str,
-                            model: str, api_key: str, keysum: str) -> None:
+                            model: str, api_key: str, keysum: str,
+                            created_by: str | None = None) -> None:
     """Apply the object set for a hermes gateway agent (agents-gateway-console.md B/D).
 
     Differs from the opencode path by design: no deployment-wide entrypoint ConfigMap and
@@ -1290,12 +1353,14 @@ async def _provision_hermes(client: httpx.AsyncClient, user: str, name: str, obj
         user, name, image=HERMES_IMAGE, model_source="integrated",
         key_secret=f"{obj}-key", cfgsum=cfgsum, keysum=keysum, connector_sums=sums,
     )
+    _stamp_created_by(docs, created_by)
     for doc in docs:
         await _apply(client, doc)
 
 
 async def _provision_openclaw(client: httpx.AsyncClient, user: str, name: str, obj: str,
-                              model: str, api_key: str, keysum: str) -> None:
+                              model: str, api_key: str, keysum: str,
+                              created_by: str | None = None) -> None:
     """Apply the object set for an openclaw gateway agent (agents-gateway-console.md B/C/D).
 
     The key Secret carries only the integrated key — there is no console credential, because
@@ -1312,27 +1377,32 @@ async def _provision_openclaw(client: httpx.AsyncClient, user: str, name: str, o
                      "labels": {USER_LABEL: user, NAME_LABEL: name}},
         "data": {"openclaw.json": seed},
     })
-    for doc in render_openclaw(
+    docs = render_openclaw(
         user, name, image=OPENCLAW_IMAGE, model_source="integrated",
         key_secret=f"{obj}-key", cfgsum=cfgsum, keysum=keysum,
-    ):
+    )
+    _stamp_created_by(docs, created_by)
+    for doc in docs:
         await _apply(client, doc)
 
 
 async def _provision_raven(client: httpx.AsyncClient, user: str, name: str, obj: str,
-                           model: str, api_key: str, keysum: str) -> None:
+                           model: str, api_key: str, keysum: str,
+                           manager_token: str) -> None:
     """Apply the object set for a Raven host agent (agents-raven.md Contract E).
 
     The key Secret carries the integrated key and the console token (`RAVEN_SERVE_TOKEN`,
     presented by the proxy as X-Raven-Token; minted here, never shown to a person). The
-    ConfigMap carries only non-secret env. There is no agent-manager token here: that is
-    Contract F, a later item.
+    ConfigMap carries only non-secret env. The Secret also carries the Contract F
+    agent-manager token as `EAF_AGENT_MANAGER_TOKEN` — the ONLY place its plaintext exists —
+    which the template hands to the Raven container alone as a `secretKeyRef` env.
     """
     env = raven_env_config(model)
     cfgsum = hashlib.sha256(json.dumps(env, sort_keys=True).encode()).hexdigest()[:16]
     await _apply(client, _secret_object(f"{obj}-key", {
         "OPENAI_API_KEY": api_key,
         "RAVEN_SERVE_TOKEN": secrets.token_urlsafe(32),
+        "EAF_AGENT_MANAGER_TOKEN": manager_token,
     }, labels={USER_LABEL: user, NAME_LABEL: name}))
     await _apply(client, {
         "apiVersion": "v1", "kind": "ConfigMap",
@@ -1389,7 +1459,8 @@ async def _provision_opencode_interim(client: httpx.AsyncClient, user: str, name
 
 
 async def create(
-    user: str, name: str, *, model: str | None = None, agent_type: str | None = None
+    user: str, name: str, *, model: str | None = None, agent_type: str | None = None,
+    via_raven: str | None = None,
 ) -> dict:
     """Contract 2's `created` transition, for the authenticated caller and nobody else.
 
@@ -1427,6 +1498,14 @@ async def create(
             f"unknown agent type {agent_type!r}. The Agents pillar carries "
             f"{', '.join(AGENT_TYPES)}; `opencode` is the Code pillar, not an agent type.",
         )
+    if via_raven is not None and agent_type not in MANAGER_CREATABLE_TYPES:
+        # Contract F: a Raven cannot create a Raven — no recursion, no token minting a
+        # token. Refused before anything is minted or applied.
+        raise HTTPException(
+            403,
+            f"a Raven may create only {', '.join(MANAGER_CREATABLE_TYPES)} agents, "
+            f"not {agent_type!r}.",
+        )
 
     async with _client() as client:
         existing = await _get(client, "apps/v1", "Deployment", obj)
@@ -1451,17 +1530,24 @@ async def create(
         keysum = hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
         if agent_type == "hermes":
-            await _provision_hermes(client, user, name, obj, model, api_key, keysum)
+            await _provision_hermes(client, user, name, obj, model, api_key, keysum,
+                                    created_by=via_raven)
         elif agent_type == "openclaw":
-            await _provision_openclaw(client, user, name, obj, model, api_key, keysum)
+            await _provision_openclaw(client, user, name, obj, model, api_key, keysum,
+                                      created_by=via_raven)
         elif agent_type == "raven":
-            await _provision_raven(client, user, name, obj, model, api_key, keysum)
+            # Contract F issuance: after the owner and collision checks, BEFORE the pod
+            # exists — the same ordering as the virtual key, for the same reason.
+            manager_token = await agent_manager_token.issue(user, name, actor=user)
+            await _provision_raven(client, user, name, obj, model, api_key, keysum,
+                                   manager_token)
         else:  # pragma: no cover - AGENT_TYPES is checked above; a fail-closed guard
             raise HTTPException(400, f"no provisioner for agent type {agent_type!r}")
 
-    await db.audit(user, "agent.create", f"{user}/{name}",
+    actor, via = _actor_and_detail(user, via_raven)
+    await db.audit(actor, "agent.create", f"{user}/{name}",
                    surface=gateway.agent_surface(name), alias=issued["key_alias"],
-                   agent_type=agent_type)
+                   agent_type=agent_type, **via)
     return {
         "name": name,
         "surface": gateway.agent_surface(name),
@@ -1492,7 +1578,8 @@ def allowed_models() -> tuple[str, ...]:
 # ---------------------------------------------------------------- stop / start
 
 
-async def scale(user: str, name: str, replicas: int) -> dict:
+async def scale(user: str, name: str, replicas: int, *,
+                via_raven: str | None = None) -> dict:
     """Contract 2's running<->stopped transitions. The PVC is never touched by either.
 
     `stopped` is `replicas: 0`: the pod terminates, opencode's session is already
@@ -1500,16 +1587,19 @@ async def scale(user: str, name: str, replicas: int) -> dict:
     to sample — not because anything told it to stop counting. `stopped -> running` is
     `replicas: 1` and resumes the SAME agent from the same volume.
     """
+    _refuse_self(name, via_raven, "stop" if replicas == 0 else "start")
     async with _client() as client:
         await _owned_deployment(client, user, name)
         await _patch(client, "apps/v1", "Deployment", object_name(user, name),
                      {"spec": {"replicas": replicas}})
-    await db.audit(user, "agent.stop" if replicas == 0 else "agent.start",
-                   f"{user}/{name}", replicas=replicas)
+    actor, via = _actor_and_detail(user, via_raven)
+    await db.audit(actor, "agent.stop" if replicas == 0 else "agent.start",
+                   f"{user}/{name}", replicas=replicas, **via)
     return {"name": name, "status": STOPPED if replicas == 0 else STARTING}
 
 
-async def set_model(user: str, name: str, model: str) -> dict:
+async def set_model(user: str, name: str, model: str, *,
+                    via_raven: str | None = None) -> dict:
     """Change a running agent's model from the control plane (Contract D, -840).
 
     The bug this fixes: the model persists in a config file on the PVC that outlives a
@@ -1521,6 +1611,7 @@ async def set_model(user: str, name: str, model: str) -> dict:
     change persists and coexists with everything else the agent manages. No pods/exec — the
     control-plane SA does not have it.
     """
+    _refuse_self(name, via_raven, "change the model of")
     model = (model or "").strip()
     if model not in allowed_models():
         raise HTTPException(
@@ -1532,7 +1623,7 @@ async def set_model(user: str, name: str, model: str) -> dict:
     # can only ever reach an agent they own, and only its dashboard.
     target = await console_target(user, name)
     if target.get("type") == "openclaw":
-        return await _set_openclaw_model(user, name, model, target)
+        return await _set_openclaw_model(user, name, model, target, via_raven=via_raven)
     if target.get("type") != "hermes":
         raise HTTPException(
             501,
@@ -1572,12 +1663,14 @@ async def set_model(user: str, name: str, model: str) -> dict:
     except HTTPException:
         restarted = False
 
-    await db.audit(user, "agent.model.set", f"{user}/{name}", model=model,
-                   restarted=restarted)
+    actor, via = _actor_and_detail(user, via_raven)
+    await db.audit(actor, "agent.model.set", f"{user}/{name}", model=model,
+                   restarted=restarted, **via)
     return {"name": name, "model": model, "restarted": restarted}
 
 
-async def _set_openclaw_model(user: str, name: str, model: str, target: dict) -> dict:
+async def _set_openclaw_model(user: str, name: str, model: str, target: dict, *,
+                              via_raven: str | None = None) -> dict:
     """Contract D for openclaw: `config.patch` through the gateway's admin RPC.
 
     The patch writes BOTH the picker's catalogue into `models.providers.gateway.models` (a
@@ -1607,7 +1700,9 @@ async def _set_openclaw_model(user: str, name: str, model: str, target: dict) ->
         raise HTTPException(
             409, ((res.get("error") or {}).get("message"))
             or "the agent's console did not apply the model change.")
-    await db.audit(user, "agent.model.set", f"{user}/{name}", model=model, restarted=False)
+    actor, via = _actor_and_detail(user, via_raven)
+    await db.audit(actor, "agent.model.set", f"{user}/{name}", model=model, restarted=False,
+                   **via)
     return {"name": name, "model": model, "restarted": False}
 
 
@@ -1766,7 +1861,7 @@ async def rolling_reprovision(*, actor: str) -> list[dict]:
 # ---------------------------------------------------------------- delete
 
 
-async def delete(user: str, name: str) -> dict:
+async def delete(user: str, name: str, *, via_raven: str | None = None) -> dict:
     """Contract 2's `deleted` transition, including the step that makes it irreversible.
 
     Order matters and the record spells it out: workload first, then the PVC, and the PVC
@@ -1779,9 +1874,23 @@ async def delete(user: str, name: str) -> dict:
     exactly the state provision-agent.sh refuses to create when it declines to switch an
     integrated agent to BYO. A user pressing Delete must not be able to leave one behind.
     """
+    _refuse_self(name, via_raven, "delete")
     async with _client() as client:
-        await _owned_deployment(client, user, name)
+        dep = await _owned_deployment(client, user, name)
         obj = object_name(user, name)
+        if via_raven is not None:
+            # Contract F delete scope (BARON RULING, gate cfa): a Raven deletes only its
+            # OWN children. Checked after the owner guard, so "not yours" is still the
+            # 404 that reveals nothing; a Raven target is refused outright.
+            labels = (dep.get("metadata") or {}).get("labels") or {}
+            if labels.get(TYPE_LABEL) == "raven":
+                raise HTTPException(403, "a Raven cannot delete a Raven.")
+            if labels.get(CREATED_BY_LABEL) != via_raven:
+                raise HTTPException(
+                    403,
+                    f"a Raven may delete only agents it created; {name!r} was not created "
+                    f"by {via_raven!r}. Its owner can delete it from the portal.",
+                )
 
         removed = []
         for api_version, kind, target in (
@@ -1819,8 +1928,12 @@ async def delete(user: str, name: str) -> dict:
             "UPDATE virtual_key SET status = 'revoked', revoked_at = now() "
             "WHERE key_alias = $1", alias,
         )
-    await db.audit(user, "agent.delete", f"{user}/{name}", alias=alias,
-                   removed=removed)
+    actor, via = _actor_and_detail(user, via_raven)
+    await db.audit(actor, "agent.delete", f"{user}/{name}", alias=alias,
+                   removed=removed, **via)
+    # Contract F revocation: a deleted Raven's agent-manager token dies in the same call
+    # that revokes its virtual key. A no-op for any other type (it holds no token).
+    await agent_manager_token.revoke(user, name, actor=actor, reason="raven_deleted")
 
     return {
         "name": name,

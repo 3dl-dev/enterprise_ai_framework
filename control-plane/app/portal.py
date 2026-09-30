@@ -28,6 +28,7 @@ the portal does not confer any operator capability. Authentication is not author
 """
 
 import hashlib
+import ipaddress
 import os
 from pathlib import Path
 
@@ -49,10 +50,37 @@ IDP_REALM = os.environ.get("IDP_REALM", "enterprise-ai")
 
 
 
+# The exact peers the oauth2-proxy sidecar arrives from. The portal honours identity headers
+# from these and nothing else.
+LOOPBACK = ("127.0.0.1", "::1")
+
+
+def _peer(request: Request) -> str:
+    return request.client.host if request.client else ""
+
+
+def is_loopback(request: Request) -> bool:
+    """Whether the TCP peer is ANY loopback address (127/8, ::1, IPv4-mapped 127/8).
+
+    The one origin predicate shared by both doors. The portal accepts only its exact
+    `LOOPBACK` peers (a subset of this); the agent-manager API refuses everything this
+    matches (Contract F). So no request satisfies both, and the refusal fails closed on a
+    loopback spelling the portal would not even accept. Sound only because uvicorn runs
+    `--no-proxy-headers` (control-plane/Dockerfile): the peer is the TCP peer, never an
+    X-Forwarded-For the sidecar passed through.
+    """
+    host = _peer(request)
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return addr.is_loopback or bool(mapped and mapped.is_loopback)
+
+
 def require_user(request: Request) -> str:
     """The signed-in username, or 401. See the module docstring for why loopback matters."""
-    client = request.client.host if request.client else ""
-    if client not in ("127.0.0.1", "::1"):
+    if _peer(request) not in LOOPBACK:
         # Not from the sidecar. Whatever identity headers this carries were written by
         # something that is not our authenticator, so they mean nothing.
         raise HTTPException(
