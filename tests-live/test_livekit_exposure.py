@@ -1,6 +1,9 @@
 """LiveKit signalling/media must not be reachable from the public edge (items 7f6/4d2).
 
-BARON RULING 2026-09-29 (gate cfa): LiveKit is LAN/VPN only.
+BARON RULING 2026-09-29 (gate cfa): LiveKit MEDIA is LAN/VPN only.
+BARON RULING 2026-09-30 (82e): SIGNALLING is the one public piece: wss://<origin>/rtc behind the
+portal's oauth2-proxy. So /rtc must DEMAND AUTHENTICATION (302 to sign-in / 401 / 403) and every
+LiveKit port and media path must stay closed.
 BARON RULING 2026-09-30: "we do not guarantee that ai.3dl.one is LAN only." Private DNS is NOT
 a protection, so this probes as if the name were public: EDGE_HOST lists the hostname AND the
 site's real WAN IP (discovered at runtime, never committed: `ssh gateway curl -s
@@ -9,7 +12,7 @@ EDGE_SNI (default ai.3dl.one), so the request is the one a browser would make.
 
     EDGE_CONTROL_HOST=github.com EDGE_HOST=ai.3dl.one,<wan-ip> pytest tests-live/test_livekit_exposure.py
 
-Probed per edge target: TCP 7880 7881 30780 30781 30782 3478 5349; /rtc over 80 and 443;
+Probed per edge target: TCP 7880 7881 30780 30781 30782 3478 5349; /rtc over 80 and 443 (auth demanded);
 UDP media 7882/30782/3478 with a real STUN binding request (LiveKit's UDP mux answers one).
 EDGE_HOST is required; a missing value fails rather than skips. The gate is
 .github/workflows/livekit-edge-probe.yml (GitHub-hosted runner, outside the LAN, on a schedule).
@@ -125,16 +128,74 @@ def _get_rtc(edge: str, scheme: str):
 
 
 def _assert_not_livekit(r) -> None:
-    assert r.status_code != 101, "the edge upgraded /rtc to a websocket: LiveKit is routed"
+    assert r.status_code != 101, "the edge upgraded /rtc to a websocket without a session: LiveKit is routed unauthenticated"
     assert r.text.strip() != "OK", "the edge answered /rtc with LiveKit's health body"
     assert "livekit" not in r.text.lower() and "livekit" not in str(r.headers).lower()
 
 
+def _demands_authentication(r) -> bool:
+    """BARON RULING 2026-09-30: /rtc is the portal's signalling door, behind oauth2-proxy. With no
+    session it must answer 302 to the sign-in (never a 101 upgrade, a 200, or LiveKit's own
+    body) or 401/403. A 404 means the route is ABSENT, which is now a defect too."""
+    if r.status_code in (401, 403):
+        return True
+    if r.status_code in (301, 302, 303, 307):
+        loc = r.headers.get("location", "")
+        return "/oauth2/" in loc or "/realms/" in loc or "sign_in" in loc
+    return False
+
+
 @pytest.mark.parametrize("scheme", ["https", "http"])
-def test_rtc_signalling_path_does_not_reach_livekit(edge, scheme):
+def test_rtc_signalling_path_demands_authentication_and_never_reaches_livekit(edge, scheme):
     r = _get_rtc(edge, scheme)
-    if r is not None:
-        _assert_not_livekit(r)
+    if r is None:
+        return  # not answering HTTP from here; the aggregate test below requires one that does
+    _assert_not_livekit(r)
+    if scheme == "https":
+        assert _demands_authentication(r), (
+            f"{edge} answered /rtc with {r.status_code} (location={r.headers.get('location')!r}); "
+            "expected a demand for authentication (302 to oauth2-proxy sign-in, or 401/403)")
+
+
+def test_rtc_is_present_and_demands_authentication_on_at_least_one_edge_target():
+    """A silent edge cannot be told from an absent route, and absent is now a defect: at least one
+    probed target must actually answer /rtc over https with the authentication demand."""
+    answered = {h: _get_rtc(h, "https") for h in _hosts()}
+    ok = [h for h, r in answered.items() if r is not None and _demands_authentication(r)]
+    seen = {h: (r.status_code if r is not None else None) for h, r in answered.items()}
+    assert ok, f"no edge target demanded authentication for /rtc: {seen}"
+
+
+def test_demand_classifier_tells_a_sign_in_redirect_from_livekit_and_from_absence():
+    """Both-ways control for the classifier: a local responder answering each way is classified
+    by the same function the live probe uses."""
+    import http.server
+    import threading
+
+    class R(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            code, loc = {"/rtc": (302, "/portal/oauth2/sign_in?rd=/rtc"), "/absent": (404, None),
+                         "/open": (200, None)}[self.path.split("?")[0]]
+            self.send_response(code)
+            if loc:
+                self.send_header("Location", loc)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"OK" if code == 200 else b"..")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), R)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        def get(path):
+            return httpx.get(f"http://127.0.0.1:{srv.server_port}{path}", follow_redirects=False)
+        assert _demands_authentication(get("/rtc"))
+        assert not _demands_authentication(get("/absent"))
+        assert not _demands_authentication(get("/open"))
+    finally:
+        srv.shutdown()
 
 
 def test_rtc_probe_can_tell_a_livekit_like_responder_from_the_catch_all():

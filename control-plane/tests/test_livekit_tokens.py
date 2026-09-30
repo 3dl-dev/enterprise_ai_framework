@@ -17,7 +17,7 @@ the minting code. Mocks: none. The only stand-in is the environment (API key/sec
 set with monkeypatch.setenv, the same way the Deployment sets them).
 
 The exposure half reads the manifests and the example Caddyfile and asserts the Baron ruling
-of 2026-09-29 (gate cfa): LAN/VPN only, no public NodePort/TURN. `_exposure_violations` is
+of 2026-09-29 (gate cfa: media LAN/VPN only, no public NodePort/TURN) as amended 2026-09-30 (82e: the ONLY public piece is /rtc signalling, routed to the oauth2-proxy portal port). `_exposure_violations` is
 pointed at a poisoned COPY of the manifest in the tests below, so the checker is proven to
 fail on the fault it exists to catch. The live probe from outside the edge is in
 tests-live/test_livekit_exposure.py.
@@ -54,6 +54,25 @@ def voice_env(monkeypatch):
     monkeypatch.setenv("LIVEKIT_API_KEY", KEY)
     monkeypatch.setenv("LIVEKIT_API_SECRET", SECRET)
     monkeypatch.setenv("LIVEKIT_URL", URL)
+    # The endpoint now checks the raven exists and is the caller's (82e), so these tests run
+    # against a cluster that holds exactly the ravens they name.
+    from test_portal_agents import FakeCluster, _SA_DIR
+    from app import agent_usage, agents
+    cluster = FakeCluster()
+    monkeypatch.setattr(agents, "KUBE_API", cluster.url)
+    monkeypatch.setattr(agent_usage, "TOKEN_FILE", _SA_DIR / "token")
+    monkeypatch.setattr(agent_usage, "CA_FILE", _SA_DIR / "ca.crt")
+    monkeypatch.setattr(agent_usage, "NAMESPACE_FILE", _SA_DIR / "namespace")
+    # ("a","b-x") and ("a-b","x") name the SAME object (agent-a-b-x), so the platform can hold
+    # only one of them at a time; the collision test swaps them.
+    for user, raven in (("alice", "raven"), ("a", "b-x"), ("bob", "raven")):
+        cluster.add_agent(user, raven, agent_type="raven")
+    from test_voice import FakeLiveKit
+    lk = FakeLiveKit(KEY, SECRET)
+    monkeypatch.setenv("LIVEKIT_API_URL", lk.url)
+    yield cluster
+    cluster.stop()
+    lk.stop()
 
 
 def _client(peer="127.0.0.1"):
@@ -108,12 +127,16 @@ def test_a_room_that_shares_a_prefix_with_mine_is_still_not_mine(voice_env):
 
 def test_hyphenated_names_cannot_collide_into_one_room(voice_env):
     # The record's `voice-<user>-<raven>` gives BOTH of these `voice-a-b-x`.
+    cluster = voice_env
     room_a = _as("a", raven="b-x").json()["room"]
+    # the platform can hold only one of the two (same k8s object name): swap, then mint again
+    cluster.store.pop(("deployments", "agent-a-b-x"))
+    cluster.add_agent("a-b", "x", agent_type="raven")
     room_ab = _as("a-b", raven="x").json()["room"]
     assert room_a != room_ab
     # And each is refused the other's, through the real endpoint.
-    assert _as("a", raven="b-x", room=room_ab).status_code == 403
     assert _as("a-b", raven="x", room=room_a).status_code == 403
+    assert _as("a", raven="b-x", room=room_ab).status_code == 403
 
 
 def test_a_body_cannot_smuggle_an_identity(voice_env):
@@ -190,6 +213,91 @@ def _routing_violations(k8s_dir: Path) -> list[str]:
     return bad
 
 
+PORTAL_MANIFEST_NAME = "40-control-plane.yaml"
+
+
+def _portal_nodeport(k8s_dir: Path) -> int:
+    """The NodePort of the Service that fronts the portal's oauth2-proxy: the only upstream a
+    public /rtc route may name. Read from the manifest, not hard-coded here."""
+    for d in yaml.safe_load_all((k8s_dir / PORTAL_MANIFEST_NAME).read_text()):
+        if d and d.get("kind") == "Service" and "portal" in d["metadata"]["name"]:
+            for p in d["spec"]["ports"]:
+                if p.get("nodePort"):
+                    return p["nodePort"]
+    raise AssertionError("no portal NodePort Service in 40-control-plane.yaml")
+
+
+def _caddy_blocks(text: str):
+    """(header, body-lines) for every `header { ... }` block of a Caddyfile, comments stripped,
+    innermost first; body lines include nested blocks' lines flattened."""
+    stack: list[list] = []
+    out = []
+    for raw in text.splitlines():
+        t = raw.split("#", 1)[0].strip()
+        if not t:
+            continue
+        if t.endswith("{"):
+            stack.append([t[:-1].strip(), []])
+        elif t == "}":
+            head, body = stack.pop()
+            out.append((head, body))
+            if stack:
+                stack[-1][1].extend(body)
+        elif stack:
+            stack[-1][1].append(t)
+    return out
+
+
+def _rtc_route_violations(caddyfile: Path, portal_port: int) -> list[str]:
+    """/rtc may be routed on the public edge ONLY to the authenticated portal upstream. Every
+    Caddy `handle`/`route` block that matches /rtc (directly, or through a named matcher) must
+    proxy to <host>:<portal nodePort> and nowhere else; an inline `reverse_proxy /rtc* x` too."""
+    lines = [ln.split("#", 1)[0].strip() for ln in caddyfile.read_text().splitlines()]
+    named = {ln.split()[0] for ln in lines if ln.startswith("@") and "/rtc" in ln.lower()}
+    bad = []
+
+    def check(where: str, proxy_lines: list[str]) -> None:
+        ups = [u for ln in proxy_lines if ln.startswith("reverse_proxy")
+               for u in ln.split()[1:] if not u.startswith(("/", "@", "{"))]
+        if not ups:
+            bad.append(f"{where}: /rtc route with no reverse_proxy upstream (cannot prove it is authenticated)")
+        for u in ups:
+            if not u.endswith(f":{portal_port}"):
+                bad.append(f"{where}: /rtc is routed to {u}, not the authenticated portal port {portal_port}")
+
+    for head, body in _caddy_blocks(caddyfile.read_text()):
+        h = head.lower().split()
+        if h and h[0] in ("handle", "handle_path", "route") and ("/rtc" in head.lower() or named & set(head.split())):
+            check(head, body)
+    for ln in lines:
+        low = ln.lower()
+        if low.startswith("reverse_proxy") and ln.endswith("{") is False and (
+                "/rtc" in low or named & set(ln.split()[1:2])):
+            check(ln, [ln])
+    return bad
+
+
+def _edge_violations(caddyfile: Path, k8s_dir: Path) -> list[str]:
+    bad = _rtc_route_violations(caddyfile, _portal_nodeport(k8s_dir))
+    # oauth2-proxy is the authentication: no skip-auth carve-out may exist for /rtc, and it must
+    # have no upstream other than the loopback control plane.
+    for d in yaml.safe_load_all((k8s_dir / PORTAL_MANIFEST_NAME).read_text()):
+        if d and d.get("kind") == "Deployment":
+            for c in d["spec"]["template"]["spec"]["containers"]:
+                if c["name"] != "oauth2-proxy":
+                    continue
+                for a in c.get("args", []):
+                    if a.startswith("--skip-auth-regex") or (a.startswith("--skip-auth") and "rtc" in a.lower()):
+                        bad.append(f"oauth2-proxy skips authentication for a route: {a}")
+                    if a.startswith("--upstream") and a != "--upstream=http://127.0.0.1:8000":
+                        bad.append(f"oauth2-proxy has an unexpected upstream: {a}")
+    edge = "\n".join(ln.split("#", 1)[0] for ln in caddyfile.read_text().lower().splitlines())
+    for token in ("livekit", "7880", "7881", "7882", "30780", "30781", "30782", "3478", "5349"):
+        if token in edge:
+            bad.append(f"the public edge routes {token}")
+    return bad
+
+
 def _exposure_violations(manifest: Path, caddyfile: Path, k8s_dir: Path = K8S_DIR) -> list[str]:
     """Every way the files put LiveKit on the public edge, or reach for a LiveKit-Cloud piece."""
     docs = [d for d in yaml.safe_load_all(manifest.read_text()) if d]
@@ -230,10 +338,7 @@ def _exposure_violations(manifest: Path, caddyfile: Path, k8s_dir: Path = K8S_DI
         # comments name what is absent; only non-comment lines count
         if any(cloud in ln for ln in text.splitlines() if not ln.strip().startswith("#")):
             bad.append(f"cloud/non-OSI piece referenced: {cloud}")
-    edge = caddyfile.read_text().lower()
-    for token in ("livekit", "/rtc", "7880", "7881", "7882", "30780", "30781", "30782", "3478", "5349"):
-        if token in edge:
-            bad.append(f"the public edge routes {token}")
+    bad += _edge_violations(caddyfile, k8s_dir)
     return bad
 
 
@@ -340,3 +445,72 @@ def test_checker_flags_a_public_site_block_proxying_to_a_livekit_nodeport(tmp_pa
 
 def test_checker_is_clean_on_the_real_caddyfile():
     assert _exposure_violations(LIVEKIT_MANIFEST, CADDYFILE) == []
+
+
+# ---- BARON RULING 2026-09-30 (82e): signalling is reachable ONLY at /rtc behind oauth2-proxy ----
+# The checker must ALLOW exactly that route and still FLAG every other way to reach LiveKit. Every
+# fault below is injected through the Caddyfile / manifest DATA, into a copy, then the unmodified
+# checker runs on it.
+
+def test_the_shipped_caddyfile_routes_rtc_to_the_portal_port_on_both_public_blocks():
+    """Non-vacuity: the allow-case is real. Both portal-bearing site blocks route /rtc, and to
+    the portal's oauth2-proxy NodePort (30460, read from the manifest, not from the checker)."""
+    text = CADDYFILE.read_text()
+    assert text.count("@rtc path /rtc /rtc/*") == 2
+    assert text.count("handle @rtc {\n        reverse_proxy NODE_IP:30460\n    }") == 2
+    docs = [d for d in yaml.safe_load_all((K8S_DIR / "40-control-plane.yaml").read_text()) if d]
+    ports = [p["nodePort"] for d in docs if d["kind"] == "Service" for p in d["spec"]["ports"] if p.get("nodePort")]
+    assert 30460 in ports and _portal_nodeport(K8S_DIR) == 30460
+
+
+_RTC = "@rtc path /rtc /rtc/*\n    handle @rtc {\n        reverse_proxy NODE_IP:30460"
+
+
+@pytest.mark.parametrize("new,expect", [
+    # relabel the upstream to LiveKit's signalling NodePort: an unauthenticated route to LiveKit
+    (_RTC.replace("30460", "30780"), "30780"),
+    # a nearby wrong value: another port that is not the authenticated portal (the inference spoke)
+    (_RTC.replace("30460", "30480"), "not the authenticated portal port"),
+    # a route with no upstream to prove
+    (_RTC.replace("reverse_proxy NODE_IP:30460", "respond 200"), "no reverse_proxy upstream"),
+])
+def test_checker_flags_a_poisoned_rtc_route_in_the_real_caddyfile(tmp_path, new, expect):
+    text = CADDYFILE.read_text()
+    assert _RTC in text
+    edge = tmp_path / "Caddyfile"
+    edge.write_text(text.replace(_RTC, new))  # poisons BOTH site blocks
+    bad = _exposure_violations(LIVEKIT_MANIFEST, edge)
+    assert any(expect in b for b in bad), bad
+
+
+def test_checker_flags_an_unauthenticated_inline_rtc_proxy_and_a_new_public_block(tmp_path):
+    edge = _caddy_with_block(tmp_path, "https://ai.example.org:443 {\n    reverse_proxy /rtc* voice:9000\n}")
+    assert any("voice:9000" in b for b in _exposure_violations(LIVEKIT_MANIFEST, edge))
+    edge2 = _caddy_with_block(tmp_path, "https://x.example.org:443 {\n    @sig path /rtc\n    handle @sig {\n        reverse_proxy NODE_IP:30781\n    }\n}")
+    assert any("30781" in b for b in _exposure_violations(LIVEKIT_MANIFEST, edge2))
+
+
+def _k8s_with_oauth_arg(tmp_path, arg):
+    d = _k8s_copy(tmp_path)
+    f = d / "40-control-plane.yaml"
+    t = f.read_text()
+    anchor = "            - --proxy-websockets=true\n"
+    assert anchor in t
+    f.write_text(t.replace(anchor, anchor + f"            - {arg}\n", 1))
+    return d
+
+
+@pytest.mark.parametrize("arg", ["--skip-auth-route=GET=^/rtc", "--skip-auth-regex=^/rtc.*", "--upstream=http://livekit:7880"])
+def test_checker_flags_an_oauth2_proxy_carve_out_that_unauthenticates_rtc(tmp_path, arg):
+    d = _k8s_with_oauth_arg(tmp_path, arg)
+    bad = _exposure_violations(LIVEKIT_MANIFEST, CADDYFILE, d)
+    assert any("oauth2-proxy" in b for b in bad), bad
+
+
+def test_livekit_pod_is_not_handed_service_link_env_that_crashes_the_server():
+    """Observed live: a Service named `livekit` injects LIVEKIT_PORT=tcp://..., which livekit-server
+    parses as its --port and dies on. The shipped Deployment must opt out of service links (proven live:
+    the pod crash-loops without it, runs with it)."""
+    def dep(manifest: Path):
+        return next(d for d in yaml.safe_load_all(manifest.read_text()) if d and d["kind"] == "Deployment")
+    assert dep(LIVEKIT_MANIFEST)["spec"]["template"]["spec"].get("enableServiceLinks") is False
