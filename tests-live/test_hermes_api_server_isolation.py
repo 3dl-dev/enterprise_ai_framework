@@ -50,7 +50,7 @@ OTHERAGENT = "otheragent-swtestd95"  # wears what every hermes/openclaw agent po
 RAVEN = "raven-swtestd95"            # wears what a Raven pod will wear (agents-raven.md Contract E)
 BARE = "bare-swtestd95"              # wears nothing but the probe label
 PROBES = {"other-agent": OTHERAGENT, "raven": RAVEN, "bare": BARE}
-AGENT_LBL = "app.kubernetes.io/component=agent"
+PARTOF = "enterprise-ai-framework"
 
 # What each fence state must do to each probe. Hand-derived from what the state admits, NOT
 # produced by the code under test. Every probe's egress to :8642 is open, so a NETFAIL can only
@@ -62,6 +62,10 @@ MATRIX = {
     "removed":       {"other-agent": OPEN,    "raven": OPEN,    "bare": OPEN},
     "widened-agent": {"other-agent": OPEN,    "raven": OPEN,    "bare": REFUSED},
     "widened-raven": {"other-agent": REFUSED, "raven": OPEN,    "bare": REFUSED},
+    # part-of is worn by EVERY real agent pod (the probes copy it), never by the bare pod.
+    "widened-partof": {"other-agent": OPEN,   "raven": OPEN,    "bare": REFUSED},
+    # NotIn over a label nobody wears matches every pod, including one that wears nothing.
+    "widened-expr":  {"other-agent": OPEN,    "raven": OPEN,    "bare": OPEN},
 }
 
 
@@ -87,16 +91,17 @@ def _cleanup():
     _k("delete", "netpol", FENCE, EGRESS, "--ignore-not-found", check=False)
 
 
-def _render() -> str:
-    text = (REPO / "deploy/k8s/65-agent-hermes.template.yaml").read_text()
-    for k, v in (("__USER__", USER), ("__NAME__", NAME), ("__IMAGE__", _hermes_image()),
+def _render(template="65-agent-hermes.template.yaml", user=USER, name=NAME, move_component=True) -> str:
+    text = (REPO / "deploy/k8s" / template).read_text()
+    for k, v in (("__USER__", user), ("__NAME__", name), ("__IMAGE__", _hermes_image()),
                  ("__MODEL_SOURCE__", "integrated"), ("__KEY_SECRET__", f"{OBJ}-key"),
                  ("__CFGSUM__", "x"), ("__KEYSUM__", "x"), ("__EMAILSUM__", "none"),
                  ("__SLACKSUM__", "none"), ("__DISCORDSUM__", "none")):
         text = text.replace(k, v)
     # The component label moves off `agent` so no shared policy (63/66/68) selects the target.
-    text = text.replace("app.kubernetes.io/component: agent\n",
-                        f"app.kubernetes.io/component: {TARGET_COMPONENT}\n")
+    if move_component:
+        text = text.replace("app.kubernetes.io/component: agent\n",
+                            f"app.kubernetes.io/component: {TARGET_COMPONENT}\n")
     # Only the resource REQUESTS are shrunk (the shared node is CPU-packed while other work
     # runs); the ports, env and Service under test are untouched.
     return text.replace('requests: { cpu: "500m", memory: "1Gi"', 'requests: { cpu: "20m", memory: "512Mi"')
@@ -115,11 +120,29 @@ def _fence_manifest(mode: str) -> dict:
     assert any(p["port"] == 8642 for p in rule["ports"]), "66 no longer admits :8642"
     if mode == "widened-agent":
         rule["from"] = [{"podSelector": {"matchLabels": {"app.kubernetes.io/component": "agent"}}}]
+    elif mode == "widened-partof":
+        rule["from"] = [{"podSelector": {"matchLabels": {"app.kubernetes.io/part-of": PARTOF}}}]
+    elif mode == "widened-expr":
+        rule["from"] = [{"podSelector": {"matchExpressions": [
+            {"key": "d95-nobody-wears-this", "operator": "NotIn", "values": ["x"]}]}}]
     elif mode == "widened-raven":
         rule["from"] = [{"podSelector": {"matchLabels": {"agent.enterprise-ai/type": "raven"}}}]
     else:
         assert mode == "real"
     return doc
+
+
+def _pod_labels(template: str, user: str, name: str) -> dict:
+    """The COMPLETE label set of the pod a real provision of `template` produces: the pod
+    template of the Deployment in the REAL template file, rendered, component NOT moved."""
+    for doc in yaml.safe_load_all(_render(template, user, name, move_component=False)):
+        if doc and doc.get("kind") == "Deployment":
+            return dict(doc["spec"]["template"]["metadata"]["labels"])
+    raise AssertionError(f"{template}: no Deployment")
+
+
+def _label_arg(labels: dict) -> str:
+    return ",".join(f"{k}={v}" for k, v in labels.items())
 
 
 def _egress_manifest() -> dict:
@@ -207,6 +230,18 @@ def agent():
                   .replace("http://gateway:4000/v1", "http://freerouter:8080/v1")
                   .replace("zai-org/GLM-5.3-Flash", "google/gemma-3-27b-it")}},
     ]
+    # Probes wear a real agent pod's whole label set. Cross-check the render against a LIVE
+    # agent pod (read-only): same keys, same part-of/component/type values.
+    other = f"other{USER}"
+    hermes_lbls = _pod_labels("65-agent-hermes.template.yaml", other, "other")
+    raven_lbls = _pod_labels("69-agent-raven.template.yaml", USER, "ravenprobe")
+    live = json.loads(_k("get", "pod", "-l", f"agent.enterprise-ai/name={DONOR.split('-', 2)[2]},"
+                         "app.kubernetes.io/component=agent", "-o", "json").stdout)["items"][0]["metadata"]["labels"]
+    live.pop("pod-template-hash", None)
+    assert set(live) == set(hermes_lbls), (sorted(live), sorted(hermes_lbls))
+    for k in ("app.kubernetes.io/part-of", "app.kubernetes.io/component", "agent.enterprise-ai/type"):
+        assert live[k] == hermes_lbls[k], k
+    assert hermes_lbls["app.kubernetes.io/part-of"] == PARTOF
     try:
         # Manifests go to kubectl on stdin: no secret material touches disk in this test.
         _k("apply", "-f", "-", stdin=json.dumps({"apiVersion": "v1", "kind": "List", "items": objs}))
@@ -219,8 +254,8 @@ def agent():
         def run(name, extra):
             _k("run", name, "--labels", PROBE_LABEL + "=1" + (f",{extra}" if extra else ""), *common)
 
-        run(OTHERAGENT, f"{AGENT_LBL},agent.enterprise-ai/user=other{USER},agent.enterprise-ai/name=other")
-        run(RAVEN, f"{AGENT_LBL},agent.enterprise-ai/type=raven,agent.enterprise-ai/user={USER}")
+        run(OTHERAGENT, _label_arg(hermes_lbls))
+        run(RAVEN, _label_arg(raven_lbls))
         run(BARE, "")
         _k("wait", "--for=condition=Ready", *[f"pod/{p}" for p in PROBES.values()], "--timeout=180s")
         ip = _k("get", "svc", OBJ, "-o", "jsonpath={.spec.clusterIP}").stdout.strip()
@@ -251,13 +286,16 @@ def test_api_server_demands_its_own_secret(agent):
     assert _probe(agent["cp"], "control-plane", agent["ip"], "wrong-" + agent["key"]).startswith("HTTP 401")
 
 
-@pytest.mark.parametrize("mode", ["real", "removed", "widened-agent", "widened-raven"])
+@pytest.mark.parametrize("mode", ["real", "removed", "widened-agent", "widened-raven",
+                                  "widened-partof", "widened-expr"])
 def test_fence_decides_every_probe(agent, mode):
     """With every probe's egress open, the refusals are the destination fence and only it.
 
-    'real' is the shipped fence: an agent-labelled pod, a Raven-labelled pod and a bare pod
-    are all refused. The other rows mutate the fence through its policy data (delete it;
-    widen its from-selector to component=agent; widen it to type=raven) and the matrix must
+    'real' is the shipped fence: probes wearing the COMPLETE label set of a real rendered
+    hermes agent pod and Raven pod (65/69 templates, cross-checked against a live agent pod),
+    and a bare pod, are all refused. The other rows mutate the fence through its policy data (delete it;
+    widen its from-selector to component=agent, to type=raven, to part-of=enterprise-ai-framework,
+    and to a matchExpressions that matches every pod) and the matrix must
     change exactly as MATRIX says. A fence test that stayed green under the widened rows
     could not tell the shipped fence from a leaky one. A bare TCP connect, not a chat
     request: a permitted chat can outlast a short timeout and look 'refused'.
