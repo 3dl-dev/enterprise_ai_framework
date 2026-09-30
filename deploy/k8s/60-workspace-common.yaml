@@ -162,3 +162,16 @@ spec:
               - 172.16.0.0/12
               - 192.168.0.0/16
               - 169.254.0.0/16
+              # Non-public space a node can still route to (enterpriseaiframework-bbf).
+              # 100.64.0.0/10 is RFC 6598 CGNAT, which is Tailscale's tailnet range (devices
+              # and 100.100.100.100 MagicDNS): without this a pod reaches the operator's
+              # private tailnet. 198.18.0.0/15 is benchmarking space that VPN/fake-IP
+              # proxies and lab networks use. 192.0.0.0/24 is IETF protocol assignments.
+              # 224.0.0.0/4 multicast and 240.0.0.0/4 reserved (incl. 255.255.255.255) are
+              # never a public host. Documentation ranges (192.0.2/24, 198.51.100/24,
+              # 203.0.113/24) and 0/8, 127/8 are not routed off a node, so are left out.
+              - 100.64.0.0/10
+              - 198.18.0.0/15
+              - 192.0.0.0/24
+              - 224.0.0.0/4
+              - 240.0.0.0/4
