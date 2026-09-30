@@ -597,36 +597,84 @@ def test_no_mail_server_component_exists_in_any_deploy_manifest():
     )
 
 
+def _agent_external_reach(policies, port):
+    """(reachable external addresses, the private/special ones among them) for a hermes agent
+    pod on `port`, EVALUATED from every shipped NetworkPolicy (netpol_eval, -d7b)."""
+    import ipaddress
+    from netpol_eval import admitted_egress_peers, dest_from_template
+    agent = dest_from_template(REPO / "deploy/k8s/65-agent-hermes.template.yaml")
+    _, ips = admitted_egress_peers(policies, agent, port)
+    # the cluster's own reach: RFC1918 (pods, services, LAN, nodes) and link-local (metadata).
+    # 127/8, 0/8 and broadcast are unroutable off the pod, so they are not a route anywhere.
+    fenced = [ipaddress.ip_network(n) for n in
+              ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")]
+    private = [i for i in ips if any(ipaddress.ip_address(i) in n for n in fenced)]
+    return ips, private
+
+
+def _shipped_agent_policies():
+    from netpol_eval import load_policies
+    files = sorted(p for p in (REPO / "deploy/k8s").glob("*.yaml") if "kind: NetworkPolicy" in p.read_text())
+    return load_policies(files, {"__LAN_CIDR__": "192.168.0.0/16", "__GATEWAY_LAN_IP__": "192.168.2.42"})
+
+
 def test_the_agent_can_reach_an_external_mail_provider_but_still_not_the_cluster():
-    """Email needs egress, and the existing agent policy already grants exactly the right
-    kind: the whole internet MINUS every private range.
-
-    Asserted rather than assumed, because this feature depends on it: if a later change
-    narrowed agent egress to named ports, mail would stop working, and the symptom would
-    be an unattended agent silently failing to send. The same rule is what keeps that
-    egress from reaching the API server, another agent, or a workspace.
+    """Email needs egress, and the agent policy grants exactly the right kind: the public
+    internet, on the mail ports (SMTP submission 587/465, IMAP 993), and NO private, loopback
+    or link-local address. Evaluated over what the policies admit, not over how the rule is
+    spelled: if a later change narrowed agent egress to named ports mail would stop working
+    (an unattended agent silently failing to send); if it bought reachability by opening a
+    private range, the agent could reach the API server, another agent or a workspace.
     """
-    policy = next(
-        doc for doc in yaml.safe_load_all(
-            (REPO / "deploy/k8s/63-agent-common.yaml").read_text())
-        if doc and doc.get("kind") == "NetworkPolicy"
-    )
-    external = [
-        rule for rule in policy["spec"]["egress"]
-        if any("ipBlock" in to and to["ipBlock"]["cidr"] == "0.0.0.0/0"
-               for to in rule.get("to", []))
-    ]
-    assert external, "agents have no route to an external mail provider at all"
-    assert len(external) == 1, "more than one internet egress rule; which one governs mail?"
+    policies = _shipped_agent_policies()
+    for port in (25, 465, 587, 993):
+        ips, private = _agent_external_reach(policies, port)
+        assert "8.8.8.8" in ips, f"agents have no route to an external mail provider on :{port}"
+        assert private == [], f":{port} reaches cluster/LAN/link-local addresses {private}: a route to the cluster"
 
-    rule = external[0]
-    assert "ports" not in rule, (
-        "the internet egress rule now restricts ports. SMTP submission (587/465) and "
-        "IMAP (993) must be reachable or an agent's mailbox silently stops working."
-    )
-    excluded = set(rule["to"][0]["ipBlock"]["except"])
-    for private in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"):
-        assert private in excluded, (
-            f"{private} is no longer excluded from agent egress — mail reachability must "
-            "not have been bought by opening a route to the cluster."
-        )
+
+def _external_rule(docs):
+    pol = next(d for d in docs if d["metadata"]["name"] == "agent-isolation")
+    return next(r for r in pol["spec"]["egress"]
+                if any("ipBlock" in t and t["ipBlock"]["cidr"] == "0.0.0.0/0" for t in r.get("to", [])))
+
+
+def _except(docs):
+    return _external_rule(docs)["to"][0]["ipBlock"]["except"]
+
+
+MAIL_DRIFTS = {
+    # each must be caught by what the policies ADMIT, whichever way it is spelled
+    "172.16/12 no longer excepted": lambda d: _except(d).remove("172.16.0.0/12"),
+    "link-local no longer excepted": lambda d: _except(d).remove("169.254.0.0/16"),
+    "except list emptied": lambda d: _external_rule(d)["to"][0]["ipBlock"].__setitem__("except", []),
+    "except key dropped": lambda d: _external_rule(d)["to"][0]["ipBlock"].pop("except"),
+    "10/8 excepted as 10/9 only": lambda d: _except(d).__setitem__(
+        _except(d).index("10.0.0.0/8"), "10.0.0.0/9"),
+    "ports narrowed to 443 (mail silently stops)": lambda d: _external_rule(d).__setitem__(
+        "ports", [{"protocol": "TCP", "port": 443}]),
+    "external rule removed": lambda d: next(
+        x for x in d if x["metadata"]["name"] == "agent-isolation")["spec"]["egress"].remove(
+            _external_rule(d)),
+    "a second policy opens everything to agents": lambda d: d.append({
+        "apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+        "metadata": {"name": "wide", "namespace": "enterprise-ai"},
+        "spec": {"podSelector": {"matchLabels": {"app.kubernetes.io/component": "agent"}},
+                 "policyTypes": ["Egress"], "egress": [{}]}}),
+}
+
+
+@pytest.mark.parametrize("drift", sorted(MAIL_DRIFTS))
+def test_every_drift_of_the_agent_mail_egress_is_caught(tmp_path, drift):
+    import copy
+    from netpol_eval import load_policies
+    docs = copy.deepcopy(_shipped_agent_policies())
+    MAIL_DRIFTS[drift](docs)
+    f = tmp_path / "p.yaml"
+    f.write_text(yaml.safe_dump_all(docs))
+    policies = load_policies([f])
+    broken = False
+    for port in (25, 465, 587, 993):
+        ips, private = _agent_external_reach(policies, port)
+        broken |= "8.8.8.8" not in ips or bool(private)
+    assert broken, drift

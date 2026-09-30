@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parents[1]
@@ -90,22 +91,87 @@ def test_audio_routes_survive_rendering_with_real_upstreams_configured():
     assert "fake-large" not in names, "premise: the fake filter is really running"
 
 
+SPEECH_SEEDS = [("enterprise-ai", {"app": "gateway"}), ("kube-system", {"k8s-app": "kube-dns"})]
+
+
+def _speech_netpol_violations(policies) -> list:
+    """Evaluated (-d7b), not pattern-matched. Hand-written expectation: the speech pod reaches
+    only kube-dns-labelled pods on :53 (either protocol), no external address; and on its
+    ingress only the gateway pod (platform namespace) on :8000."""
+    from netpol_eval import (Dest, admitted_egress_peers, admitted_peers, build_universe,
+                             probe_ports)
+    speech = Dest("enterprise-ai", {"app": "speech"})
+    bad = []
+    eg = {p for p, _ in build_universe(policies, "enterprise-ai", "egress", SPEECH_SEEDS)[0]}
+    ing = {p for p, _ in build_universe(policies, "enterprise-ai", "ingress", SPEECH_SEEDS)[0]}
+    for proto in ("TCP", "UDP"):
+        for port in probe_ports(policies, extra=(53, 8000, 443)):
+            pods, ips = admitted_egress_peers(policies, speech, port, proto, SPEECH_SEEDS)
+            want = {p for p in eg if port == 53 and dict(p.labels).get("k8s-app") == "kube-dns"}
+            if set(pods) != want or ips:
+                bad.append(("egress", proto, port))
+            pods, ips = admitted_peers(policies, speech, port, proto, SPEECH_SEEDS)
+            want = {p for p in ing if proto == "TCP" and port == 8000
+                    and p.namespace == "enterprise-ai" and dict(p.labels).get("app") == "gateway"}
+            if set(pods) != want or ips:
+                bad.append(("ingress", proto, port))
+    return bad
+
+
+def _speech_policies(edit=None, tmp=None):
+    from netpol_eval import load_policies
+    docs = [d for d in _k8s_docs() if d["kind"] == "NetworkPolicy"]
+    extra = edit(docs) if edit else []
+    if tmp is None:
+        return docs + (extra or [])
+    f = tmp / "speech.yaml"
+    f.write_text(yaml.safe_dump_all(docs + (extra if isinstance(extra, list) else [])))
+    return load_policies([f])
+
+
 def test_speech_server_is_sealed_to_dns_only_and_offline():
     docs = _k8s_docs()
-    (pol,) = [d for d in docs if d["kind"] == "NetworkPolicy"]
-    assert pol["spec"]["podSelector"]["matchLabels"] == {"app": "speech"}
-    assert set(pol["spec"]["policyTypes"]) == {"Ingress", "Egress"}
-    for rule in pol["spec"]["egress"]:
-        assert {p["port"] for p in rule["ports"]} == {53}, "egress beyond DNS"
-    assert [r["from"][0]["podSelector"]["matchLabels"] for r in pol["spec"]["ingress"]] == [
-        {"app": "gateway"}
-    ], "only the gateway may reach the speech server"
+    assert _speech_netpol_violations(_speech_policies()) == []
     (dep,) = [d for d in docs if d["kind"] == "Deployment"]
     env = {e["name"]: e["value"] for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
     assert env["HF_HUB_OFFLINE"] == "1"
     # The fetch Job is the ONLY hub-reaching workload, and must not be covered by the policy.
+    from netpol_eval import selector_matches
     (job,) = [d for d in docs if d["kind"] == "Job"]
-    assert job["spec"]["template"]["metadata"]["labels"] != {"app": "speech"}
+    (pol,) = [d for d in docs if d["kind"] == "NetworkPolicy"]
+    assert not selector_matches(pol["spec"]["podSelector"], job["spec"]["template"]["metadata"]["labels"])
+    assert selector_matches(pol["spec"]["podSelector"], dep["spec"]["template"]["metadata"]["labels"])
+
+
+_ANY = {"namespaceSelector": {}}
+SPEECH_DRIFTS = {
+    "egress rule {}": lambda d: d[0]["spec"]["egress"].append({}),
+    "egress to [] + 443": lambda d: d[0]["spec"]["egress"].append({"to": [], "ports": [{"port": 443}]}),
+    "egress ipBlock 0.0.0.0/0": lambda d: d[0]["spec"]["egress"].append(
+        {"to": [{"ipBlock": {"cidr": "0.0.0.0/0"}}]}),
+    "egress dns ports []": lambda d: d[0]["spec"]["egress"][0].__setitem__("ports", []),
+    "egress dns port range 1-1024": lambda d: d[0]["spec"]["egress"][0]["ports"].append(
+        {"port": 1, "endPort": 1024}),
+    "egress dns any pod": lambda d: d[0]["spec"]["egress"][0].__setitem__("to", [_ANY]),
+    "egress to every namespace 443": lambda d: d[0]["spec"]["egress"].append(
+        {"to": [_ANY], "ports": [{"port": 443, "protocol": "TCP"}]}),
+    "egress policyType dropped": lambda d: d[0]["spec"].__setitem__("policyTypes", ["Ingress"]),
+    "ingress from omitted": lambda d: d[0]["spec"]["ingress"][0].pop("from"),
+    "ingress from any pod": lambda d: d[0]["spec"]["ingress"][0].__setitem__("from", [{"podSelector": {}}]),
+    "ingress + other namespaces": lambda d: d[0]["spec"]["ingress"][0]["from"].append(_ANY),
+    "ingress port range 8000-9000 from any": lambda d: d[0]["spec"]["ingress"].append(
+        {"from": [{"podSelector": {}}], "ports": [{"port": 8000, "endPort": 9000}]}),
+    "ingress gateway relabelled": lambda d: d[0]["spec"]["ingress"][0]["from"][0]["podSelector"][
+        "matchLabels"].__setitem__("app", "gateway-v2"),
+    "policy podSelector relabelled (selects nothing)": lambda d: d[0]["spec"]["podSelector"][
+        "matchLabels"].__setitem__("app", "speech2"),
+}
+
+
+
+@pytest.mark.parametrize("drift", sorted(SPEECH_DRIFTS))
+def test_every_drift_of_the_speech_seal_is_caught(tmp_path, drift):
+    assert _speech_netpol_violations(_speech_policies(SPEECH_DRIFTS[drift], tmp_path)), drift
 
 
 def test_compose_puts_the_speech_server_on_an_internal_network_only():
