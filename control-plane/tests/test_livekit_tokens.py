@@ -17,7 +17,7 @@ the minting code. Mocks: none. The only stand-in is the environment (API key/sec
 set with monkeypatch.setenv, the same way the Deployment sets them).
 
 The exposure half reads the manifests and the example Caddyfile and asserts the Baron ruling
-of 2026-09-29 (gate cfa): LAN/VPN only, no public NodePort/TURN. `_exposure_violations` is
+of 2026-09-29 (gate cfa: media LAN/VPN only, no public NodePort/TURN) as amended 2026-09-30 (82e: the ONLY public piece is /rtc signalling, routed to the oauth2-proxy portal port). `_exposure_violations` is
 pointed at a poisoned COPY of the manifest in the tests below, so the checker is proven to
 fail on the fault it exists to catch. The live probe from outside the edge is in
 tests-live/test_livekit_exposure.py.
@@ -505,3 +505,12 @@ def test_checker_flags_an_oauth2_proxy_carve_out_that_unauthenticates_rtc(tmp_pa
     d = _k8s_with_oauth_arg(tmp_path, arg)
     bad = _exposure_violations(LIVEKIT_MANIFEST, CADDYFILE, d)
     assert any("oauth2-proxy" in b for b in bad), bad
+
+
+def test_livekit_pod_is_not_handed_service_link_env_that_crashes_the_server():
+    """Observed live: a Service named `livekit` injects LIVEKIT_PORT=tcp://..., which livekit-server
+    parses as its --port and dies on. The shipped Deployment must opt out of service links (proven live:
+    the pod crash-loops without it, runs with it)."""
+    def dep(manifest: Path):
+        return next(d for d in yaml.safe_load_all(manifest.read_text()) if d and d["kind"] == "Deployment")
+    assert dep(LIVEKIT_MANIFEST)["spec"]["template"]["spec"].get("enableServiceLinks") is False
