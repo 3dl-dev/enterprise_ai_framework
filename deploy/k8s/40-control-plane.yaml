@@ -138,8 +138,8 @@ spec:
             - name: CHAT_CREDS_IV
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CHAT_CREDS_IV, optional: true } }
             # Voice: the control plane mints LiveKit room tokens for the caller's own rooms
-            # (app/livekit_tokens.py). LIVEKIT_URL is the LAN/VPN-reachable signalling URL a
-            # browser dials (ws://<node-lan-ip>:30780); all three optional — unset means the
+            # (app/livekit_tokens.py). LIVEKIT_URL is the direct LAN signalling address (informational:
+            # browsers dial the portal origin's /rtc instead, app/rtc_proxy.py); all three optional — unset means the
             # token endpoint answers 503 and nothing else changes. See 72-livekit.yaml.
             - name: LIVEKIT_API_KEY
               valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: LIVEKIT_API_KEY, optional: true } }

@@ -31,6 +31,8 @@ from . import (
     identity,
     issuance,
     livekit_tokens,
+    rtc_proxy,
+    voice,
     metering,
     metering_select,
     mirror,
@@ -143,6 +145,10 @@ app.include_router(livekit_tokens.router)
 # The agent-manager API (agents-raven.md, Contract F): a Raven drives its owner's agents
 # with an owner-scoped bearer, pod-IP only (loopback, i.e. the portal's proxy, is refused).
 app.include_router(agent_manager.router)
+# The voice registry, session tokens and the /voice/v1 relay the worker calls (-82e). See voice.py.
+app.include_router(voice.router)
+# LiveKit signalling on the portal origin, behind oauth2-proxy (-82e). See rtc_proxy.py.
+app.include_router(rtc_proxy.router)
 
 
 # ---------------------------------------------------------------- health
