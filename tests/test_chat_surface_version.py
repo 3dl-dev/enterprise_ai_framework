@@ -589,14 +589,22 @@ class TestTheModelPickerActuallyRenders:
         page.on("console", lambda m: console_errors.append(m.text) if m.type == "error" else None)
         try:
             page.goto(chat_url + "/", wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(1500)
-            if "/login" in page.url:
-                # OPENID_AUTO_REDIRECT is off on the local bundle (the cluster sets it),
-                # so a person lands on our own /login page first and clicks through to
-                # Keycloak — reproduced here rather than deep-linking to /oauth/openid,
-                # so this exercises the button a real user actually clicks.
-                page.click("text=Sign in with Enterprise AI")
-            page.wait_for_selector("input[name='username']", timeout=20000)
+            # OPENID_AUTO_REDIRECT is off on the local bundle (the cluster sets it), so a
+            # person lands on our own /login page first and clicks through to Keycloak —
+            # reproduced here rather than deep-linking to /oauth/openid, so this exercises
+            # the button a real user actually clicks.
+            #
+            # Wait for whichever of the two the SPA actually renders. This used to sleep
+            # 1500 ms and then read page.url once: the SPA only routes "/" to "/login"
+            # after its own auth calls return, so on a loaded host (the full suite) the
+            # URL was still "/" at 1.5 s, the button was never clicked, and the Keycloak
+            # form it then waited for never came (enterpriseaiframework-47b).
+            sign_in = page.locator("text=Sign in with Enterprise AI")
+            username = page.locator("input[name='username']")
+            sign_in.or_(username).first.wait_for(state="visible", timeout=20000)
+            if sign_in.is_visible():
+                sign_in.click()
+            username.wait_for(state="visible", timeout=20000)
             page.fill("input[name='username']", DOGFOOD_USER)
             page.fill("input[name='password']", DOGFOOD_PASSWORD)
             page.click("input[type='submit'], button[type='submit']")
@@ -617,11 +625,15 @@ class TestTheModelPickerActuallyRenders:
             # 2. The picker button itself now names the picked model — the rendered
             #    proof that the click actually changed the active selection, not just
             #    that an option existed to click.
-            page.wait_for_timeout(500)
-            assert page.locator("button", has_text="fake-small").count() > 0, (
-                "clicking the fake-small option did not change what the picker button "
-                "displays — the click may have landed on the wrong element"
-            )
+            from playwright.sync_api import TimeoutError as PlaywrightTimeout
+            picked = page.locator("button", has_text="fake-small")
+            try:
+                picked.first.wait_for(state="visible", timeout=10000)
+            except PlaywrightTimeout:
+                pytest.fail(
+                    "clicking the fake-small option did not change what the picker button "
+                    "displays — the click may have landed on the wrong element"
+                )
 
             # 3. Send a real turn through the actual composer, not chat_turn.py's direct
             #    POST — this is the wire shape ONLY the rendered UI can produce.

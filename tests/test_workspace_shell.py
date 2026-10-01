@@ -147,6 +147,21 @@ class Shell:
             time.sleep(PULSE_INTERVAL / 2)
         pytest.fail(f"timed out waiting for {what}; last pulse was {last}")
 
+    def land(self, rel: str, text: str) -> None:
+        """Put a whole file into the served tree in ONE filesystem event.
+
+        `Path.write_text` is create-then-write: a sampler window that falls between the two
+        sees an empty file, and the write then moves the fingerprint a second time. Tests
+        that count revisions, or read offline_refs off the first snapshot with has_index,
+        need the file to arrive complete. Staged outside WS_PROJECTS_ROOT (same filesystem),
+        then renamed in, which is how an editor's atomic save arrives.
+        """
+        staging = self.root.parent / "staging"
+        staging.mkdir(exist_ok=True)
+        tmp = staging / rel.replace("/", "_")
+        tmp.write_text(text)
+        os.replace(tmp, self.root / rel)
+
     def settle(self, windows: int = 3) -> dict:
         """Let the sampler run N full windows, then return the snapshot.
 
@@ -231,7 +246,7 @@ def test_pulse_is_stable_with_no_filesystem_change(shell):
 
 def test_writing_a_file_bumps_revision_by_exactly_one(shell):
     before = shell.pulse()["rev"]
-    (shell.root / "alpha" / "index.html").write_text("<h1>hi</h1>")
+    shell.land("alpha/index.html", "<h1>hi</h1>")
     after = shell.wait_for(lambda p: p["rev"] != before, "revision to move")
     assert after["rev"] == before + 1
     assert after["changed"][0] == "index.html"
@@ -241,7 +256,7 @@ def test_writing_a_file_bumps_revision_by_exactly_one(shell):
 
 
 def test_git_and_node_modules_churn_does_not_bump_revision(shell):
-    (shell.root / "alpha" / "index.html").write_text("<h1>hi</h1>")
+    shell.land("alpha/index.html", "<h1>hi</h1>")
     settled = shell.wait_for(lambda p: p["has_index"], "index.html to register")
     rev = settled["rev"]
 
@@ -265,6 +280,25 @@ def test_has_index_flips_with_the_file(shell):
     shell.wait_for(lambda p: p["has_index"] is False, "has_index false")
 
 
+def test_has_index_is_the_same_file_whatever_form_it_takes(shell):
+    """has_index is read off the sampler's own scan (so it can never run ahead of rev).
+    The scan skips symlinks and nested files; has_index must still mean exactly "the
+    project root has an index.html /preview will serve" — a symlinked one counts, one in a
+    subfolder or a directory by that name does not."""
+    alpha = shell.root / "alpha"
+    (alpha / "sub").mkdir()
+    shell.land("alpha/sub/index.html", "<h1>nested</h1>")
+    (alpha / "index.html").mkdir()
+    before = shell.pulse()["rev"]
+    shell.land("alpha/other.html", "<h1>x</h1>")
+    p = shell.wait_for(lambda p: p["rev"] != before, "the scan to pass over both")
+    assert p["has_index"] is False
+    (alpha / "index.html").rmdir()
+    (alpha / "index.html").symlink_to("other.html")
+    shell.wait_for(lambda p: p["has_index"] is True, "a symlinked index.html to count")
+    assert shell.get("/preview/").status_code == 200
+
+
 def test_offline_refs_counts_only_loadable_references(shell):
     """The highest-value line in the server: it turns "your page reaches off itself for a
     piece of itself" into a sentence a child can act on.
@@ -273,7 +307,7 @@ def test_offline_refs_counts_only_loadable_references(shell):
     blank page". That was false twice over — see the OFFLINE_REF comment in shell-server.py
     and enterpriseaiframework-644. The counter is a house-rule check, not a capability
     check; what it counts is unchanged."""
-    (shell.root / "alpha" / "index.html").write_text(
+    shell.land("alpha/index.html",
         '<script src="https://cdn.example.com/x.js"></script>\n'
         '<link rel="stylesheet" href="//fonts.example.com/f.css">\n'
         '<IMG SRC="http://example.com/a.png">\n'
@@ -286,7 +320,7 @@ def test_offline_refs_counts_only_loadable_references(shell):
 
 
 def test_offline_refs_is_zero_for_a_self_contained_page(shell):
-    (shell.root / "alpha" / "index.html").write_text(
+    shell.land("alpha/index.html",
         "<style>body{color:red}</style><script>const x=1//2\n</script>"
     )
     p = shell.wait_for(lambda p: p["has_index"], "index.html to register")

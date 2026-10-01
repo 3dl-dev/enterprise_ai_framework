@@ -360,35 +360,179 @@ def test_default_overlay_path_is_outside_the_repo_and_under_home(tmp_path, clust
 
 OVERLAY_NAMES = ("operated.env", "DEPLOY_OVERLAY_FILE", ".env.operated", "instance-source.sh")
 
+# The files compose and the bundle scripts run from: what git tracks under bundle/ plus the
+# Makefile. Two things are deliberately NOT scanned, and both are why the e7f version of this
+# scan went red only in the primary checkout:
+#   * the vendored submodule bundle/codeapi (ClickHouse/code-interpreter, pinned by gitlink).
+#     It is not repo-owned, and it cannot reach the overlay: compose uses it only as a docker
+#     BUILD CONTEXT (no host mounts on any codeapi service), so its code runs inside containers
+#     whose environment is exactly what docker-compose.yml declares, and docker-compose.yml IS
+#     scanned. Its `process.env.X` (JavaScript attribute access) and its .dockerignore's `.env.*`
+#     (an exclusion) are not env-file reads at all.
+#   * untracked/ignored output (bundle/.env, generated configs, exports). It is written by the
+#     tracked renderers, which are scanned, and it differs per checkout, which is what made the
+#     result depend on WHICH checkout ran the suite.
+def _repo_owned_bundle_files():
+    out = subprocess.run(["git", "-C", str(REPO), "ls-files", "-z", "--", "bundle", "Makefile"],
+                         capture_output=True, check=True).stdout.decode()
+    return [REPO / p for p in out.split("\0") if p and (REPO / p).is_file()]
+
+
+# The only env file compose and the bundle scripts may read: the shared bundle/.env.
+SHARED_ENV = {".env", "./.env", "bundle/.env", "$(BUNDLE)/.env", "${BUNDLE}/.env", "$BUNDLE/.env"}
+# `.env` used as a PATH (after start, whitespace, quote, `/`, `=`, a bracket, `:` or `,`) — not
+# attribute access like JavaScript `process.env.X` / `process.env[k]`, where an identifier,
+# `]` or `)` precedes it.
+_PATH_ENV = r"(?<![\w$\])])\.env"
+_SHELL_WORD = r"(\"[^\"]*\"|'[^']*'|(?:\$\([^)]*\)|\$\{[^}]*\}|[^\s;|&()\"'])+)"
+
+
+def _unquote(w):
+    return w[1:-1] if len(w) >= 2 and w[0] == w[-1] and w[0] in "\"'" else w
+
+
+def _is_shell(path, text):
+    return path.suffix == ".sh" or path.name == "Makefile" or re.match(r"#!.*\b(ba|z|da)?sh\b", text) is not None
+
+
+def _overlay_reads(path, text):
+    """Every way `text` (the content of `path`) could read the operated-instance overlay.
+
+    The overlay lives at ~/.config/enterprise-ai/operated.env, outside the repo, so a read has
+    to name it, name its directory, or read an env FILE whose path it controls. What counts as
+    an env-file read is the set of forms that load a file into an environment: compose
+    `env_file:`, `--env-file`, COMPOSE_ENV_FILES, shell `source`/`.`, and dotenv loaders; plus
+    any path token or glob that names a `.env` sibling (`.env.operated`, `.env*`, `*.env`),
+    whatever verb reads it.
+    """
+    hits = [n for n in OVERLAY_NAMES if n in text]
+    hits += [n for n in ("enterprise-ai/operated", ".config/enterprise-ai") if n in text]
+    # the overlay's parent directory, however $HOME is spelled
+    hits += [f"home .config {m}" for m in re.findall(r"(?:~|\$HOME|\$\{HOME[^}]*\})/\.config\b", text)]
+    # compose: an env_file key in any spelling (block, flow, quoted, JSON), and the env var form
+    hits += [f"env_file {m}" for m in re.findall(r"\benv_file\b[\"']?\s*:", text)]
+    hits += [f"compose env {m}" for m in re.findall(r"\bCOMPOSE_ENV_FILES\b", text)]
+    # --env-file with anything but the shared file, quoted or not, `=` or space
+    hits += [f"--env-file {m}" for m in re.findall(r"--env-file(?:=|[ \t]+)" + _SHELL_WORD, text)
+             if _unquote(m) not in SHARED_ENV]
+    hits += [f"--env-file {m}" for m in re.findall(r"--env-file(?:=|[ \t]*)(\\?\n|$)", text, re.M)]
+    # dotenv loaders (python-dotenv, node dotenv, the dotenv/env-cmd CLIs)
+    hits += [f"dotenv {m}" for m in re.findall(
+        r"\b(load_dotenv|dotenv_values|find_dotenv|from\s+dotenv|dotenv/config|require\(\s*['\"]dotenv|"
+        r"dotenv\.config|dotenv\s+(?:-f|-e|run)|env-cmd)\b", text)]
+    # shell source / . of anything but the shared file
+    if _is_shell(path, text):
+        code = re.sub(r"(?m)(^|\s)#.*$", r"\1", text)   # a comment executes nothing
+        for m in re.findall(r"(?:^|[;&|({!]|\bthen|\bdo|\belse)[ \t]*(?:source|\.)[ \t]+" + _SHELL_WORD, code, re.M):
+            if _unquote(m) not in SHARED_ENV:
+                hits.append(f"source {m}")
+    # a path naming a .env sibling, or a glob/brace over .env
+    hits += [f"glob {m}" for m in re.findall(_PATH_ENV + r"\.?[*?\[{]", text)]
+    hits += [f"glob {m}" for m in re.findall(r"\*\.env\b", text)]
+    hits += [f"sibling {m}" for m in re.findall(_PATH_ENV + r"\.[A-Za-z0-9*?_-]+", text)
+             if m not in {".env.example", ".env.tmp"} and not m.startswith(".env.ALLOW_")]
+    return hits
+
 
 def test_compose_files_and_bundle_scripts_never_read_the_overlay():
     """The incident: operated values in a file compose reads flipped the local stack to freerouter."""
-    offenders = []
-    roots = [REPO / "bundle", REPO / "Makefile"]
-    files = [f for r in roots for f in ([r] if r.is_file() else r.rglob("*")) if f.is_file()]
+    files = _repo_owned_bundle_files()
     assert any(f.name == "docker-compose.yml" for f in files) and any(f.parent.name == "bin" for f in files)
+    assert (REPO / "Makefile") in files
+    offenders = []
     for f in files:
         try:
             text = f.read_text()
         except (UnicodeDecodeError, OSError):
             continue
-        offenders += [f"{f.relative_to(REPO)}: {n}" for n in OVERLAY_NAMES if n in text]
-    # Indirect forms that would reach the overlay without naming it: its directory, a glob over
-    # `.env*`/`.env.?*`, an `env_file:` key, or any `--env-file` other than the shared bundle/.env.
-    indirect = {"enterprise-ai/operated", ".config/enterprise-ai", "env_file:"}
-    sibling_ok = {".env.example", ".env.tmp"}
-    for f in files:
-        try:
-            text = f.read_text()
-        except (UnicodeDecodeError, OSError):
-            continue
-        offenders += [f"{f.relative_to(REPO)}: {n}" for n in indirect if n in text]
-        offenders += [f"{f.relative_to(REPO)}: glob {m}" for m in re.findall(r"\.env[*?\[]", text)]
-        offenders += [f"{f.relative_to(REPO)}: sibling {m}" for m in re.findall(r"\.env\.[A-Za-z*?_-]+", text)
-                      if m not in sibling_ok and not m.startswith(".env.ALLOW_")]
-        offenders += [f"{f.relative_to(REPO)}: --env-file {m}" for m in re.findall(r"--env-file[ =]+(\$\(BUNDLE\)/[^\s)]*|[^\s)\"';]+)", text)
-                      if m not in ("$(BUNDLE)/.env", "bundle/.env", ".env")]
+        offenders += [f"{f.relative_to(REPO)}: {h}" for h in _overlay_reads(f, text)]
     assert not offenders, offenders
+
+
+# Controls for the scan above, fed through the same input it reads (a file's text).
+# Every form here reaches the overlay (or an env file compose/the scripts would load) and must
+# be caught; the benign forms below it must not be.
+_READS = [
+    ("Makefile", "COMPOSE := docker compose --env-file $(HOME)/.config/enterprise-ai/operated.env\n"),
+    ("Makefile", "COMPOSE := docker compose --env-file $(BUNDLE)/.env --env-file $(OVERLAY)\n"),
+    ("Makefile", "COMPOSE := docker compose --env-file=$(BUNDLE)/.env.operated\n"),
+    ("x.sh", 'docker compose --env-file "$OVERLAY" up -d\n'),
+    ("x.sh", "docker compose --env-file '$ENVF' up -d\n"),
+    ("x.sh", "docker compose --env-file \\\n  \"$ENVF\" up -d\n"),
+    ("x.sh", "export COMPOSE_ENV_FILES=.env,/etc/x.env\n"),
+    ("docker-compose.yml", "services:\n  gw:\n    env_file:\n      - ../x.env\n"),
+    ("docker-compose.yml", "services:\n  gw:\n    env_file: [.env]\n"),
+    ("docker-compose.yml", "services: {gw: {env_file: .env}}\n"),
+    ("docker-compose.yml", "services:\n  gw:\n    \"env_file\" : x\n"),
+    ("docker-compose.yml", "services:\n  gw:\n    env_file:\n      - path: ./x\n        required: false\n"),
+    ("docker-compose.yml", "services:\n  gw:\n    volumes:\n      - ${HOME}/.config:/cfg:ro\n"),
+    ("docker-compose.yml", "services:\n  gw:\n    volumes:\n      - ~/.config:/cfg:ro\n"),
+    ("x.json", '{"services": {"gw": {"env_file": "x"}}}'),
+    ("x.sh", "set -a; . \"$DEPLOY_OVERLAY_FILE\"; set +a\n"),
+    ("x.sh", "set -a; . \"$OVERLAY\"; set +a\n"),
+    ("x.sh", "source ~/.config/enterprise-ai/operated.env\n"),
+    ("x.sh", "source \"$F\"\n"),
+    ("x.sh", "if true; then . ./.env.operated; fi\n"),
+    ("x.sh", ". \"$HOME/.config/x\"\n"),
+    ("x.sh", "for f in .env*; do cat \"$f\"; done\n"),
+    ("x.sh", "cat ./.env.? >> .env\n"),
+    ("x.sh", "cat .env.[a-z]* >> .env\n"),
+    ("x.sh", "cat .env{,.operated} >> .env\n"),
+    ("x.sh", "cat \"$DIR\"/*.env >> .env\n"),
+    ("x.sh", "export $(grep -v '^#' .env.operated | xargs)\n"),
+    ("x.py", "from dotenv import load_dotenv\nload_dotenv('/etc/x')\n"),
+    ("x.py", "vals = dotenv_values(p)\n"),
+    ("x.py", "open(os.path.join(root, '.env.local')).read()\n"),
+    ("x.py", "glob.glob('.env*')\n"),
+    ("x.js", "require('dotenv').config({ path: p })\n"),
+    ("x.js", "import 'dotenv/config'\n"),
+    ("x.sh", "dotenv -f /x run -- up\n"),
+    ("x.sh", "env-cmd -f x node s.js\n"),
+    ("x.sh", "cp \"$DEPLOY_OVERLAY_FILE\" .\n"),
+    ("x.sh", "o=\"${HOME:-/root}/.config/enterprise-ai\"; cat \"$o/op\"\n"),
+    ("x.sh", ". deploy/bin/lib/instance-source.sh\n"),
+]
+_NOT_READS = [
+    # the false positives from bundle/codeapi/test-sandbox.sh (JavaScript attribute access)
+    ("x.sh", "const payload = JSON.parse(process.env.PAYLOAD_JSON);\n"),
+    ("x.sh", "  const value = Number(process.env[name]);\n"),
+    ("x.sh", "const k = process.env.CODEAPI_EXECUTION_MANIFEST_PRIVATE_KEY.trim();\n"),
+    ("x.py", "os.environ['X']\nos.environ.get('Y')\n"),
+    # the shared file, every spelling the bundle uses
+    ("Makefile", "COMPOSE := docker compose -f $(BUNDLE)/docker-compose.yml --env-file $(BUNDLE)/.env\n"),
+    ("x.sh", "COMPOSE=(docker compose -f docker-compose.yml --env-file .env)\n"),
+    ("x.sh", "set -a; . ./.env; set +a\n"),
+    ("x.sh", "source \"./.env\"\n"),
+    ("x.sh", "cp .env.example .env\n"),
+    # a sentence ending in a period in shell prose is not a source
+    ("x.sh", "# the key lives in .env. Next line.\necho hi\n"),
+]
+
+
+@pytest.mark.parametrize("name,text", _READS, ids=[f"read{i}" for i in range(len(_READS))])
+def test_the_overlay_scan_catches_every_env_file_read_form(name, text):
+    assert _overlay_reads(Path(name), text), f"missed: {text!r}"
+
+
+@pytest.mark.parametrize("name,text", _NOT_READS, ids=[f"benign{i}" for i in range(len(_NOT_READS))])
+def test_the_overlay_scan_does_not_flag_attribute_access_or_the_shared_file(name, text):
+    assert _overlay_reads(Path(name), text) == []
+
+
+def test_the_vendored_submodule_is_not_in_the_scan_and_cannot_reach_the_host():
+    """Why bundle/codeapi is out of scope: it enters compose only as a build context, never as a
+    host mount, so nothing in it runs with the host filesystem (and the overlay) visible."""
+    files = {f.relative_to(REPO).as_posix() for f in _repo_owned_bundle_files()}
+    assert not any(f.startswith("bundle/codeapi/") for f in files)
+    compose = yaml.safe_load((REPO / "bundle/docker-compose.yml").read_text())
+    for name, svc in compose["services"].items():
+        build = svc.get("build")
+        ctx = build.get("context") if isinstance(build, dict) else build
+        if not (ctx and ctx.rstrip("/").endswith("codeapi")):
+            continue
+        for v in svc.get("volumes") or []:
+            src = v.get("source", "") if isinstance(v, dict) else str(v).split(":")[0]
+            assert not src.startswith(("/", ".", "~", "$")), f"{name} mounts host path {src}"
 
 
 def test_the_overlay_default_path_is_not_inside_the_repo():
