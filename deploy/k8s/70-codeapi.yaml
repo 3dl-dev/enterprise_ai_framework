@@ -66,7 +66,11 @@ spec:
     spec:
       containers:
         - name: minio
-          image: quay.io/minio/minio
+          # Pinned by digest: the untagged `quay.io/minio/minio` (= :latest, pull Always)
+          # stopped pulling, so every container restart crash-looped in ImagePullBackOff
+          # and blocked deploy rollouts. This digest is the image the cluster already ran.
+          image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+          imagePullPolicy: IfNotPresent
           args: ["server", "/data", "--console-address", ":9001"]
           env:
             - name: MINIO_ROOT_USER
