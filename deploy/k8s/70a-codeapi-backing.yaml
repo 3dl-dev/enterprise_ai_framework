@@ -1,0 +1,80 @@
+# codeapi's backing services (redis, minio): third-party images, pinned, applied by every deploy.
+# Split out of 70-codeapi.yaml on 2026-10-01: that file also holds codeapi images deploy.sh does not
+# build (REPLACED_BY_DEPLOY), so deploy.sh held the WHOLE file back and the minio image pin never
+# reached the cluster. A file is applied or held back as a unit, so keep these separate.
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeapi-redis
+  namespace: enterprise-ai
+spec:
+  selector: { app: codeapi-redis }
+  ports: [{ name: redis, port: 6379, targetPort: 6379 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeapi-redis
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: codeapi-redis } }
+  template:
+    metadata: { labels: { app: codeapi-redis } }
+    spec:
+      containers:
+        - name: redis
+          image: valkey/valkey:8-alpine
+          args: ["valkey-server", "--requirepass", "$(CODEAPI_REDIS_PASSWORD)", "--save", "60", "1", "--appendonly", "no"]
+          env:
+            - name: CODEAPI_REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: CODEAPI_REDIS_PASSWORD } }
+          ports: [{ containerPort: 6379 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codeapi-minio
+  namespace: enterprise-ai
+spec:
+  selector: { app: codeapi-minio }
+  ports: [{ name: s3, port: 9000, targetPort: 9000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codeapi-minio
+  namespace: enterprise-ai
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: codeapi-minio } }
+  template:
+    metadata: { labels: { app: codeapi-minio } }
+    spec:
+      containers:
+        - name: minio
+          # Pinned by digest: the untagged `quay.io/minio/minio` (= :latest, pull Always)
+          # stopped pulling, so every container restart crash-looped in ImagePullBackOff
+          # and blocked deploy rollouts. This digest is the image the cluster already ran.
+          image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: MINIO_ROOT_USER } }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: enterprise-ai-secrets, key: MINIO_ROOT_PASSWORD } }
+          ports: [{ containerPort: 9000 }]
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: codeapi-minio-data }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: codeapi-minio-data
+  namespace: enterprise-ai
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources: { requests: { storage: 5Gi } }
