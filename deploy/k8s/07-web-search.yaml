@@ -121,7 +121,7 @@ spec:
             - { name: config, mountPath: /config }
       containers:
         - name: searxng
-          image: searxng/searxng:latest
+          image: docker.io/searxng/searxng@sha256:5286edb35782454ab8a102c5eff6b54bff745853191b46aeead95f225aa6dfb6  # pinned: the digest running on 2026-10-01; :latest re-pulls on every restart
           env:
             - { name: SEARXNG_SETTINGS_PATH, value: "/etc/searxng-config/settings.yml" }
             - { name: SEARXNG_BASE_URL, value: "http://searxng:8080/" }

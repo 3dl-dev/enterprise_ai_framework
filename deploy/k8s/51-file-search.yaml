@@ -111,7 +111,7 @@ spec:
       enableServiceLinks: false
       containers:
         - name: rag-api
-          image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite:latest
+          image: registry.librechat.ai/danny-avila/librechat-rag-api-dev-lite@sha256:a62ce2221b43a9bb57fa6cb733e7047c80132960272c33d5704028f3071a1251  # pinned: the digest running on 2026-10-01; :latest re-pulls on every restart
           env:
             - name: DB_HOST
               value: ragvector
