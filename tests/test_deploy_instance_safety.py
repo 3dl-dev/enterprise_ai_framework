@@ -191,6 +191,39 @@ def test_the_freerouter_keys_are_empty_live_and_deploy_does_not_blank_them(tmp_p
     assert "FREEROUTER_MASTER_KEY" not in r.stderr
 
 
+def _replenish_live(cluster, peer_serve):
+    # The live secret after the 2026-09-02 hand patch: replenish configured, PEER_SERVE as given.
+    cluster.set_secret({"PUBLIC_BASE_URL": LIVE_URL, "OPENID_ISSUER": LIVE_ISSUER, "GATEWAY_PROVIDER": "",
+                        "FREEROUTER_MASTER_KEY": "", "POSTGRES_PASSWORD": "pgpw", "GATEWAY_MASTER_KEY": "gmk",
+                        "FREEROUTER_REPLENISH_ENABLED": "on", "FREEROUTER_PEER_SERVE": peer_serve})
+
+
+@pytest.mark.parametrize("live_peer_serve", ["on", ""])
+def test_a_deploy_that_leaves_replenish_on_without_peer_serve_is_refused(tmp_path, cluster, live_peer_serve):
+    # enterpriseaiframework-eb3: freerouter starts the buyer auto-replenish only when
+    # FREEROUTER_PEER_SERVE is on. The 2026-09-30 watcher deploys wrote it '' (it lived only in the
+    # secret), the next freerouter pod came up with no replenisher, the router.3dl.one balance
+    # drained and every agent got 402. "" is the state AFTER that blanking: the secret-vs-secret
+    # check sees no change, so this dependency has to be checked on its own.
+    _replenish_live(cluster, live_peer_serve)
+    r = run_deploy(tmp_path, cluster, OPERATED)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "FREEROUTER_PEER_SERVE" in r.stderr and "FREEROUTER_REPLENISH_ENABLED" in r.stderr
+    assert_no_mutation(cluster)
+
+
+def test_replenish_with_peer_serve_declared_in_the_overlay_deploys(tmp_path, cluster):
+    _replenish_live(cluster, "on")
+    r = run_deploy(tmp_path, cluster, {**OPERATED, "FREEROUTER_PEER_SERVE": "on"})
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_no_replenish_live_does_not_require_peer_serve(tmp_path, cluster):
+    # The base product (no upstream tenancy) never sets PEER_SERVE; the guard must not fire.
+    r = run_deploy(tmp_path, cluster, OPERATED)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
 def test_ambient_shell_env_never_reaches_the_cluster_values(tmp_path, cluster):
     # The file omits PUBLIC_BASE_URL/GATEWAY_PROVIDER; the caller's shell (direnv, a watcher
     # default) supplies plausible-looking values. They must be ignored: fail closed.

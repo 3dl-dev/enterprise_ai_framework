@@ -40,6 +40,13 @@ _predeploy_allowed() {
     return 1
 }
 
+# freerouter's boolEnvDefault truthiness (internal/gateway/config.go): trimmed, case-insensitive.
+_predeploy_truthy() {
+    local v="${1,,}"
+    v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    case "$v" in 1|true|on|yes|y) return 0 ;; *) return 1 ;; esac
+}
+
 predeploy_check() {
     local ns="$1"; shift
     local -a refused=() notes=()
@@ -92,6 +99,19 @@ for k, v in json.loads(sys.stdin.read()).get("data", {}).items():
             fi
         fi
     done
+
+    # A dependency, not a value comparison (enterpriseaiframework-eb3): freerouter starts the buyer
+    # auto-replenish ONLY when FREEROUTER_PEER_SERVE is on (it reads the settlement wallet from the
+    # peer config, which is empty otherwise). With replenish configured live and PEER_SERVE not
+    # declared, the next freerouter pod comes up with no replenisher, the upstream router balance
+    # drains and every surface 402s. Checked against what this deploy WRITES, so a secret that was
+    # already blanked by an earlier deploy (live '' == desired '') is still caught.
+    local replenish
+    replenish=$(awk -F'\t' '$1=="FREEROUTER_REPLENISH_ENABLED"{print $2}' <<<"$live" | base64 -d 2>/dev/null || true)
+    if _predeploy_truthy "$replenish" && [[ -v "desired[FREEROUTER_PEER_SERVE]" ]] \
+        && ! _predeploy_truthy "${desired[FREEROUTER_PEER_SERVE]}" && ! _predeploy_allowed FREEROUTER_PEER_SERVE; then
+        refused+=("FREEROUTER_PEER_SERVE (live FREEROUTER_REPLENISH_ENABLED is on; freerouter only starts the replenisher when PEER_SERVE is on, so the upstream balance would drain)")
+    fi
 
     local n
     (( filled )) && echo "predeploy: note: $filled other key(s) empty/absent live, deploy fills them"
